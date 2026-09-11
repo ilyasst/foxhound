@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/foxhound/contracts/candidate-feed-v1.schema.json",
+  "title": "Foxhound ordered task candidate feed",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "producer",
+    "stream_id",
+    "from_cursor",
+    "to_cursor",
+    "items",
+    "emitted_at"
+  ],
+  "properties": {
+    "schema": {"const": "foxhound.task-candidate-feed"},
+    "schema_version": {"const": 1},
+    "producer": {"enum": ["gw"]},
+    "stream_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$"
+    },
+    "from_cursor": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9223372036854775807
+    },
+    "to_cursor": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9223372036854775807
+    },
+    "items": {
+      "type": "array",
+      "maxItems": 500,
+      "items": {
+        "type": "object",
+        "required": ["sequence", "candidate"],
+        "properties": {
+          "sequence": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9223372036854775807
+          },
+          "candidate": {"$ref": "task-candidate-v1.schema.json"}
+        },
+        "additionalProperties": false
+      }
+    },
+    "emitted_at": {"type": "string", "format": "date-time"}
+  },
+  "additionalProperties": false
+}

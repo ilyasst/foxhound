@@ -2,6 +2,9 @@
 
 from .candidate_inbox import (
     CandidateInbox,
+    FeedImportDisposition,
+    FeedImportRefusal,
+    FeedImportResult,
     ImportDisposition,
     ImportRefusal,
     ImportResult,
@@ -12,6 +15,9 @@ __version__ = "0.1.0"
 
 __all__ = (
     "CandidateInbox",
+    "FeedImportDisposition",
+    "FeedImportRefusal",
+    "FeedImportResult",
     "ImportDisposition",
     "ImportRefusal",
     "ImportResult",
