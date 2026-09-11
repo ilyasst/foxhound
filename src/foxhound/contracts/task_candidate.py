@@ -64,6 +64,33 @@ class TaskCandidate:
     schema_version: int = SCHEMA_VERSION
 
 
+def task_candidate_document(candidate: TaskCandidate) -> dict[str, Any]:
+    """Return the canonical document shape for a validated candidate."""
+    return {
+        "schema": candidate.schema,
+        "schema_version": candidate.schema_version,
+        "candidate_id": candidate.candidate_id,
+        "source": {
+            "system": candidate.source.system,
+            "kind": candidate.source.kind,
+            "record_id": candidate.source.record_id,
+            "item_id": candidate.source.item_id,
+            "revision": candidate.source.revision,
+        },
+        "task": {
+            "text": candidate.task.text,
+            "project": candidate.task.project,
+            "owner": candidate.task.owner,
+            "due": candidate.task.due,
+        },
+        "evidence": {
+            "document_id": candidate.evidence.document_id,
+            "locator": candidate.evidence.locator,
+        },
+        "created_at": candidate.created_at,
+    }
+
+
 def candidate_id_for(*, system: str, kind: str, record_id: str,
                      item_id: str) -> str:
     """Return the stable idempotency identity for a source-owned action.
