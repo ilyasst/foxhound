@@ -68,6 +68,16 @@ same candidate; it does not create a duplicate durable task.
 `created_at` is the time the producer first emitted the candidate, not the time
 of the source material. It is preserved across retries.
 
+The `foxhound.task-candidate-feed` version 1 contract adds delivery order. Each
+page identifies one producer stream and carries a bounded, contiguous range of
+integer cursor positions. The cursor is delivery metadata; Foxhound never
+interprets candidate revision digests as ordered values.
+
+Foxhound advances a stream cursor only in the same transaction that stores all
+candidate changes and the page receipt. An exact page replay is accepted
+without rewriting state. A gap, unreceipted overlap, altered reuse of a cursor
+range, or candidate conflict refuses the entire page without partial writes.
+
 Future boundaries will use separate contracts for lifecycle events and bounded
 knowledge context. A task candidate is not permission to read producer state.
 
