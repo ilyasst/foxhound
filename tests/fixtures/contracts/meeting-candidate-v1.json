@@ -1,0 +1,23 @@
+{
+  "schema": "foxhound.task-candidate",
+  "schema_version": 1,
+  "candidate_id": "tc_4bbd8df4200fb56db3bbccb194c281c5067724edc631de6c6530278e65c4e1bc",
+  "source": {
+    "system": "gw",
+    "kind": "meeting",
+    "record_id": "record-001",
+    "item_id": "action-01",
+    "revision": "1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "task": {
+    "text": "Prepare the Project Alpha summary",
+    "project": "Project Alpha",
+    "owner": "Person A",
+    "due": "2030-01-15"
+  },
+  "evidence": {
+    "document_id": "document-001",
+    "locator": "action-item-01"
+  },
+  "created_at": "2030-01-01T12:00:00Z"
+}

@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/foxhound/contracts/task-candidate-v1.schema.json",
+  "title": "Foxhound task candidate",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "candidate_id",
+    "source",
+    "task",
+    "evidence",
+    "created_at"
+  ],
+  "properties": {
+    "schema": {"const": "foxhound.task-candidate"},
+    "schema_version": {"const": 1},
+    "candidate_id": {
+      "description": "Stable source identity: tc_ plus the contract-defined SHA-256 digest.",
+      "type": "string",
+      "pattern": "^tc_[0-9a-f]{64}$"
+    },
+    "source": {
+      "type": "object",
+      "required": ["system", "kind", "record_id", "item_id", "revision"],
+      "properties": {
+        "system": {"enum": ["gw"]},
+        "kind": {"enum": ["meeting", "email"]},
+        "record_id": {"$ref": "#/$defs/opaqueId"},
+        "item_id": {"$ref": "#/$defs/opaqueId"},
+        "revision": {
+          "description": "Digest of the source representation used to derive this candidate.",
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "task": {
+      "type": "object",
+      "required": ["text", "project", "owner", "due"],
+      "properties": {
+        "text": {"$ref": "#/$defs/taskText"},
+        "project": {"$ref": "#/$defs/shortText"},
+        "owner": {
+          "oneOf": [{"$ref": "#/$defs/shortText"}, {"type": "null"}]
+        },
+        "due": {
+          "oneOf": [{"type": "string", "format": "date"}, {"type": "null"}]
+        }
+      },
+      "additionalProperties": false
+    },
+    "evidence": {
+      "type": "object",
+      "required": ["document_id", "locator"],
+      "properties": {
+        "document_id": {"$ref": "#/$defs/opaqueId"},
+        "locator": {"$ref": "#/$defs/opaqueId"}
+      },
+      "additionalProperties": false
+    },
+    "created_at": {
+      "description": "Time the producer first emitted this candidate; preserved on retry.",
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "$defs": {
+    "opaqueId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$"
+    },
+    "shortText": {"type": "string", "minLength": 1, "maxLength": 200},
+    "taskText": {"type": "string", "minLength": 1, "maxLength": 1000}
+  },
+  "additionalProperties": false
+}
