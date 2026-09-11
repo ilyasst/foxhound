@@ -1,0 +1,113 @@
+from __future__ import annotations
+
+import copy
+import json
+import unittest
+from pathlib import Path
+
+from foxhound.contracts import ContractError, candidate_id_for, parse_task_candidate
+
+
+FIXTURES = Path(__file__).parent / "fixtures" / "contracts"
+
+
+def fixture(name: str) -> dict:
+    return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
+
+
+class TaskCandidateContractTests(unittest.TestCase):
+    def test_accepts_synthetic_meeting_candidate(self):
+        candidate = parse_task_candidate(fixture("meeting-candidate-v1.json"))
+        self.assertEqual(candidate.source.kind, "meeting")
+        self.assertEqual(candidate.task.project, "Project Alpha")
+        self.assertEqual(candidate.task.due, "2030-01-15")
+
+    def test_accepts_synthetic_email_candidate(self):
+        candidate = parse_task_candidate(fixture("email-candidate-v1.json"))
+        self.assertEqual(candidate.source.kind, "email")
+        self.assertIsNone(candidate.task.owner)
+        self.assertIsNone(candidate.task.due)
+
+    def test_identity_is_stable_across_source_revisions(self):
+        original = fixture("meeting-candidate-v1.json")
+        revised = copy.deepcopy(original)
+        revised["source"]["revision"] = "f" * 64
+        revised["task"]["text"] = "Prepare the revised Project Alpha summary"
+
+        first = parse_task_candidate(original)
+        second = parse_task_candidate(revised)
+
+        self.assertEqual(first.candidate_id, second.candidate_id)
+        self.assertNotEqual(first.source.revision, second.source.revision)
+
+    def test_identity_changes_for_a_different_source_action(self):
+        first = candidate_id_for(
+            system="gw", kind="meeting", record_id="record-001",
+            item_id="action-01")
+        second = candidate_id_for(
+            system="gw", kind="meeting", record_id="record-001",
+            item_id="action-02")
+        self.assertNotEqual(first, second)
+
+    def test_rejects_unknown_version_without_echoing_candidate_content(self):
+        document = fixture("meeting-candidate-v1.json")
+        document["schema_version"] = 2
+        document["task"]["text"] = "private candidate text"
+
+        with self.assertRaisesRegex(ContractError, "schema_version") as raised:
+            parse_task_candidate(document)
+        self.assertNotIn("private candidate text", str(raised.exception))
+
+    def test_rejects_additional_secret_bearing_field(self):
+        document = fixture("meeting-candidate-v1.json")
+        document["token"] = "synthetic-secret-value"
+
+        with self.assertRaisesRegex(ContractError, "additional fields") as raised:
+            parse_task_candidate(document)
+        self.assertNotIn("synthetic-secret-value", str(raised.exception))
+
+    def test_rejects_nested_deployment_field(self):
+        document = fixture("meeting-candidate-v1.json")
+        document["source"]["host"] = "host-a"
+        with self.assertRaisesRegex(ContractError, "additional fields"):
+            parse_task_candidate(document)
+
+    def test_rejects_path_shaped_identifier(self):
+        document = fixture("meeting-candidate-v1.json")
+        document["source"]["record_id"] = "/srv/example/record-001"
+        with self.assertRaisesRegex(ContractError, "record_id"):
+            parse_task_candidate(document)
+
+    def test_rejects_naive_timestamp(self):
+        document = fixture("meeting-candidate-v1.json")
+        document["created_at"] = "2030-01-01T12:00:00"
+        with self.assertRaisesRegex(ContractError, "timezone"):
+            parse_task_candidate(document)
+
+    def test_rejects_invalid_calendar_date(self):
+        document = fixture("meeting-candidate-v1.json")
+        document["task"]["due"] = "2030-02-30"
+        with self.assertRaisesRegex(ContractError, "ISO-8601 date"):
+            parse_task_candidate(document)
+
+    def test_rejects_candidate_id_that_does_not_match_source(self):
+        document = fixture("meeting-candidate-v1.json")
+        document["candidate_id"] = "tc_" + "0" * 64
+        with self.assertRaisesRegex(ContractError, "does not match"):
+            parse_task_candidate(document)
+
+    def test_schema_is_strict_at_every_object_boundary(self):
+        schema_path = (
+            Path(__file__).parents[1]
+            / "src" / "foxhound" / "contracts" / "schemas"
+            / "task-candidate-v1.schema.json"
+        )
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        self.assertFalse(schema["additionalProperties"])
+        self.assertFalse(schema["properties"]["source"]["additionalProperties"])
+        self.assertFalse(schema["properties"]["task"]["additionalProperties"])
+        self.assertFalse(schema["properties"]["evidence"]["additionalProperties"])
+
+
+if __name__ == "__main__":
+    unittest.main()
