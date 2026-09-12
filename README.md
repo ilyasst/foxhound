@@ -53,6 +53,22 @@ python -m foxhound.task_shadow_feed_import \
 The observation importer uses its own producer lock and cursor. It does not
 change producer files or activate any candidate.
 
+For repeated operation, Foxhound provides one ordered cycle that imports both
+ledgers under an exclusive local lock and appends an immutable aggregate
+success receipt only after both imports complete:
+
+```sh
+python -m foxhound.shadow_cycle \
+  --candidate-outbox /srv/example/private-candidate-outbox \
+  --observation-outbox /srv/example/private-observation-outbox \
+  --database /srv/example/private-foxhound-state/foxhound.sqlite3 \
+  --stream-id example-shadow
+```
+
+A failure between the two imports leaves no false success receipt; the next
+cycle replays the committed candidate prefix and resumes safely. This command
+still does not bootstrap tasks, schedule itself, create cards, or run agents.
+
 After a comparison ledger is complete, an application may explicitly invoke
 the task ledger's shadow bootstrap. Imports never invoke it. Only current,
 agreed mapped observations can become tasks, and Foxhound allocates its own
@@ -80,3 +96,5 @@ read-only observation-ledger adapter. See
 identity, lifecycle, and the explicit shadow-bootstrap boundary.
 See [ADR 0007](docs/architecture/0007-bounded-gw-knowledge-client.md) for the
 read-only knowledge retrieval boundary.
+See [ADR 0008](docs/architecture/0008-shadow-import-cycle.md) for the ordered,
+overlap-safe passive import cycle and its durable success receipts.
