@@ -173,6 +173,14 @@ class ExecutionReadiness:
     cancelled: int
 
 
+@dataclass(frozen=True)
+class ExecutionScheduleResult:
+    """Content-free result of one bounded new-task scheduling pass."""
+
+    scheduled: int
+    remaining: int
+
+
 class TaskExecutionService:
     """Durable workflow operations over one initialized Foxhound database."""
 
@@ -197,6 +205,61 @@ class TaskExecutionService:
 
     def initialize(self) -> None:
         CandidateInbox(self.database_path, clock=self._clock).initialize()
+
+    def schedule_new(self, *, limit: int = 100) -> ExecutionScheduleResult:
+        """Create Start-gated workflows only for never-scheduled open tasks."""
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 1_000
+        ):
+            raise ValueError("execution schedule limit is invalid")
+        now = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                eligible = int(connection.execute(
+                    "SELECT COUNT(*) FROM tasks AS t "
+                    "LEFT JOIN task_execution_workflows AS w "
+                    "ON w.task_id=t.id WHERE t.status='open' "
+                    "AND w.task_id IS NULL"
+                ).fetchone()[0])
+                rows = connection.execute(
+                    "SELECT t.id,t.version FROM tasks AS t "
+                    "LEFT JOIN task_execution_workflows AS w "
+                    "ON w.task_id=t.id WHERE t.status='open' "
+                    "AND w.task_id IS NULL ORDER BY t.id LIMIT ?",
+                    (limit,),
+                ).fetchall()
+                for row in rows:
+                    task_id = int(row["id"])
+                    task_version = int(row["version"])
+                    connection.execute(
+                        "INSERT INTO task_execution_workflows("
+                        "task_id,task_version,status,phase,version,due_at,"
+                        "failure_count,created_at,updated_at) "
+                        "VALUES(?,?,'awaiting_start','plan',1,NULL,0,?,?)",
+                        (task_id, task_version, now, now),
+                    )
+                    self._event(
+                        connection,
+                        task_id,
+                        "scheduled",
+                        1,
+                        task_version,
+                        WorkflowPhase.PLAN,
+                        WorkflowStatus.AWAITING_START,
+                        now,
+                    )
+                connection.commit()
+                return ExecutionScheduleResult(
+                    scheduled=len(rows),
+                    remaining=eligible - len(rows),
+                )
+            except Exception:
+                connection.rollback()
+                raise
 
     def schedule(
         self, task_id: int, *, expected_task_version: int

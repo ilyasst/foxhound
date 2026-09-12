@@ -174,6 +174,20 @@ Starting this command with no queued workflow exits successfully without
 launching an agent. See
 [ADR 0015](docs/architecture/0015-supervised-execution-runner.md).
 
+Newly accepted open tasks can be projected to the reader Start gate with an
+explicit bounded pass:
+
+```sh
+foxhound-execution-schedule \
+  --database /srv/example/private-foxhound-state/foxhound.sqlite3 \
+  --limit 100
+```
+
+The command schedules only tasks that have never had an execution workflow;
+it cannot reset a completed, cancelled, parked, or otherwise existing
+workflow. It does not advance Start or launch an agent. See
+[ADR 0019](docs/architecture/0019-new-task-execution-scheduler.md).
+
 Execution gates have their own transport-neutral durable review cards. An
 explicit scheduling pass projects only workflows currently awaiting start,
 plan review, or external-action review. Each card is bound to exact task,
@@ -235,3 +249,5 @@ See [ADR 0017](docs/architecture/0017-execution-card-service.md) for the
 authenticated loopback execution-card adapter.
 See [ADR 0018](docs/architecture/0018-one-shot-shadow-bootstrap.md) for the
 explicit deployment boundary around verified shadow activation.
+See [ADR 0019](docs/architecture/0019-new-task-execution-scheduler.md) for the
+bounded projection of new open tasks to the reader Start gate.

@@ -177,6 +177,51 @@ class TaskExecutionTests(unittest.TestCase):
         refused = self.service.schedule(1, expected_task_version=2)
         self.assertEqual(refused.refusal, WorkflowRefusal.INVALID_STATE)
 
+    def test_schedule_new_is_bounded_and_never_resets_existing_workflows(self):
+        with closing(sqlite3.connect(self.database)) as connection:
+            for task_id, status in ((2, "open"), (3, "open"), (4, "open"),
+                                    (5, "done")):
+                connection.execute(
+                    "INSERT INTO tasks(id,status,text,owner,due,version,"
+                    "created_at,updated_at,closed_at) VALUES(?,?,?,?,NULL,1,?,?,?)",
+                    (
+                        task_id,
+                        status,
+                        f"Synthetic task {task_id}",
+                        "Person A",
+                        self._now(),
+                        self._now(),
+                        self._now() if status == "done" else None,
+                    ),
+                )
+            connection.commit()
+        existing = self.service.schedule(2, expected_task_version=1)
+        cancelled = self.service.start_action(
+            2, expected_version=existing.version, action="cancel"
+        )
+
+        first = self.service.schedule_new(limit=1)
+        self.assertEqual((first.scheduled, first.remaining), (1, 2))
+        self.assertEqual(
+            self.service.get(1).status, WorkflowStatus.AWAITING_START
+        )
+        cancelled_state = self.service.get(2)
+        self.assertEqual(cancelled_state.status, WorkflowStatus.CANCELLED)
+        self.assertEqual(cancelled_state.version, cancelled.version)
+        self.assertIsNone(self.service.get(3))
+
+        second = self.service.schedule_new(limit=10)
+        self.assertEqual((second.scheduled, second.remaining), (2, 0))
+        self.assertIsNotNone(self.service.get(3))
+        self.assertIsNotNone(self.service.get(4))
+        self.assertIsNone(self.service.get(5))
+        cancelled_state = self.service.get(2)
+        self.assertEqual(cancelled_state.status, WorkflowStatus.CANCELLED)
+        self.assertEqual(cancelled_state.version, cancelled.version)
+
+        replay = self.service.schedule_new(limit=10)
+        self.assertEqual((replay.scheduled, replay.remaining), (0, 0))
+
     def test_start_gate_snooze_cancel_and_stale_taps_are_fenced(self):
         scheduled = self.service.schedule(1, expected_task_version=1)
         snoozed = self.service.start_action(
