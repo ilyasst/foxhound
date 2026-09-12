@@ -6,7 +6,8 @@ material.
 
 The implementation includes versioned candidate and passive shadow-observation
 contracts, a Foxhound-owned durable task ledger, and transport-neutral durable
-task review cards. It has no network service, chat transport, recurring host
+task review cards. Its only task-card network surface is an opt-in
+authenticated loopback service. It has no chat transport, recurring host
 scheduler, agent runner, or implicit production-data access.
 
 Foxhound can retrieve bounded task context through an explicitly configured,
@@ -91,6 +92,14 @@ versions reject stale callbacks without partial writes. Schema initialization
 does not create or deliver cards. See
 [ADR 0010](docs/architecture/0010-task-review-cards.md).
 
+Foxhound also provides an opt-in authenticated loopback service for a trusted
+local card gateway. It exposes only scheduling, one leased claim, delivery
+acknowledgement/failure, and reader action. The database must already be
+migrated, every application request is strict and authenticated, and access
+logs contain no task/card identifiers or content. Starting the service creates
+no cards. See
+[ADR 0011](docs/architecture/0011-local-task-card-service.md).
+
 Run the contract tests with:
 
 ```sh
@@ -117,3 +126,5 @@ See [ADR 0009](docs/architecture/0009-owner-equivalence-bootstrap.md) for the
 bounded owner-equivalence attestation and fail-closed bootstrap rules.
 See [ADR 0010](docs/architecture/0010-task-review-cards.md) for durable card
 scheduling, delivery leases, reader actions, and activation rollback.
+See [ADR 0011](docs/architecture/0011-local-task-card-service.md) for the
+authenticated loopback card-gateway boundary.
