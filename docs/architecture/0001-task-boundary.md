@@ -46,8 +46,10 @@ The knowledge system owns:
 
 ## Integration contracts
 
-The first contract is `foxhound.task-candidate` version 1. It contains a small
-action description and opaque source references. It contains no source body,
+The candidate boundary supports two immutable shapes. Version 1 retains its
+required project field for already-produced pages. Version 2 requires that
+field to be absent so the producer can stop asserting a filing taxonomy. Both
+contain a small action description and opaque source references, with no body,
 transcript, email address, filesystem path, host detail, environment value, or
 credential.
 
@@ -72,6 +74,29 @@ The `foxhound.task-candidate-feed` version 1 contract adds delivery order. Each
 page identifies one producer stream and carries a bounded, contiguous range of
 integer cursor positions. The cursor is delivery metadata; Foxhound never
 interprets candidate revision digests as ordered values.
+
+A feed page may carry either candidate version. The embedded candidate version
+selects its exact shape; it does not change stable candidate identity. Version
+1 pages remain valid and immutable when version 2 begins arriving.
+
+The producer also selects the source-revision digest by candidate version.
+Version 1 retains its established compact JSON input:
+
+```text
+[project, task text, owner, due, evidence locator]
+```
+
+Version 2 uses the project-less input:
+
+```text
+[task text, owner, due, evidence locator]
+```
+
+A producer continues emitting version 1, with the original digest, whenever a
+project is present. It emits version 2 only when project is absent. Existing
+project-bearing candidate revisions therefore remain stable across producer
+contract upgrades; removing a project is an explicit new revision of the same
+stable candidate identity.
 
 Foxhound advances a stream cursor only in the same transaction that stores all
 candidate changes and the page receipt. An exact page replay is accepted

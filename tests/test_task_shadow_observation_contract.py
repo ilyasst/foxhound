@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import unittest
 from pathlib import Path
@@ -63,6 +64,28 @@ class TaskShadowObservationContractTests(unittest.TestCase):
             owner="Person A",
         )
         self.assertNotEqual(changed, digest)
+
+    def test_projectless_digest_has_a_distinct_fixed_shape(self):
+        digest = comparable_task_digest(
+            text="Prepare the synthetic summary",
+            project=None,
+            owner="Person A",
+        )
+        material = json.dumps(
+            ["Prepare the synthetic summary", "Person A"],
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        self.assertEqual(digest, hashlib.sha256(material).hexdigest())
+
+        document = fixture("meeting-shadow-observation-v1.json")
+        projectless = fixture("meeting-candidate-v2.json")
+        document["candidate"] = projectless
+        document["legacy_task"]["comparable_digest"] = digest
+        observation = parse_task_shadow_observation(document)
+        self.assertEqual(
+            candidate_comparable_digest(observation.candidate), digest
+        )
 
     def test_distinct_candidates_may_reference_one_legacy_task(self):
         meeting = fixture("meeting-shadow-observation-v1.json")
@@ -182,9 +205,10 @@ class TaskShadowObservationContractTests(unittest.TestCase):
         self.assertFalse(schema["additionalProperties"])
         legacy = schema["properties"]["legacy_task"]["oneOf"][0]
         self.assertFalse(legacy["additionalProperties"])
+        candidate_versions = schema["properties"]["candidate"]["oneOf"]
         self.assertEqual(
-            schema["properties"]["candidate"]["$ref"],
-            "task-candidate-v1.schema.json",
+            [item["$ref"] for item in candidate_versions],
+            ["task-candidate-v1.schema.json", "task-candidate-v2.schema.json"],
         )
 
 

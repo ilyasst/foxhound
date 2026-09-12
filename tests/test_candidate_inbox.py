@@ -77,6 +77,19 @@ class CandidateInboxTests(unittest.TestCase):
         self.assertEqual(stored.source.revision, "f" * 64)
         self.assertEqual(stored.task.text, revised["task"]["text"])
 
+    def test_projectless_version_updates_same_candidate_identity(self):
+        version_1 = fixture("meeting-candidate-v1.json")
+        version_2 = fixture("meeting-candidate-v2.json")
+        self.inbox.import_document(version_1)
+
+        result = self.inbox.import_document(version_2)
+        stored = self.inbox.get(version_1["candidate_id"])
+
+        self.assertEqual(result.disposition, ImportDisposition.UPDATED)
+        self.assertEqual(self.inbox.count(), 1)
+        self.assertEqual(stored.schema_version, 2)
+        self.assertIsNone(stored.task.project)
+
     def test_same_revision_with_different_content_is_refused_without_write(self):
         document = fixture()
         self.inbox.import_document(document)

@@ -15,7 +15,12 @@
   "properties": {
     "schema": {"const": "foxhound.task-shadow-observation"},
     "schema_version": {"const": 1},
-    "candidate": {"$ref": "task-candidate-v1.schema.json"},
+    "candidate": {
+      "oneOf": [
+        {"$ref": "task-candidate-v1.schema.json"},
+        {"$ref": "task-candidate-v2.schema.json"}
+      ]
+    },
     "disposition": {
       "enum": ["minted", "folded", "refused", "unmapped"]
     },

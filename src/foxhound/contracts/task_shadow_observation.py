@@ -58,19 +58,21 @@ class TaskShadowObservation:
     schema_version: int = SCHEMA_VERSION
 
 
-def comparable_task_digest(*, text: str, project: str,
+def comparable_task_digest(*, text: str, project: str | None,
                            owner: str | None) -> str:
     """Digest the task fields represented independently by both systems.
 
     Due date is deliberately absent: the legacy GW task row does not retain a
     separate due field, so including it would pretend that it can be compared.
     """
+    text = _bounded_text(text, "task.text", 1, 1_000)
+    owner = _optional_text(owner, "task.owner", 200)
+    fields = (
+        [text, _bounded_text(project, "task.project", 1, 200), owner]
+        if project is not None else [text, owner]
+    )
     material = json.dumps(
-        [
-            _bounded_text(text, "task.text", 1, 1_000),
-            _bounded_text(project, "task.project", 1, 200),
-            _optional_text(owner, "task.owner", 200),
-        ],
+        fields,
         ensure_ascii=True,
         separators=(",", ":"),
     ).encode("utf-8")
