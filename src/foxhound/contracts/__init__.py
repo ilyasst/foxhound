@@ -44,6 +44,20 @@ from .task_owner_equivalence import (
     parse_owner_equivalence_response,
     task_owner_equivalence_document,
 )
+from .task_lifecycle_outcome import (
+    LegacyTaskCorrelation,
+    LifecycleOutcomeContractError,
+    TaskLifecycleOutcome,
+    parse_task_lifecycle_outcome,
+    task_lifecycle_outcome_document,
+)
+from .task_lifecycle_outcome_feed import (
+    LifecycleOutcomeFeedContractError,
+    TaskLifecycleOutcomeFeed,
+    TaskLifecycleOutcomeFeedItem,
+    parse_task_lifecycle_outcome_feed,
+    task_lifecycle_outcome_feed_document,
+)
 
 __all__ = (
     "CandidateEvidence",
@@ -55,12 +69,18 @@ __all__ = (
     "FeedContractError",
     "EQUIVALENCE_BASIS",
     "LegacyTaskObservation",
+    "LegacyTaskCorrelation",
+    "LifecycleOutcomeContractError",
+    "LifecycleOutcomeFeedContractError",
     "OwnerEquivalenceContractError",
     "OwnerEquivalenceResolutionError",
     "OwnerEquivalenceRequest",
     "ShadowObservationError",
     "ShadowFeedContractError",
     "TaskCandidate",
+    "TaskLifecycleOutcome",
+    "TaskLifecycleOutcomeFeed",
+    "TaskLifecycleOutcomeFeedItem",
     "TaskOwnerEquivalence",
     "TaskShadowObservation",
     "TaskShadowFeed",
@@ -69,6 +89,8 @@ __all__ = (
     "candidate_comparable_digest",
     "comparable_task_digest",
     "parse_task_candidate",
+    "parse_task_lifecycle_outcome",
+    "parse_task_lifecycle_outcome_feed",
     "parse_candidate_feed",
     "owner_equivalence_request",
     "owner_equivalence_request_document",
@@ -77,6 +99,8 @@ __all__ = (
     "parse_task_shadow_observation_json",
     "parse_task_shadow_feed",
     "task_candidate_document",
+    "task_lifecycle_outcome_document",
+    "task_lifecycle_outcome_feed_document",
     "task_owner_equivalence_document",
     "task_shadow_observation_document",
     "task_shadow_feed_document",
