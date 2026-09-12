@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/foxhound/contracts/task-shadow-observation-v1.schema.json",
+  "title": "Foxhound legacy task shadow observation",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "candidate",
+    "disposition",
+    "legacy_task",
+    "reason_code",
+    "observed_at"
+  ],
+  "properties": {
+    "schema": {"const": "foxhound.task-shadow-observation"},
+    "schema_version": {"const": 1},
+    "candidate": {"$ref": "task-candidate-v1.schema.json"},
+    "disposition": {
+      "enum": ["minted", "folded", "refused", "unmapped"]
+    },
+    "legacy_task": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["task_id", "comparable_digest"],
+          "properties": {
+            "task_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9223372036854775807
+            },
+            "comparable_digest": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          },
+          "additionalProperties": false
+        },
+        {"type": "null"}
+      ]
+    },
+    "reason_code": {
+      "oneOf": [
+        {
+          "enum": [
+            "ambiguous_match",
+            "ambiguous_retrofit",
+            "identity_conflict",
+            "legacy_identity_absent",
+            "source_unavailable",
+            "unaddressable_projection",
+            "unsupported_source"
+          ]
+        },
+        {"type": "null"}
+      ]
+    },
+    "observed_at": {"type": "string", "format": "date-time"}
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "disposition": {"enum": ["minted", "folded"]}
+        }
+      },
+      "then": {
+        "properties": {
+          "legacy_task": {"type": "object"},
+          "reason_code": {"type": "null"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"disposition": {"const": "refused"}}},
+      "then": {
+        "properties": {
+          "legacy_task": {"type": "null"},
+          "reason_code": {
+            "enum": [
+              "ambiguous_match",
+              "identity_conflict",
+              "source_unavailable",
+              "unaddressable_projection",
+              "unsupported_source"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"disposition": {"const": "unmapped"}}},
+      "then": {
+        "properties": {
+          "legacy_task": {"type": "null"},
+          "reason_code": {
+            "enum": ["ambiguous_retrofit", "legacy_identity_absent"]
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
+}
