@@ -43,7 +43,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _SCHEMA_COLUMNS = {
     "candidate_inbox": (
@@ -105,6 +105,47 @@ _SCHEMA_COLUMNS = {
         "page_digest",
         "imported_at",
     ),
+    "tasks": (
+        "id",
+        "status",
+        "text",
+        "owner",
+        "due",
+        "version",
+        "created_at",
+        "updated_at",
+        "closed_at",
+    ),
+    "task_candidate_bindings": (
+        "candidate_id",
+        "source_revision",
+        "task_id",
+        "relation",
+        "decided_at",
+    ),
+    "task_bootstrap_correlations": (
+        "producer",
+        "legacy_task_id",
+        "task_id",
+        "created_at",
+    ),
+    "task_events": (
+        "sequence",
+        "task_id",
+        "kind",
+        "task_version",
+        "candidate_id",
+        "source_revision",
+        "from_status",
+        "to_status",
+        "occurred_at",
+    ),
+}
+
+_SCHEMA_OBJECTS = {
+    "task_candidate_bindings_one_accepted": "index",
+    "task_events_no_update": "trigger",
+    "task_events_no_delete": "trigger",
 }
 
 _SCHEMA_V1 = """
@@ -200,6 +241,79 @@ CREATE TABLE task_shadow_feed_receipts (
     imported_at TEXT NOT NULL,
     PRIMARY KEY(producer, stream_id, from_cursor, to_cursor)
 );
+""",
+)
+
+_SCHEMA_V4 = (
+    """
+CREATE TABLE tasks (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    status     TEXT NOT NULL CHECK(status IN ('open','done','dropped')),
+    text       TEXT NOT NULL,
+    owner      TEXT,
+    due        TEXT,
+    version    INTEGER NOT NULL CHECK(version >= 1),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    closed_at  TEXT
+);
+""",
+    """
+CREATE TABLE task_candidate_bindings (
+    candidate_id    TEXT PRIMARY KEY,
+    source_revision TEXT NOT NULL,
+    task_id         INTEGER NOT NULL,
+    relation        TEXT NOT NULL CHECK(relation IN ('accepted','folded')),
+    decided_at      TEXT NOT NULL,
+    FOREIGN KEY(candidate_id, source_revision)
+        REFERENCES candidate_revision_history(candidate_id, source_revision),
+    FOREIGN KEY(task_id) REFERENCES tasks(id)
+);
+""",
+    """
+CREATE UNIQUE INDEX task_candidate_bindings_one_accepted
+    ON task_candidate_bindings(task_id)
+    WHERE relation='accepted';
+""",
+    """
+CREATE TABLE task_bootstrap_correlations (
+    producer       TEXT NOT NULL,
+    legacy_task_id INTEGER NOT NULL CHECK(legacy_task_id > 0),
+    task_id        INTEGER NOT NULL UNIQUE,
+    created_at     TEXT NOT NULL,
+    PRIMARY KEY(producer, legacy_task_id),
+    FOREIGN KEY(task_id) REFERENCES tasks(id)
+);
+""",
+    """
+CREATE TABLE task_events (
+    sequence        INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id         INTEGER NOT NULL,
+    kind            TEXT NOT NULL CHECK(
+                        kind IN ('created','candidate_folded','status_changed')
+                    ),
+    task_version    INTEGER NOT NULL CHECK(task_version >= 1),
+    candidate_id    TEXT,
+    source_revision TEXT,
+    from_status     TEXT,
+    to_status       TEXT,
+    occurred_at     TEXT NOT NULL,
+    FOREIGN KEY(task_id) REFERENCES tasks(id)
+);
+""",
+    """
+CREATE TRIGGER task_events_no_update
+BEFORE UPDATE ON task_events
+BEGIN
+    SELECT RAISE(ABORT, 'task events are append-only');
+END;
+""",
+    """
+CREATE TRIGGER task_events_no_delete
+BEFORE DELETE ON task_events
+BEGIN
+    SELECT RAISE(ABORT, 'task events are append-only');
+END;
 """,
 )
 
@@ -358,6 +472,30 @@ class CandidateInbox:
                     for statement in _SCHEMA_V3:
                         connection.execute(statement)
                     connection.execute("PRAGMA user_version = 3")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 3
+            if version == 3:
+                self._require_tables(
+                    connection,
+                    (
+                        "candidate_inbox",
+                        "candidate_feed_cursors",
+                        "candidate_feed_receipts",
+                        "candidate_revision_history",
+                        "task_shadow_observations",
+                        "task_shadow_feed_cursors",
+                        "task_shadow_feed_receipts",
+                    ),
+                )
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V4:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 4")
                     connection.commit()
                 except Exception:
                     connection.rollback()
@@ -857,6 +995,12 @@ class CandidateInbox:
     @staticmethod
     def _require_schema(connection: sqlite3.Connection) -> None:
         CandidateInbox._require_tables(connection, tuple(_SCHEMA_COLUMNS))
+        for name, expected_type in _SCHEMA_OBJECTS.items():
+            row = connection.execute(
+                "SELECT type FROM sqlite_master WHERE name=?", (name,)
+            ).fetchone()
+            if row is None or row["type"] != expected_type:
+                raise InboxError("candidate inbox schema is incomplete")
 
     @staticmethod
     def _require_tables(connection: sqlite3.Connection,

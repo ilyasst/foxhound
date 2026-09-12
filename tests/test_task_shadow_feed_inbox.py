@@ -231,6 +231,10 @@ class TaskShadowFeedInboxTests(unittest.TestCase):
         meeting = fixture("meeting-candidate-v1.json")
         self.inbox.import_document(meeting)
         with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute("DROP TABLE task_events")
+            connection.execute("DROP TABLE task_bootstrap_correlations")
+            connection.execute("DROP TABLE task_candidate_bindings")
+            connection.execute("DROP TABLE tasks")
             connection.execute("DROP TABLE task_shadow_feed_receipts")
             connection.execute("DROP TABLE task_shadow_feed_cursors")
             connection.execute("DROP TABLE task_shadow_observations")
@@ -246,7 +250,7 @@ class TaskShadowFeedInboxTests(unittest.TestCase):
         self.assertEqual(self.inbox.shadow_report().agreed, 1)
         with closing(sqlite3.connect(self.database)) as connection, connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-        self.assertEqual(version, 3)
+        self.assertEqual(version, 4)
 
     def test_invalid_contract_and_empty_page_do_not_write_receipts(self):
         invalid = self.observation_feed()
