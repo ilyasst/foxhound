@@ -123,6 +123,13 @@ private, immutable records; failures cool down and eventually park. The ledger
 does not launch an agent, call GW, render execution cards, or close a task. See
 [ADR 0013](docs/architecture/0013-task-execution-workflows.md).
 
+The authenticated read-only GW client can also retrieve one digest-bound,
+allowlisted execution-context snapshot. It includes only the display name,
+operator context, self aliases, and institution domains for the configured
+alias. It excludes task state, paths, environment variables, credentials,
+machine inventory, and producer configuration. See
+[ADR 0014](docs/architecture/0014-execution-context-client.md).
+
 Run the contract tests with:
 
 ```sh
@@ -155,3 +162,5 @@ See [ADR 0012](docs/architecture/0012-lifecycle-outcome-feed.md) for the
 content-free correlated lifecycle outcome export boundary.
 See [ADR 0013](docs/architecture/0013-task-execution-workflows.md) for durable
 execution scheduling, gates, claims, results, and retry state.
+See [ADR 0014](docs/architecture/0014-execution-context-client.md) for the
+strict allowlisted GW persona-variable boundary.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import math
@@ -25,10 +26,18 @@ from .contracts.task_owner_equivalence import (
 
 SEARCH_SCHEMA = "gw.search"
 SEARCH_SCHEMA_VERSION = 1
+EXECUTION_CONTEXT_REQUEST_SCHEMA = "gw.execution-context-request"
+EXECUTION_CONTEXT_RESPONSE_SCHEMA = "gw.execution-context"
+EXECUTION_CONTEXT_SCHEMA_VERSION = 1
 LAYER_ORDER = ("kb", "secondary", "emails")
 
 _ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _DOCUMENT_ID_RE = re.compile(r"^(kb|secondary|emails):(.+)$")
+_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+_DOMAIN_RE = re.compile(
+    r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+)
 
 
 class KnowledgeClientError(OwnerEquivalenceResolutionError):
@@ -106,6 +115,16 @@ class KnowledgeSearchResult:
         return sum(len(layer.documents) for layer in self.layers)
 
 
+@dataclass(frozen=True)
+class ExecutionContext:
+    alias: str
+    revision: str
+    display_name: str = field(repr=False)
+    operator_context: str = field(repr=False)
+    self_aliases: tuple[str, ...] = field(default=(), repr=False)
+    institution_domains: tuple[str, ...] = field(default=(), repr=False)
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -173,6 +192,16 @@ class GwKnowledgeClient:
             raise KnowledgeResponseError(
                 "GW owner equivalence response is invalid"
             ) from None
+
+    def execution_context(self) -> ExecutionContext:
+        """Read one bounded allowlisted persona-variable snapshot."""
+        request = {
+            "schema": EXECUTION_CONTEXT_REQUEST_SCHEMA,
+            "schema_version": EXECUTION_CONTEXT_SCHEMA_VERSION,
+            "alias": self._config.alias,
+        }
+        document = self._request_json("/v1/execution-context", request)
+        return _parse_execution_context(document, self._config.alias)
 
     def _request_json(
         self, route: str, request: Mapping[str, Any]
@@ -372,6 +401,98 @@ def _parse_search_response(
             documents=parsed_documents,
         ))
     return KnowledgeSearchResult(tuple(parsed_layers))
+
+
+def _parse_execution_context(value: object, alias: str) -> ExecutionContext:
+    root = _object(value, "execution context response")
+    _exact_fields(
+        root,
+        "execution context response",
+        {
+            "schema", "schema_version", "ok", "alias", "revision",
+            "variables",
+        },
+    )
+    version = root["schema_version"]
+    revision = root["revision"]
+    if (
+        root["schema"] != EXECUTION_CONTEXT_RESPONSE_SCHEMA
+        or isinstance(version, bool)
+        or version != EXECUTION_CONTEXT_SCHEMA_VERSION
+        or root["ok"] is not True
+        or root["alias"] != alias
+        or not isinstance(revision, str)
+        or not _DIGEST_RE.fullmatch(revision)
+    ):
+        raise KnowledgeResponseError(
+            "GW execution context response identity is invalid"
+        )
+    variables = _object(root["variables"], "execution context variables")
+    _exact_fields(
+        variables,
+        "execution context variables",
+        {
+            "display_name", "operator_context", "self_aliases",
+            "institution_domains",
+        },
+    )
+    display_name = _text(
+        variables["display_name"], "execution context display name", 200
+    )
+    operator_context = _content_text(
+        variables["operator_context"],
+        "execution context operator text",
+        32_768,
+    )
+    self_aliases = _context_text_list(
+        variables["self_aliases"], "execution context self aliases", 32, 200
+    )
+    institution_domains = _context_text_list(
+        variables["institution_domains"],
+        "execution context institution domains",
+        32,
+        253,
+    )
+    if any(
+        not _DOMAIN_RE.fullmatch(domain) for domain in institution_domains
+    ):
+        raise KnowledgeResponseError(
+            "GW execution context institution domains are invalid"
+        )
+    canonical = json.dumps(
+        {
+            "display_name": display_name,
+            "operator_context": operator_context,
+            "self_aliases": list(self_aliases),
+            "institution_domains": list(institution_domains),
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    if revision != hashlib.sha256(canonical).hexdigest():
+        raise KnowledgeResponseError(
+            "GW execution context revision does not match its variables"
+        )
+    return ExecutionContext(
+        alias=alias,
+        revision=revision,
+        display_name=display_name,
+        operator_context=operator_context,
+        self_aliases=self_aliases,
+        institution_domains=institution_domains,
+    )
+
+
+def _context_text_list(
+    value: object, field_name: str, maximum_items: int, maximum_chars: int
+) -> tuple[str, ...]:
+    if not isinstance(value, list) or len(value) > maximum_items:
+        raise KnowledgeResponseError(f"GW knowledge {field_name} is invalid")
+    items = tuple(_text(item, field_name, maximum_chars) for item in value)
+    if len(items) != len(set(items)):
+        raise KnowledgeResponseError(f"GW knowledge {field_name} is invalid")
+    return items
 
 
 def _parse_document(value: object, layer: str) -> KnowledgeDocument:
