@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import stat
 from contextlib import closing
@@ -43,7 +44,9 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
+_STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
+_MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
 _SCHEMA_COLUMNS = {
     "candidate_inbox": (
@@ -140,12 +143,32 @@ _SCHEMA_COLUMNS = {
         "to_status",
         "occurred_at",
     ),
+    "shadow_import_cycles": (
+        "sequence",
+        "stream_id",
+        "started_at",
+        "completed_at",
+        "candidate_previous_cursor",
+        "candidate_current_cursor",
+        "candidates_inserted",
+        "candidates_updated",
+        "observation_previous_cursor",
+        "observation_current_cursor",
+        "observations_inserted",
+        "comparison_total",
+        "comparison_agreed",
+        "comparison_divergent",
+        "comparison_refused",
+        "comparison_unmapped",
+    ),
 }
 
 _SCHEMA_OBJECTS = {
     "task_candidate_bindings_one_accepted": "index",
     "task_events_no_update": "trigger",
     "task_events_no_delete": "trigger",
+    "shadow_import_cycles_no_update": "trigger",
+    "shadow_import_cycles_no_delete": "trigger",
 }
 
 _SCHEMA_V1 = """
@@ -317,6 +340,57 @@ END;
 """,
 )
 
+_SCHEMA_V5 = (
+    """
+CREATE TABLE shadow_import_cycles (
+    sequence                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    stream_id                   TEXT NOT NULL,
+    started_at                  TEXT NOT NULL,
+    completed_at                TEXT NOT NULL,
+    candidate_previous_cursor   INTEGER NOT NULL
+                                CHECK(candidate_previous_cursor >= 0),
+    candidate_current_cursor    INTEGER NOT NULL
+                                CHECK(candidate_current_cursor >= 0),
+    candidates_inserted         INTEGER NOT NULL
+                                CHECK(candidates_inserted >= 0),
+    candidates_updated          INTEGER NOT NULL
+                                CHECK(candidates_updated >= 0),
+    observation_previous_cursor INTEGER NOT NULL
+                                CHECK(observation_previous_cursor >= 0),
+    observation_current_cursor  INTEGER NOT NULL
+                                CHECK(observation_current_cursor >= 0),
+    observations_inserted       INTEGER NOT NULL
+                                CHECK(observations_inserted >= 0),
+    comparison_total            INTEGER NOT NULL CHECK(comparison_total >= 0),
+    comparison_agreed           INTEGER NOT NULL CHECK(comparison_agreed >= 0),
+    comparison_divergent        INTEGER NOT NULL
+                                CHECK(comparison_divergent >= 0),
+    comparison_refused          INTEGER NOT NULL
+                                CHECK(comparison_refused >= 0),
+    comparison_unmapped         INTEGER NOT NULL
+                                CHECK(comparison_unmapped >= 0),
+    CHECK(candidate_current_cursor >= candidate_previous_cursor),
+    CHECK(observation_current_cursor >= observation_previous_cursor),
+    CHECK(comparison_total = comparison_agreed + comparison_divergent
+          + comparison_refused + comparison_unmapped)
+);
+""",
+    """
+CREATE TRIGGER shadow_import_cycles_no_update
+BEFORE UPDATE ON shadow_import_cycles
+BEGIN
+    SELECT RAISE(ABORT, 'shadow import cycle receipts are append-only');
+END;
+""",
+    """
+CREATE TRIGGER shadow_import_cycles_no_delete
+BEFORE DELETE ON shadow_import_cycles
+BEGIN
+    SELECT RAISE(ABORT, 'shadow import cycle receipts are append-only');
+END;
+""",
+)
+
 
 class InboxError(RuntimeError):
     """The inbox cannot safely initialize or read its state."""
@@ -419,6 +493,23 @@ class ShadowComparisonReport:
     unmapped: int
 
 
+@dataclass(frozen=True)
+class ShadowImportCycleReceipt:
+    """Content-free durable record of one completed import cycle."""
+
+    stream_id: str
+    started_at: str
+    completed_at: str
+    candidate_previous_cursor: int
+    candidate_current_cursor: int
+    candidates_inserted: int
+    candidates_updated: int
+    observation_previous_cursor: int
+    observation_current_cursor: int
+    observations_inserted: int
+    comparison: ShadowComparisonReport
+
+
 class CandidateInbox:
     """A versioned SQLite inbox at one explicitly selected path."""
 
@@ -496,6 +587,33 @@ class CandidateInbox:
                     for statement in _SCHEMA_V4:
                         connection.execute(statement)
                     connection.execute("PRAGMA user_version = 4")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 4
+            if version == 4:
+                self._require_tables(
+                    connection,
+                    (
+                        "candidate_inbox",
+                        "candidate_feed_cursors",
+                        "candidate_feed_receipts",
+                        "candidate_revision_history",
+                        "task_shadow_observations",
+                        "task_shadow_feed_cursors",
+                        "task_shadow_feed_receipts",
+                        "tasks",
+                        "task_candidate_bindings",
+                        "task_bootstrap_correlations",
+                        "task_events",
+                    ),
+                )
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V5:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 5")
                     connection.commit()
                 except Exception:
                     connection.rollback()
@@ -770,6 +888,51 @@ class CandidateInbox:
             ).fetchone()
             return 0 if row is None else int(row["cursor"])
 
+    def append_shadow_import_cycle(
+        self, receipt: ShadowImportCycleReceipt
+    ) -> int:
+        """Append one validated success receipt and return its sequence."""
+        _validate_shadow_cycle_receipt(receipt)
+        with closing(self._connect()) as connection:
+            self._require_current_schema(connection)
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                report = receipt.comparison
+                cursor = connection.execute(
+                    "INSERT INTO shadow_import_cycles("
+                    "stream_id,started_at,completed_at,"
+                    "candidate_previous_cursor,candidate_current_cursor,"
+                    "candidates_inserted,candidates_updated,"
+                    "observation_previous_cursor,observation_current_cursor,"
+                    "observations_inserted,comparison_total,"
+                    "comparison_agreed,comparison_divergent,"
+                    "comparison_refused,comparison_unmapped) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        receipt.stream_id,
+                        receipt.started_at,
+                        receipt.completed_at,
+                        receipt.candidate_previous_cursor,
+                        receipt.candidate_current_cursor,
+                        receipt.candidates_inserted,
+                        receipt.candidates_updated,
+                        receipt.observation_previous_cursor,
+                        receipt.observation_current_cursor,
+                        receipt.observations_inserted,
+                        report.total,
+                        report.agreed,
+                        report.divergent,
+                        report.refused,
+                        report.unmapped,
+                    ),
+                )
+                sequence = int(cursor.lastrowid)
+                connection.commit()
+                return sequence
+            except Exception:
+                connection.rollback()
+                raise
+
     def get(self, candidate_id: str) -> TaskCandidate | None:
         """Return one validated stored candidate for internal application use."""
         with closing(self._connect()) as connection:
@@ -1024,6 +1187,59 @@ class CandidateInbox:
         if value.tzinfo is None or value.utcoffset() is None:
             raise InboxError("candidate inbox clock must include a timezone")
         return value.isoformat(timespec="seconds")
+
+
+def _validate_shadow_cycle_receipt(receipt: object) -> None:
+    if not isinstance(receipt, ShadowImportCycleReceipt):
+        raise InboxError("shadow import cycle receipt is invalid")
+    stream_id = receipt.stream_id
+    if not isinstance(stream_id, str) or not _STREAM_ID_RE.fullmatch(stream_id):
+        raise InboxError("shadow import cycle stream ID is invalid")
+    started = _receipt_timestamp(receipt.started_at)
+    completed = _receipt_timestamp(receipt.completed_at)
+    if completed < started:
+        raise InboxError("shadow import cycle timestamps are invalid")
+
+    counts = (
+        receipt.candidate_previous_cursor,
+        receipt.candidate_current_cursor,
+        receipt.candidates_inserted,
+        receipt.candidates_updated,
+        receipt.observation_previous_cursor,
+        receipt.observation_current_cursor,
+        receipt.observations_inserted,
+        receipt.comparison.total,
+        receipt.comparison.agreed,
+        receipt.comparison.divergent,
+        receipt.comparison.refused,
+        receipt.comparison.unmapped,
+    )
+    if any(isinstance(value, bool) or not isinstance(value, int)
+           or not 0 <= value <= _MAX_SQLITE_INTEGER
+           for value in counts):
+        raise InboxError("shadow import cycle counts are invalid")
+    if (receipt.candidate_current_cursor
+            < receipt.candidate_previous_cursor
+            or receipt.observation_current_cursor
+            < receipt.observation_previous_cursor):
+        raise InboxError("shadow import cycle cursors are invalid")
+    report = receipt.comparison
+    if report.total != (
+        report.agreed + report.divergent + report.refused + report.unmapped
+    ):
+        raise InboxError("shadow import cycle comparison is invalid")
+
+
+def _receipt_timestamp(value: object) -> datetime:
+    if not isinstance(value, str) or not value or len(value) > 64:
+        raise InboxError("shadow import cycle timestamp is invalid")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise InboxError("shadow import cycle timestamp is invalid") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise InboxError("shadow import cycle timestamp is invalid")
+    return parsed
 
 
 def _canonical_payload(candidate: TaskCandidate) -> str:

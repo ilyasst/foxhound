@@ -289,6 +289,9 @@ class TaskLedgerTests(unittest.TestCase):
         item = candidate(1)
         self.import_candidates(item)
         with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute("DROP TRIGGER shadow_import_cycles_no_update")
+            connection.execute("DROP TRIGGER shadow_import_cycles_no_delete")
+            connection.execute("DROP TABLE shadow_import_cycles")
             connection.execute("DROP TRIGGER task_events_no_update")
             connection.execute("DROP TRIGGER task_events_no_delete")
             connection.execute("DROP TABLE task_events")
@@ -303,7 +306,7 @@ class TaskLedgerTests(unittest.TestCase):
         self.assertEqual(self.ledger.count(), 0)
         with closing(sqlite3.connect(self.database)) as connection:
             self.assertEqual(
-                connection.execute("PRAGMA user_version").fetchone()[0], 4
+                connection.execute("PRAGMA user_version").fetchone()[0], 5
             )
 
     def test_missing_append_only_trigger_is_refused(self):
