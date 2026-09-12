@@ -9,6 +9,10 @@ from .candidate_inbox import (
     ImportRefusal,
     ImportResult,
     InboxError,
+    ShadowComparisonReport,
+    ShadowFeedImportDisposition,
+    ShadowFeedImportRefusal,
+    ShadowFeedImportResult,
 )
 
 __version__ = "0.1.0"
@@ -22,4 +26,8 @@ __all__ = (
     "ImportRefusal",
     "ImportResult",
     "InboxError",
+    "ShadowComparisonReport",
+    "ShadowFeedImportDisposition",
+    "ShadowFeedImportRefusal",
+    "ShadowFeedImportResult",
 )

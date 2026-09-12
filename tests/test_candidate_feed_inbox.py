@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -197,7 +198,11 @@ class CandidateFeedInboxTests(unittest.TestCase):
     def test_version_one_database_migrates_without_losing_candidates(self):
         meeting = fixture("meeting-candidate-v1.json")
         self.inbox.import_document(meeting)
-        with sqlite3.connect(self.database) as connection:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute("DROP TABLE task_shadow_feed_receipts")
+            connection.execute("DROP TABLE task_shadow_feed_cursors")
+            connection.execute("DROP TABLE task_shadow_observations")
+            connection.execute("DROP TABLE candidate_revision_history")
             connection.execute("DROP TABLE candidate_feed_cursors")
             connection.execute("DROP TABLE candidate_feed_receipts")
             connection.execute("PRAGMA user_version = 1")
@@ -207,12 +212,16 @@ class CandidateFeedInboxTests(unittest.TestCase):
         self.assertEqual(self.inbox.count(), 1)
         self.assertIsNotNone(self.inbox.get(meeting["candidate_id"]))
         self.assertEqual(self.inbox.feed_cursor("gw", "primary"), 0)
-        with sqlite3.connect(self.database) as connection:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-        self.assertEqual(version, 2)
+        self.assertEqual(version, 3)
 
     def test_incomplete_version_one_database_is_not_migrated(self):
-        with sqlite3.connect(self.database) as connection:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute("DROP TABLE task_shadow_feed_receipts")
+            connection.execute("DROP TABLE task_shadow_feed_cursors")
+            connection.execute("DROP TABLE task_shadow_observations")
+            connection.execute("DROP TABLE candidate_revision_history")
             connection.execute("DROP TABLE candidate_feed_cursors")
             connection.execute("DROP TABLE candidate_feed_receipts")
             connection.execute("DROP TABLE candidate_inbox")
@@ -222,7 +231,7 @@ class CandidateFeedInboxTests(unittest.TestCase):
         with self.assertRaisesRegex(InboxError, "incomplete"):
             self.inbox.initialize()
 
-        with sqlite3.connect(self.database) as connection:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
             feed_tables = connection.execute(
                 "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE "
@@ -232,7 +241,7 @@ class CandidateFeedInboxTests(unittest.TestCase):
         self.assertEqual(feed_tables, 0)
 
     def _receipt_count(self) -> int:
-        with sqlite3.connect(self.database) as connection:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
             return int(connection.execute(
                 "SELECT COUNT(*) FROM candidate_feed_receipts"
             ).fetchone()[0])
@@ -245,7 +254,7 @@ class CandidateFeedInboxTests(unittest.TestCase):
         )
 
     def _database_state(self) -> tuple[tuple, tuple, tuple]:
-        with sqlite3.connect(self.database) as connection:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
             candidates = tuple(connection.execute(
                 "SELECT * FROM candidate_inbox ORDER BY candidate_id"
             ))
