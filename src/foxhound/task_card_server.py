@@ -61,6 +61,7 @@ ROUTES = {
     "/v1/execution-cards/delivered": "execution_delivered",
     "/v1/execution-cards/delivery-failed": "execution_delivery_failed",
     "/v1/execution-cards/action": "execution_action",
+    "/v1/execution-cards/input": "execution_input",
 }
 
 
@@ -329,7 +330,9 @@ class TaskCardApplication:
             )
             action = request["action"]
             if not isinstance(action, str) or action not in {
-                "start", "snooze", "cancel", "approve", "revise"
+                "start", "snooze", "cancel", "approve", "revise",
+                "done", "drop", "snooze_1d", "snooze_7d",
+                "snooze_14d", "snooze_30d",
             }:
                 raise TaskCardServerRequestError(
                     "invalid_request", "execution card action is invalid"
@@ -339,6 +342,27 @@ class TaskCardApplication:
                 expected_version=_integer(request["card_version"], minimum=1),
                 action=action,
             ))
+        if operation == "execution_input":
+            request = _request(
+                payload,
+                required={"card_id", "card_version", "input_kind", "value"},
+            )
+            kind = request["input_kind"]
+            if kind not in {"discussion", "reassignment"}:
+                raise TaskCardServerRequestError(
+                    "invalid_request", "execution card input kind is invalid"
+                )
+            value = _reader_input(request["value"], kind=kind)
+            return _execution_operation_document(
+                self._execution_cards().submit_input(
+                    _integer(request["card_id"], minimum=1),
+                    expected_version=_integer(
+                        request["card_version"], minimum=1
+                    ),
+                    kind=kind,
+                    value=value,
+                )
+            )
         raise TaskCardServerRequestError(
             "not_found", "route not found", HTTPStatus.NOT_FOUND
         )
@@ -609,6 +633,22 @@ def _opaque(value: object, *, maximum: int) -> str:
     ):
         raise TaskCardServerRequestError(
             "invalid_request", "opaque request field is invalid"
+        )
+    return value
+
+
+def _reader_input(value: object, *, kind: str) -> str:
+    maximum = 200 if kind == "reassignment" else 12 * 1024
+    if (
+        not isinstance(value, str)
+        or value != value.strip()
+        or not value
+        or len(value.encode("utf-8")) > maximum
+        or "\x00" in value
+        or (kind == "reassignment" and "\n" in value)
+    ):
+        raise TaskCardServerRequestError(
+            "invalid_request", "execution card input value is invalid"
         )
     return value
 

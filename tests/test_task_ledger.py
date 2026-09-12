@@ -35,6 +35,12 @@ NOW = datetime(2030, 3, 1, 12, 0, tzinfo=timezone.utc)
 
 
 def _drop_native_intake_schema(connection: sqlite3.Connection) -> None:
+    connection.execute("DROP TRIGGER task_owner_events_no_update")
+    connection.execute("DROP TRIGGER task_owner_events_no_delete")
+    connection.execute("DROP TRIGGER execution_reader_inputs_no_update")
+    connection.execute("DROP TRIGGER execution_reader_inputs_no_delete")
+    connection.execute("DROP TABLE task_owner_events")
+    connection.execute("DROP TABLE execution_reader_inputs")
     connection.execute("DROP TRIGGER native_candidate_intake_events_no_update")
     connection.execute("DROP TRIGGER native_candidate_intake_events_no_delete")
     connection.execute("DROP TRIGGER candidate_feed_items_no_update")

@@ -243,19 +243,24 @@ workflow. It does not advance Start or launch an agent. See
 
 Execution gates have their own transport-neutral durable review cards. An
 explicit scheduling pass projects only workflows currently awaiting start,
-plan review, or external-action review. Each card is bound to exact task,
-workflow, phase, and result state; delivery uses an expiring digest-fenced
-claim. A delivered action advances the workflow and resolves the card in one
-SQLite transaction, so a stale or failed tap changes neither. Card rendering
+plan review, external-action review, or final-result review. Each card is
+bound to exact task, workflow, phase, and result state; delivery uses an
+expiring digest-fenced claim. Plan and result cards can request more
+investigation, collect one private discussion instruction, execute, snooze for
+a bounded interval, complete, reassign, or drop as appropriate. External
+effects still require their own exact authorization. Every delivered decision
+advances all affected task and workflow state and resolves the card in one
+SQLite transaction, so a stale or failed input changes nothing. Card rendering
 is HTML-escaped and transport-bounded. If the complete private content cannot
-fit, approval is absent from the keyboard and a forged approval callback is
-also refused. These cards do not change task lifecycle. See
+fit, approval and completion are absent from the keyboard and forged
+affirmative callbacks are refused. See
 [ADR 0016](docs/architecture/0016-execution-review-cards.md).
 
 The authenticated loopback card service exposes execution cards through a
 separate `/v1/execution-cards/*` route family. A trusted local gateway can read
 aggregate stats, run the explicit scheduler, claim one rendered card,
-acknowledge or retry delivery, and submit one versioned reader action. The
+acknowledge or retry delivery, submit one versioned reader action, and submit
+one bounded discussion or reassignment response. The
 existing `/v1/task-cards/*` contracts are unchanged. Starting the service
 still creates no card and advances no gate. See
 [ADR 0017](docs/architecture/0017-execution-card-service.md).

@@ -25,6 +25,12 @@ from .task_ledger import TaskLedgerError, TaskStatus
 
 
 START_SNOOZE_INTERVAL = timedelta(days=1)
+REVIEW_SNOOZE_INTERVALS = {
+    "snooze_1d": timedelta(days=1),
+    "snooze_7d": timedelta(days=7),
+    "snooze_14d": timedelta(days=14),
+    "snooze_30d": timedelta(days=30),
+}
 DEFAULT_LEASE_SECONDS = 300
 MIN_LEASE_SECONDS = 5
 MAX_LEASE_SECONDS = 3_600
@@ -362,9 +368,11 @@ class TaskExecutionService:
     ) -> WorkflowOperationResult:
         if not _valid_identity(task_id, expected_version):
             return _refused(task_id, WorkflowRefusal.INVALID_ARGUMENT)
-        if action not in {"approve", "revise", "cancel"}:
+        if action not in {
+            "approve", "revise", "cancel", *REVIEW_SNOOZE_INTERVALS,
+        }:
             return _refused(task_id, WorkflowRefusal.INVALID_ACTION)
-        now = self._now()
+        stamp = self._clock_value()
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
@@ -373,7 +381,7 @@ class TaskExecutionService:
                     task_id,
                     expected_version=expected_version,
                     action=action,
-                    now=now,
+                    stamp=stamp,
                 )
                 if not result.accepted:
                     connection.rollback()
@@ -765,6 +773,44 @@ class TaskExecutionService:
             ).fetchone()
         return None if row is None else _workflow(row)
 
+    def reader_instruction(
+        self,
+        task_id: int,
+        *,
+        expected_version: int,
+        claim_token: str,
+    ) -> str | None:
+        """Return only the discussion bound to this supervised run."""
+        if (
+            not _valid_identity(task_id, expected_version)
+            or not _valid_secret(claim_token)
+        ):
+            raise TaskLedgerError("execution claim is unavailable")
+        now = self._now()
+        with closing(self._connect()) as connection:
+            row = self._workflow_with_task(connection, task_id)
+            refusal = _running_guard(
+                row,
+                expected_version,
+                _token_digest(claim_token),
+                now,
+            )
+            if refusal is None:
+                refusal = _task_guard(row, int(row["task_version"]))
+            if refusal is not None:
+                raise TaskLedgerError("execution claim is unavailable")
+            value = connection.execute(
+                "SELECT i.value FROM execution_reader_inputs AS i "
+                "WHERE i.task_id=? AND i.kind='discussion' "
+                "AND i.target_workflow_version<=? AND NOT EXISTS("
+                " SELECT 1 FROM task_execution_results AS r "
+                " WHERE r.task_id=i.task_id "
+                " AND r.workflow_version>=i.target_workflow_version"
+                ") ORDER BY i.sequence DESC LIMIT 1",
+                (task_id, expected_version),
+            ).fetchone()
+        return None if value is None else str(value["value"])
+
     def readiness(self) -> ExecutionReadiness:
         now = self._now()
         with closing(self._connect()) as connection:
@@ -1066,19 +1112,39 @@ def _apply_review_action(
     *,
     expected_version: int,
     action: str,
-    now: str,
+    stamp: datetime,
 ) -> WorkflowOperationResult:
     """Apply one review gate inside the caller transaction."""
     if not _valid_identity(task_id, expected_version):
         return _refused(task_id, WorkflowRefusal.INVALID_ARGUMENT)
-    if action not in {"approve", "revise", "cancel"}:
+    if action not in {
+        "approve", "revise", "cancel", *REVIEW_SNOOZE_INTERVALS,
+    }:
         return _refused(task_id, WorkflowRefusal.INVALID_ACTION)
+    if stamp.tzinfo is None or stamp.utcoffset() is None:
+        raise TaskLedgerError("task execution clock must include a timezone")
+    stamp = stamp.astimezone(timezone.utc)
+    now = stamp.isoformat(timespec="seconds")
     row = TaskExecutionService._workflow_with_task(connection, task_id)
+    allowed_statuses = {
+        WorkflowStatus.AWAITING_REVIEW,
+        WorkflowStatus.SNOOZED,
+    }
+    if action in REVIEW_SNOOZE_INTERVALS:
+        allowed_statuses.add(WorkflowStatus.COMPLETED)
     refusal = _workflow_guard(
-        row, expected_version, {WorkflowStatus.AWAITING_REVIEW}
+        row,
+        expected_version,
+        allowed_statuses,
     )
     if refusal is None:
         refusal = _task_guard(row, int(row["task_version"]))
+    if (
+        refusal is None
+        and row["status"] == WorkflowStatus.SNOOZED
+        and row["due_at"] > now
+    ):
+        refusal = WorkflowRefusal.INVALID_STATE
     result_row = None
     if refusal is None:
         result_row = connection.execute(
@@ -1095,11 +1161,21 @@ def _apply_review_action(
         status = WorkflowStatus.CANCELLED
         completed = now
         kind = "cancelled"
+        wake = None
     elif action == "revise":
         phase = WorkflowPhase.PLAN
         status = WorkflowStatus.QUEUED
         completed = None
         kind = "revision_requested"
+        wake = None
+    elif action in REVIEW_SNOOZE_INTERVALS:
+        phase = WorkflowPhase(row["phase"])
+        status = WorkflowStatus.SNOOZED
+        completed = None
+        kind = "snoozed"
+        wake = (stamp + REVIEW_SNOOZE_INTERVALS[action]).isoformat(
+            timespec="seconds"
+        )
     else:
         targets = {
             ExecutionOutcome.AWAITING_PLAN: WorkflowPhase.EXECUTE,
@@ -1113,10 +1189,11 @@ def _apply_review_action(
         status = WorkflowStatus.QUEUED
         completed = None
         kind = "phase_approved"
+        wake = None
     version = expected_version + 1
     connection.execute(
         "UPDATE task_execution_workflows SET status=?,phase=?,version=?,"
-        "due_at=NULL,claim_token_digest=NULL,claimed_at=NULL,"
+        "due_at=?,claim_token_digest=NULL,claimed_at=NULL,"
         "claim_heartbeat_at=NULL,claim_expires_at=NULL,failure_count=0,"
         "last_failure_reason=NULL,last_failure_at=NULL,next_attempt_at=NULL,"
         "parked_at=NULL,updated_at=?,completed_at=? "
@@ -1125,6 +1202,7 @@ def _apply_review_action(
             status,
             phase,
             version,
+            wake,
             now,
             completed,
             task_id,
@@ -1147,6 +1225,7 @@ def _apply_review_action(
         version,
         status,
         phase,
+        wake_at=wake,
     )
 
 
@@ -1289,12 +1368,7 @@ def _result_target(
     }
     if outcome not in allowed[phase]:
         return None
-    if outcome in {
-        ExecutionOutcome.AWAITING_PLAN,
-        ExecutionOutcome.AWAITING_EXTERNAL,
-    }:
-        return WorkflowStatus.AWAITING_REVIEW
-    return WorkflowStatus.COMPLETED
+    return WorkflowStatus.AWAITING_REVIEW
 
 
 def _validated_result(envelope: ExecutionResultEnvelope) -> dict[str, object]:

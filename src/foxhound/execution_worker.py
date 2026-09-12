@@ -118,6 +118,11 @@ class ExecutionWorker:
             "workflow": {
                 "version": state.workflow_version,
                 "phase": state.phase.value,
+                "reader_instruction": service.reader_instruction(
+                    state.task_id,
+                    expected_version=state.workflow_version,
+                    claim_token=state.claim_token,
+                ),
             },
             "operator": {
                 "revision": context.revision,
