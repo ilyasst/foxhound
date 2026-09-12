@@ -199,6 +199,9 @@ class CandidateFeedInboxTests(unittest.TestCase):
         meeting = fixture("meeting-candidate-v1.json")
         self.inbox.import_document(meeting)
         with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute("DROP TRIGGER task_owner_equivalences_no_update")
+            connection.execute("DROP TRIGGER task_owner_equivalences_no_delete")
+            connection.execute("DROP TABLE task_owner_equivalences")
             connection.execute("DROP TRIGGER shadow_import_cycles_no_update")
             connection.execute("DROP TRIGGER shadow_import_cycles_no_delete")
             connection.execute("DROP TABLE shadow_import_cycles")
@@ -221,10 +224,13 @@ class CandidateFeedInboxTests(unittest.TestCase):
         self.assertEqual(self.inbox.feed_cursor("gw", "primary"), 0)
         with closing(sqlite3.connect(self.database)) as connection, connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-        self.assertEqual(version, 5)
+        self.assertEqual(version, 6)
 
     def test_incomplete_version_one_database_is_not_migrated(self):
         with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute("DROP TRIGGER task_owner_equivalences_no_update")
+            connection.execute("DROP TRIGGER task_owner_equivalences_no_delete")
+            connection.execute("DROP TABLE task_owner_equivalences")
             connection.execute("DROP TRIGGER shadow_import_cycles_no_update")
             connection.execute("DROP TRIGGER shadow_import_cycles_no_delete")
             connection.execute("DROP TABLE shadow_import_cycles")

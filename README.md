@@ -6,8 +6,7 @@ material.
 
 The implementation includes versioned candidate and passive shadow-observation
 contracts plus a Foxhound-owned durable task ledger. It has no service
-connection, scheduler, card transport, agent runner, or production-data
-access.
+scheduler, card transport, agent runner, or implicit production-data access.
 
 Foxhound can retrieve bounded task context through an explicitly configured,
 authenticated, read-only GW search endpoint. The client accepts loopback HTTP
@@ -71,10 +70,16 @@ still does not bootstrap tasks, schedule itself, create cards, or run agents.
 
 After a comparison ledger is complete, an application may explicitly invoke
 the task ledger's shadow bootstrap. Imports never invoke it. Only current,
-agreed mapped observations can become tasks, and Foxhound allocates its own
-task identity while retaining legacy grouping as private migration state.
+agreed mapped observations can normally become tasks. An owner-only divergence
+may also become a task when the explicitly supplied GW client returns an
+identity-bound speaker-merge attestation and the resulting comparable digest
+exactly matches the immutable observation. Foxhound persists that evidence
+append-only, allocates its own task identity, and retains legacy grouping only
+as private migration state. Resolver calls happen outside the database write
+transaction and the complete input snapshot is revalidated before commit.
 Lifecycle transitions are optimistic-version fenced and append immutable
-events. See [ADR 0006](docs/architecture/0006-durable-task-ledger.md).
+events. See [ADR 0006](docs/architecture/0006-durable-task-ledger.md) and
+[ADR 0009](docs/architecture/0009-owner-equivalence-bootstrap.md).
 
 Run the contract tests with:
 
@@ -98,3 +103,5 @@ See [ADR 0007](docs/architecture/0007-bounded-gw-knowledge-client.md) for the
 read-only knowledge retrieval boundary.
 See [ADR 0008](docs/architecture/0008-shadow-import-cycle.md) for the ordered,
 overlap-safe passive import cycle and its durable success receipts.
+See [ADR 0009](docs/architecture/0009-owner-equivalence-bootstrap.md) for the
+bounded owner-equivalence attestation and fail-closed bootstrap rules.

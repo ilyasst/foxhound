@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -161,6 +161,15 @@ _SCHEMA_COLUMNS = {
         "comparison_refused",
         "comparison_unmapped",
     ),
+    "task_owner_equivalences": (
+        "candidate_id",
+        "source_revision",
+        "legacy_task_id",
+        "legacy_digest",
+        "effective_owner",
+        "basis",
+        "resolved_at",
+    ),
 }
 
 _SCHEMA_OBJECTS = {
@@ -169,6 +178,8 @@ _SCHEMA_OBJECTS = {
     "task_events_no_delete": "trigger",
     "shadow_import_cycles_no_update": "trigger",
     "shadow_import_cycles_no_delete": "trigger",
+    "task_owner_equivalences_no_update": "trigger",
+    "task_owner_equivalences_no_delete": "trigger",
 }
 
 _SCHEMA_V1 = """
@@ -387,6 +398,37 @@ CREATE TRIGGER shadow_import_cycles_no_delete
 BEFORE DELETE ON shadow_import_cycles
 BEGIN
     SELECT RAISE(ABORT, 'shadow import cycle receipts are append-only');
+END;
+""",
+)
+
+_SCHEMA_V6 = (
+    """
+CREATE TABLE task_owner_equivalences (
+    candidate_id    TEXT NOT NULL,
+    source_revision TEXT NOT NULL,
+    legacy_task_id  INTEGER NOT NULL CHECK(legacy_task_id > 0),
+    legacy_digest   TEXT NOT NULL,
+    effective_owner TEXT NOT NULL,
+    basis           TEXT NOT NULL CHECK(basis = 'speaker_merge'),
+    resolved_at     TEXT NOT NULL,
+    PRIMARY KEY(candidate_id, source_revision),
+    FOREIGN KEY(candidate_id, source_revision)
+        REFERENCES task_shadow_observations(candidate_id, source_revision)
+);
+""",
+    """
+CREATE TRIGGER task_owner_equivalences_no_update
+BEFORE UPDATE ON task_owner_equivalences
+BEGIN
+    SELECT RAISE(ABORT, 'task owner equivalences are append-only');
+END;
+""",
+    """
+CREATE TRIGGER task_owner_equivalences_no_delete
+BEFORE DELETE ON task_owner_equivalences
+BEGIN
+    SELECT RAISE(ABORT, 'task owner equivalences are append-only');
 END;
 """,
 )
@@ -614,6 +656,35 @@ class CandidateInbox:
                     for statement in _SCHEMA_V5:
                         connection.execute(statement)
                     connection.execute("PRAGMA user_version = 5")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 5
+            if version == 5:
+                self._require_tables(
+                    connection,
+                    (
+                        "candidate_inbox",
+                        "candidate_feed_cursors",
+                        "candidate_feed_receipts",
+                        "candidate_revision_history",
+                        "task_shadow_observations",
+                        "task_shadow_feed_cursors",
+                        "task_shadow_feed_receipts",
+                        "tasks",
+                        "task_candidate_bindings",
+                        "task_bootstrap_correlations",
+                        "task_events",
+                        "shadow_import_cycles",
+                    ),
+                )
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V6:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 6")
                     connection.commit()
                 except Exception:
                     connection.rollback()

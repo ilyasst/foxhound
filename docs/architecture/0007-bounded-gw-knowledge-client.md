@@ -24,7 +24,7 @@ with credentials, paths, query strings, or fragments are refused. Requests do
 not use process proxy configuration and redirects are refused, so private task
 queries and bearer credentials cannot be redirected or forwarded implicitly.
 
-The only operation is a POST to `/v1/search`. Query length, layer selection,
+The search operation is a POST to `/v1/search`. Query length, layer selection,
 context, per-document matches, per-layer results, timeout, and response bytes
 are bounded. The default layer is `kb`; email or secondary-layer access must be
 requested explicitly.
@@ -35,6 +35,10 @@ relative paths, excerpts, optional KB paths and sections, and optional ranking
 metadata all have closed shapes. Absolute paths, parent traversal, duplicate
 JSON fields, additional fields, inconsistent counts, unexpected media types,
 and oversized bodies fail closed.
+
+ADR 0009 adds a second fixed, read-only route to the same bounded client for
+identity-bound task-owner equivalence. It does not broaden knowledge search or
+grant either component task-mutation authority.
 
 Returned excerpts remain private task context. Failures contain only a closed
 classification and rule; they never echo the endpoint, token, query, response,

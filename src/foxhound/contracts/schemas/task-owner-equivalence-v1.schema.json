@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/foxhound/contracts/task-owner-equivalence-v1.schema.json",
+  "title": "GW-attested task-owner equivalence",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "ok",
+    "alias",
+    "candidate_id",
+    "source_revision",
+    "legacy_task_id",
+    "legacy_digest",
+    "status",
+    "basis",
+    "effective_owner"
+  ],
+  "properties": {
+    "schema": {"const": "gw.task-owner-equivalence"},
+    "schema_version": {"const": 1},
+    "ok": {"const": true},
+    "alias": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+    },
+    "candidate_id": {
+      "type": "string",
+      "pattern": "^tc_[0-9a-f]{64}$"
+    },
+    "source_revision": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "legacy_task_id": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9223372036854775807
+    },
+    "legacy_digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "status": {"enum": ["equivalent", "unresolved"]},
+    "basis": {
+      "oneOf": [{"const": "speaker_merge"}, {"type": "null"}]
+    },
+    "effective_owner": {
+      "oneOf": [
+        {"type": "string", "minLength": 1, "maxLength": 200},
+        {"type": "null"}
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "equivalent"}}},
+      "then": {
+        "properties": {
+          "basis": {"const": "speaker_merge"},
+          "effective_owner": {"type": "string"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"status": {"const": "unresolved"}}},
+      "then": {
+        "properties": {
+          "basis": {"type": "null"},
+          "effective_owner": {"type": "null"}
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
+}
