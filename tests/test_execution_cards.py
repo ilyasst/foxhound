@@ -14,6 +14,7 @@ from foxhound.candidate_inbox import CandidateInbox, SCHEMA_VERSION
 from foxhound.execution_cards import (
     CALLBACK_DATA_LIMIT,
     MAX_CARD_BODY_BYTES,
+    MAX_TRUNCATED_CARD_BODY_BYTES,
     ExecutionCardDisposition,
     ExecutionCardKind,
     ExecutionCardRefusal,
@@ -120,6 +121,7 @@ class ExecutionCardTests(unittest.TestCase):
         outcome: ExecutionOutcome,
         result_id: str,
         long_work: bool = False,
+        work_markdown: str | None = None,
     ):
         claim = self.execution.claim_next(lease_seconds=300)
         self.assertIsNotNone(claim)
@@ -133,8 +135,15 @@ class ExecutionCardTests(unittest.TestCase):
             claim_token=claim.token,
             outcome=outcome,
             summary="Synthetic <summary>",
-            work_markdown=(("Synthetic plan. " * 8_000).strip() if long_work
-                           else "Synthetic plan."),
+            work_markdown=(
+                work_markdown
+                if work_markdown is not None
+                else (
+                    ("Synthetic plan. " * 8_000).strip()
+                    if long_work
+                    else "Synthetic plan."
+                )
+            ),
             questions=("Proceed with Example A?",),
             external_actions=("Publish synthetic draft <alpha>.",),
             deliverables=("Synthetic deliverable",),
@@ -142,7 +151,14 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertTrue(result.accepted)
         return result
 
-    def _plan_review(self, task_id: int, result_id: str, *, long_work=False):
+    def _plan_review(
+        self,
+        task_id: int,
+        result_id: str,
+        *,
+        long_work: bool = False,
+        work_markdown: str | None = None,
+    ):
         scheduled = self._schedule_workflow(task_id)
         started = self.execution.start_action(
             task_id, expected_version=scheduled.version, action="start"
@@ -154,6 +170,7 @@ class ExecutionCardTests(unittest.TestCase):
             outcome=ExecutionOutcome.AWAITING_PLAN,
             result_id=result_id,
             long_work=long_work,
+            work_markdown=work_markdown,
         )
 
     def _external_review(self, task_id: int, prefix: str):
@@ -293,6 +310,39 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertIsNone(parse_execution_review_callback("fhe|01|1|start"))
         self.assertIsNone(parse_execution_review_callback("fhc|1|1|start"))
 
+    def test_operator_can_retry_only_a_current_delivered_presentation(self):
+        workflow = self._schedule_workflow(1)
+        self.cards.schedule()
+        claim = self._claim_and_deliver()
+
+        retried = self.cards.retry_delivery(
+            claim.card.id,
+            expected_version=claim.card.version,
+        )
+
+        self.assertEqual(
+            (retried.card_status, retried.card_version),
+            (ExecutionCardStatus.PENDING, claim.card.version + 1),
+        )
+        self.assertEqual(
+            (self.execution.get(1).status, self.execution.get(1).version),
+            (WorkflowStatus.AWAITING_START, workflow.version),
+        )
+        old_action = self.cards.act(
+            claim.card.id,
+            expected_version=claim.card.version,
+            action="start",
+        )
+        self.assertEqual(old_action.refusal, ExecutionCardRefusal.STALE_VERSION)
+        duplicate = self.cards.retry_delivery(
+            claim.card.id,
+            expected_version=claim.card.version + 1,
+        )
+        self.assertEqual(duplicate.refusal, ExecutionCardRefusal.INVALID_STATE)
+        replacement = self.cards.claim_next(lease_seconds=60)
+        self.assertEqual(replacement.card.id, claim.card.id)
+        self.assertGreater(replacement.card.version, retried.card_version)
+
     def test_start_actions_are_atomic_and_do_not_change_task_lifecycle(self):
         expected = {
             1: ("start", WorkflowStatus.QUEUED),
@@ -344,12 +394,21 @@ class ExecutionCardTests(unittest.TestCase):
             self.assertLessEqual(len(body.encode("utf-8")), MAX_CARD_BODY_BYTES)
             callbacks = [
                 button["callback_data"]
-                for button in keyboard["inline_keyboard"][0]
+                for row in keyboard["inline_keyboard"]
+                for button in row
             ]
             self.assertEqual(
                 [parse_execution_review_callback(value)[2]
                  for value in callbacks],
-                ["approve", "revise", "cancel"],
+                ["revise", "approve", "cancel"],
+            )
+            self.assertEqual(
+                [row[0]["text"] for row in keyboard["inline_keyboard"]],
+                [
+                    "🔎 Investigate further",
+                    "▶️ Execute plan",
+                    "⛔ Cancel workflow",
+                ],
             )
             result = self.cards.act(
                 claim.card.id,
@@ -367,11 +426,14 @@ class ExecutionCardTests(unittest.TestCase):
         self.cards.schedule()
         claim = self._claim_and_deliver()
         body, keyboard = render_execution_review_card(claim.card)
-        self.assertLessEqual(len(body.encode("utf-8")), MAX_CARD_BODY_BYTES)
+        self.assertLessEqual(
+            len(body.encode("utf-8")), MAX_TRUNCATED_CARD_BODY_BYTES
+        )
         self.assertIn("too long to approve", body)
         actions = [
             parse_execution_review_callback(button["callback_data"])[2]
-            for button in keyboard["inline_keyboard"][0]
+            for row in keyboard["inline_keyboard"]
+            for button in row
         ]
         self.assertEqual(actions, ["revise", "cancel"])
         before = self.execution.get(1)
@@ -401,7 +463,7 @@ class ExecutionCardTests(unittest.TestCase):
             self.assertIn("Publish synthetic draft &lt;alpha&gt;.", body)
             self.assertEqual(
                 keyboard["inline_keyboard"][0][0]["text"],
-                "Approve action",
+                "✅ Authorize action",
             )
             result = self.cards.act(
                 claim.card.id,
@@ -412,6 +474,70 @@ class ExecutionCardTests(unittest.TestCase):
                 (result.workflow_status, result.workflow_phase),
                 targets[action],
             )
+
+    def test_markdown_is_safe_readable_html(self):
+        markdown = (
+            "# Synthetic heading\n"
+            "- **Important** & <unsafe>\n"
+            "1. [Safe example](https://example.com/path?a=1&b=2)\n"
+            "[Unsafe example](javascript:unsafe) and `sample code`"
+        )
+        self._plan_review(1, "markdown-plan", work_markdown=markdown)
+        self.cards.schedule()
+        claim = self._claim_and_deliver()
+
+        body, _keyboard = render_execution_review_card(claim.card)
+
+        self.assertIn("<b>Synthetic heading</b>", body)
+        self.assertIn("• <b>Important</b> &amp; &lt;unsafe&gt;", body)
+        self.assertIn(
+            '<a href="https://example.com/path?a=1&amp;b=2">'
+            "Safe example</a>",
+            body,
+        )
+        self.assertIn("[Unsafe example](javascript:unsafe)", body)
+        self.assertNotIn('href="javascript:', body)
+        self.assertIn("<code>sample code</code>", body)
+        self.assertNotIn("**Important**", body)
+
+    def test_complete_multi_message_review_retains_approval(self):
+        markdown = "\n".join(
+            f"- Synthetic review line {index} with **detail**."
+            for index in range(220)
+        )
+        self._plan_review(1, "multi-message-plan", work_markdown=markdown)
+        self.cards.schedule()
+        claim = self._claim_and_deliver()
+
+        body, keyboard = render_execution_review_card(claim.card)
+        actions = [
+            parse_execution_review_callback(button["callback_data"])[2]
+            for row in keyboard["inline_keyboard"]
+            for button in row
+        ]
+
+        self.assertGreater(len(body), 4_096)
+        self.assertLessEqual(len(body.encode("utf-8")), MAX_CARD_BODY_BYTES)
+        self.assertIn("Synthetic review line 219", body)
+        self.assertIn("approve", actions)
+        self.assertNotIn("Approval is disabled", body)
+
+    def test_complete_review_has_transport_safe_html_lines(self):
+        markdown = "**" + ("&" * 1_000) + "**"
+        self._plan_review(1, "single-line-plan", work_markdown=markdown)
+        self.cards.schedule()
+        claim = self._claim_and_deliver()
+
+        body, keyboard = render_execution_review_card(claim.card)
+
+        self.assertLessEqual(max(map(len, body.splitlines())), 3_000)
+        self.assertEqual(body.count("<b>"), body.count("</b>"))
+        self.assertEqual(body.count("<i>"), body.count("</i>"))
+        self.assertTrue(any(
+            button["text"] == "▶️ Execute plan"
+            for row in keyboard["inline_keyboard"]
+            for button in row
+        ))
 
     def test_invalid_or_stale_actions_change_neither_card_nor_workflow(self):
         workflow = self._schedule_workflow(1)
