@@ -8,6 +8,9 @@ version = "0.1.0"
 description = "Task lifecycle and execution service."
 requires-python = ">=3.11"
 
+[project.scripts]
+foxhound-task-cards = "foxhound.task_card_server:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
