@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -10,6 +11,7 @@ from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import foxhound.candidate_inbox as inbox_schema
 from foxhound.candidate_inbox import CandidateInbox, SCHEMA_VERSION
 from foxhound.execution_cards import (
     CALLBACK_DATA_LIMIT,
@@ -31,12 +33,19 @@ from foxhound.task_execution import (
     WorkflowStatus,
 )
 from foxhound.task_ledger import TaskLedger, TaskStatus
+from foxhound.task_lifecycle_outcome_export import export_outcomes
 
 
 NOW = datetime(2030, 4, 5, 12, 0, tzinfo=timezone.utc)
 
 
 def _drop_native_intake_schema(connection: sqlite3.Connection) -> None:
+    connection.execute("DROP TRIGGER task_owner_events_no_update")
+    connection.execute("DROP TRIGGER task_owner_events_no_delete")
+    connection.execute("DROP TRIGGER execution_reader_inputs_no_update")
+    connection.execute("DROP TRIGGER execution_reader_inputs_no_delete")
+    connection.execute("DROP TABLE task_owner_events")
+    connection.execute("DROP TABLE execution_reader_inputs")
     connection.execute("DROP TRIGGER native_candidate_intake_events_no_update")
     connection.execute("DROP TRIGGER native_candidate_intake_events_no_delete")
     connection.execute("DROP TRIGGER candidate_feed_items_no_update")
@@ -217,6 +226,69 @@ class ExecutionCardTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM execution_review_cards"
             ).fetchone()[0]
         self.assertEqual((version, workflows, cards), (SCHEMA_VERSION, 1, 0))
+
+    def test_schema_ten_migration_preserves_active_cards_and_events(self):
+        database = Path(self.temporary.name) / "schema-ten.sqlite3"
+        with closing(sqlite3.connect(database)) as connection:
+            connection.execute(inbox_schema._SCHEMA_V1)
+            for version in range(2, 11):
+                for statement in getattr(inbox_schema, f"_SCHEMA_V{version}"):
+                    connection.execute(statement)
+                connection.commit()
+            now = NOW.isoformat(timespec="seconds")
+            connection.execute(
+                "INSERT INTO tasks(id,status,text,owner,due,version,created_at,"
+                "updated_at,closed_at) VALUES(1,'open','Synthetic task',"
+                "'Person A',NULL,1,?,?,NULL)",
+                (now, now),
+            )
+            connection.execute(
+                "INSERT INTO task_execution_workflows("
+                "task_id,task_version,status,phase,version,due_at,"
+                "claim_token_digest,claimed_at,claim_heartbeat_at,"
+                "claim_expires_at,failure_count,last_failure_reason,"
+                "last_failure_at,next_attempt_at,parked_at,last_result_id,"
+                "created_at,updated_at,completed_at) VALUES(1,1,"
+                "'awaiting_start','plan',1,NULL,NULL,NULL,NULL,NULL,0,NULL,"
+                "NULL,NULL,NULL,NULL,?,?,NULL)",
+                (now, now),
+            )
+            connection.execute(
+                "INSERT INTO execution_review_cards("
+                "id,task_id,task_version,workflow_version,kind,phase,result_id,"
+                "status,version,created_at,updated_at) VALUES(1,1,1,1,'start',"
+                "'plan',NULL,'delivered',2,?,?)",
+                (now, now),
+            )
+            connection.execute(
+                "INSERT INTO execution_review_card_events("
+                "card_id,task_id,kind,card_version,workflow_version,action,"
+                "occurred_at) VALUES(1,1,'delivered',2,1,NULL,?)",
+                (now,),
+            )
+            connection.execute("PRAGMA user_version = 10")
+            connection.commit()
+
+        CandidateInbox(database, clock=self.clock).initialize()
+
+        with closing(sqlite3.connect(database)) as connection:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            card = connection.execute(
+                "SELECT kind,status,version FROM execution_review_cards"
+            ).fetchone()
+            event = connection.execute(
+                "SELECT kind,card_version FROM execution_review_card_events"
+            ).fetchone()
+            private_tables = tuple(
+                connection.execute(
+                    "SELECT COUNT(*) FROM " + table
+                ).fetchone()[0]
+                for table in ("execution_reader_inputs", "task_owner_events")
+            )
+        self.assertEqual(version, SCHEMA_VERSION)
+        self.assertEqual(card, ("start", "delivered", 2))
+        self.assertEqual(event, ("delivered", 2))
+        self.assertEqual(private_tables, (0, 0))
 
     def test_schedule_is_explicit_current_bounded_and_idempotent(self):
         self.assertEqual(
@@ -400,14 +472,19 @@ class ExecutionCardTests(unittest.TestCase):
             self.assertEqual(
                 [parse_execution_review_callback(value)[2]
                  for value in callbacks],
-                ["revise", "approve", "cancel"],
+                [
+                    "revise", "discuss", "approve", "snooze", "done",
+                    "reassign", "drop",
+                ],
             )
             self.assertEqual(
-                [row[0]["text"] for row in keyboard["inline_keyboard"]],
+                [[button["text"] for button in row]
+                 for row in keyboard["inline_keyboard"]],
                 [
-                    "🔎 Investigate further",
-                    "▶️ Execute plan",
-                    "⛔ Cancel workflow",
+                    ["🔎 Investigate further", "💬 Discuss"],
+                    ["▶️ Execute plan", "🕒 Snooze"],
+                    ["✅ Mark as done"],
+                    ["👥 Reassign", "🗑 Drop task"],
                 ],
             )
             result = self.cards.act(
@@ -435,7 +512,9 @@ class ExecutionCardTests(unittest.TestCase):
             for row in keyboard["inline_keyboard"]
             for button in row
         ]
-        self.assertEqual(actions, ["revise", "cancel"])
+        self.assertEqual(
+            actions, ["revise", "discuss", "snooze", "reassign", "drop"]
+        )
         before = self.execution.get(1)
         refused = self.cards.act(
             claim.card.id,
@@ -604,7 +683,7 @@ class ExecutionCardTests(unittest.TestCase):
         )
         self.assertEqual(self.cards.stats().delivered, 1)
 
-    def test_events_are_append_only_and_completed_work_gets_no_card(self):
+    def test_events_are_append_only_and_completed_work_gets_result_card(self):
         scheduled = self._schedule_workflow(1)
         self.execution.start_action(
             1, expected_version=scheduled.version, action="start"
@@ -615,7 +694,34 @@ class ExecutionCardTests(unittest.TestCase):
             outcome=ExecutionOutcome.COMPLETED,
             result_id="completed-plan",
         )
-        self.assertEqual(self.cards.schedule().created, 0)
+        self.assertEqual(self.cards.schedule().created, 1)
+        claim = self.cards.claim_next()
+        self.assertEqual(claim.card.kind, ExecutionCardKind.RESULT_REVIEW)
+        body, keyboard = render_execution_review_card(claim.card)
+        self.assertIn("Foxhound result review", body)
+        self.assertIn("<b>Outcome:</b> completed", body)
+        self.assertEqual(
+            [
+                parse_execution_review_callback(button["callback_data"])[2]
+                for row in keyboard["inline_keyboard"]
+                for button in row
+            ],
+            ["done", "discuss", "snooze", "reassign", "drop"],
+        )
+        self.cards.complete_delivery(
+            claim.card.id,
+            expected_version=claim.card.version,
+            claim_token=claim.token,
+            transport="synthetic",
+            delivery_ref="result-message",
+        )
+        completed = self.cards.act(
+            claim.card.id,
+            expected_version=claim.card.version,
+            action="done",
+        )
+        self.assertEqual(completed.workflow_status, WorkflowStatus.COMPLETED)
+        self.assertEqual(self.ledger.get(1).status, TaskStatus.DONE)
 
         self._schedule_workflow(2)
         self.cards.schedule()
@@ -629,6 +735,275 @@ class ExecutionCardTests(unittest.TestCase):
             with closing(sqlite3.connect(self.database)) as connection:
                 connection.execute("DELETE FROM execution_review_card_events")
         self.assertEqual(self.cards.event_count(), before)
+
+    def test_review_snooze_is_durable_and_resumes_the_same_gate(self):
+        self._plan_review(1, "snooze-plan")
+        self.cards.schedule()
+        claim = self._claim_and_deliver()
+
+        snoozed = self.cards.act(
+            claim.card.id,
+            expected_version=claim.card.version,
+            action="snooze_7d",
+        )
+
+        self.assertEqual(snoozed.workflow_status, WorkflowStatus.SNOOZED)
+        self.assertEqual(
+            snoozed.wake_at,
+            (NOW + timedelta(days=7)).isoformat(timespec="seconds"),
+        )
+        self.assertEqual(self.cards.schedule().created, 0)
+        self.clock.advance(timedelta(days=7))
+        self.assertEqual(self.cards.schedule().created, 1)
+        resumed = self._claim_and_deliver()
+        self.assertEqual(resumed.card.kind, ExecutionCardKind.PLAN_REVIEW)
+        approved = self.cards.act(
+            resumed.card.id,
+            expected_version=resumed.card.version,
+            action="approve",
+        )
+        self.assertEqual(
+            (approved.workflow_status, approved.workflow_phase),
+            (WorkflowStatus.QUEUED, WorkflowPhase.EXECUTE),
+        )
+
+    def test_pre_migration_completed_result_can_be_snoozed_for_review(self):
+        scheduled = self._schedule_workflow(1)
+        self.execution.start_action(
+            1, expected_version=scheduled.version, action="start"
+        )
+        recorded = self._record(
+            1,
+            phase=WorkflowPhase.PLAN,
+            outcome=ExecutionOutcome.COMPLETED,
+            result_id="legacy-completed-result",
+        )
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "UPDATE task_execution_workflows SET status='completed',"
+                "completed_at=? WHERE task_id=1 AND version=?",
+                (NOW.isoformat(timespec="seconds"), recorded.version),
+            )
+            connection.commit()
+        self.cards.schedule()
+        claim = self._claim_and_deliver()
+
+        result = self.cards.act(
+            claim.card.id,
+            expected_version=claim.card.version,
+            action="snooze_1d",
+        )
+
+        self.assertEqual(result.workflow_status, WorkflowStatus.SNOOZED)
+        self.assertEqual(self.ledger.get(1).status, TaskStatus.OPEN)
+
+    def test_discussion_is_private_version_bound_and_consumed_by_result(self):
+        self._plan_review(1, "discussion-plan")
+        self.cards.schedule()
+        claim = self._claim_and_deliver()
+        before = self.execution.get(1)
+
+        discussed = self.cards.submit_input(
+            claim.card.id,
+            expected_version=claim.card.version,
+            kind="discussion",
+            value="Check the synthetic constraint.",
+        )
+
+        self.assertEqual(discussed.workflow_status, WorkflowStatus.QUEUED)
+        run = self.execution.claim_next()
+        self.assertEqual(
+            self.execution.reader_instruction(
+                1,
+                expected_version=run.workflow_version,
+                claim_token=run.token,
+            ),
+            "Check the synthetic constraint.",
+        )
+        self.execution.record_result(ExecutionResultEnvelope(
+            result_id="discussion-result",
+            task_id=1,
+            task_version=1,
+            workflow_version=run.workflow_version,
+            phase="plan",
+            claim_token=run.token,
+            outcome="awaiting_plan",
+            summary="Synthetic updated plan.",
+            work_markdown="Synthetic updated work.",
+        ))
+        self.cards.schedule()
+        followup = self._claim_and_deliver()
+        revised = self.cards.act(
+            followup.card.id,
+            expected_version=followup.card.version,
+            action="revise",
+        )
+        next_run = self.execution.claim_next()
+        self.assertEqual(next_run.workflow_version, revised.workflow_version + 1)
+        self.assertIsNone(self.execution.reader_instruction(
+            1,
+            expected_version=next_run.workflow_version,
+            claim_token=next_run.token,
+        ))
+        self.assertGreater(discussed.workflow_version, before.version)
+
+    def test_reassignment_versions_task_and_restarts_at_start_gate(self):
+        self._plan_review(1, "reassignment-plan")
+        self.cards.schedule()
+        claim = self._claim_and_deliver()
+
+        reassigned = self.cards.submit_input(
+            claim.card.id,
+            expected_version=claim.card.version,
+            kind="reassignment",
+            value="Person Example",
+        )
+
+        task = self.ledger.get(1)
+        workflow = self.execution.get(1)
+        self.assertEqual((task.owner, task.version), ("Person Example", 2))
+        self.assertEqual(
+            (workflow.task_version, workflow.status, workflow.phase,
+             workflow.last_result_id),
+            (2, WorkflowStatus.AWAITING_START, WorkflowPhase.PLAN, None),
+        )
+        self.assertEqual(reassigned.workflow_status, WorkflowStatus.AWAITING_START)
+        self.assertEqual(self.cards.schedule().created, 1)
+        replacement = self.cards.claim_next()
+        self.assertEqual(
+            (replacement.card.kind, replacement.card.task_version),
+            (ExecutionCardKind.START, 2),
+        )
+        with closing(sqlite3.connect(self.database)) as connection:
+            event = connection.execute(
+                "SELECT from_owner,to_owner,task_version "
+                "FROM task_owner_events WHERE task_id=1"
+            ).fetchone()
+        self.assertEqual(event, ("Person 1", "Person Example", 2))
+
+    def test_plan_drop_and_result_done_atomically_close_task_and_workflow(self):
+        self._plan_review(1, "drop-plan")
+        self._plan_review(2, "done-plan")
+        self.cards.schedule()
+        dropped_card = self._claim_and_deliver()
+        dropped = self.cards.act(
+            dropped_card.card.id,
+            expected_version=dropped_card.card.version,
+            action="drop",
+        )
+        self.assertEqual(self.ledger.get(1).status, TaskStatus.DROPPED)
+        self.assertEqual(dropped.workflow_status, WorkflowStatus.CANCELLED)
+
+        plan_card = self._claim_and_deliver()
+        self.cards.act(
+            plan_card.card.id,
+            expected_version=plan_card.card.version,
+            action="done",
+        )
+        self.assertEqual(self.ledger.get(2).status, TaskStatus.DONE)
+        self.assertEqual(self.execution.get(2).status, WorkflowStatus.COMPLETED)
+
+    def test_card_completion_projects_through_lifecycle_outcome_feed(self):
+        self._plan_review(1, "outcome-plan")
+        self.cards.schedule()
+        claim = self._claim_and_deliver()
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "INSERT INTO task_bootstrap_correlations("
+                "producer,legacy_task_id,task_id,created_at) "
+                "VALUES('gw',101,1,?)",
+                (NOW.isoformat(timespec="seconds"),),
+            )
+            connection.commit()
+        self.cards.act(
+            claim.card.id,
+            expected_version=claim.card.version,
+            action="done",
+        )
+        outbox = Path(self.temporary.name) / "outcomes"
+        outbox.mkdir(mode=0o700)
+
+        exported = export_outcomes(
+            self.database,
+            outbox_dir=outbox,
+            stream_id="synthetic-pilot",
+            clock=self.clock,
+        )
+
+        page = json.loads(exported.pages[0].read_text(encoding="utf-8"))
+        outcome = page["items"][0]["outcome"]
+        self.assertEqual(
+            (outcome["task_id"], outcome["task_version"],
+             outcome["to_status"]),
+            (1, 2, "done"),
+        )
+
+    def test_input_card_update_failure_rolls_back_all_state(self):
+        self._plan_review(1, "rollback-plan")
+        self.cards.schedule()
+        claim = self._claim_and_deliver()
+        before_task = self.ledger.get(1)
+        before_workflow = self.execution.get(1)
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "CREATE TRIGGER synthetic_refuse_execution_input_card_update "
+                "BEFORE UPDATE ON execution_review_cards "
+                "BEGIN SELECT RAISE(ABORT, 'synthetic refusal'); END"
+            )
+            connection.commit()
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.cards.submit_input(
+                claim.card.id,
+                expected_version=claim.card.version,
+                kind="reassignment",
+                value="Person Example",
+            )
+
+        self.assertEqual(self.ledger.get(1), before_task)
+        self.assertEqual(self.execution.get(1), before_workflow)
+        with closing(sqlite3.connect(self.database)) as connection:
+            counts = (
+                connection.execute(
+                    "SELECT COUNT(*) FROM execution_reader_inputs"
+                ).fetchone()[0],
+                connection.execute(
+                    "SELECT COUNT(*) FROM task_owner_events"
+                ).fetchone()[0],
+            )
+        self.assertEqual(counts, (0, 0))
+
+    def test_lifecycle_card_update_failure_rolls_back_task_and_workflow(self):
+        self._plan_review(1, "lifecycle-rollback-plan")
+        self.cards.schedule()
+        claim = self._claim_and_deliver()
+        before_task = self.ledger.get(1)
+        before_workflow = self.execution.get(1)
+        with closing(sqlite3.connect(self.database)) as connection:
+            event_count = connection.execute(
+                "SELECT COUNT(*) FROM task_events"
+            ).fetchone()[0]
+            connection.execute(
+                "CREATE TRIGGER synthetic_refuse_lifecycle_card_update "
+                "BEFORE UPDATE ON execution_review_cards "
+                "BEGIN SELECT RAISE(ABORT, 'synthetic refusal'); END"
+            )
+            connection.commit()
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.cards.act(
+                claim.card.id,
+                expected_version=claim.card.version,
+                action="done",
+            )
+
+        self.assertEqual(self.ledger.get(1), before_task)
+        self.assertEqual(self.execution.get(1), before_workflow)
+        with closing(sqlite3.connect(self.database)) as connection:
+            after_events = connection.execute(
+                "SELECT COUNT(*) FROM task_events"
+            ).fetchone()[0]
+        self.assertEqual(after_events, event_count)
 
 
 if __name__ == "__main__":

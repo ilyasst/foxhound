@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -302,6 +302,28 @@ _SCHEMA_COLUMNS = {
         "action",
         "occurred_at",
     ),
+    "execution_reader_inputs": (
+        "sequence",
+        "card_id",
+        "task_id",
+        "card_version",
+        "task_version",
+        "workflow_version",
+        "target_workflow_version",
+        "kind",
+        "value",
+        "prior_value",
+        "occurred_at",
+    ),
+    "task_owner_events": (
+        "sequence",
+        "task_id",
+        "task_version",
+        "card_id",
+        "from_owner",
+        "to_owner",
+        "occurred_at",
+    ),
 }
 
 _SCHEMA_OBJECTS = {
@@ -329,6 +351,10 @@ _SCHEMA_OBJECTS = {
     "native_candidate_intakes_no_delete": "trigger",
     "native_candidate_intake_events_no_update": "trigger",
     "native_candidate_intake_events_no_delete": "trigger",
+    "execution_reader_inputs_no_update": "trigger",
+    "execution_reader_inputs_no_delete": "trigger",
+    "task_owner_events_no_update": "trigger",
+    "task_owner_events_no_delete": "trigger",
 }
 
 _SCHEMA_V1 = """
@@ -1017,6 +1043,161 @@ END;
 """,
 )
 
+_SCHEMA_V11_CARD_TABLE = (
+    _SCHEMA_V9[0]
+    .replace(
+        "'start','plan_review','external_review'",
+        "'start','plan_review','external_review','result_review'",
+    )
+    .replace("'plan','execute'", "'plan','execute','external_action'")
+    .replace(
+        "'start','snooze','cancel','approve','revise'",
+        "'start','snooze','cancel','approve','revise','discuss','done',"
+        "'reassign','drop'",
+    )
+    .replace(
+        "            AND result_id IS NOT NULL)\n    ),",
+        "            AND result_id IS NOT NULL)\n"
+        "        OR (kind = 'result_review' AND result_id IS NOT NULL)\n"
+        "    ),",
+    )
+)
+_SCHEMA_V11_CARD_EVENT_TABLE = _SCHEMA_V9[2].replace(
+    "'start','snooze','cancel','approve','revise'",
+    "'start','snooze','cancel','approve','revise','discuss','done',"
+    "'reassign','drop'",
+)
+_SCHEMA_V11_EXECUTION_EVENT_TABLE = _SCHEMA_V8[5].replace(
+    "'phase_approved','revision_requested'",
+    "'phase_approved','revision_requested','discussion_requested',"
+    "'task_completed','task_dropped','reassigned'",
+)
+
+_SCHEMA_V11 = (
+    "DROP TRIGGER execution_review_card_events_no_update;",
+    "DROP TRIGGER execution_review_card_events_no_delete;",
+    "DROP INDEX execution_review_cards_one_active;",
+    "ALTER TABLE execution_review_card_events "
+    "RENAME TO execution_review_card_events_v10;",
+    "ALTER TABLE execution_review_cards "
+    "RENAME TO execution_review_cards_v10;",
+    _SCHEMA_V11_CARD_TABLE,
+    _SCHEMA_V9[1],
+    _SCHEMA_V11_CARD_EVENT_TABLE,
+    """
+INSERT INTO execution_review_cards(
+    id,task_id,task_version,workflow_version,kind,phase,result_id,status,
+    version,claim_token_digest,claim_expires_at,transport,delivery_ref,
+    delivered_at,resolution,created_at,updated_at,resolved_at
+)
+SELECT id,task_id,task_version,workflow_version,kind,phase,result_id,status,
+       version,claim_token_digest,claim_expires_at,transport,delivery_ref,
+       delivered_at,resolution,created_at,updated_at,resolved_at
+FROM execution_review_cards_v10;
+""",
+    """
+INSERT INTO execution_review_card_events(
+    sequence,card_id,task_id,kind,card_version,workflow_version,action,
+    occurred_at
+)
+SELECT sequence,card_id,task_id,kind,card_version,workflow_version,action,
+       occurred_at
+FROM execution_review_card_events_v10;
+""",
+    "DROP TABLE execution_review_card_events_v10;",
+    "DROP TABLE execution_review_cards_v10;",
+    _SCHEMA_V9[3],
+    _SCHEMA_V9[4],
+    """
+CREATE TABLE execution_reader_inputs (
+    sequence                INTEGER PRIMARY KEY AUTOINCREMENT,
+    card_id                 INTEGER NOT NULL,
+    task_id                 INTEGER NOT NULL,
+    card_version            INTEGER NOT NULL CHECK(card_version >= 1),
+    task_version            INTEGER NOT NULL CHECK(task_version >= 1),
+    workflow_version        INTEGER NOT NULL CHECK(workflow_version >= 1),
+    target_workflow_version INTEGER NOT NULL
+                                CHECK(target_workflow_version >= 1),
+    kind                    TEXT NOT NULL CHECK(kind IN (
+                                'discussion','reassignment'
+                            )),
+    value                   TEXT NOT NULL CHECK(
+                                (kind = 'discussion'
+                                 AND length(value) BETWEEN 1 AND 16000)
+                                OR
+                                (kind = 'reassignment'
+                                 AND length(value) BETWEEN 1 AND 200
+                                 AND instr(value, char(10)) = 0)
+                            ),
+    prior_value             TEXT CHECK(
+                                prior_value IS NULL
+                                OR length(prior_value) <= 200
+                            ),
+    occurred_at             TEXT NOT NULL,
+    FOREIGN KEY(card_id) REFERENCES execution_review_cards(id),
+    FOREIGN KEY(task_id) REFERENCES task_execution_workflows(task_id)
+);
+""",
+    """
+CREATE TRIGGER execution_reader_inputs_no_update
+BEFORE UPDATE ON execution_reader_inputs
+BEGIN
+    SELECT RAISE(ABORT, 'execution reader inputs are append-only');
+END;
+""",
+    """
+CREATE TRIGGER execution_reader_inputs_no_delete
+BEFORE DELETE ON execution_reader_inputs
+BEGIN
+    SELECT RAISE(ABORT, 'execution reader inputs are append-only');
+END;
+""",
+    """
+CREATE TABLE task_owner_events (
+    sequence     INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id      INTEGER NOT NULL,
+    task_version INTEGER NOT NULL CHECK(task_version >= 1),
+    card_id      INTEGER NOT NULL,
+    from_owner   TEXT,
+    to_owner     TEXT NOT NULL CHECK(length(to_owner) BETWEEN 1 AND 200),
+    occurred_at  TEXT NOT NULL,
+    FOREIGN KEY(task_id) REFERENCES tasks(id),
+    FOREIGN KEY(card_id) REFERENCES execution_review_cards(id)
+);
+""",
+    """
+CREATE TRIGGER task_owner_events_no_update
+BEFORE UPDATE ON task_owner_events
+BEGIN
+    SELECT RAISE(ABORT, 'task owner events are append-only');
+END;
+""",
+    """
+CREATE TRIGGER task_owner_events_no_delete
+BEFORE DELETE ON task_owner_events
+BEGIN
+    SELECT RAISE(ABORT, 'task owner events are append-only');
+END;
+""",
+    "DROP TRIGGER task_execution_events_no_update;",
+    "DROP TRIGGER task_execution_events_no_delete;",
+    "ALTER TABLE task_execution_events "
+    "RENAME TO task_execution_events_v10;",
+    _SCHEMA_V11_EXECUTION_EVENT_TABLE,
+    """
+INSERT INTO task_execution_events(
+    sequence,task_id,kind,workflow_version,task_version,phase,status,
+    occurred_at
+)
+SELECT sequence,task_id,kind,workflow_version,task_version,phase,status,
+       occurred_at
+FROM task_execution_events_v10;
+""",
+    "DROP TABLE task_execution_events_v10;",
+    _SCHEMA_V8[6],
+    _SCHEMA_V8[7],
+)
+
 
 class InboxError(RuntimeError):
     """The inbox cannot safely initialize or read its state."""
@@ -1403,6 +1584,31 @@ class CandidateInbox:
                     for statement in _SCHEMA_V10:
                         connection.execute(statement)
                     connection.execute("PRAGMA user_version = 10")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 10
+            if version == 10:
+                self._require_tables(
+                    connection,
+                    (
+                        "tasks",
+                        "task_execution_workflows",
+                        "task_execution_results",
+                        "task_execution_events",
+                        "execution_review_cards",
+                        "execution_review_card_events",
+                        "native_candidate_intakes",
+                        "native_candidate_intake_events",
+                    ),
+                )
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V11:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 11")
                     connection.commit()
                 except Exception:
                     connection.rollback()

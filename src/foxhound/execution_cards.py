@@ -20,14 +20,22 @@ from typing import Callable, Mapping, Sequence
 from .candidate_inbox import CandidateInbox, InboxError, SCHEMA_VERSION
 from .task_execution import (
     ExecutionOutcome,
+    REVIEW_SNOOZE_INTERVALS,
+    TaskExecutionService,
     WorkflowDisposition,
+    WorkflowOperationResult,
     WorkflowPhase,
     WorkflowRefusal,
     WorkflowStatus,
     _apply_review_action,
     _apply_start_action,
 )
-from .task_ledger import TaskLedgerError, TaskStatus
+from .task_ledger import (
+    TaskLedgerError,
+    TaskStatus,
+    TransitionDisposition,
+    _apply_task_transition,
+)
 
 
 CALLBACK_PREFIX = "fhe"
@@ -36,12 +44,20 @@ MAX_CARD_BODY_BYTES = 24 * 1024
 MAX_RENDER_SOURCE_LINE_CHARS = 500
 MAX_TRUNCATED_CARD_BODY_BYTES = 3_500
 ACTIVE_STATUSES = ("pending", "delivering", "delivered")
+REVIEW_DIRECT_ACTIONS = {
+    "approve", "revise", "cancel", "done", "drop",
+    *REVIEW_SNOOZE_INTERVALS,
+}
+READER_INPUT_KINDS = {"discussion", "reassignment"}
+MAX_DISCUSSION_CHARS = 16_000
+MAX_OWNER_CHARS = 200
 
 
 class ExecutionCardKind(StrEnum):
     START = "start"
     PLAN_REVIEW = "plan_review"
     EXTERNAL_REVIEW = "external_review"
+    RESULT_REVIEW = "result_review"
 
 
 class ExecutionCardStatus(StrEnum):
@@ -103,6 +119,7 @@ class ExecutionReviewCard:
     questions: tuple[str, ...] = field(default=(), repr=False)
     external_actions: tuple[str, ...] = field(default=(), repr=False)
     deliverables: tuple[str, ...] = field(default=(), repr=False)
+    outcome: ExecutionOutcome | None = None
 
 
 @dataclass(frozen=True)
@@ -178,7 +195,9 @@ class ExecutionCardService:
                     " (w.status='awaiting_review' AND w.phase='plan' "
                     "  AND r.outcome='awaiting_plan') OR "
                     " (w.status='awaiting_review' AND w.phase='execute' "
-                    "  AND r.outcome='awaiting_external')"
+                    "  AND r.outcome='awaiting_external') OR "
+                    " (w.status IN ('awaiting_review','completed') "
+                    "  AND r.outcome IN ('completed','declined','ineligible'))"
                     ") ORDER BY w.updated_at,w.task_id LIMIT ?",
                     (now, limit),
                 ).fetchall()
@@ -544,7 +563,7 @@ class ExecutionCardService:
     ) -> ExecutionCardOperationResult:
         if not _valid_identity(card_id, expected_version):
             return _refused(card_id, ExecutionCardRefusal.INVALID_ARGUMENT)
-        if action not in {"start", "snooze", "cancel", "approve", "revise"}:
+        if action not in {"start", "snooze", *REVIEW_DIRECT_ACTIONS}:
             return _refused(card_id, ExecutionCardRefusal.INVALID_ACTION)
         stamp = self._clock_value()
         now = stamp.isoformat(timespec="seconds")
@@ -560,13 +579,13 @@ class ExecutionCardService:
                     refusal = ExecutionCardRefusal.INVALID_STATE
                 if refusal is None and not _current_card(row):
                     refusal = ExecutionCardRefusal.STALE_VERSION
-                if refusal is None and action not in _actions_for_kind(
+                if refusal is None and action not in _direct_actions_for_kind(
                     ExecutionCardKind(row["kind"])
                 ):
                     refusal = ExecutionCardRefusal.INVALID_ACTION
                 if (
                     refusal is None
-                    and action in {"start", "approve"}
+                    and action in {"start", "approve", "done"}
                     and not _card_fits(_card(row))
                 ):
                     refusal = ExecutionCardRefusal.INVALID_STATE
@@ -574,7 +593,8 @@ class ExecutionCardService:
                     connection.rollback()
                     return _refused_row(card_id, row, refusal)
 
-                if row["kind"] == ExecutionCardKind.START:
+                card_kind = ExecutionCardKind(row["kind"])
+                if card_kind is ExecutionCardKind.START:
                     workflow = _apply_start_action(
                         connection,
                         int(row["task_id"]),
@@ -582,13 +602,20 @@ class ExecutionCardService:
                         action=action,
                         stamp=stamp,
                     )
+                elif action in {"done", "drop"}:
+                    workflow = _apply_review_lifecycle_action(
+                        connection,
+                        row,
+                        action=action,
+                        now=now,
+                    )
                 else:
                     workflow = _apply_review_action(
                         connection,
                         int(row["task_id"]),
                         expected_version=int(row["workflow_version"]),
                         action=action,
-                        now=now,
+                        stamp=stamp,
                     )
                 if workflow.disposition is WorkflowDisposition.REFUSED:
                     connection.rollback()
@@ -603,7 +630,14 @@ class ExecutionCardService:
                     "version=?,claim_token_digest=NULL,claim_expires_at=NULL,"
                     "resolution=?,resolved_at=?,updated_at=? "
                     "WHERE id=? AND version=? AND status='delivered'",
-                    (version, action, now, now, card_id, expected_version),
+                    (
+                        version,
+                        _stored_action(action),
+                        now,
+                        now,
+                        card_id,
+                        expected_version,
+                    ),
                 )
                 if updated.rowcount != 1:
                     raise TaskLedgerError("execution card state changed")
@@ -614,7 +648,7 @@ class ExecutionCardService:
                     kind="resolved",
                     card_version=version,
                     workflow_version=int(workflow.version),
-                    action=action,
+                    action=_stored_action(action),
                     now=now,
                 )
                 connection.commit()
@@ -627,6 +661,198 @@ class ExecutionCardService:
                     workflow_status=workflow.status,
                     workflow_phase=workflow.phase,
                     wake_at=workflow.wake_at,
+                )
+            except Exception:
+                connection.rollback()
+                raise
+
+    def submit_input(
+        self,
+        card_id: int,
+        *,
+        expected_version: int,
+        kind: str,
+        value: str,
+    ) -> ExecutionCardOperationResult:
+        """Apply one version-bound discussion or reassignment response."""
+        if (
+            not _valid_identity(card_id, expected_version)
+            or kind not in READER_INPUT_KINDS
+            or not _valid_reader_input(kind, value)
+        ):
+            return _refused(card_id, ExecutionCardRefusal.INVALID_ARGUMENT)
+        stamp = self._clock_value()
+        now = stamp.isoformat(timespec="seconds")
+        with closing(self._connect()) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    self._card_select() + " WHERE c.id=?", (card_id,)
+                ).fetchone()
+                refusal = _card_guard(row, expected_version)
+                if (
+                    refusal is None
+                    and row["status"] != ExecutionCardStatus.DELIVERED
+                ):
+                    refusal = ExecutionCardRefusal.INVALID_STATE
+                if refusal is None and not _current_card(row):
+                    refusal = ExecutionCardRefusal.STALE_VERSION
+                if (
+                    refusal is None
+                    and ExecutionCardKind(row["kind"])
+                    is ExecutionCardKind.START
+                ):
+                    refusal = ExecutionCardRefusal.INVALID_ACTION
+                if (
+                    refusal is None
+                    and kind == "reassignment"
+                    and row["owner"] == value
+                ):
+                    refusal = ExecutionCardRefusal.INVALID_STATE
+                if refusal is not None:
+                    connection.rollback()
+                    return _refused_row(card_id, row, refusal)
+
+                target_workflow_version = int(row["workflow_version"]) + 1
+                connection.execute(
+                    "INSERT INTO execution_reader_inputs("
+                    "card_id,task_id,card_version,task_version,"
+                    "workflow_version,target_workflow_version,kind,value,"
+                    "prior_value,occurred_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        card_id,
+                        int(row["task_id"]),
+                        expected_version,
+                        int(row["task_version"]),
+                        int(row["workflow_version"]),
+                        target_workflow_version,
+                        kind,
+                        value,
+                        row["owner"] if kind == "reassignment" else None,
+                        now,
+                    ),
+                )
+                if kind == "discussion":
+                    task_version = int(row["task_version"])
+                    status = WorkflowStatus.QUEUED
+                    phase = WorkflowPhase.PLAN
+                    event_kind = "discussion_requested"
+                    resolution = "discuss"
+                    workflow_update = connection.execute(
+                        "UPDATE task_execution_workflows SET "
+                        "status='queued',phase='plan',version=?,due_at=NULL,"
+                        "claim_token_digest=NULL,claimed_at=NULL,"
+                        "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
+                        "failure_count=0,last_failure_reason=NULL,"
+                        "last_failure_at=NULL,next_attempt_at=NULL,"
+                        "parked_at=NULL,updated_at=?,completed_at=NULL "
+                        "WHERE task_id=? AND version=?",
+                        (
+                            target_workflow_version,
+                            now,
+                            int(row["task_id"]),
+                            int(row["workflow_version"]),
+                        ),
+                    )
+                else:
+                    task_version = int(row["task_version"]) + 1
+                    status = WorkflowStatus.AWAITING_START
+                    phase = WorkflowPhase.PLAN
+                    event_kind = "reassigned"
+                    resolution = "reassign"
+                    task_update = connection.execute(
+                        "UPDATE tasks SET owner=?,version=?,updated_at=? "
+                        "WHERE id=? AND version=? AND status='open'",
+                        (
+                            value,
+                            task_version,
+                            now,
+                            int(row["task_id"]),
+                            int(row["task_version"]),
+                        ),
+                    )
+                    if task_update.rowcount != 1:
+                        raise TaskLedgerError("task ownership state changed")
+                    connection.execute(
+                        "INSERT INTO task_owner_events("
+                        "task_id,task_version,card_id,from_owner,to_owner,"
+                        "occurred_at) VALUES(?,?,?,?,?,?)",
+                        (
+                            int(row["task_id"]),
+                            task_version,
+                            card_id,
+                            row["owner"],
+                            value,
+                            now,
+                        ),
+                    )
+                    workflow_update = connection.execute(
+                        "UPDATE task_execution_workflows SET task_version=?,"
+                        "status='awaiting_start',phase='plan',version=?,"
+                        "due_at=NULL,claim_token_digest=NULL,claimed_at=NULL,"
+                        "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
+                        "failure_count=0,last_failure_reason=NULL,"
+                        "last_failure_at=NULL,next_attempt_at=NULL,"
+                        "parked_at=NULL,last_result_id=NULL,updated_at=?,"
+                        "completed_at=NULL WHERE task_id=? AND version=?",
+                        (
+                            task_version,
+                            target_workflow_version,
+                            now,
+                            int(row["task_id"]),
+                            int(row["workflow_version"]),
+                        ),
+                    )
+
+                if workflow_update.rowcount != 1:
+                    raise TaskLedgerError("execution workflow state changed")
+
+                TaskExecutionService._event(
+                    connection,
+                    int(row["task_id"]),
+                    event_kind,
+                    target_workflow_version,
+                    task_version,
+                    phase,
+                    status,
+                    now,
+                )
+                version = expected_version + 1
+                updated = connection.execute(
+                    "UPDATE execution_review_cards SET status='resolved',"
+                    "version=?,resolution=?,resolved_at=?,updated_at=? "
+                    "WHERE id=? AND version=? AND status='delivered'",
+                    (
+                        version,
+                        resolution,
+                        now,
+                        now,
+                        card_id,
+                        expected_version,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise TaskLedgerError("execution card state changed")
+                self._event(
+                    connection,
+                    card_id=card_id,
+                    task_id=int(row["task_id"]),
+                    kind="resolved",
+                    card_version=version,
+                    workflow_version=target_workflow_version,
+                    action=resolution,
+                    now=now,
+                )
+                connection.commit()
+                return ExecutionCardOperationResult(
+                    ExecutionCardDisposition.APPLIED,
+                    card_id,
+                    card_version=version,
+                    card_status=ExecutionCardStatus.RESOLVED,
+                    workflow_version=target_workflow_version,
+                    workflow_status=status,
+                    workflow_phase=phase,
                 )
             except Exception:
                 connection.rollback()
@@ -829,26 +1055,45 @@ def parse_execution_review_callback(
         return None
     if parts[1] != str(card_id) or parts[2] != str(version):
         return None
-    if parts[3] not in {"start", "snooze", "cancel", "approve", "revise"}:
+    if parts[3] not in {
+        "start", "snooze", "cancel", "approve", "revise", "discuss",
+        "done", "reassign", "drop", *REVIEW_SNOOZE_INTERVALS,
+    }:
         return None
     return card_id, version, parts[3]
 
 
 def _kind_for_workflow(row: Mapping[str, object]) -> ExecutionCardKind:
-    if row["status"] in {WorkflowStatus.AWAITING_START, WorkflowStatus.SNOOZED}:
+    if (
+        row["status"] in {WorkflowStatus.AWAITING_START, WorkflowStatus.SNOOZED}
+        and row["last_result_id"] is None
+    ):
         return ExecutionCardKind.START
     if (
-        row["status"] == WorkflowStatus.AWAITING_REVIEW
+        row["status"] in {WorkflowStatus.AWAITING_REVIEW, WorkflowStatus.SNOOZED}
         and row["phase"] == WorkflowPhase.PLAN
         and row["outcome"] == ExecutionOutcome.AWAITING_PLAN
     ):
         return ExecutionCardKind.PLAN_REVIEW
     if (
-        row["status"] == WorkflowStatus.AWAITING_REVIEW
+        row["status"] in {WorkflowStatus.AWAITING_REVIEW, WorkflowStatus.SNOOZED}
         and row["phase"] == WorkflowPhase.EXECUTE
         and row["outcome"] == ExecutionOutcome.AWAITING_EXTERNAL
     ):
         return ExecutionCardKind.EXTERNAL_REVIEW
+    if (
+        row["status"] in {
+            WorkflowStatus.AWAITING_REVIEW,
+            WorkflowStatus.COMPLETED,
+            WorkflowStatus.SNOOZED,
+        }
+        and row["outcome"] in {
+            ExecutionOutcome.COMPLETED,
+            ExecutionOutcome.DECLINED,
+            ExecutionOutcome.INELIGIBLE,
+        }
+    ):
+        return ExecutionCardKind.RESULT_REVIEW
     raise TaskLedgerError("execution workflow cannot be rendered as a card")
 
 
@@ -871,20 +1116,31 @@ def _current_card(row: Mapping[str, object]) -> bool:
                 and row["workflow_status_current"]
                 in {WorkflowStatus.AWAITING_START, WorkflowStatus.SNOOZED}
             )
-        expected = (
-            ExecutionOutcome.AWAITING_PLAN
-            if kind is ExecutionCardKind.PLAN_REVIEW
-            else ExecutionOutcome.AWAITING_EXTERNAL
-        )
+        expected = {
+            ExecutionCardKind.PLAN_REVIEW: {ExecutionOutcome.AWAITING_PLAN},
+            ExecutionCardKind.EXTERNAL_REVIEW: {
+                ExecutionOutcome.AWAITING_EXTERNAL
+            },
+            ExecutionCardKind.RESULT_REVIEW: {
+                ExecutionOutcome.COMPLETED,
+                ExecutionOutcome.DECLINED,
+                ExecutionOutcome.INELIGIBLE,
+            },
+        }[kind]
+        statuses = {
+            WorkflowStatus.AWAITING_REVIEW,
+            WorkflowStatus.SNOOZED,
+        }
+        if kind is ExecutionCardKind.RESULT_REVIEW:
+            statuses.add(WorkflowStatus.COMPLETED)
         return (
-            row["workflow_status_current"] == WorkflowStatus.AWAITING_REVIEW
+            row["workflow_status_current"] in statuses
             and row["workflow_result_id"] == row["result_id"]
             and row["result_task_id"] == row["task_id"]
             and row["result_task_version"] == row["task_version"]
-            and int(row["result_version"]) + 1
-            == int(row["workflow_version"])
+            and int(row["result_version"]) < int(row["workflow_version"])
             and row["result_phase"] == row["phase"]
-            and row["result_outcome"] == expected
+            and row["result_outcome"] in expected
         )
     except (KeyError, TypeError, ValueError):
         return False
@@ -915,6 +1171,11 @@ def _card(row: Mapping[str, object]) -> ExecutionReviewCard:
             questions=_stored_collection(row["questions_json"]),
             external_actions=_stored_collection(row["external_actions_json"]),
             deliverables=_stored_collection(row["deliverables_json"]),
+            outcome=(
+                None
+                if row["result_outcome"] is None
+                else ExecutionOutcome(row["result_outcome"])
+            ),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise TaskLedgerError("execution review card state is invalid") from exc
@@ -963,6 +1224,22 @@ def _card_lines(card: ExecutionReviewCard) -> list[str]:
         ]
         if card.questions:
             lines.extend(("", "Questions:", *_listed(card.questions)))
+        return lines
+    if card.kind is ExecutionCardKind.RESULT_REVIEW:
+        lines = [
+            "Foxhound result review",
+            "",
+            *details,
+            "",
+            f"Outcome: {card.outcome}",
+            f"Summary: {card.summary}",
+        ]
+        if card.questions:
+            lines.extend(("", "Questions:", *_listed(card.questions)))
+        if card.deliverables:
+            lines.extend(("", "Deliverables:", *_listed(card.deliverables)))
+        if card.work_markdown:
+            lines.extend(("", "Work:", card.work_markdown))
         return lines
     lines = [
         "Foxhound plan review",
@@ -1023,6 +1300,22 @@ def _html_card_lines(card: ExecutionReviewCard) -> list[str]:
                 "<b>Questions:</b>",
                 *_html_listed(card.questions),
             ))
+        return lines
+    if card.kind is ExecutionCardKind.RESULT_REVIEW:
+        lines = [
+            "<b>Foxhound result review</b>",
+            "",
+            *details,
+            "",
+            *_labelled_html_lines("Outcome", str(card.outcome)),
+            *_labelled_html_lines("Summary", card.summary),
+        ]
+        if card.questions:
+            lines.extend(("", "<b>Questions:</b>", *_html_listed(card.questions)))
+        if card.deliverables:
+            lines.extend(("", "<b>Deliverables:</b>", *_html_listed(card.deliverables)))
+        if card.work_markdown:
+            lines.extend(("", "<b>Work:</b>", *_markdown_lines(card.work_markdown)))
         return lines
     lines = [
         "<b>Foxhound plan review</b>",
@@ -1192,23 +1485,124 @@ def _button_rows(
         return rows if approvable else rows[1:]
     if kind is ExecutionCardKind.EXTERNAL_REVIEW:
         rows = (
-            (("✅ Authorize action", "approve"),),
-            (("↩ Return for revision", "revise"),),
-            (("⛔ Cancel workflow", "cancel"),),
+            (("✅ Authorize action", "approve"), ("⛔ Not now", "revise")),
+            (("🕒 Snooze", "snooze"),),
+            (("💬 Discuss", "discuss"), ("✅ Mark as done", "done")),
+            (("👥 Reassign", "reassign"), ("🗑 Drop task", "drop")),
         )
-        return rows if approvable else rows[1:]
-    rows = (
-        (("🔎 Investigate further", "revise"),),
-        (("▶️ Execute plan", "approve"),),
-        (("⛔ Cancel workflow", "cancel"),),
+    elif kind is ExecutionCardKind.RESULT_REVIEW:
+        rows = (
+            (("✅ Mark as done", "done"),),
+            (("💬 Discuss", "discuss"), ("🕒 Snooze", "snooze")),
+            (("👥 Reassign", "reassign"), ("🗑 Drop task", "drop")),
+        )
+    else:
+        rows = (
+            (("🔎 Investigate further", "revise"), ("💬 Discuss", "discuss")),
+            (("▶️ Execute plan", "approve"), ("🕒 Snooze", "snooze")),
+            (("✅ Mark as done", "done"),),
+            (("👥 Reassign", "reassign"), ("🗑 Drop task", "drop")),
+        )
+    if approvable:
+        return rows
+    return tuple(
+        tuple(button for button in row if button[1] not in {"approve", "done"})
+        for row in rows
+        if any(button[1] not in {"approve", "done"} for button in row)
     )
-    return rows if approvable else (rows[0], rows[2])
 
 
-def _actions_for_kind(kind: ExecutionCardKind) -> set[str]:
+def _direct_actions_for_kind(kind: ExecutionCardKind) -> set[str]:
     if kind is ExecutionCardKind.START:
         return {"start", "snooze", "cancel"}
-    return {"approve", "revise", "cancel"}
+    if kind is ExecutionCardKind.RESULT_REVIEW:
+        return {"done", "drop", *REVIEW_SNOOZE_INTERVALS}
+    return {
+        "approve", "revise", "cancel", "done", "drop",
+        *REVIEW_SNOOZE_INTERVALS,
+    }
+
+
+def _stored_action(action: str) -> str:
+    return "snooze" if action in REVIEW_SNOOZE_INTERVALS else action
+
+
+def _valid_reader_input(kind: str, value: object) -> bool:
+    maximum = MAX_DISCUSSION_CHARS if kind == "discussion" else MAX_OWNER_CHARS
+    return (
+        isinstance(value, str)
+        and value == value.strip()
+        and 1 <= len(value) <= maximum
+        and not any(ord(character) == 0 for character in value)
+        and (kind != "reassignment" or "\n" not in value)
+    )
+
+
+def _apply_review_lifecycle_action(
+    connection: sqlite3.Connection,
+    row: Mapping[str, object],
+    *,
+    action: str,
+    now: str,
+) -> WorkflowOperationResult:
+    transition = _apply_task_transition(
+        connection,
+        task_id=int(row["task_id"]),
+        expected_version=int(row["task_version"]),
+        action=action,
+        now=now,
+    )
+    if transition.disposition is TransitionDisposition.REFUSED:
+        return WorkflowOperationResult(
+            WorkflowDisposition.REFUSED,
+            int(row["task_id"]),
+            refusal=WorkflowRefusal.STALE_TASK,
+        )
+    workflow_status = (
+        WorkflowStatus.COMPLETED if action == "done" else WorkflowStatus.CANCELLED
+    )
+    workflow_version = int(row["workflow_version"]) + 1
+    phase = WorkflowPhase(row["phase"])
+    updated = connection.execute(
+        "UPDATE task_execution_workflows SET task_version=?,status=?,"
+        "version=?,due_at=NULL,claim_token_digest=NULL,claimed_at=NULL,"
+        "claim_heartbeat_at=NULL,claim_expires_at=NULL,failure_count=0,"
+        "last_failure_reason=NULL,last_failure_at=NULL,next_attempt_at=NULL,"
+        "parked_at=NULL,updated_at=?,completed_at=? "
+        "WHERE task_id=? AND version=?",
+        (
+            int(transition.version),
+            workflow_status,
+            workflow_version,
+            now,
+            now,
+            int(row["task_id"]),
+            int(row["workflow_version"]),
+        ),
+    )
+    if updated.rowcount != 1:
+        return WorkflowOperationResult(
+            WorkflowDisposition.REFUSED,
+            int(row["task_id"]),
+            refusal=WorkflowRefusal.STALE_WORKFLOW,
+        )
+    TaskExecutionService._event(
+        connection,
+        int(row["task_id"]),
+        "task_completed" if action == "done" else "task_dropped",
+        workflow_version,
+        int(transition.version),
+        phase,
+        workflow_status,
+        now,
+    )
+    return WorkflowOperationResult(
+        WorkflowDisposition.APPLIED,
+        int(row["task_id"]),
+        workflow_version,
+        workflow_status,
+        phase,
+    )
 
 
 def _callback(card_id: int, version: int, action: str) -> str:

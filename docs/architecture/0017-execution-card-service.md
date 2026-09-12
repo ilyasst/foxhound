@@ -19,8 +19,9 @@ as task-review cards:
 - aggregate active-card statistics;
 - an explicit bounded scheduling pass;
 - one digest-fenced delivery claim;
-- delivery acknowledgement or failure; and
-- one versioned reader action.
+- delivery acknowledgement or failure;
+- one versioned reader action; and
+- one bounded, versioned discussion or reassignment input.
 
 Each route uses the existing exact request contract, bearer authentication,
 canonical IPv4 loopback bind, body and response limits, request timeout,
@@ -30,6 +31,9 @@ keys. Only a successful claim returns private rendered content and its
 short-lived delivery capability. A complete rendered body may exceed one chat
 message while remaining within the bounded response contract; safe transport
 chunking does not weaken the card's single versioned decision capability.
+Free-text input is accepted only at `/v1/execution-cards/input`; prompt-only
+callbacks make no durable change, and stale or malformed responses fail
+without partial task, workflow, card, or event writes.
 
 The service audit record contains only the allowlisted route, HTTP method,
 status, and coarse duration. It contains no task/card identity, content,

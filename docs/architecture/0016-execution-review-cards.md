@@ -15,9 +15,9 @@ lifecycle decisions rather than execution workflow state.
 
 `foxhound.execution_cards.ExecutionCardService` owns a separate durable card
 projection. Its explicit scheduler creates cards only for current open tasks
-whose execution workflow is awaiting start, awaiting plan review, or awaiting
-external-action review. Schema migration is passive: it creates no card and
-changes no workflow.
+whose execution workflow is awaiting start, awaiting plan review,
+external-action review, or final-result review. Schema migration is passive:
+it creates no card and changes no workflow.
 
 At most one execution card is active for a task. Each card binds the exact
 task version, workflow version, phase, kind, and, for reviews, immutable result
@@ -26,18 +26,29 @@ Delivery claims use a random capability whose digest is stored with a bounded
 expiry. Failure and expiry make the same card retryable under a new version;
 delivery acknowledgement removes the capability.
 
-The three card kinds have closed action sets:
+The four card kinds have closed action sets:
 
 | Card | Allowed reader actions |
 |---|---|
 | Start | Start planning, snooze one day, cancel execution |
-| Plan review | Execute plan, investigate further, cancel execution |
-| External review | Authorize the proposed external action, return for revision, cancel execution |
+| Plan review | Investigate, discuss, execute, snooze, complete, reassign, or drop |
+| External review | Authorize the exact action, return for revision, discuss, snooze, complete, reassign, or drop |
+| Result review | Discuss, snooze, complete, reassign, or drop |
 
-A delivered action and its execution workflow transition occur in one
-`BEGIN IMMEDIATE` transaction. The card and workflow must both still match all
-bound versions and state. Any refusal or write failure rolls back both. These
-operations never alter task lifecycle.
+A delivered action and every affected execution workflow or task-lifecycle
+transition occur in one `BEGIN IMMEDIATE` transaction. The card, task, and
+workflow must still match all bound versions and state. Any refusal or write
+failure rolls back all of them. Completion and drop write the ordinary task
+lifecycle event, making the existing outcome feed authoritative. Reassignment
+versions the task, records an append-only owner event, discards the obsolete
+result binding, and returns execution to a fresh Start gate.
+
+Discussion and reassignment use a separate bounded input operation because
+their values cannot safely fit in callback data. The gateway may collect text,
+but Foxhound validates and commits it against the exact delivered card version.
+Discussion queues a planning pass and becomes its private reader instruction;
+the next immutable result consumes it. Snooze choices are fixed at 1, 7, 14,
+or 30 days and retain the same review kind when the deadline is reached.
 
 Card bodies are private, line-oriented HTML projections with a strict local
 service byte ceiling and a distinct callback namespace. A small Markdown
@@ -49,10 +60,10 @@ The ceiling is larger than one Telegram message but remains below the bounded
 local client and service response limits. The transport may split the complete
 line-oriented projection and attaches the keyboard only to its final chunk.
 If the complete body does not fit the local-service ceiling, the projection
-clearly reports truncation, removes the affirmative Start or Approve button,
-and rejects a forged affirmative callback. Revision, snooze, and cancellation
-remain available as appropriate. This prevents approval of content the reader
-could not see.
+clearly reports truncation, removes affirmative Start, Approve, and Complete
+buttons, and rejects a forged affirmative callback. Non-affirmative controls
+remain available as appropriate. This prevents approval or closure based on
+content the reader could not see.
 
 If a transport acknowledgement succeeded but the resulting presentation is
 unreadable, a local operator may requeue that still-current delivered card.

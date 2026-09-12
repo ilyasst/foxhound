@@ -42,9 +42,18 @@ An `awaiting_plan` result requires a reader approval before `execute` can be
 queued. An `awaiting_external` result requires a separate approval before
 `external_action` can be queued. A revision decision returns to `plan`.
 
+Terminal worker outcomes also stop at `awaiting_review`; only the reader's
+version-bound completion or drop decision closes task lifecycle. A bounded
+private discussion input queues one new planning pass. The worker receives it
+only while holding the matching supervised claim. Retries of that logical pass
+retain the instruction, while recording the next immutable result consumes it.
+The instruction is not an external-action authorization.
+
 Workflow events are append-only and content-free. Aggregate readiness contains
-counts only. Task lifecycle remains separate: a successful execution result
-does not silently close or drop its task.
+counts only. Task lifecycle remains separate from worker output: a successful
+execution result does not silently close or drop its task. The execution-card
+aggregate may atomically apply an explicit reader completion or drop to both
+ledgers.
 
 ## Failure and rollback
 

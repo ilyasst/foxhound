@@ -33,6 +33,7 @@ from foxhound.task_card_server import (
     TaskCardApplication,
     TaskCardServerConfigError,
     TaskCardServerLimits,
+    TaskCardServerRequestError,
     is_canonical_loopback,
     load_token,
     make_server,
@@ -608,6 +609,66 @@ class TaskCardServerTests(unittest.TestCase):
                 (status, body["error"]["code"]),
                 (400, "invalid_request"),
             )
+
+    def test_execution_input_route_is_strict_and_version_bound(self):
+        workflow = self.execution.schedule(1, expected_task_version=1)
+        self.execution.start_action(
+            1, expected_version=workflow.version, action="start"
+        )
+        run = self.execution.claim_next()
+        self.execution.record_result(ExecutionResultEnvelope(
+            result_id="synthetic-input-plan",
+            task_id=1,
+            task_version=1,
+            workflow_version=run.workflow_version,
+            phase="plan",
+            claim_token=run.token,
+            outcome="awaiting_plan",
+            summary="Synthetic plan.",
+            work_markdown="Synthetic work.",
+        ))
+        self.execution_cards.schedule()
+        claim = self.execution_cards.claim_next()
+        self.execution_cards.complete_delivery(
+            claim.card.id,
+            expected_version=claim.card.version,
+            claim_token=claim.token,
+            transport="synthetic",
+            delivery_ref="synthetic-input-message",
+        )
+
+        result = self.app.dispatch("execution_input", request_document(
+            card_id=claim.card.id,
+            card_version=claim.card.version,
+            input_kind="discussion",
+            value="Check the synthetic constraint.",
+        ))
+
+        self.assertEqual(
+            (result["schema"], result["workflow_status"]),
+            (EXECUTION_OPERATION_SCHEMA, "queued"),
+        )
+        stale = self.app.dispatch("execution_input", request_document(
+            card_id=claim.card.id,
+            card_version=claim.card.version,
+            input_kind="discussion",
+            value="A second synthetic request.",
+        ))
+        self.assertEqual((stale["ok"], stale["refusal"]),
+                         (False, "stale_version"))
+        for kind, value in (
+            ("invented", "Synthetic value"),
+            ("reassignment", "Person A\nPerson B"),
+            ("discussion", "\x00"),
+        ):
+            with self.subTest(kind=kind):
+                with self.assertRaises(TaskCardServerRequestError):
+                    self.app.dispatch("execution_input", request_document(
+                        card_id=claim.card.id,
+                        card_version=claim.card.version,
+                        input_kind=kind,
+                        value=value,
+                    ))
 
     def test_access_logs_exclude_content_tokens_and_identifiers(self):
         stream = io.StringIO()
