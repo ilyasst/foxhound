@@ -65,6 +65,14 @@ from .task_execution import (
     WorkflowRefusal,
     WorkflowStatus,
 )
+from .execution_runner import (
+    ExecutionRunnerConfig,
+    ExecutionRunnerError,
+    ExecutionRunResult,
+    agent_prompt,
+    hermes_argv,
+    run_once,
+)
 
 __version__ = "0.1.0"
 
@@ -124,4 +132,10 @@ __all__ = (
     "WorkflowPhase",
     "WorkflowRefusal",
     "WorkflowStatus",
+    "ExecutionRunnerConfig",
+    "ExecutionRunnerError",
+    "ExecutionRunResult",
+    "agent_prompt",
+    "hermes_argv",
+    "run_once",
 )
