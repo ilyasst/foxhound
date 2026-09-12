@@ -4,8 +4,8 @@ Foxhound will own durable task lifecycle and execution while knowledge systems
 remain responsible for discovering task candidates and organizing their source
 material.
 
-The first implementation is deliberately limited to versioned task-candidate
-and ordered-feed contracts. It has no service connection, scheduler, card
+The implementation is deliberately limited to versioned candidate and passive
+shadow-observation contracts. It has no service connection, scheduler, card
 transport, agent runner, or production-data access.
 
 The offline candidate inbox stores validated candidates in an explicitly
@@ -33,6 +33,19 @@ The command is manual and content-free in its output. It does not acknowledge
 or remove feed pages, create tasks, connect to knowledge data, schedule work,
 or dispatch agents.
 
+After candidates have been imported, a separate read-only adapter can apply a
+GW-owned shadow-observation ledger and report aggregate comparisons:
+
+```sh
+python -m foxhound.task_shadow_feed_import \
+  --outbox /srv/example/private-observation-outbox \
+  --database /srv/example/private-foxhound-state/candidate-inbox.sqlite3 \
+  --stream-id pilot-alpha
+```
+
+The observation importer uses its own producer lock and cursor. It does not
+change producer files or activate any candidate.
+
 Run the contract tests with:
 
 ```sh
@@ -46,4 +59,6 @@ producer-outbox connection. See
 [ADR 0003](docs/architecture/0003-task-shadow-observation.md) for the passive
 candidate-to-legacy-task observation contract. See
 [ADR 0004](docs/architecture/0004-passive-shadow-inbox.md) for ordered durable
-observation ingestion and content-free comparison reports.
+observation ingestion and content-free comparison reports. See
+[ADR 0005](docs/architecture/0005-shadow-observation-import.md) for the
+read-only observation-ledger adapter.
