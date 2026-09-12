@@ -17,6 +17,7 @@ from foxhound import (
     FeedImportRefusal,
     InboxError,
 )
+from foxhound.candidate_inbox import SCHEMA_VERSION
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "contracts"
@@ -199,6 +200,10 @@ class CandidateFeedInboxTests(unittest.TestCase):
         meeting = fixture("meeting-candidate-v1.json")
         self.inbox.import_document(meeting)
         with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute("DROP TRIGGER task_review_card_events_no_update")
+            connection.execute("DROP TRIGGER task_review_card_events_no_delete")
+            connection.execute("DROP TABLE task_review_card_events")
+            connection.execute("DROP TABLE task_review_cards")
             connection.execute("DROP TRIGGER task_owner_equivalences_no_update")
             connection.execute("DROP TRIGGER task_owner_equivalences_no_delete")
             connection.execute("DROP TABLE task_owner_equivalences")
@@ -224,10 +229,14 @@ class CandidateFeedInboxTests(unittest.TestCase):
         self.assertEqual(self.inbox.feed_cursor("gw", "primary"), 0)
         with closing(sqlite3.connect(self.database)) as connection, connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-        self.assertEqual(version, 6)
+        self.assertEqual(version, SCHEMA_VERSION)
 
     def test_incomplete_version_one_database_is_not_migrated(self):
         with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute("DROP TRIGGER task_review_card_events_no_update")
+            connection.execute("DROP TRIGGER task_review_card_events_no_delete")
+            connection.execute("DROP TABLE task_review_card_events")
+            connection.execute("DROP TABLE task_review_cards")
             connection.execute("DROP TRIGGER task_owner_equivalences_no_update")
             connection.execute("DROP TRIGGER task_owner_equivalences_no_delete")
             connection.execute("DROP TABLE task_owner_equivalences")

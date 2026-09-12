@@ -1,0 +1,340 @@
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import sqlite3
+import tempfile
+import unittest
+from contextlib import closing
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from foxhound import CandidateInbox
+from foxhound.contracts import candidate_id_for, comparable_task_digest
+from foxhound.task_cards import (
+    CardDisposition,
+    CardRefusal,
+    CardStatus,
+    TaskCardService,
+    parse_task_review_callback,
+    render_task_review_card,
+)
+from foxhound.task_ledger import TaskLedger, TaskLedgerError, TaskStatus
+
+
+NOW = datetime(2030, 3, 1, 12, 0, tzinfo=timezone.utc)
+TOKEN = "a" * 43
+
+
+class Clock:
+    def __init__(self):
+        self.value = NOW
+
+    def __call__(self):
+        return self.value
+
+    def advance(self, delta: timedelta):
+        self.value += delta
+
+
+def candidate(index: int) -> dict:
+    text = f"Prepare synthetic item {index} < safely"
+    owner = f"Person {index}"
+    revision = hashlib.sha256(
+        json.dumps([text, owner, index]).encode("utf-8")
+    ).hexdigest()
+    return {
+        "schema": "foxhound.task-candidate",
+        "schema_version": 2,
+        "candidate_id": candidate_id_for(
+            system="gw",
+            kind="meeting",
+            record_id=f"record-{index:03d}",
+            item_id=f"action-{index:03d}",
+        ),
+        "source": {
+            "system": "gw",
+            "kind": "meeting",
+            "record_id": f"record-{index:03d}",
+            "item_id": f"action-{index:03d}",
+            "revision": revision,
+        },
+        "task": {
+            "text": text,
+            "owner": owner,
+            "due": f"2030-03-{index + 10:02d}",
+        },
+        "evidence": {
+            "document_id": f"record-{index:03d}",
+            "locator": f"action-item-{index:03d}",
+        },
+        "created_at": f"2030-01-{index:02d}T12:00:00Z",
+    }
+
+
+def observation(item: dict, legacy_task_id: int) -> dict:
+    return {
+        "schema": "foxhound.task-shadow-observation",
+        "schema_version": 1,
+        "candidate": copy.deepcopy(item),
+        "disposition": "minted",
+        "legacy_task": {
+            "task_id": legacy_task_id,
+            "comparable_digest": comparable_task_digest(
+                text=item["task"]["text"],
+                project=None,
+                owner=item["task"]["owner"],
+            ),
+        },
+        "reason_code": None,
+        "observed_at": "2030-02-01T12:00:00Z",
+    }
+
+
+class TaskCardTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.database = Path(self.temporary.name) / "foxhound.sqlite3"
+        self.clock = Clock()
+        inbox = CandidateInbox(self.database, clock=self.clock)
+        inbox.initialize()
+        items = [candidate(index) for index in range(1, 5)]
+        for item in items:
+            self.assertTrue(inbox.import_document(item).accepted)
+        feed = {
+            "schema": "foxhound.task-shadow-observation-feed",
+            "schema_version": 1,
+            "producer": "gw",
+            "stream_id": "synthetic",
+            "from_cursor": 0,
+            "to_cursor": len(items),
+            "items": [
+                {
+                    "sequence": index,
+                    "observation": observation(item, 1000 + index),
+                }
+                for index, item in enumerate(items, start=1)
+            ],
+            "emitted_at": "2030-03-01T12:00:00Z",
+        }
+        self.assertTrue(inbox.import_shadow_feed(feed).accepted)
+        self.ledger = TaskLedger(self.database, clock=self.clock)
+        self.assertEqual(self.ledger.bootstrap_from_shadow().tasks_created, 4)
+        self.cards = TaskCardService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: TOKEN,
+        )
+
+    def claim_and_deliver(self):
+        claim = self.cards.claim_next()
+        self.assertIsNotNone(claim)
+        delivered = self.cards.complete_delivery(
+            claim.card.id,
+            expected_version=claim.card.version,
+            claim_token=claim.token,
+            transport="synthetic",
+            delivery_ref=f"message-{claim.card.id}",
+        )
+        self.assertEqual(delivered.disposition, CardDisposition.APPLIED)
+        return claim
+
+    def test_schema_six_migration_is_passive(self):
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute("DROP TRIGGER task_review_card_events_no_update")
+            connection.execute("DROP TRIGGER task_review_card_events_no_delete")
+            connection.execute("DROP TABLE task_review_card_events")
+            connection.execute("DROP TABLE task_review_cards")
+            connection.execute("PRAGMA user_version = 6")
+
+        CandidateInbox(self.database, clock=self.clock).initialize()
+
+        with closing(sqlite3.connect(self.database)) as connection:
+            self.assertEqual(connection.execute(
+                "PRAGMA user_version"
+            ).fetchone()[0], 7)
+            self.assertEqual(connection.execute(
+                "SELECT count(*) FROM tasks"
+            ).fetchone()[0], 4)
+            self.assertEqual(connection.execute(
+                "SELECT count(*) FROM task_review_cards"
+            ).fetchone()[0], 0)
+
+    def test_explicit_schedule_is_bounded_ordered_and_idempotent(self):
+        first = self.cards.schedule(limit=2)
+        self.assertEqual(first.disposition, CardDisposition.APPLIED)
+        self.assertEqual((first.created, first.cancelled), (2, 0))
+        self.assertEqual([card.task_id for card in self.cards.due(limit=20)], [1, 2])
+
+        second = self.cards.schedule(limit=2)
+        self.assertEqual(second.created, 2)
+        self.assertEqual([card.task_id for card in self.cards.due(limit=20)],
+                         [1, 2, 3, 4])
+        replay = self.cards.schedule()
+        self.assertEqual(replay.disposition, CardDisposition.UNCHANGED)
+        self.assertEqual(self.cards.count(), 4)
+
+    def test_delivery_claim_render_ack_and_replay_are_fenced(self):
+        self.cards.schedule()
+        claim = self.cards.claim_next(lease_seconds=60)
+        self.assertEqual(claim.card.status, CardStatus.DELIVERING)
+        self.assertEqual(claim.card.version, 2)
+        body, keyboard = render_task_review_card(claim.card)
+        self.assertIn("&lt; safely", body)
+        callbacks = [
+            button["callback_data"]
+            for row in keyboard["inline_keyboard"] for button in row
+        ]
+        self.assertEqual(
+            [parse_task_review_callback(value)[2] for value in callbacks],
+            ["done", "keep_open", "drop", "snooze"],
+        )
+
+        refused = self.cards.complete_delivery(
+            claim.card.id,
+            expected_version=claim.card.version,
+            claim_token="b" * 43,
+            transport="synthetic",
+            delivery_ref="message-1",
+        )
+        self.assertEqual(refused.refusal, CardRefusal.CLAIM_MISMATCH)
+        before = self.cards.event_count()
+        applied = self.cards.complete_delivery(
+            claim.card.id,
+            expected_version=claim.card.version,
+            claim_token=claim.token,
+            transport="synthetic",
+            delivery_ref="message-1",
+        )
+        self.assertEqual(applied.status, CardStatus.DELIVERED)
+        replay = self.cards.complete_delivery(
+            claim.card.id,
+            expected_version=claim.card.version,
+            claim_token=claim.token,
+            transport="synthetic",
+            delivery_ref="message-1",
+        )
+        self.assertEqual(replay.disposition, CardDisposition.UNCHANGED)
+        self.assertEqual(self.cards.event_count(), before + 1)
+
+    def test_actions_are_atomic_and_stale_replays_write_nothing(self):
+        self.cards.schedule()
+        actions = ("done", "keep_open", "drop", "snooze")
+        claims = []
+        for action in actions:
+            claim = self.claim_and_deliver()
+            claims.append(claim)
+            before = self.cards.event_count()
+            result = self.cards.act(
+                claim.card.id,
+                expected_version=claim.card.version,
+                action=action,
+            )
+            self.assertEqual(result.disposition, CardDisposition.APPLIED)
+            replay = self.cards.act(
+                claim.card.id,
+                expected_version=claim.card.version,
+                action=action,
+            )
+            self.assertEqual(replay.refusal, CardRefusal.STALE_VERSION)
+            self.assertEqual(self.cards.event_count(), before + 1)
+
+        self.assertEqual(self.ledger.get(1).status, TaskStatus.DONE)
+        self.assertEqual(self.ledger.get(2).status, TaskStatus.OPEN)
+        self.assertEqual(self.ledger.get(3).status, TaskStatus.DROPPED)
+        self.assertEqual(self.ledger.get(4).status, TaskStatus.OPEN)
+        self.assertEqual(
+            self.cards.act(
+                claims[3].card.id,
+                expected_version=claims[3].card.version,
+                action="snooze",
+            ).refusal,
+            CardRefusal.STALE_VERSION,
+        )
+        self.assertEqual(self.cards.schedule().created, 0)
+
+        self.clock.advance(timedelta(days=3))
+        self.assertEqual([card.task_id for card in self.cards.due()], [4])
+        self.clock.advance(timedelta(days=4))
+        self.assertEqual(self.cards.schedule().created, 1)
+        self.assertEqual([card.task_id for card in self.cards.due()], [4, 2])
+
+    def test_failed_and_expired_delivery_claims_can_be_retried(self):
+        self.cards.schedule(limit=1)
+        first = self.cards.claim_next(lease_seconds=60)
+        failed = self.cards.fail_delivery(
+            first.card.id,
+            expected_version=first.card.version,
+            claim_token=first.token,
+        )
+        self.assertEqual((failed.status, failed.version), (CardStatus.PENDING, 3))
+        self.assertEqual(self.cards.complete_delivery(
+            first.card.id,
+            expected_version=first.card.version,
+            claim_token=first.token,
+            transport="synthetic",
+            delivery_ref="message-1",
+        ).refusal, CardRefusal.STALE_VERSION)
+
+        second = self.cards.claim_next(lease_seconds=60)
+        self.assertEqual(second.card.version, 4)
+        self.clock.advance(timedelta(seconds=61))
+        third = self.cards.claim_next(lease_seconds=60)
+        self.assertEqual(third.card.id, second.card.id)
+        self.assertEqual(third.card.version, 6)
+        self.assertEqual(self.cards.complete_delivery(
+            second.card.id,
+            expected_version=second.card.version,
+            claim_token=second.token,
+            transport="synthetic",
+            delivery_ref="message-2",
+        ).refusal, CardRefusal.STALE_VERSION)
+
+    def test_external_task_change_invalidates_active_card(self):
+        self.cards.schedule(limit=1)
+        claim = self.claim_and_deliver()
+        self.assertTrue(self.ledger.transition(
+            claim.card.task_id,
+            expected_version=claim.card.task_version,
+            action="done",
+        ).accepted)
+        before = self.cards.event_count()
+        result = self.cards.act(
+            claim.card.id,
+            expected_version=claim.card.version,
+            action="drop",
+        )
+        self.assertEqual(result.refusal, CardRefusal.STALE_VERSION)
+        self.assertEqual(self.cards.event_count(), before)
+        scheduled = self.cards.schedule()
+        self.assertEqual(scheduled.cancelled, 1)
+        self.assertEqual(self.ledger.get(claim.card.task_id).status, TaskStatus.DONE)
+
+    def test_invalid_inputs_and_append_only_history_fail_closed(self):
+        self.assertEqual(self.cards.schedule(limit=0).refusal,
+                         CardRefusal.INVALID_ARGUMENT)
+        self.assertEqual(self.cards.act(
+            1, expected_version=1, action="invented"
+        ).refusal, CardRefusal.INVALID_ACTION)
+        self.assertIsNone(parse_task_review_callback("fhc|1|1|invented"))
+        with self.assertRaisesRegex(TaskLedgerError, "limit"):
+            self.cards.due(limit=0)
+        with self.assertRaisesRegex(TaskLedgerError, "lease"):
+            self.cards.claim_next(lease_seconds=1)
+        self.cards.schedule(limit=1)
+        before = self.cards.event_count()
+        with self.assertRaises(sqlite3.IntegrityError):
+            with closing(sqlite3.connect(self.database)) as connection:
+                connection.execute(
+                    "UPDATE task_review_card_events SET kind='cancelled'"
+                )
+        with self.assertRaises(sqlite3.IntegrityError):
+            with closing(sqlite3.connect(self.database)) as connection:
+                connection.execute("DELETE FROM task_review_card_events")
+        self.assertEqual(self.cards.event_count(), before)
+
+
+if __name__ == "__main__":
+    unittest.main()
