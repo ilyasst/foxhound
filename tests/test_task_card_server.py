@@ -24,6 +24,7 @@ from foxhound.task_card_server import (
     OPERATION_SCHEMA,
     REQUEST_SCHEMA,
     SCHEDULE_SCHEMA,
+    STATS_SCHEMA,
     TaskCardApplication,
     TaskCardServerConfigError,
     TaskCardServerLimits,
@@ -189,6 +190,41 @@ class TaskCardServerTests(unittest.TestCase):
             )
             self.assertEqual((status, headers["Allow"]), (405, "GET, POST"))
             self.assertEqual(body["error"]["code"], "method_not_allowed")
+
+    def test_authenticated_stats_are_exact_and_do_not_write(self):
+        before = (self.cards.count(), self.cards.event_count())
+        with running_server(self.app) as endpoint:
+            status, _, body = request(
+                endpoint,
+                "/v1/task-cards/stats",
+                request_document(),
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(body, {
+                "schema": STATS_SCHEMA,
+                "schema_version": 1,
+                "ok": True,
+                "pending": 0,
+                "delivering": 0,
+                "delivered": 0,
+                "snoozed": 0,
+                "active": 0,
+            })
+            status, _, body = request(
+                endpoint,
+                "/v1/task-cards/stats",
+                request_document(extra=True),
+            )
+            self.assertEqual((status, body["error"]["code"]),
+                             (400, "invalid_request"))
+            status, _, _ = request(
+                endpoint,
+                "/v1/task-cards/stats",
+                request_document(),
+                token=None,
+            )
+            self.assertEqual(status, 401)
+        self.assertEqual((self.cards.count(), self.cards.event_count()), before)
 
     def test_strict_request_parsing_and_limits_are_content_free(self):
         private = "Synthetic private request value"

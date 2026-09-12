@@ -176,6 +176,30 @@ class TaskCardTests(unittest.TestCase):
         self.assertEqual(replay.disposition, CardDisposition.UNCHANGED)
         self.assertEqual(self.cards.count(), 4)
 
+    def test_stats_are_aggregate_and_from_one_queue_snapshot(self):
+        empty = self.cards.stats()
+        self.assertEqual(
+            (empty.pending, empty.delivering, empty.delivered,
+             empty.snoozed, empty.active),
+            (0, 0, 0, 0, 0),
+        )
+        self.cards.schedule()
+        first = self.claim_and_deliver()
+        self.cards.act(
+            first.card.id,
+            expected_version=first.card.version,
+            action="snooze",
+        )
+        self.cards.claim_next()
+
+        stats = self.cards.stats()
+
+        self.assertEqual(
+            (stats.pending, stats.delivering, stats.delivered,
+             stats.snoozed, stats.active),
+            (2, 1, 0, 1, 4),
+        )
+
     def test_delivery_claim_render_ack_and_replay_are_fenced(self):
         self.cards.schedule()
         claim = self.cards.claim_next(lease_seconds=60)
