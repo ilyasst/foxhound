@@ -9,6 +9,12 @@ contracts plus a Foxhound-owned durable task ledger. It has no service
 connection, scheduler, card transport, agent runner, or production-data
 access.
 
+Foxhound can retrieve bounded task context through an explicitly configured,
+authenticated, read-only GW search endpoint. The client accepts loopback HTTP
+or validated HTTPS, refuses redirects, ignores process proxy settings, and
+strictly validates the bounded response before returning private excerpts. It
+does not read GW files, persona configuration, environment, or writable state.
+
 The offline candidate inbox stores validated candidates in an explicitly
 selected SQLite database. It does not create active tasks or connect to a
 producer. Applications must keep that database in private host-local state,
@@ -72,3 +78,5 @@ observation ingestion and content-free comparison reports. See
 read-only observation-ledger adapter. See
 [ADR 0006](docs/architecture/0006-durable-task-ledger.md) for durable task
 identity, lifecycle, and the explicit shadow-bootstrap boundary.
+See [ADR 0007](docs/architecture/0007-bounded-gw-knowledge-client.md) for the
+read-only knowledge retrieval boundary.
