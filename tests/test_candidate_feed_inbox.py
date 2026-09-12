@@ -200,6 +200,15 @@ class CandidateFeedInboxTests(unittest.TestCase):
         meeting = fixture("meeting-candidate-v1.json")
         self.inbox.import_document(meeting)
         with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "DROP TRIGGER execution_review_card_events_no_update"
+            )
+            connection.execute(
+                "DROP TRIGGER execution_review_card_events_no_delete"
+            )
+            connection.execute("DROP INDEX execution_review_cards_one_active")
+            connection.execute("DROP TABLE execution_review_card_events")
+            connection.execute("DROP TABLE execution_review_cards")
             connection.execute("DROP TRIGGER task_execution_events_no_update")
             connection.execute("DROP TRIGGER task_execution_events_no_delete")
             connection.execute("DROP TRIGGER task_execution_results_no_update")
@@ -241,6 +250,15 @@ class CandidateFeedInboxTests(unittest.TestCase):
 
     def test_incomplete_version_one_database_is_not_migrated(self):
         with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "DROP TRIGGER execution_review_card_events_no_update"
+            )
+            connection.execute(
+                "DROP TRIGGER execution_review_card_events_no_delete"
+            )
+            connection.execute("DROP INDEX execution_review_cards_one_active")
+            connection.execute("DROP TABLE execution_review_card_events")
+            connection.execute("DROP TABLE execution_review_cards")
             connection.execute("DROP TRIGGER task_execution_events_no_update")
             connection.execute("DROP TRIGGER task_execution_events_no_delete")
             connection.execute("DROP TRIGGER task_execution_results_no_update")
