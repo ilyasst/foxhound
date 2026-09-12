@@ -193,6 +193,14 @@ Phase restriction does not change lifecycle or card authority; a shadow
 deployment must separately keep lifecycle projection disabled. See
 [ADR 0020](docs/architecture/0020-phase-restricted-runner.md).
 
+A production authority switch is a separate, staged operation. The pilot
+first proves plan-only behavior, then transfers lifecycle, cards, and execution
+while preserving candidate discovery, and finally removes the temporary
+producer-side creation bridge. Scheduler rollback material must always be
+captured from current state; an older candidate may omit unrelated ingestion
+jobs added later. See
+[ADR 0021](docs/architecture/0021-staged-task-authority-cutover.md).
+
 Newly accepted open tasks can be projected to the reader Start gate with an
 explicit bounded pass:
 
