@@ -15,6 +15,7 @@ from foxhound import (
     ShadowFeedImportDisposition,
     ShadowFeedImportRefusal,
 )
+from foxhound.contracts import comparable_task_digest
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "contracts"
@@ -73,6 +74,25 @@ class TaskShadowFeedInboxTests(unittest.TestCase):
         self.assertTrue(result.accepted)
         report = self.inbox.shadow_report()
         self.assertEqual((report.total, report.agreed, report.divergent), (1, 0, 1))
+
+    def test_projectless_candidate_uses_version_two_comparison_shape(self):
+        candidate = fixture("meeting-candidate-v2.json")
+        self.inbox.import_document(candidate)
+        document = self.observation_feed()
+        document["to_cursor"] = 1
+        document["items"] = document["items"][:1]
+        observation = document["items"][0]["observation"]
+        observation["candidate"] = candidate
+        observation["legacy_task"]["comparable_digest"] = comparable_task_digest(
+            text=candidate["task"]["text"],
+            project=None,
+            owner=candidate["task"]["owner"],
+        )
+
+        result = self.inbox.import_shadow_feed(document)
+
+        self.assertTrue(result.accepted)
+        self.assertEqual(self.inbox.shadow_report().agreed, 1)
 
     def test_refused_and_unmapped_outcomes_remain_distinct(self):
         self.import_candidates()

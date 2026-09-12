@@ -45,7 +45,12 @@
             "minimum": 1,
             "maximum": 9223372036854775807
           },
-          "candidate": {"$ref": "task-candidate-v1.schema.json"}
+          "candidate": {
+            "oneOf": [
+              {"$ref": "task-candidate-v1.schema.json"},
+              {"$ref": "task-candidate-v2.schema.json"}
+            ]
+          }
         },
         "additionalProperties": false
       }

@@ -58,6 +58,21 @@ class CandidateFeedContractTests(unittest.TestCase):
 
         self.assertNotIn("private", str(raised.exception))
 
+    def test_feed_accepts_a_projectless_version_2_candidate(self):
+        document = fixture()
+        candidate = json.loads(
+            (FIXTURES / "meeting-candidate-v2.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        document["items"] = [{"sequence": 1, "candidate": candidate}]
+        document["to_cursor"] = 1
+
+        feed = parse_candidate_feed(document)
+
+        self.assertEqual(feed.items[0].candidate.schema_version, 2)
+        self.assertIsNone(feed.items[0].candidate.task.project)
+
     def test_cursor_range_must_match_item_count(self):
         document = fixture()
         document["to_cursor"] = 3
@@ -98,6 +113,21 @@ class CandidateFeedContractTests(unittest.TestCase):
 
         with self.assertRaisesRegex(FeedContractError, "timezone"):
             parse_candidate_feed(document)
+
+    def test_schema_allows_both_candidate_versions(self):
+        schema_path = (
+            Path(__file__).parents[1]
+            / "src" / "foxhound" / "contracts" / "schemas"
+            / "candidate-feed-v1.schema.json"
+        )
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        candidates = schema["properties"]["items"]["items"]["properties"][
+            "candidate"
+        ]["oneOf"]
+        self.assertEqual(
+            [item["$ref"] for item in candidates],
+            ["task-candidate-v1.schema.json", "task-candidate-v2.schema.json"],
+        )
 
 
 if __name__ == "__main__":

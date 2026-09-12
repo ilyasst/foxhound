@@ -1,4 +1,4 @@
-"""Strict parser for the ``foxhound.task-candidate`` version 1 contract.
+"""Strict parser for supported ``foxhound.task-candidate`` contracts.
 
 The parser is dependency-free so a producer cannot change validation behavior
 by changing an optional schema library. Error messages name only the rejected
@@ -18,6 +18,11 @@ from typing import Any, Mapping
 
 SCHEMA_ID = "foxhound.task-candidate"
 SCHEMA_VERSION = 1
+PROJECTLESS_SCHEMA_VERSION = 2
+SUPPORTED_SCHEMA_VERSIONS = frozenset({
+    SCHEMA_VERSION,
+    PROJECTLESS_SCHEMA_VERSION,
+})
 SOURCE_SYSTEMS = frozenset({"gw"})
 SOURCE_KINDS = frozenset({"meeting", "email"})
 
@@ -42,7 +47,7 @@ class CandidateSource:
 @dataclass(frozen=True)
 class CandidateTask:
     text: str
-    project: str
+    project: str | None
     owner: str | None
     due: str | None
 
@@ -66,6 +71,13 @@ class TaskCandidate:
 
 def task_candidate_document(candidate: TaskCandidate) -> dict[str, Any]:
     """Return the canonical document shape for a validated candidate."""
+    task = {
+        "text": candidate.task.text,
+        "owner": candidate.task.owner,
+        "due": candidate.task.due,
+    }
+    if candidate.schema_version == SCHEMA_VERSION:
+        task["project"] = candidate.task.project
     return {
         "schema": candidate.schema,
         "schema_version": candidate.schema_version,
@@ -77,12 +89,7 @@ def task_candidate_document(candidate: TaskCandidate) -> dict[str, Any]:
             "item_id": candidate.source.item_id,
             "revision": candidate.source.revision,
         },
-        "task": {
-            "text": candidate.task.text,
-            "project": candidate.task.project,
-            "owner": candidate.task.owner,
-            "due": candidate.task.due,
-        },
+        "task": task,
         "evidence": {
             "document_id": candidate.evidence.document_id,
             "locator": candidate.evidence.locator,
@@ -107,7 +114,7 @@ def candidate_id_for(*, system: str, kind: str, record_id: str,
 
 
 def parse_task_candidate(document: object) -> TaskCandidate:
-    """Validate and decode one version 1 task candidate.
+    """Validate and decode one supported task candidate.
 
     Unknown versions, missing fields, and additional fields fail closed.
     """
@@ -121,7 +128,8 @@ def parse_task_candidate(document: object) -> TaskCandidate:
     if root["schema"] != SCHEMA_ID:
         raise ContractError("candidate.schema is unsupported")
     version = root["schema_version"]
-    if isinstance(version, bool) or version != SCHEMA_VERSION:
+    if (isinstance(version, bool)
+            or version not in SUPPORTED_SCHEMA_VERSIONS):
         raise ContractError("candidate.schema_version is unsupported")
 
     source_doc = _object(root["source"], "candidate.source")
@@ -153,12 +161,20 @@ def parse_task_candidate(document: object) -> TaskCandidate:
         raise ContractError("candidate.candidate_id does not match source identity")
 
     task_doc = _object(root["task"], "candidate.task")
-    _exact_fields(task_doc, "candidate.task",
-                  {"text", "project", "owner", "due"})
+    task_fields = (
+        {"text", "project", "owner", "due"}
+        if version == SCHEMA_VERSION
+        else {"text", "owner", "due"}
+    )
+    _exact_fields(task_doc, "candidate.task", task_fields)
     task = CandidateTask(
         text=_bounded_text(task_doc["text"], "candidate.task.text", 1, 1_000),
-        project=_bounded_text(
-            task_doc["project"], "candidate.task.project", 1, 200),
+        project=(
+            _bounded_text(
+                task_doc["project"], "candidate.task.project", 1, 200
+            )
+            if version == SCHEMA_VERSION else None
+        ),
         owner=_optional_text(task_doc["owner"], "candidate.task.owner", 200),
         due=_optional_date(task_doc["due"], "candidate.task.due"),
     )
@@ -180,6 +196,7 @@ def parse_task_candidate(document: object) -> TaskCandidate:
         task=task,
         evidence=evidence,
         created_at=created_at,
+        schema_version=version,
     )
 
 
