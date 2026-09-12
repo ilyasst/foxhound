@@ -4,9 +4,10 @@ Foxhound will own durable task lifecycle and execution while knowledge systems
 remain responsible for discovering task candidates and organizing their source
 material.
 
-The implementation is deliberately limited to versioned candidate and passive
-shadow-observation contracts. It has no service connection, scheduler, card
-transport, agent runner, or production-data access.
+The implementation includes versioned candidate and passive shadow-observation
+contracts plus a Foxhound-owned durable task ledger. It has no service
+connection, scheduler, card transport, agent runner, or production-data
+access.
 
 The offline candidate inbox stores validated candidates in an explicitly
 selected SQLite database. It does not create active tasks or connect to a
@@ -46,6 +47,13 @@ python -m foxhound.task_shadow_feed_import \
 The observation importer uses its own producer lock and cursor. It does not
 change producer files or activate any candidate.
 
+After a comparison ledger is complete, an application may explicitly invoke
+the task ledger's shadow bootstrap. Imports never invoke it. Only current,
+agreed mapped observations can become tasks, and Foxhound allocates its own
+task identity while retaining legacy grouping as private migration state.
+Lifecycle transitions are optimistic-version fenced and append immutable
+events. See [ADR 0006](docs/architecture/0006-durable-task-ledger.md).
+
 Run the contract tests with:
 
 ```sh
@@ -61,4 +69,6 @@ candidate-to-legacy-task observation contract. See
 [ADR 0004](docs/architecture/0004-passive-shadow-inbox.md) for ordered durable
 observation ingestion and content-free comparison reports. See
 [ADR 0005](docs/architecture/0005-shadow-observation-import.md) for the
-read-only observation-ledger adapter.
+read-only observation-ledger adapter. See
+[ADR 0006](docs/architecture/0006-durable-task-ledger.md) for durable task
+identity, lifecycle, and the explicit shadow-bootstrap boundary.
