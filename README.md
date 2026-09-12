@@ -83,6 +83,20 @@ Lifecycle transitions are optimistic-version fenced and append immutable
 events. See [ADR 0006](docs/architecture/0006-durable-task-ledger.md) and
 [ADR 0009](docs/architecture/0009-owner-equivalence-bootstrap.md).
 
+Correlated status transitions can be exported manually as a content-free,
+append-only offline feed for a knowledge system to project. Only tasks carrying
+the temporary GW bootstrap correlation enter this stream; native Foxhound
+tasks do not. The exporter neither connects to nor mutates the consumer:
+
+```sh
+python -m foxhound.task_lifecycle_outcome_export \
+  --database /srv/example/private-foxhound-state/foxhound.sqlite3 \
+  --outbox /srv/example/private-lifecycle-outbox \
+  --stream-id pilot-alpha
+```
+
+See [ADR 0012](docs/architecture/0012-lifecycle-outcome-feed.md).
+
 An application may explicitly schedule review cards for open tasks, claim one
 due card under a bounded delivery lease, render it for a private card surface,
 and acknowledge delivery before accepting a reader action. Done and Drop are
@@ -129,3 +143,5 @@ See [ADR 0010](docs/architecture/0010-task-review-cards.md) for durable card
 scheduling, delivery leases, reader actions, and activation rollback.
 See [ADR 0011](docs/architecture/0011-local-task-card-service.md) for the
 authenticated loopback card-gateway boundary.
+See [ADR 0012](docs/architecture/0012-lifecycle-outcome-feed.md) for the
+content-free correlated lifecycle outcome export boundary.

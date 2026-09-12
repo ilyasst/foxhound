@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/foxhound/contracts/task-lifecycle-outcome-v1.schema.json",
+  "title": "Foxhound correlated task lifecycle outcome",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "schema_version", "event_sequence", "task_id", "task_version",
+    "correlation", "from_status", "to_status", "occurred_at"
+  ],
+  "properties": {
+    "schema": {"const": "foxhound.task-lifecycle-outcome"},
+    "schema_version": {"const": 1},
+    "event_sequence": {"type": "integer", "minimum": 1, "maximum": 9223372036854775807},
+    "task_id": {"type": "integer", "minimum": 1, "maximum": 9223372036854775807},
+    "task_version": {"type": "integer", "minimum": 2, "maximum": 9223372036854775807},
+    "correlation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["system", "task_id"],
+      "properties": {
+        "system": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$"},
+        "task_id": {"type": "integer", "minimum": 1, "maximum": 9223372036854775807}
+      }
+    },
+    "from_status": {"enum": ["open", "done", "dropped"]},
+    "to_status": {"enum": ["open", "done", "dropped"]},
+    "occurred_at": {"type": "string", "minLength": 1, "maxLength": 64}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"from_status": {"const": "open"}}},
+      "then": {"properties": {"to_status": {"enum": ["done", "dropped"]}}}
+    },
+    {
+      "if": {"properties": {"from_status": {"enum": ["done", "dropped"]}}},
+      "then": {"properties": {"to_status": {"const": "open"}}}
+    }
+  ]
+}

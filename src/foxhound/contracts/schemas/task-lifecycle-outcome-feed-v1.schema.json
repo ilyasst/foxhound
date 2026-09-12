@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/foxhound/contracts/task-lifecycle-outcome-feed-v1.schema.json",
+  "title": "Foxhound ordered task lifecycle outcome feed",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "schema_version", "producer", "stream_id", "from_cursor",
+    "to_cursor", "items", "emitted_at"
+  ],
+  "properties": {
+    "schema": {"const": "foxhound.task-lifecycle-outcome-feed"},
+    "schema_version": {"const": 1},
+    "producer": {"const": "foxhound"},
+    "stream_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$"},
+    "from_cursor": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807},
+    "to_cursor": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807},
+    "items": {
+      "type": "array",
+      "maxItems": 500,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["sequence", "outcome"],
+        "properties": {
+          "sequence": {"type": "integer", "minimum": 1, "maximum": 9223372036854775807},
+          "outcome": {"$ref": "task-lifecycle-outcome-v1.schema.json"}
+        }
+      }
+    },
+    "emitted_at": {"type": "string", "minLength": 1, "maxLength": 64}
+  }
+}
