@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -76,6 +77,26 @@ def owner_response(request: dict) -> dict:
     }
 
 
+def execution_context_response(request: dict) -> dict:
+    variables = {
+        "display_name": "Person A",
+        "operator_context": "Person A works with Example Org.\n",
+        "self_aliases": ["Person A", "A. Person"],
+        "institution_domains": ["example.edu"],
+    }
+    canonical = json.dumps(
+        variables, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    return {
+        "schema": "gw.execution-context",
+        "schema_version": 1,
+        "ok": True,
+        "alias": request["alias"],
+        "revision": hashlib.sha256(canonical).hexdigest(),
+        "variables": variables,
+    }
+
+
 @contextmanager
 def server(
     *,
@@ -105,11 +126,12 @@ def server(
                 self.send_header("Location", self.path)
                 self.end_headers()
                 return
-            response = (
-                owner_response(request)
-                if self.path == "/v1/task-owner-equivalence"
-                else search_response(request)
-            )
+            if self.path == "/v1/task-owner-equivalence":
+                response = owner_response(request)
+            elif self.path == "/v1/execution-context":
+                response = execution_context_response(request)
+            else:
+                response = search_response(request)
             if transform is not None:
                 response = transform(response)
             payload = raw if raw is not None else (
@@ -149,6 +171,74 @@ def client(endpoint: str, **changes) -> GwKnowledgeClient:
 
 
 class KnowledgeClientTests(unittest.TestCase):
+    def test_execution_context_is_allowlisted_and_digest_bound(self):
+        with server() as (endpoint, requests):
+            result = client(endpoint).execution_context()
+
+        self.assertEqual(result.alias, "primary")
+        self.assertEqual(result.display_name, "Person A")
+        self.assertEqual(
+            result.operator_context, "Person A works with Example Org.\n"
+        )
+        self.assertEqual(result.self_aliases, ("Person A", "A. Person"))
+        self.assertEqual(result.institution_domains, ("example.edu",))
+        self.assertNotIn(result.operator_context, repr(result))
+        self.assertNotIn(result.display_name, repr(result))
+        self.assertEqual(requests, [{
+            "path": "/v1/execution-context",
+            "authorization": f"Bearer {TOKEN}",
+            "document": {
+                "schema": "gw.execution-context-request",
+                "schema_version": 1,
+                "alias": "primary",
+            },
+        }])
+
+    def test_execution_context_shape_identity_and_revision_fail_closed(self):
+        def extra_variable(document):
+            document["variables"]["source_settings"] = {"enabled": True}
+            return document
+
+        def wrong_alias(document):
+            document["alias"] = "secondary"
+            return document
+
+        def wrong_revision(document):
+            document["revision"] = "0" * 64
+            return document
+
+        def excessive_aliases(document):
+            document["variables"]["self_aliases"] = [
+                f"Person {index}" for index in range(33)
+            ]
+            return document
+
+        def malformed_domain(document):
+            document["variables"]["institution_domains"] = ["not a domain"]
+            return document
+
+        def duplicate_alias(document):
+            document["variables"]["self_aliases"] = ["Person A", "Person A"]
+            return document
+
+        def oversized_context(document):
+            document["variables"]["operator_context"] = "x" * 32_769
+            return document
+
+        for mutation in (
+            extra_variable,
+            wrong_alias,
+            wrong_revision,
+            excessive_aliases,
+            malformed_domain,
+            duplicate_alias,
+            oversized_context,
+        ):
+            with self.subTest(mutation=mutation.__name__):
+                with server(transform=mutation) as (endpoint, _requests):
+                    with self.assertRaises(KnowledgeResponseError):
+                        client(endpoint).execution_context()
+
     def test_search_is_bounded_authenticated_and_strictly_parsed(self):
         with server() as (endpoint, requests):
             result = client(endpoint).search(
@@ -341,9 +431,10 @@ class KnowledgeClientTests(unittest.TestCase):
                         if not name.startswith("_")
                         and callable(getattr(instance, name))
                     },
-                    {"resolve_task_owner", "search"},
+                    {"execution_context", "resolve_task_owner", "search"},
                 )
                 instance.search("synthetic query")
+                instance.execution_context()
             after = tuple(os.scandir(temporary))
             self.assertEqual(
                 [entry.name for entry in before],

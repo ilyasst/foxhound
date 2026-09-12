@@ -27,6 +27,7 @@ from .task_ledger import (
     TransitionResult,
 )
 from .knowledge_client import (
+    ExecutionContext,
     GwKnowledgeClient,
     KnowledgeClientConfig,
     KnowledgeClientError,
@@ -91,6 +92,7 @@ __all__ = (
     "TransitionRefusal",
     "TransitionResult",
     "GwKnowledgeClient",
+    "ExecutionContext",
     "KnowledgeClientConfig",
     "KnowledgeClientError",
     "KnowledgeConfigError",
