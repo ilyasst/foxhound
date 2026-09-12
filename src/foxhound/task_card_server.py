@@ -36,8 +36,10 @@ HEALTH_SCHEMA = "foxhound.task-card-service.health"
 SCHEDULE_SCHEMA = "foxhound.task-card-service.schedule"
 CLAIM_SCHEMA = "foxhound.task-card-service.claim"
 OPERATION_SCHEMA = "foxhound.task-card-service.operation"
+STATS_SCHEMA = "foxhound.task-card-service.stats"
 
 ROUTES = {
+    "/v1/task-cards/stats": "stats",
     "/v1/task-cards/schedule": "schedule",
     "/v1/task-cards/claim": "claim",
     "/v1/task-cards/delivered": "delivered",
@@ -119,6 +121,19 @@ class TaskCardApplication:
         )
 
     def dispatch(self, operation: str, payload: object) -> dict[str, Any]:
+        if operation == "stats":
+            _request(payload, required=set())
+            stats = self.cards.stats()
+            return {
+                "schema": STATS_SCHEMA,
+                "schema_version": SERVICE_VERSION,
+                "ok": True,
+                "pending": stats.pending,
+                "delivering": stats.delivering,
+                "delivered": stats.delivered,
+                "snoozed": stats.snoozed,
+                "active": stats.active,
+            }
         if operation == "schedule":
             request = _request(payload, required={"limit"})
             limit = _integer(request["limit"], minimum=1, maximum=1_000)
