@@ -85,6 +85,20 @@ Lifecycle transitions are optimistic-version fenced and append immutable
 events. See [ADR 0006](docs/architecture/0006-durable-task-ledger.md) and
 [ADR 0009](docs/architecture/0009-owner-equivalence-bootstrap.md).
 
+The same operation is available as a content-free one-shot command for a host
+scheduler. Both the database and token must be in private directories:
+
+```sh
+foxhound-task-bootstrap \\
+  --database /srv/example/private-foxhound-state/foxhound.sqlite3 \\
+  --gw-endpoint http://127.0.0.1:8787 \\
+  --gw-alias example-operator \\
+  --gw-token-file /srv/example/private-foxhound-state/knowledge.token
+```
+
+It neither imports feeds nor schedules cards or execution. See
+[ADR 0018](docs/architecture/0018-one-shot-shadow-bootstrap.md).
+
 Correlated status transitions can be exported manually as a content-free,
 append-only offline feed for a knowledge system to project. Only tasks carrying
 the temporary GW bootstrap correlation enter this stream; native Foxhound
@@ -219,3 +233,5 @@ See [ADR 0016](docs/architecture/0016-execution-review-cards.md) for durable
 execution-gate delivery and atomic reader decisions.
 See [ADR 0017](docs/architecture/0017-execution-card-service.md) for the
 authenticated loopback execution-card adapter.
+See [ADR 0018](docs/architecture/0018-one-shot-shadow-bootstrap.md) for the
+explicit deployment boundary around verified shadow activation.
