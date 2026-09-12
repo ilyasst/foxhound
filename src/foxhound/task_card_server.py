@@ -1,4 +1,4 @@
-"""Authenticated loopback HTTP boundary for Foxhound task review cards."""
+"""Authenticated loopback boundary for task and execution review cards."""
 
 from __future__ import annotations
 
@@ -18,6 +18,12 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
 
+from .execution_cards import (
+    ExecutionCardOperationResult,
+    ExecutionCardScheduleResult,
+    ExecutionCardService,
+    render_execution_review_card,
+)
 from .task_cards import (
     CardOperationResult,
     ScheduleResult,
@@ -37,6 +43,10 @@ SCHEDULE_SCHEMA = "foxhound.task-card-service.schedule"
 CLAIM_SCHEMA = "foxhound.task-card-service.claim"
 OPERATION_SCHEMA = "foxhound.task-card-service.operation"
 STATS_SCHEMA = "foxhound.task-card-service.stats"
+EXECUTION_SCHEDULE_SCHEMA = "foxhound.execution-card-service.schedule"
+EXECUTION_CLAIM_SCHEMA = "foxhound.execution-card-service.claim"
+EXECUTION_OPERATION_SCHEMA = "foxhound.execution-card-service.operation"
+EXECUTION_STATS_SCHEMA = "foxhound.execution-card-service.stats"
 
 ROUTES = {
     "/v1/task-cards/stats": "stats",
@@ -45,6 +55,12 @@ ROUTES = {
     "/v1/task-cards/delivered": "delivered",
     "/v1/task-cards/delivery-failed": "delivery_failed",
     "/v1/task-cards/action": "action",
+    "/v1/execution-cards/stats": "execution_stats",
+    "/v1/execution-cards/schedule": "execution_schedule",
+    "/v1/execution-cards/claim": "execution_claim",
+    "/v1/execution-cards/delivered": "execution_delivered",
+    "/v1/execution-cards/delivery-failed": "execution_delivery_failed",
+    "/v1/execution-cards/action": "execution_action",
 }
 
 
@@ -101,13 +117,21 @@ class TaskCardApplication:
         cards: TaskCardService,
         token: str,
         *,
+        execution_cards: ExecutionCardService | None = None,
         limits: TaskCardServerLimits | None = None,
     ) -> None:
         if not isinstance(cards, TaskCardService):
             raise TaskCardServerConfigError("task card service is invalid")
         if not _valid_secret(token):
             raise TaskCardServerConfigError("task card bearer token is invalid")
+        if execution_cards is not None and not isinstance(
+            execution_cards, ExecutionCardService
+        ):
+            raise TaskCardServerConfigError(
+                "execution card service is invalid"
+            )
         self.cards = cards
+        self.execution_cards = execution_cards
         self.token = token
         self.limits = limits or TaskCardServerLimits()
         self.limits.validate()
@@ -212,9 +236,121 @@ class TaskCardApplication:
                 expected_version=_integer(request["card_version"], minimum=1),
                 action=action,
             ))
+        if operation == "execution_stats":
+            _request(payload, required=set())
+            stats = self._execution_cards().stats()
+            return {
+                "schema": EXECUTION_STATS_SCHEMA,
+                "schema_version": SERVICE_VERSION,
+                "ok": True,
+                "pending": stats.pending,
+                "delivering": stats.delivering,
+                "delivered": stats.delivered,
+                "active": stats.active,
+            }
+        if operation == "execution_schedule":
+            request = _request(payload, required={"limit"})
+            limit = _integer(request["limit"], minimum=1, maximum=1_000)
+            return _execution_schedule_document(
+                self._execution_cards().schedule(limit=limit)
+            )
+        if operation == "execution_claim":
+            request = _request(payload, required={"lease_seconds"})
+            lease = _integer(request["lease_seconds"], minimum=5, maximum=300)
+            claim = self._execution_cards().claim_next(lease_seconds=lease)
+            if claim is None:
+                return {
+                    "schema": EXECUTION_CLAIM_SCHEMA,
+                    "schema_version": SERVICE_VERSION,
+                    "ok": True,
+                    "status": "empty",
+                    "claim": None,
+                }
+            body, reply_markup = render_execution_review_card(claim.card)
+            return {
+                "schema": EXECUTION_CLAIM_SCHEMA,
+                "schema_version": SERVICE_VERSION,
+                "ok": True,
+                "status": "claimed",
+                "claim": {
+                    "card_id": claim.card.id,
+                    "card_version": claim.card.version,
+                    "kind": claim.card.kind.value,
+                    "phase": claim.card.phase.value,
+                    "claim_token": claim.token,
+                    "expires_at": claim.expires_at,
+                    "delivery_key": (
+                        f"foxhound-execution-card-{claim.card.id}-"
+                        f"v{claim.card.version}"
+                    ),
+                    "body": body,
+                    "reply_markup": reply_markup,
+                },
+            }
+        if operation == "execution_delivered":
+            request = _request(
+                payload,
+                required={
+                    "card_id", "card_version", "claim_token", "transport",
+                    "delivery_ref",
+                },
+            )
+            return _execution_operation_document(
+                self._execution_cards().complete_delivery(
+                    _integer(request["card_id"], minimum=1),
+                    expected_version=_integer(
+                        request["card_version"], minimum=1
+                    ),
+                    claim_token=_secret(request["claim_token"]),
+                    transport=_opaque(request["transport"], maximum=64),
+                    delivery_ref=_opaque(
+                        request["delivery_ref"], maximum=200
+                    ),
+                )
+            )
+        if operation == "execution_delivery_failed":
+            request = _request(
+                payload,
+                required={"card_id", "card_version", "claim_token"},
+            )
+            return _execution_operation_document(
+                self._execution_cards().fail_delivery(
+                    _integer(request["card_id"], minimum=1),
+                    expected_version=_integer(
+                        request["card_version"], minimum=1
+                    ),
+                    claim_token=_secret(request["claim_token"]),
+                )
+            )
+        if operation == "execution_action":
+            request = _request(
+                payload,
+                required={"card_id", "card_version", "action"},
+            )
+            action = request["action"]
+            if not isinstance(action, str) or action not in {
+                "start", "snooze", "cancel", "approve", "revise"
+            }:
+                raise TaskCardServerRequestError(
+                    "invalid_request", "execution card action is invalid"
+                )
+            return _execution_operation_document(self._execution_cards().act(
+                _integer(request["card_id"], minimum=1),
+                expected_version=_integer(request["card_version"], minimum=1),
+                action=action,
+            ))
         raise TaskCardServerRequestError(
             "not_found", "route not found", HTTPStatus.NOT_FOUND
         )
+
+    def _execution_cards(self) -> ExecutionCardService:
+        if self.execution_cards is None:
+            raise TaskCardServerRequestError(
+                "service_unavailable",
+                "execution card service is unavailable",
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+        return self.execution_cards
 
 
 class _TaskCardHTTPServer(HTTPServer):
@@ -524,6 +660,49 @@ def _operation_document(result: CardOperationResult) -> dict[str, Any]:
     }
 
 
+def _execution_schedule_document(
+    result: ExecutionCardScheduleResult,
+) -> dict[str, Any]:
+    return {
+        "schema": EXECUTION_SCHEDULE_SCHEMA,
+        "schema_version": SERVICE_VERSION,
+        "ok": result.disposition != "refused",
+        "disposition": result.disposition.value,
+        "created": result.created,
+        "cancelled": result.cancelled,
+        "refusal": None if result.refusal is None else result.refusal.value,
+    }
+
+
+def _execution_operation_document(
+    result: ExecutionCardOperationResult,
+) -> dict[str, Any]:
+    return {
+        "schema": EXECUTION_OPERATION_SCHEMA,
+        "schema_version": SERVICE_VERSION,
+        "ok": result.accepted,
+        "disposition": result.disposition.value,
+        "card_id": result.card_id,
+        "card_version": result.card_version,
+        "card_status": (
+            None if result.card_status is None else result.card_status.value
+        ),
+        "workflow_version": result.workflow_version,
+        "workflow_status": (
+            None
+            if result.workflow_status is None
+            else result.workflow_status.value
+        ),
+        "workflow_phase": (
+            None
+            if result.workflow_phase is None
+            else result.workflow_phase.value
+        ),
+        "wake_at": result.wake_at,
+        "refusal": None if result.refusal is None else result.refusal.value,
+    }
+
+
 def load_token(path: str | os.PathLike[str]) -> str:
     token_path = Path(path).expanduser()
     if token_path.is_symlink():
@@ -597,7 +776,7 @@ def serve(host: str, port: int, app: TaskCardApplication) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Serve Foxhound task cards on an authenticated loopback API"
+        description="Serve Foxhound review cards on an authenticated loopback API"
     )
     parser.add_argument("--database", required=True)
     parser.add_argument("--token-file", required=True)
@@ -608,9 +787,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         cards = TaskCardService(arguments.database)
         cards.count()
+        execution_cards = ExecutionCardService(arguments.database)
+        execution_cards.count()
         app = TaskCardApplication(
             cards,
             load_token(arguments.token_file),
+            execution_cards=execution_cards,
             limits=TaskCardServerLimits(
                 request_timeout_seconds=arguments.request_timeout
             ),

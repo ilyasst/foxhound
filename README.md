@@ -171,6 +171,14 @@ fit, approval is absent from the keyboard and a forged approval callback is
 also refused. These cards do not change task lifecycle. See
 [ADR 0016](docs/architecture/0016-execution-review-cards.md).
 
+The authenticated loopback card service exposes execution cards through a
+separate `/v1/execution-cards/*` route family. A trusted local gateway can read
+aggregate stats, run the explicit scheduler, claim one rendered card,
+acknowledge or retry delivery, and submit one versioned reader action. The
+existing `/v1/task-cards/*` contracts are unchanged. Starting the service
+still creates no card and advances no gate. See
+[ADR 0017](docs/architecture/0017-execution-card-service.md).
+
 Run the contract tests with:
 
 ```sh
@@ -209,3 +217,5 @@ See [ADR 0015](docs/architecture/0015-supervised-execution-runner.md) for the
 one-shot runner, private worker capability, and failure boundary.
 See [ADR 0016](docs/architecture/0016-execution-review-cards.md) for durable
 execution-gate delivery and atomic reader decisions.
+See [ADR 0017](docs/architecture/0017-execution-card-service.md) for the
+authenticated loopback execution-card adapter.
