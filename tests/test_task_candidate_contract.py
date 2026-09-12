@@ -5,7 +5,12 @@ import json
 import unittest
 from pathlib import Path
 
-from foxhound.contracts import ContractError, candidate_id_for, parse_task_candidate
+from foxhound.contracts import (
+    ContractError,
+    candidate_id_for,
+    parse_task_candidate,
+    task_candidate_document,
+)
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "contracts"
@@ -27,6 +32,30 @@ class TaskCandidateContractTests(unittest.TestCase):
         self.assertEqual(candidate.source.kind, "email")
         self.assertIsNone(candidate.task.owner)
         self.assertIsNone(candidate.task.due)
+
+    def test_accepts_and_round_trips_projectless_version_2(self):
+        document = fixture("meeting-candidate-v2.json")
+        candidate = parse_task_candidate(document)
+
+        self.assertEqual(candidate.schema_version, 2)
+        self.assertIsNone(candidate.task.project)
+        self.assertEqual(task_candidate_document(candidate), document)
+
+    def test_versions_have_distinct_strict_task_shapes(self):
+        version_1 = fixture("meeting-candidate-v1.json")
+        version_1["task"].pop("project")
+        with self.assertRaisesRegex(ContractError, "missing required fields"):
+            parse_task_candidate(version_1)
+
+        version_2 = fixture("meeting-candidate-v2.json")
+        version_2["task"]["project"] = "Project Alpha"
+        with self.assertRaisesRegex(ContractError, "additional fields"):
+            parse_task_candidate(version_2)
+
+        empty_project = fixture("meeting-candidate-v2.json")
+        empty_project["task"]["project"] = ""
+        with self.assertRaisesRegex(ContractError, "additional fields"):
+            parse_task_candidate(empty_project)
 
     def test_identity_is_stable_across_source_revisions(self):
         original = fixture("meeting-candidate-v1.json")
@@ -51,7 +80,7 @@ class TaskCandidateContractTests(unittest.TestCase):
 
     def test_rejects_unknown_version_without_echoing_candidate_content(self):
         document = fixture("meeting-candidate-v1.json")
-        document["schema_version"] = 2
+        document["schema_version"] = 999
         document["task"]["text"] = "private candidate text"
 
         with self.assertRaisesRegex(ContractError, "schema_version") as raised:
@@ -107,6 +136,15 @@ class TaskCandidateContractTests(unittest.TestCase):
         self.assertFalse(schema["properties"]["source"]["additionalProperties"])
         self.assertFalse(schema["properties"]["task"]["additionalProperties"])
         self.assertFalse(schema["properties"]["evidence"]["additionalProperties"])
+
+        version_2_path = schema_path.with_name("task-candidate-v2.schema.json")
+        version_2 = json.loads(version_2_path.read_text(encoding="utf-8"))
+        self.assertEqual(version_2["properties"]["schema_version"]["const"], 2)
+        self.assertFalse(version_2["additionalProperties"])
+        self.assertFalse(
+            version_2["properties"]["task"]["additionalProperties"]
+        )
+        self.assertNotIn("project", version_2["properties"]["task"]["properties"])
 
 
 if __name__ == "__main__":

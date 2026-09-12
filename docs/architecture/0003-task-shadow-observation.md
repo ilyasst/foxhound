@@ -30,7 +30,8 @@ closed reason vocabularies. These combinations are structural: a consumer
 cannot reinterpret an absent task reference as refusal or a refusal as a
 pending task.
 
-The comparable digest is SHA-256 over the compact JSON array:
+For a version-1 candidate, the comparable digest is SHA-256 over the compact
+JSON array:
 
 ```text
 [task text, project, owner]
@@ -40,6 +41,16 @@ Those are the task fields represented independently by both current systems.
 Due date is deliberately excluded because the legacy GW task row does not
 retain it separately. Exclusion is a declared comparison limit, not a claim
 that due dates agree.
+
+For a project-less version-2 candidate, the corresponding array is:
+
+```text
+[task text, owner]
+```
+
+The embedded candidate version therefore determines the comparison shape.
+This preserves every version-1 digest while allowing later observations to
+avoid inventing a project value.
 
 The observation carries the complete candidate so Foxhound can verify its
 identity and revision against the candidate inbox before comparing the legacy
