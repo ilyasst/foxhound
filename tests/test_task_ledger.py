@@ -11,7 +11,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from foxhound import CandidateInbox, InboxError
-from foxhound.contracts import candidate_id_for, comparable_task_digest
+from foxhound.contracts import (
+    EQUIVALENCE_BASIS,
+    OwnerEquivalenceResolutionError,
+    TaskOwnerEquivalence,
+    candidate_id_for,
+    comparable_task_digest,
+    owner_equivalence_request,
+)
 from foxhound.task_ledger import (
     BootstrapDisposition,
     BootstrapRefusal,
@@ -71,13 +78,15 @@ def observation(
     legacy_task_id: int | None = None,
     reason_code: str | None = None,
     divergent: bool = False,
+    legacy_owner: str | None = None,
 ) -> dict:
     legacy = None
     if legacy_task_id is not None:
         digest = comparable_task_digest(
             text=item["task"]["text"],
             project=None,
-            owner=item["task"]["owner"],
+            owner=(item["task"]["owner"]
+                   if legacy_owner is None else legacy_owner),
         )
         legacy = {
             "task_id": legacy_task_id,
@@ -92,6 +101,28 @@ def observation(
         "reason_code": reason_code,
         "observed_at": "2030-02-01T12:00:00Z",
     }
+
+
+def equivalence(
+    item: dict, *, legacy_task_id: int, effective_owner: str
+) -> TaskOwnerEquivalence:
+    digest = comparable_task_digest(
+        text=item["task"]["text"],
+        project=None,
+        owner=effective_owner,
+    )
+    return TaskOwnerEquivalence(
+        request=owner_equivalence_request(
+            alias="primary",
+            candidate_id=item["candidate_id"],
+            source_revision=item["source"]["revision"],
+            legacy_task_id=legacy_task_id,
+            legacy_digest=digest,
+        ),
+        status="equivalent",
+        basis=EQUIVALENCE_BASIS,
+        effective_owner=effective_owner,
+    )
 
 
 def shadow_feed(observations: list[dict]) -> dict:
@@ -211,6 +242,132 @@ class TaskLedgerTests(unittest.TestCase):
         self.assertEqual(result.incomplete_groups, 1)
         self.assertEqual(self.ledger.count(), 0)
 
+    def test_verified_owner_equivalence_is_persisted_and_replayed(self):
+        item = candidate(1, owner="Person A (SPK_001)")
+        effective_owner = "Person A (SPK_002)"
+        self.import_candidates(item)
+        self.import_observations(observation(
+            item,
+            disposition="minted",
+            legacy_task_id=111,
+            legacy_owner=effective_owner,
+        ))
+        calls = []
+
+        def resolver(**request):
+            with closing(sqlite3.connect(
+                self.database, timeout=0
+            )) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.rollback()
+            calls.append(request)
+            return equivalence(
+                item,
+                legacy_task_id=111,
+                effective_owner=effective_owner,
+            )
+
+        result = self.ledger.bootstrap_from_shadow(owner_resolver=resolver)
+
+        self.assertEqual(result.disposition, BootstrapDisposition.APPLIED)
+        self.assertEqual(result.tasks_created, 1)
+        self.assertEqual(result.candidates_owner_equivalent, 1)
+        self.assertEqual(result.owner_equivalences_created, 1)
+        self.assertEqual(result.candidates_divergent, 0)
+        self.assertEqual(self.ledger.get(1).owner, effective_owner)
+        self.assertEqual(len(calls), 1)
+
+        def unexpected_resolver(**_request):
+            raise AssertionError("persisted evidence must be reused")
+
+        replay = self.ledger.bootstrap_from_shadow(
+            owner_resolver=unexpected_resolver
+        )
+        self.assertEqual(replay.disposition, BootstrapDisposition.UNCHANGED)
+        self.assertEqual(replay.candidates_owner_equivalent, 1)
+        self.assertEqual(replay.owner_equivalences_unchanged, 1)
+
+        with closing(sqlite3.connect(self.database)) as connection:
+            row = connection.execute(
+                "SELECT legacy_task_id,effective_owner,basis "
+                "FROM task_owner_equivalences"
+            ).fetchone()
+            self.assertEqual(row, (111, effective_owner, EQUIVALENCE_BASIS))
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "UPDATE task_owner_equivalences SET effective_owner=?",
+                    ("Person C",),
+                )
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute("DELETE FROM task_owner_equivalences")
+
+    def test_unavailable_or_invalid_owner_equivalence_stays_divergent(self):
+        item = candidate(1, owner="Person A (SPK_001)")
+        effective_owner = "Person A (SPK_002)"
+        self.import_candidates(item)
+        self.import_observations(observation(
+            item,
+            disposition="minted",
+            legacy_task_id=121,
+            legacy_owner=effective_owner,
+        ))
+
+        def unavailable(**_request):
+            raise OwnerEquivalenceResolutionError("unavailable")
+
+        result = self.ledger.bootstrap_from_shadow(owner_resolver=unavailable)
+        self.assertEqual(result.disposition, BootstrapDisposition.UNCHANGED)
+        self.assertEqual(result.candidates_divergent, 1)
+        self.assertEqual(self.ledger.count(), 0)
+
+        invalid = equivalence(
+            item,
+            legacy_task_id=121,
+            effective_owner="Person C (SPK_003)",
+        )
+        result = self.ledger.bootstrap_from_shadow(
+            owner_resolver=lambda **_request: invalid
+        )
+        self.assertEqual(result.disposition, BootstrapDisposition.UNCHANGED)
+        self.assertEqual(result.candidates_divergent, 1)
+        self.assertEqual(self.ledger.count(), 0)
+        with closing(sqlite3.connect(self.database)) as connection:
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM task_owner_equivalences"
+            ).fetchone()[0], 0)
+
+    def test_owner_resolution_snapshot_change_refuses_all_writes(self):
+        item = candidate(1, owner="Person A (SPK_001)")
+        effective_owner = "Person A (SPK_002)"
+        self.import_candidates(item)
+        self.import_observations(observation(
+            item,
+            disposition="minted",
+            legacy_task_id=131,
+            legacy_owner=effective_owner,
+        ))
+
+        def resolver(**_request):
+            revised = copy.deepcopy(item)
+            revised["source"]["revision"] = "f" * 64
+            revised["task"]["text"] = "Prepare the revised synthetic summary"
+            self.assertTrue(self.inbox.import_document(revised).accepted)
+            return equivalence(
+                item,
+                legacy_task_id=131,
+                effective_owner=effective_owner,
+            )
+
+        result = self.ledger.bootstrap_from_shadow(owner_resolver=resolver)
+
+        self.assertEqual(result.disposition, BootstrapDisposition.REFUSED)
+        self.assertEqual(result.refusal, BootstrapRefusal.STATE_CONFLICT)
+        self.assertEqual(self.ledger.count(), 0)
+        with closing(sqlite3.connect(self.database)) as connection:
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM task_owner_equivalences"
+            ).fetchone()[0], 0)
+
     def test_conflicting_group_rolls_back_every_task(self):
         first = candidate(1)
         second = candidate(2)
@@ -289,6 +446,9 @@ class TaskLedgerTests(unittest.TestCase):
         item = candidate(1)
         self.import_candidates(item)
         with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute("DROP TRIGGER task_owner_equivalences_no_update")
+            connection.execute("DROP TRIGGER task_owner_equivalences_no_delete")
+            connection.execute("DROP TABLE task_owner_equivalences")
             connection.execute("DROP TRIGGER shadow_import_cycles_no_update")
             connection.execute("DROP TRIGGER shadow_import_cycles_no_delete")
             connection.execute("DROP TABLE shadow_import_cycles")
@@ -306,12 +466,12 @@ class TaskLedgerTests(unittest.TestCase):
         self.assertEqual(self.ledger.count(), 0)
         with closing(sqlite3.connect(self.database)) as connection:
             self.assertEqual(
-                connection.execute("PRAGMA user_version").fetchone()[0], 5
+                connection.execute("PRAGMA user_version").fetchone()[0], 6
             )
 
     def test_missing_append_only_trigger_is_refused(self):
         with closing(sqlite3.connect(self.database)) as connection, connection:
-            connection.execute("DROP TRIGGER task_events_no_update")
+            connection.execute("DROP TRIGGER task_owner_equivalences_no_update")
 
         with self.assertRaisesRegex(InboxError, "schema is incomplete"):
             self.inbox.initialize()

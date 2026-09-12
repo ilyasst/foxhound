@@ -60,6 +60,22 @@ def search_response(request: dict) -> dict:
     }
 
 
+def owner_response(request: dict) -> dict:
+    return {
+        "schema": "gw.task-owner-equivalence",
+        "schema_version": 1,
+        "ok": True,
+        "alias": request["alias"],
+        "candidate_id": request["candidate_id"],
+        "source_revision": request["source_revision"],
+        "legacy_task_id": request["legacy_task_id"],
+        "legacy_digest": request["legacy_digest"],
+        "status": "equivalent",
+        "basis": "speaker_merge",
+        "effective_owner": "Person B (SPK_002)",
+    }
+
+
 @contextmanager
 def server(
     *,
@@ -86,10 +102,14 @@ def server(
                 time.sleep(delay)
             if redirect:
                 self.send_response(302)
-                self.send_header("Location", "/v1/search")
+                self.send_header("Location", self.path)
                 self.end_headers()
                 return
-            response = search_response(request)
+            response = (
+                owner_response(request)
+                if self.path == "/v1/task-owner-equivalence"
+                else search_response(request)
+            )
             if transform is not None:
                 response = transform(response)
             payload = raw if raw is not None else (
@@ -156,6 +176,56 @@ class KnowledgeClientTests(unittest.TestCase):
             "max_matches_per_document": 3,
             "max_results_per_layer": 4,
         })
+
+    def test_owner_equivalence_is_identity_bound_and_strictly_parsed(self):
+        request = {
+            "candidate_id": "tc_" + "a" * 64,
+            "source_revision": "b" * 64,
+            "legacy_task_id": 101,
+            "legacy_digest": "c" * 64,
+        }
+        with server() as (endpoint, requests):
+            result = client(endpoint).resolve_task_owner(**request)
+
+        self.assertTrue(result.equivalent)
+        self.assertEqual(result.effective_owner, "Person B (SPK_002)")
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(
+            requests[0]["path"], "/v1/task-owner-equivalence"
+        )
+        self.assertEqual(requests[0]["authorization"], f"Bearer {TOKEN}")
+        self.assertEqual(requests[0]["document"], {
+            "schema": "gw.task-owner-equivalence-request",
+            "schema_version": 1,
+            "alias": "primary",
+            **request,
+        })
+
+        def wrong_revision(document):
+            document["source_revision"] = "d" * 64
+            return document
+
+        with server(transform=wrong_revision) as (endpoint, _requests):
+            with self.assertRaises(KnowledgeResponseError):
+                client(endpoint).resolve_task_owner(**request)
+
+        def unresolved(document):
+            document["status"] = "unresolved"
+            document["basis"] = None
+            document["effective_owner"] = None
+            return document
+
+        with server(transform=unresolved) as (endpoint, _requests):
+            result = client(endpoint).resolve_task_owner(**request)
+        self.assertFalse(result.equivalent)
+        self.assertIsNone(result.effective_owner)
+
+        with server() as (endpoint, requests):
+            with self.assertRaises(KnowledgeRequestError):
+                client(endpoint).resolve_task_owner(
+                    **{**request, "candidate_id": "not-an-id"}
+                )
+        self.assertEqual(requests, [])
 
     def test_configuration_refuses_unsafe_endpoints_and_tokens(self):
         refused = (
@@ -271,7 +341,7 @@ class KnowledgeClientTests(unittest.TestCase):
                         if not name.startswith("_")
                         and callable(getattr(instance, name))
                     },
-                    {"search"},
+                    {"resolve_task_owner", "search"},
                 )
                 instance.search("synthetic query")
             after = tuple(os.scandir(temporary))

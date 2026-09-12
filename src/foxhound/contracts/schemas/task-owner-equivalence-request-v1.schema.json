@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/foxhound/contracts/task-owner-equivalence-request-v1.schema.json",
+  "title": "GW task-owner equivalence request",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "alias",
+    "candidate_id",
+    "source_revision",
+    "legacy_task_id",
+    "legacy_digest"
+  ],
+  "properties": {
+    "schema": {"const": "gw.task-owner-equivalence-request"},
+    "schema_version": {"const": 1},
+    "alias": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+    },
+    "candidate_id": {
+      "type": "string",
+      "pattern": "^tc_[0-9a-f]{64}$"
+    },
+    "source_revision": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "legacy_task_id": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9223372036854775807
+    },
+    "legacy_digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  },
+  "additionalProperties": false
+}

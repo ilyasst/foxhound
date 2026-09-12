@@ -20,7 +20,17 @@ from pathlib import Path
 from typing import Callable
 
 from .candidate_inbox import CandidateInbox, InboxError, SCHEMA_VERSION
-from .contracts import ContractError, TaskCandidate, parse_task_candidate
+from .contracts import (
+    ContractError,
+    EQUIVALENCE_BASIS,
+    OwnerEquivalenceContractError,
+    OwnerEquivalenceResolutionError,
+    TaskCandidate,
+    TaskOwnerEquivalence,
+    comparable_task_digest,
+    owner_equivalence_request,
+    parse_task_candidate,
+)
 
 
 class TaskLedgerError(RuntimeError):
@@ -68,6 +78,9 @@ class BootstrapResult:
     candidates_refused: int = 0
     candidates_unmapped: int = 0
     candidates_divergent: int = 0
+    candidates_owner_equivalent: int = 0
+    owner_equivalences_created: int = 0
+    owner_equivalences_unchanged: int = 0
     incomplete_groups: int = 0
     refusal: BootstrapRefusal | None = None
 
@@ -109,6 +122,7 @@ class _ObservedCandidate:
     candidate: TaskCandidate
     disposition: str
     legacy_task_id: int
+    effective_owner: str | None
 
 
 class _BootstrapConflict(ValueError):
@@ -130,7 +144,12 @@ class TaskLedger:
     def initialize(self) -> None:
         CandidateInbox(self.database_path, clock=self._clock).initialize()
 
-    def bootstrap_from_shadow(self, *, producer: str = "gw") -> BootstrapResult:
+    def bootstrap_from_shadow(
+        self,
+        *,
+        producer: str = "gw",
+        owner_resolver: Callable[..., TaskOwnerEquivalence] | None = None,
+    ) -> BootstrapResult:
         """Explicitly materialize current, agreed mapped observations.
 
         Import paths never call this operation.  New groups require exactly
@@ -143,22 +162,21 @@ class TaskLedger:
                 BootstrapDisposition.REFUSED,
                 refusal=BootstrapRefusal.INVALID_STATE,
             )
+        snapshot, resolutions = self._resolve_owner_equivalences(
+            owner_resolver
+        )
         now = self._now()
         with closing(self._connect()) as connection:
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("BEGIN IMMEDIATE")
             try:
-                rows = connection.execute(
-                    "SELECT c.candidate_id,c.source_revision,c.payload_json,"
-                    "o.disposition,o.legacy_task_id,o.comparison "
-                    "FROM candidate_inbox AS c "
-                    "LEFT JOIN task_shadow_observations AS o "
-                    "ON o.candidate_id=c.candidate_id "
-                    "AND o.source_revision=c.source_revision "
-                    "ORDER BY c.candidate_id"
-                ).fetchall()
+                rows = self._bootstrap_rows(connection)
+                if self._row_snapshot(rows) != snapshot:
+                    raise _BootstrapConflict
                 groups: dict[int, list[_ObservedCandidate]] = defaultdict(list)
                 pending = refused = unmapped = divergent = 0
+                owner_equivalent = 0
+                equivalences_created = equivalences_unchanged = 0
                 for row in rows:
                     if row["comparison"] is None:
                         pending += 1
@@ -169,10 +187,7 @@ class TaskLedger:
                     if row["comparison"] == "unmapped":
                         unmapped += 1
                         continue
-                    if row["comparison"] == "divergent":
-                        divergent += 1
-                        continue
-                    if (row["comparison"] != "agreed"
+                    if (row["comparison"] not in {"agreed", "divergent"}
                             or row["disposition"] not in {"minted", "folded"}
                             or row["legacy_task_id"] is None):
                         raise _BootstrapConflict
@@ -186,11 +201,46 @@ class TaskLedger:
                             or candidate.source.revision
                             != row["source_revision"]):
                         raise _BootstrapConflict
+                    effective_owner = candidate.task.owner
+                    if row["comparison"] == "divergent":
+                        resolution = self._owner_equivalence(
+                            row,
+                            candidate,
+                            resolutions.get((
+                                candidate.candidate_id,
+                                candidate.source.revision,
+                            )),
+                        )
+                        if resolution is None:
+                            divergent += 1
+                            continue
+                        effective_owner, is_new = resolution
+                        owner_equivalent += 1
+                        if is_new:
+                            connection.execute(
+                                "INSERT INTO task_owner_equivalences("
+                                "candidate_id,source_revision,legacy_task_id,"
+                                "legacy_digest,effective_owner,basis,resolved_at) "
+                                "VALUES(?,?,?,?,?,?,?)",
+                                (
+                                    candidate.candidate_id,
+                                    candidate.source.revision,
+                                    int(row["legacy_task_id"]),
+                                    row["comparable_digest"],
+                                    effective_owner,
+                                    EQUIVALENCE_BASIS,
+                                    now,
+                                ),
+                            )
+                            equivalences_created += 1
+                        else:
+                            equivalences_unchanged += 1
                     groups[int(row["legacy_task_id"])].append(
                         _ObservedCandidate(
                             candidate=candidate,
                             disposition=row["disposition"],
                             legacy_task_id=int(row["legacy_task_id"]),
+                            effective_owner=effective_owner,
                         )
                     )
 
@@ -214,15 +264,16 @@ class TaskLedger:
 
                     reference = minted[0].candidate if minted else None
                     if reference is not None:
+                        reference_owner = minted[0].effective_owner
                         for item in observations:
                             task = item.candidate.task
                             if (task.text != reference.task.text
-                                    or task.owner != reference.task.owner):
+                                    or item.effective_owner != reference_owner):
                                 raise _BootstrapConflict
 
                     if correlation is None:
                         task_id = self._insert_task(
-                            connection, reference, now
+                            connection, reference, reference_owner, now
                         )
                         task_version = 1
                         connection.execute(
@@ -243,7 +294,8 @@ class TaskLedger:
                         for item in observations:
                             task = item.candidate.task
                             if (task.text != task_row["text"]
-                                    or task.owner != task_row["owner"]):
+                                    or item.effective_owner
+                                    != task_row["owner"]):
                                 raise _BootstrapConflict
                         task_version = int(task_row["version"])
                         accepted = connection.execute(
@@ -310,7 +362,8 @@ class TaskLedger:
                 connection.commit()
                 disposition = (
                     BootstrapDisposition.APPLIED
-                    if tasks_created or bindings_created
+                    if (tasks_created or bindings_created
+                        or equivalences_created)
                     else BootstrapDisposition.UNCHANGED
                 )
                 return BootstrapResult(
@@ -322,6 +375,9 @@ class TaskLedger:
                     candidates_refused=refused,
                     candidates_unmapped=unmapped,
                     candidates_divergent=divergent,
+                    candidates_owner_equivalent=owner_equivalent,
+                    owner_equivalences_created=equivalences_created,
+                    owner_equivalences_unchanged=equivalences_unchanged,
                     incomplete_groups=incomplete_groups,
                 )
             except _BootstrapConflict:
@@ -333,6 +389,147 @@ class TaskLedger:
             except Exception:
                 connection.rollback()
                 raise
+
+    def _resolve_owner_equivalences(
+        self,
+        resolver: Callable[..., TaskOwnerEquivalence] | None,
+    ) -> tuple[
+        tuple[tuple[object, ...], ...],
+        dict[tuple[str, str], TaskOwnerEquivalence],
+    ]:
+        """Call the read-only resolver without holding a database write lock."""
+        with closing(self._connect()) as connection:
+            rows = self._bootstrap_rows(connection)
+            snapshot = self._row_snapshot(rows)
+            requests = []
+            if resolver is not None:
+                for row in rows:
+                    if (row["comparison"] != "divergent"
+                            or row["disposition"] not in {"minted", "folded"}
+                            or row["legacy_task_id"] is None
+                            or row["comparable_digest"] is None
+                            or row["equivalence_candidate_id"] is not None):
+                        continue
+                    try:
+                        candidate = parse_task_candidate(
+                            json.loads(row["payload_json"])
+                        )
+                    except (
+                        json.JSONDecodeError,
+                        TypeError,
+                        ContractError,
+                    ):
+                        continue
+                    requests.append((
+                        candidate.candidate_id,
+                        candidate.source.revision,
+                        int(row["legacy_task_id"]),
+                        row["comparable_digest"],
+                    ))
+
+        resolved = {}
+        if resolver is not None:
+            for candidate_id, revision, task_id, digest in requests:
+                try:
+                    result = resolver(
+                        candidate_id=candidate_id,
+                        source_revision=revision,
+                        legacy_task_id=task_id,
+                        legacy_digest=digest,
+                    )
+                except (
+                    OwnerEquivalenceResolutionError,
+                    OwnerEquivalenceContractError,
+                ):
+                    continue
+                resolved[(candidate_id, revision)] = result
+        return snapshot, resolved
+
+    @staticmethod
+    def _bootstrap_rows(connection: sqlite3.Connection) -> list[sqlite3.Row]:
+        return connection.execute(
+            "SELECT c.candidate_id,c.source_revision,c.payload_json,"
+            "o.disposition,o.legacy_task_id,o.comparable_digest,o.comparison,"
+            "e.candidate_id AS equivalence_candidate_id,"
+            "e.source_revision AS equivalence_source_revision,"
+            "e.legacy_task_id AS equivalence_legacy_task_id,"
+            "e.legacy_digest AS equivalence_legacy_digest,"
+            "e.effective_owner AS equivalence_effective_owner,"
+            "e.basis AS equivalence_basis,e.resolved_at AS equivalence_resolved_at "
+            "FROM candidate_inbox AS c "
+            "LEFT JOIN task_shadow_observations AS o "
+            "ON o.candidate_id=c.candidate_id "
+            "AND o.source_revision=c.source_revision "
+            "LEFT JOIN task_owner_equivalences AS e "
+            "ON e.candidate_id=c.candidate_id "
+            "AND e.source_revision=c.source_revision "
+            "ORDER BY c.candidate_id"
+        ).fetchall()
+
+    @staticmethod
+    def _row_snapshot(
+        rows: list[sqlite3.Row],
+    ) -> tuple[tuple[object, ...], ...]:
+        return tuple(tuple(row) for row in rows)
+
+    @staticmethod
+    def _owner_equivalence(
+        row: sqlite3.Row,
+        candidate: TaskCandidate,
+        pending: TaskOwnerEquivalence | None,
+    ) -> tuple[str, bool] | None:
+        if row["equivalence_candidate_id"] is not None:
+            if (
+                row["equivalence_candidate_id"] != candidate.candidate_id
+                or row["equivalence_source_revision"]
+                != candidate.source.revision
+                or row["equivalence_legacy_task_id"]
+                != row["legacy_task_id"]
+                or row["equivalence_legacy_digest"]
+                != row["comparable_digest"]
+                or row["equivalence_basis"] != EQUIVALENCE_BASIS
+                or not _valid_effective_owner(
+                    row["equivalence_effective_owner"]
+                )
+                or not _valid_timestamp(row["equivalence_resolved_at"])
+            ):
+                raise _BootstrapConflict
+            effective_owner = row["equivalence_effective_owner"]
+            if comparable_task_digest(
+                text=candidate.task.text,
+                project=candidate.task.project,
+                owner=effective_owner,
+            ) != row["comparable_digest"]:
+                raise _BootstrapConflict
+            return effective_owner, False
+
+        if not isinstance(pending, TaskOwnerEquivalence) or not pending.equivalent:
+            return None
+        try:
+            request = owner_equivalence_request(
+                alias=pending.request.alias,
+                candidate_id=pending.request.candidate_id,
+                source_revision=pending.request.source_revision,
+                legacy_task_id=pending.request.legacy_task_id,
+                legacy_digest=pending.request.legacy_digest,
+            )
+        except (AttributeError, OwnerEquivalenceContractError):
+            return None
+        if (
+            request.candidate_id != candidate.candidate_id
+            or request.source_revision != candidate.source.revision
+            or request.legacy_task_id != row["legacy_task_id"]
+            or request.legacy_digest != row["comparable_digest"]
+            or pending.basis != EQUIVALENCE_BASIS
+            or not _valid_effective_owner(pending.effective_owner)
+            or comparable_task_digest(
+                text=candidate.task.text,
+                project=candidate.task.project,
+                owner=pending.effective_owner,
+            ) != row["comparable_digest"]
+        ):
+            return None
+        return pending.effective_owner, True
 
     def transition(
         self, task_id: int, *, expected_version: int, action: str
@@ -465,13 +662,14 @@ class TaskLedger:
     def _insert_task(
         connection: sqlite3.Connection,
         candidate: TaskCandidate,
+        effective_owner: str | None,
         now: str,
     ) -> int:
         task = candidate.task
         cursor = connection.execute(
             "INSERT INTO tasks(status,text,owner,due,version,created_at,"
             "updated_at,closed_at) VALUES('open',?,?,?,?,?,?,NULL)",
-            (task.text, task.owner, task.due, 1, now, now),
+            (task.text, effective_owner, task.due, 1, now, now),
         )
         task_id = int(cursor.lastrowid)
         connection.execute(
@@ -530,3 +728,23 @@ def _task_record(row: sqlite3.Row) -> TaskRecord:
         )
     except (IndexError, KeyError, TypeError, ValueError) as exc:
         raise InboxError("task ledger contains invalid state") from exc
+
+
+def _valid_effective_owner(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and value == value.strip()
+        and len(value) <= 200
+        and not any(ord(char) < 32 or ord(char) == 127 for char in value)
+    )
+
+
+def _valid_timestamp(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() is not None
