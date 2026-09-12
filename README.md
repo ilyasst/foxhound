@@ -42,4 +42,6 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 See [ADR 0001](docs/architecture/0001-task-boundary.md) for the component
 boundary and migration invariants. See
 [ADR 0002](docs/architecture/0002-offline-shadow-import.md) for the offline
-producer-outbox connection.
+producer-outbox connection. See
+[ADR 0003](docs/architecture/0003-task-shadow-observation.md) for the passive
+candidate-to-legacy-task observation contract.

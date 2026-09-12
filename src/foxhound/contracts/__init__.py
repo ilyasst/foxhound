@@ -16,6 +16,16 @@ from .candidate_feed import (
     FeedContractError,
     parse_candidate_feed,
 )
+from .task_shadow_observation import (
+    LegacyTaskObservation,
+    ShadowObservationError,
+    TaskShadowObservation,
+    candidate_comparable_digest,
+    comparable_task_digest,
+    parse_task_shadow_observation,
+    parse_task_shadow_observation_json,
+    task_shadow_observation_document,
+)
 
 __all__ = (
     "CandidateEvidence",
@@ -25,9 +35,17 @@ __all__ = (
     "CandidateTask",
     "ContractError",
     "FeedContractError",
+    "LegacyTaskObservation",
+    "ShadowObservationError",
     "TaskCandidate",
+    "TaskShadowObservation",
     "candidate_id_for",
+    "candidate_comparable_digest",
+    "comparable_task_digest",
     "parse_task_candidate",
     "parse_candidate_feed",
+    "parse_task_shadow_observation",
+    "parse_task_shadow_observation_json",
     "task_candidate_document",
+    "task_shadow_observation_document",
 )
