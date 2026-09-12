@@ -13,6 +13,15 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit
 
+from .contracts.task_owner_equivalence import (
+    OwnerEquivalenceContractError,
+    OwnerEquivalenceResolutionError,
+    TaskOwnerEquivalence,
+    owner_equivalence_request,
+    owner_equivalence_request_document,
+    parse_owner_equivalence_response,
+)
+
 
 SEARCH_SCHEMA = "gw.search"
 SEARCH_SCHEMA_VERSION = 1
@@ -22,7 +31,7 @@ _ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _DOCUMENT_ID_RE = re.compile(r"^(kb|secondary|emails):(.+)$")
 
 
-class KnowledgeClientError(RuntimeError):
+class KnowledgeClientError(OwnerEquivalenceResolutionError):
     """Base class for content-free GW knowledge client failures."""
 
 
@@ -130,6 +139,44 @@ class GwKnowledgeClient:
             max_matches_per_document=max_matches_per_document,
             max_results_per_layer=max_results_per_layer,
         )
+        document = self._request_json("/v1/search", request)
+        return _parse_search_response(document, request)
+
+    def resolve_task_owner(
+        self,
+        *,
+        candidate_id: str,
+        source_revision: str,
+        legacy_task_id: int,
+        legacy_digest: str,
+    ) -> TaskOwnerEquivalence:
+        """Request one identity-bound, read-only owner equivalence."""
+        try:
+            request = owner_equivalence_request(
+                alias=self._config.alias,
+                candidate_id=candidate_id,
+                source_revision=source_revision,
+                legacy_task_id=legacy_task_id,
+                legacy_digest=legacy_digest,
+            )
+            payload = owner_equivalence_request_document(request)
+        except OwnerEquivalenceContractError:
+            raise KnowledgeRequestError(
+                "owner equivalence request is invalid"
+            ) from None
+        document = self._request_json(
+            "/v1/task-owner-equivalence", payload
+        )
+        try:
+            return parse_owner_equivalence_response(document, request)
+        except OwnerEquivalenceContractError:
+            raise KnowledgeResponseError(
+                "GW owner equivalence response is invalid"
+            ) from None
+
+    def _request_json(
+        self, route: str, request: Mapping[str, Any]
+    ) -> object:
         payload = (json.dumps(
             request,
             ensure_ascii=True,
@@ -137,7 +184,7 @@ class GwKnowledgeClient:
             sort_keys=True,
         ) + "\n").encode("utf-8")
         message = urllib.request.Request(
-            self._config.endpoint + "/v1/search",
+            self._config.endpoint + route,
             data=payload,
             method="POST",
             headers={
@@ -184,10 +231,9 @@ class GwKnowledgeClient:
                 "GW knowledge response exceeds its size limit"
             )
         try:
-            document = json.loads(raw, object_pairs_hook=_strict_object)
+            return json.loads(raw, object_pairs_hook=_strict_object)
         except (UnicodeDecodeError, ValueError, TypeError):
             raise KnowledgeResponseError("GW knowledge response is invalid") from None
-        return _parse_search_response(document, request)
 
 
 def _endpoint(value: object) -> str:
