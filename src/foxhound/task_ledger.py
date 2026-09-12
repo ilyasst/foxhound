@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 from collections import defaultdict
 from contextlib import closing
@@ -48,6 +49,20 @@ class BootstrapRefusal(StrEnum):
     INVALID_STATE = "invalid_state"
 
 
+class NativeIntakeDisposition(StrEnum):
+    APPLIED = "applied"
+    UNCHANGED = "unchanged"
+    REFUSED = "refused"
+
+
+class NativeIntakeRefusal(StrEnum):
+    INVALID_ARGUMENT = "invalid_argument"
+    NOT_ACTIVATED = "not_activated"
+    CURSOR_MISMATCH = "cursor_mismatch"
+    UNRECONCILED_PREFIX = "unreconciled_prefix"
+    STATE_CONFLICT = "state_conflict"
+
+
 class TaskStatus(StrEnum):
     OPEN = "open"
     DONE = "done"
@@ -64,6 +79,11 @@ class TransitionRefusal(StrEnum):
     INVALID_STATE = "invalid_state"
     NOT_FOUND = "not_found"
     STALE_VERSION = "stale_version"
+
+
+_STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
+_MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
+_MAX_NATIVE_INTAKE_LIMIT = 500
 
 
 @dataclass(frozen=True)
@@ -87,6 +107,37 @@ class BootstrapResult:
     @property
     def accepted(self) -> bool:
         return self.disposition is not BootstrapDisposition.REFUSED
+
+
+@dataclass(frozen=True)
+class NativeIntakeActivationResult:
+    """Content-free result for the one-way native-intake boundary."""
+
+    disposition: NativeIntakeDisposition
+    activation_cursor: int | None = None
+    refusal: NativeIntakeRefusal | None = None
+
+    @property
+    def accepted(self) -> bool:
+        return self.disposition is not NativeIntakeDisposition.REFUSED
+
+
+@dataclass(frozen=True)
+class NativeIntakeResult:
+    """Aggregate-only result for one ordered native-intake pass."""
+
+    disposition: NativeIntakeDisposition
+    previous_cursor: int = 0
+    current_cursor: int = 0
+    tasks_created: int = 0
+    tasks_revised: int = 0
+    candidates_unchanged: int = 0
+    remaining: int = 0
+    refusal: NativeIntakeRefusal | None = None
+
+    @property
+    def accepted(self) -> bool:
+        return self.disposition is not NativeIntakeDisposition.REFUSED
 
 
 @dataclass(frozen=True)
@@ -129,6 +180,10 @@ class _BootstrapConflict(ValueError):
     pass
 
 
+class _NativeIntakeConflict(ValueError):
+    pass
+
+
 class TaskLedger:
     """Durable Foxhound task operations over one private inbox database."""
 
@@ -143,6 +198,329 @@ class TaskLedger:
 
     def initialize(self) -> None:
         CandidateInbox(self.database_path, clock=self._clock).initialize()
+
+    def activate_native_intake(
+        self,
+        *,
+        producer: str,
+        stream_id: str,
+        expected_cursor: int,
+    ) -> NativeIntakeActivationResult:
+        """Fix the reconciled historical prefix for native task intake."""
+        if not _valid_native_identity(producer, stream_id, expected_cursor):
+            return NativeIntakeActivationResult(
+                NativeIntakeDisposition.REFUSED,
+                refusal=NativeIntakeRefusal.INVALID_ARGUMENT,
+            )
+        now = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                existing = connection.execute(
+                    "SELECT activation_cursor FROM native_candidate_intakes "
+                    "WHERE producer=? AND stream_id=?",
+                    (producer, stream_id),
+                ).fetchone()
+                if existing is not None:
+                    connection.rollback()
+                    if int(existing["activation_cursor"]) == expected_cursor:
+                        return NativeIntakeActivationResult(
+                            NativeIntakeDisposition.UNCHANGED,
+                            activation_cursor=expected_cursor,
+                        )
+                    return NativeIntakeActivationResult(
+                        NativeIntakeDisposition.REFUSED,
+                        refusal=NativeIntakeRefusal.CURSOR_MISMATCH,
+                    )
+
+                feed = connection.execute(
+                    "SELECT cursor FROM candidate_feed_cursors "
+                    "WHERE producer=? AND stream_id=?",
+                    (producer, stream_id),
+                ).fetchone()
+                current_cursor = 0 if feed is None else int(feed["cursor"])
+                if current_cursor != expected_cursor:
+                    connection.rollback()
+                    return NativeIntakeActivationResult(
+                        NativeIntakeDisposition.REFUSED,
+                        refusal=NativeIntakeRefusal.CURSOR_MISMATCH,
+                    )
+
+                unreconciled = connection.execute(
+                    "SELECT COUNT(*) AS total FROM candidate_inbox AS c "
+                    "WHERE c.source_system=? AND NOT EXISTS("
+                    " SELECT 1 FROM task_candidate_bindings AS b "
+                    " WHERE b.candidate_id=c.candidate_id "
+                    " AND b.source_revision=c.source_revision"
+                    ") AND NOT EXISTS("
+                    " SELECT 1 FROM task_shadow_observations AS o "
+                    " WHERE o.candidate_id=c.candidate_id "
+                    " AND o.source_revision=c.source_revision "
+                    " AND o.comparison='refused'"
+                    ")",
+                    (producer,),
+                ).fetchone()
+                if int(unreconciled["total"]):
+                    connection.rollback()
+                    return NativeIntakeActivationResult(
+                        NativeIntakeDisposition.REFUSED,
+                        refusal=NativeIntakeRefusal.UNRECONCILED_PREFIX,
+                    )
+
+                connection.execute(
+                    "INSERT INTO native_candidate_intakes("
+                    "producer,stream_id,activation_cursor,cursor,"
+                    "activated_at,updated_at) VALUES(?,?,?,?,?,?)",
+                    (
+                        producer,
+                        stream_id,
+                        expected_cursor,
+                        expected_cursor,
+                        now,
+                        now,
+                    ),
+                )
+                self._native_intake_event(
+                    connection,
+                    producer=producer,
+                    stream_id=stream_id,
+                    kind="activated",
+                    from_cursor=expected_cursor,
+                    to_cursor=expected_cursor,
+                    tasks_created=0,
+                    tasks_revised=0,
+                    candidates_unchanged=0,
+                    now=now,
+                )
+                connection.commit()
+                return NativeIntakeActivationResult(
+                    NativeIntakeDisposition.APPLIED,
+                    activation_cursor=expected_cursor,
+                )
+            except Exception:
+                connection.rollback()
+                raise
+
+    def accept_native_candidates(
+        self,
+        *,
+        producer: str,
+        stream_id: str,
+        limit: int = 100,
+    ) -> NativeIntakeResult:
+        """Accept a bounded contiguous suffix after native intake activation."""
+        if (
+            not _valid_native_identity(producer, stream_id, 0)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= _MAX_NATIVE_INTAKE_LIMIT
+        ):
+            return NativeIntakeResult(
+                NativeIntakeDisposition.REFUSED,
+                refusal=NativeIntakeRefusal.INVALID_ARGUMENT,
+            )
+        now = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                intake = connection.execute(
+                    "SELECT cursor FROM native_candidate_intakes "
+                    "WHERE producer=? AND stream_id=?",
+                    (producer, stream_id),
+                ).fetchone()
+                if intake is None:
+                    connection.rollback()
+                    return NativeIntakeResult(
+                        NativeIntakeDisposition.REFUSED,
+                        refusal=NativeIntakeRefusal.NOT_ACTIVATED,
+                    )
+                previous_cursor = int(intake["cursor"])
+                feed = connection.execute(
+                    "SELECT cursor FROM candidate_feed_cursors "
+                    "WHERE producer=? AND stream_id=?",
+                    (producer, stream_id),
+                ).fetchone()
+                feed_cursor = 0 if feed is None else int(feed["cursor"])
+                if feed_cursor < previous_cursor:
+                    raise _NativeIntakeConflict
+
+                rows = connection.execute(
+                    "SELECT i.sequence,i.candidate_id,i.source_revision,"
+                    "h.payload_json FROM candidate_feed_items AS i "
+                    "JOIN candidate_revision_history AS h "
+                    "ON h.candidate_id=i.candidate_id "
+                    "AND h.source_revision=i.source_revision "
+                    "WHERE i.producer=? AND i.stream_id=? "
+                    "AND i.sequence>? AND i.sequence<=? "
+                    "ORDER BY i.sequence LIMIT ?",
+                    (
+                        producer,
+                        stream_id,
+                        previous_cursor,
+                        feed_cursor,
+                        limit,
+                    ),
+                ).fetchall()
+                if not rows:
+                    if feed_cursor != previous_cursor:
+                        raise _NativeIntakeConflict
+                    connection.rollback()
+                    return NativeIntakeResult(
+                        NativeIntakeDisposition.UNCHANGED,
+                        previous_cursor=previous_cursor,
+                        current_cursor=previous_cursor,
+                    )
+
+                expected_sequence = previous_cursor + 1
+                tasks_created = tasks_revised = candidates_unchanged = 0
+                for row in rows:
+                    if int(row["sequence"]) != expected_sequence:
+                        raise _NativeIntakeConflict
+                    expected_sequence += 1
+                    try:
+                        candidate = parse_task_candidate(
+                            json.loads(row["payload_json"])
+                        )
+                    except (json.JSONDecodeError, TypeError, ContractError) as exc:
+                        raise _NativeIntakeConflict from exc
+                    if (
+                        candidate.source.system != producer
+                        or candidate.candidate_id != row["candidate_id"]
+                        or candidate.source.revision != row["source_revision"]
+                    ):
+                        raise _NativeIntakeConflict
+
+                    producer_decision = connection.execute(
+                        "SELECT 1 FROM task_shadow_observations "
+                        "WHERE candidate_id=? AND source_revision=?",
+                        (
+                            candidate.candidate_id,
+                            candidate.source.revision,
+                        ),
+                    ).fetchone()
+                    if producer_decision is not None:
+                        raise _NativeIntakeConflict
+
+                    binding = connection.execute(
+                        "SELECT source_revision,task_id,relation "
+                        "FROM task_candidate_bindings WHERE candidate_id=?",
+                        (candidate.candidate_id,),
+                    ).fetchone()
+                    if binding is None:
+                        task_id = self._insert_task(
+                            connection, candidate, candidate.task.owner, now
+                        )
+                        connection.execute(
+                            "INSERT INTO task_candidate_bindings("
+                            "candidate_id,source_revision,task_id,relation,"
+                            "decided_at) VALUES(?,?,?,'accepted',?)",
+                            (
+                                candidate.candidate_id,
+                                candidate.source.revision,
+                                task_id,
+                                now,
+                            ),
+                        )
+                        tasks_created += 1
+                        continue
+
+                    if binding["source_revision"] == candidate.source.revision:
+                        candidates_unchanged += 1
+                        continue
+                    if binding["relation"] != "accepted":
+                        raise _NativeIntakeConflict
+                    task = connection.execute(
+                        "SELECT status,version FROM tasks WHERE id=?",
+                        (int(binding["task_id"]),),
+                    ).fetchone()
+                    if task is None or task["status"] != TaskStatus.OPEN:
+                        raise _NativeIntakeConflict
+                    version = int(task["version"]) + 1
+                    connection.execute(
+                        "UPDATE tasks SET text=?,owner=?,due=?,version=?,"
+                        "updated_at=? WHERE id=?",
+                        (
+                            candidate.task.text,
+                            candidate.task.owner,
+                            candidate.task.due,
+                            version,
+                            now,
+                            int(binding["task_id"]),
+                        ),
+                    )
+                    connection.execute(
+                        "UPDATE task_candidate_bindings SET source_revision=?,"
+                        "decided_at=? WHERE candidate_id=?",
+                        (
+                            candidate.source.revision,
+                            now,
+                            candidate.candidate_id,
+                        ),
+                    )
+                    connection.execute(
+                        "INSERT INTO task_events("
+                        "task_id,kind,task_version,candidate_id,source_revision,"
+                        "from_status,to_status,occurred_at) "
+                        "VALUES(?,'candidate_revised',?,?,?,?,?,?)",
+                        (
+                            int(binding["task_id"]),
+                            version,
+                            candidate.candidate_id,
+                            candidate.source.revision,
+                            None,
+                            None,
+                            now,
+                        ),
+                    )
+                    tasks_revised += 1
+
+                current_cursor = int(rows[-1]["sequence"])
+                remaining = feed_cursor - current_cursor
+                updated = connection.execute(
+                    "UPDATE native_candidate_intakes SET cursor=?,updated_at=? "
+                    "WHERE producer=? AND stream_id=? AND cursor=?",
+                    (
+                        current_cursor,
+                        now,
+                        producer,
+                        stream_id,
+                        previous_cursor,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise _NativeIntakeConflict
+                self._native_intake_event(
+                    connection,
+                    producer=producer,
+                    stream_id=stream_id,
+                    kind="advanced",
+                    from_cursor=previous_cursor,
+                    to_cursor=current_cursor,
+                    tasks_created=tasks_created,
+                    tasks_revised=tasks_revised,
+                    candidates_unchanged=candidates_unchanged,
+                    now=now,
+                )
+                connection.commit()
+                return NativeIntakeResult(
+                    NativeIntakeDisposition.APPLIED,
+                    previous_cursor=previous_cursor,
+                    current_cursor=current_cursor,
+                    tasks_created=tasks_created,
+                    tasks_revised=tasks_revised,
+                    candidates_unchanged=candidates_unchanged,
+                    remaining=remaining,
+                )
+            except _NativeIntakeConflict:
+                connection.rollback()
+                return NativeIntakeResult(
+                    NativeIntakeDisposition.REFUSED,
+                    refusal=NativeIntakeRefusal.STATE_CONFLICT,
+                )
+            except Exception:
+                connection.rollback()
+                raise
 
     def bootstrap_from_shadow(
         self,
@@ -162,6 +540,16 @@ class TaskLedger:
                 BootstrapDisposition.REFUSED,
                 refusal=BootstrapRefusal.INVALID_STATE,
             )
+        with closing(self._connect()) as connection:
+            native_intake = connection.execute(
+                "SELECT 1 FROM native_candidate_intakes WHERE producer=? LIMIT 1",
+                (producer,),
+            ).fetchone()
+        if native_intake is not None:
+            return BootstrapResult(
+                BootstrapDisposition.REFUSED,
+                refusal=BootstrapRefusal.INVALID_STATE,
+            )
         snapshot, resolutions = self._resolve_owner_equivalences(
             owner_resolver
         )
@@ -170,6 +558,17 @@ class TaskLedger:
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("BEGIN IMMEDIATE")
             try:
+                native_intake = connection.execute(
+                    "SELECT 1 FROM native_candidate_intakes "
+                    "WHERE producer=? LIMIT 1",
+                    (producer,),
+                ).fetchone()
+                if native_intake is not None:
+                    connection.rollback()
+                    return BootstrapResult(
+                        BootstrapDisposition.REFUSED,
+                        refusal=BootstrapRefusal.INVALID_STATE,
+                    )
                 rows = self._bootstrap_rows(connection)
                 if self._row_snapshot(rows) != snapshot:
                     raise _BootstrapConflict
@@ -596,6 +995,38 @@ class TaskLedger:
             return int(row["total"])
 
     @staticmethod
+    def _native_intake_event(
+        connection: sqlite3.Connection,
+        *,
+        producer: str,
+        stream_id: str,
+        kind: str,
+        from_cursor: int,
+        to_cursor: int,
+        tasks_created: int,
+        tasks_revised: int,
+        candidates_unchanged: int,
+        now: str,
+    ) -> None:
+        connection.execute(
+            "INSERT INTO native_candidate_intake_events("
+            "producer,stream_id,kind,from_cursor,to_cursor,tasks_created,"
+            "tasks_revised,candidates_unchanged,occurred_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                producer,
+                stream_id,
+                kind,
+                from_cursor,
+                to_cursor,
+                tasks_created,
+                tasks_revised,
+                candidates_unchanged,
+                now,
+            ),
+        )
+
+    @staticmethod
     def _insert_task(
         connection: sqlite3.Connection,
         candidate: TaskCandidate,
@@ -665,6 +1096,19 @@ def _task_record(row: sqlite3.Row) -> TaskRecord:
         )
     except (IndexError, KeyError, TypeError, ValueError) as exc:
         raise InboxError("task ledger contains invalid state") from exc
+
+
+def _valid_native_identity(
+    producer: object, stream_id: object, cursor: object
+) -> bool:
+    return (
+        producer == "gw"
+        and isinstance(stream_id, str)
+        and bool(_STREAM_ID_RE.fullmatch(stream_id))
+        and not isinstance(cursor, bool)
+        and isinstance(cursor, int)
+        and 0 <= cursor <= _MAX_SQLITE_INTEGER
+    )
 
 
 def _valid_effective_owner(value: object) -> bool:

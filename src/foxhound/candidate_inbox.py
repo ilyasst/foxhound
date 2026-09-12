@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -73,6 +73,14 @@ _SCHEMA_COLUMNS = {
         "from_cursor",
         "to_cursor",
         "page_digest",
+        "imported_at",
+    ),
+    "candidate_feed_items": (
+        "producer",
+        "stream_id",
+        "sequence",
+        "candidate_id",
+        "source_revision",
         "imported_at",
     ),
     "candidate_revision_history": (
@@ -141,6 +149,26 @@ _SCHEMA_COLUMNS = {
         "source_revision",
         "from_status",
         "to_status",
+        "occurred_at",
+    ),
+    "native_candidate_intakes": (
+        "producer",
+        "stream_id",
+        "activation_cursor",
+        "cursor",
+        "activated_at",
+        "updated_at",
+    ),
+    "native_candidate_intake_events": (
+        "sequence",
+        "producer",
+        "stream_id",
+        "kind",
+        "from_cursor",
+        "to_cursor",
+        "tasks_created",
+        "tasks_revised",
+        "candidates_unchanged",
         "occurred_at",
     ),
     "shadow_import_cycles": (
@@ -295,6 +323,12 @@ _SCHEMA_OBJECTS = {
     "execution_review_cards_one_active": "index",
     "execution_review_card_events_no_update": "trigger",
     "execution_review_card_events_no_delete": "trigger",
+    "candidate_feed_items_no_update": "trigger",
+    "candidate_feed_items_no_delete": "trigger",
+    "native_candidate_intakes_identity_immutable": "trigger",
+    "native_candidate_intakes_no_delete": "trigger",
+    "native_candidate_intake_events_no_update": "trigger",
+    "native_candidate_intake_events_no_delete": "trigger",
 }
 
 _SCHEMA_V1 = """
@@ -845,6 +879,144 @@ END;
 """,
 )
 
+_SCHEMA_V10 = (
+    """
+CREATE TABLE candidate_feed_items (
+    producer        TEXT NOT NULL,
+    stream_id       TEXT NOT NULL,
+    sequence        INTEGER NOT NULL CHECK(sequence > 0),
+    candidate_id    TEXT NOT NULL,
+    source_revision TEXT NOT NULL,
+    imported_at     TEXT NOT NULL,
+    PRIMARY KEY(producer, stream_id, sequence),
+    FOREIGN KEY(candidate_id, source_revision)
+        REFERENCES candidate_revision_history(candidate_id, source_revision)
+);
+""",
+    """
+CREATE TRIGGER candidate_feed_items_no_update
+BEFORE UPDATE ON candidate_feed_items
+BEGIN
+    SELECT RAISE(ABORT, 'candidate feed items are append-only');
+END;
+""",
+    """
+CREATE TRIGGER candidate_feed_items_no_delete
+BEFORE DELETE ON candidate_feed_items
+BEGIN
+    SELECT RAISE(ABORT, 'candidate feed items are append-only');
+END;
+""",
+    """
+CREATE TABLE native_candidate_intakes (
+    producer          TEXT NOT NULL,
+    stream_id         TEXT NOT NULL,
+    activation_cursor INTEGER NOT NULL CHECK(activation_cursor >= 0),
+    cursor            INTEGER NOT NULL CHECK(cursor >= activation_cursor),
+    activated_at      TEXT NOT NULL,
+    updated_at        TEXT NOT NULL,
+    PRIMARY KEY(producer, stream_id)
+);
+""",
+    """
+CREATE TRIGGER native_candidate_intakes_identity_immutable
+BEFORE UPDATE OF producer,stream_id,activation_cursor,activated_at
+ON native_candidate_intakes
+BEGIN
+    SELECT RAISE(ABORT, 'native candidate intake activation is immutable');
+END;
+""",
+    """
+CREATE TRIGGER native_candidate_intakes_no_delete
+BEFORE DELETE ON native_candidate_intakes
+BEGIN
+    SELECT RAISE(ABORT, 'native candidate intake activation is permanent');
+END;
+""",
+    """
+CREATE TABLE native_candidate_intake_events (
+    sequence             INTEGER PRIMARY KEY AUTOINCREMENT,
+    producer             TEXT NOT NULL,
+    stream_id            TEXT NOT NULL,
+    kind                 TEXT NOT NULL CHECK(kind IN ('activated','advanced')),
+    from_cursor          INTEGER NOT NULL CHECK(from_cursor >= 0),
+    to_cursor            INTEGER NOT NULL CHECK(to_cursor >= from_cursor),
+    tasks_created        INTEGER NOT NULL CHECK(tasks_created >= 0),
+    tasks_revised        INTEGER NOT NULL CHECK(tasks_revised >= 0),
+    candidates_unchanged INTEGER NOT NULL CHECK(candidates_unchanged >= 0),
+    occurred_at          TEXT NOT NULL,
+    FOREIGN KEY(producer, stream_id)
+        REFERENCES native_candidate_intakes(producer, stream_id)
+);
+""",
+    """
+CREATE TRIGGER native_candidate_intake_events_no_update
+BEFORE UPDATE ON native_candidate_intake_events
+BEGIN
+    SELECT RAISE(ABORT, 'native candidate intake events are append-only');
+END;
+""",
+    """
+CREATE TRIGGER native_candidate_intake_events_no_delete
+BEFORE DELETE ON native_candidate_intake_events
+BEGIN
+    SELECT RAISE(ABORT, 'native candidate intake events are append-only');
+END;
+""",
+    """
+DROP TRIGGER task_events_no_update;
+""",
+    """
+DROP TRIGGER task_events_no_delete;
+""",
+    """
+ALTER TABLE task_events RENAME TO task_events_v9;
+""",
+    """
+CREATE TABLE task_events (
+    sequence        INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id         INTEGER NOT NULL,
+    kind            TEXT NOT NULL CHECK(kind IN (
+                        'created','candidate_folded','candidate_revised',
+                        'status_changed'
+                    )),
+    task_version    INTEGER NOT NULL CHECK(task_version >= 1),
+    candidate_id    TEXT,
+    source_revision TEXT,
+    from_status     TEXT,
+    to_status       TEXT,
+    occurred_at     TEXT NOT NULL,
+    FOREIGN KEY(task_id) REFERENCES tasks(id)
+);
+""",
+    """
+INSERT INTO task_events(
+    sequence,task_id,kind,task_version,candidate_id,source_revision,
+    from_status,to_status,occurred_at
+)
+SELECT sequence,task_id,kind,task_version,candidate_id,source_revision,
+       from_status,to_status,occurred_at
+FROM task_events_v9;
+""",
+    """
+DROP TABLE task_events_v9;
+""",
+    """
+CREATE TRIGGER task_events_no_update
+BEFORE UPDATE ON task_events
+BEGIN
+    SELECT RAISE(ABORT, 'task events are append-only');
+END;
+""",
+    """
+CREATE TRIGGER task_events_no_delete
+BEFORE DELETE ON task_events
+BEGIN
+    SELECT RAISE(ABORT, 'task events are append-only');
+END;
+""",
+)
+
 
 class InboxError(RuntimeError):
     """The inbox cannot safely initialize or read its state."""
@@ -1198,6 +1370,43 @@ class CandidateInbox:
                 except Exception:
                     connection.rollback()
                     raise
+                version = 9
+            if version == 9:
+                self._require_tables(
+                    connection,
+                    (
+                        "candidate_inbox",
+                        "candidate_feed_cursors",
+                        "candidate_feed_receipts",
+                        "candidate_revision_history",
+                        "task_shadow_observations",
+                        "task_shadow_feed_cursors",
+                        "task_shadow_feed_receipts",
+                        "tasks",
+                        "task_candidate_bindings",
+                        "task_bootstrap_correlations",
+                        "task_events",
+                        "shadow_import_cycles",
+                        "task_owner_equivalences",
+                        "task_review_cards",
+                        "task_review_card_events",
+                        "task_execution_workflows",
+                        "task_execution_results",
+                        "task_execution_events",
+                        "execution_review_cards",
+                        "execution_review_card_events",
+                    ),
+                )
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V10:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 10")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:
@@ -1298,6 +1507,19 @@ class CandidateInbox:
                             refusal=FeedImportRefusal.CANDIDATE_CONFLICT,
                         )
                     counts[result.disposition] += 1
+                    connection.execute(
+                        "INSERT INTO candidate_feed_items("
+                        "producer,stream_id,sequence,candidate_id,"
+                        "source_revision,imported_at) VALUES(?,?,?,?,?,?)",
+                        (
+                            feed.producer,
+                            feed.stream_id,
+                            item.sequence,
+                            item.candidate.candidate_id,
+                            item.candidate.source.revision,
+                            imported_at,
+                        ),
+                    )
 
                 connection.execute(
                     "INSERT INTO candidate_feed_receipts("
