@@ -51,6 +51,19 @@ from .task_cards import (
     parse_task_review_callback,
     render_task_review_card,
 )
+from .task_execution import (
+    ExecutionClaim,
+    ExecutionOutcome,
+    ExecutionReadiness,
+    ExecutionResultEnvelope,
+    ExecutionWorkflow,
+    TaskExecutionService,
+    WorkflowDisposition,
+    WorkflowOperationResult,
+    WorkflowPhase,
+    WorkflowRefusal,
+    WorkflowStatus,
+)
 
 __version__ = "0.1.0"
 
@@ -98,4 +111,15 @@ __all__ = (
     "TaskReviewCard",
     "parse_task_review_callback",
     "render_task_review_card",
+    "ExecutionClaim",
+    "ExecutionOutcome",
+    "ExecutionReadiness",
+    "ExecutionResultEnvelope",
+    "ExecutionWorkflow",
+    "TaskExecutionService",
+    "WorkflowDisposition",
+    "WorkflowOperationResult",
+    "WorkflowPhase",
+    "WorkflowRefusal",
+    "WorkflowStatus",
 )

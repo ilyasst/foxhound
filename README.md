@@ -115,6 +115,14 @@ no cards. Its aggregate stats route lets a gateway cap on-screen delivery
 without listing private tasks or cards. See
 [ADR 0011](docs/architecture/0011-local-task-card-service.md).
 
+Foxhound now also owns a transport-neutral execution workflow ledger. An
+explicitly scheduled open task stops at a reader start gate, then advances
+through separately approved plan, execution, and external-action phases under
+optimistic versions and digest-fenced expiring claims. Results are bounded,
+private, immutable records; failures cool down and eventually park. The ledger
+does not launch an agent, call GW, render execution cards, or close a task. See
+[ADR 0013](docs/architecture/0013-task-execution-workflows.md).
+
 Run the contract tests with:
 
 ```sh
@@ -145,3 +153,5 @@ See [ADR 0011](docs/architecture/0011-local-task-card-service.md) for the
 authenticated loopback card-gateway boundary.
 See [ADR 0012](docs/architecture/0012-lifecycle-outcome-feed.md) for the
 content-free correlated lifecycle outcome export boundary.
+See [ADR 0013](docs/architecture/0013-task-execution-workflows.md) for durable
+execution scheduling, gates, claims, results, and retry state.
