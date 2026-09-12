@@ -165,6 +165,7 @@ def agent_prompt(worker_command: str = "foxhound-task-worker") -> str:
         "In `plan`, research and prepare a reviewable plan. Do not cause an external effect.",
         "In `execute`, perform only approved reversible work and prepare any external action for separate review. Do not send, publish, deploy, push, purchase, or contact anyone.",
         "In `external_action`, perform only the explicitly approved external action represented by the current phase, then report what happened.",
+        "If workflow.reader_instruction is present, it is the reader's exact request for this next supervised pass. Address it without treating it as approval for an external effect.",
         "Task lifecycle is separate. A completed execution result does not authorize you to close or drop the task.",
         "# Result contract",
         "Create exactly one owner-only file named `result-<32 lowercase hex characters>.json` in the starting directory. Use umask 077.",
