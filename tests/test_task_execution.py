@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+"""Synthetic tests for Foxhound-owned task execution workflow state."""
+
+from __future__ import annotations
+
+import sqlite3
+import tempfile
+import unittest
+from contextlib import closing
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from foxhound.candidate_inbox import CandidateInbox, SCHEMA_VERSION
+from foxhound.task_execution import (
+    ExecutionOutcome,
+    ExecutionResultEnvelope,
+    TaskExecutionService,
+    WorkflowDisposition,
+    WorkflowPhase,
+    WorkflowRefusal,
+    WorkflowStatus,
+)
+from foxhound.task_ledger import TaskLedger
+
+
+TOKEN = "execution-claim-token-000000000000000000000000"
+OTHER_TOKEN = "different-claim-token-000000000000000000000"
+
+
+class MutableClock:
+    def __init__(self) -> None:
+        self.value = datetime(2030, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+
+    def __call__(self) -> datetime:
+        return self.value
+
+    def advance(self, **values) -> None:
+        self.value += timedelta(**values)
+
+
+class TaskExecutionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.root.chmod(0o700)
+        self.database = self.root / "foxhound.sqlite3"
+        self.clock = MutableClock()
+        CandidateInbox(self.database, clock=self.clock).initialize()
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "INSERT INTO tasks(id,status,text,owner,due,version,"
+                "created_at,"
+                "updated_at,closed_at) VALUES(1,'open','Synthetic task',"
+                "'Person A',NULL,1,?,?,NULL)",
+                (self._now(), self._now()),
+            )
+            connection.execute(
+                "INSERT INTO task_events(task_id,kind,task_version,"
+                "candidate_id,source_revision,from_status,to_status,"
+                "occurred_at) VALUES(1,'created',1,NULL,NULL,NULL,'open',?)",
+                (self._now(),),
+            )
+            connection.commit()
+        self.service = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: TOKEN,
+            max_attempts=3,
+        )
+
+    def _now(self) -> str:
+        return self.clock().isoformat(timespec="seconds")
+
+    def _schedule_and_start(self):
+        scheduled = self.service.schedule(1, expected_task_version=1)
+        self.assertEqual(scheduled.status, WorkflowStatus.AWAITING_START)
+        started = self.service.start_action(
+            1, expected_version=scheduled.version, action="start"
+        )
+        self.assertEqual(started.status, WorkflowStatus.QUEUED)
+        return started
+
+    def _claim(self):
+        claim = self.service.claim_next(lease_seconds=300)
+        self.assertIsNotNone(claim)
+        return claim
+
+    def _result(
+        self,
+        claim,
+        *,
+        result_id="result-001",
+        outcome=ExecutionOutcome.AWAITING_PLAN,
+    ) -> ExecutionResultEnvelope:
+        return ExecutionResultEnvelope(
+            result_id=result_id,
+            task_id=claim.task_id,
+            task_version=claim.task_version,
+            workflow_version=claim.workflow_version,
+            phase=claim.phase,
+            claim_token=claim.token,
+            outcome=outcome,
+            summary="Synthetic result summary",
+            work_markdown="# Synthetic work\n\nNo private evidence.",
+            questions=("Should Example A proceed?",),
+            external_actions=("Prepare a synthetic draft for review.",),
+            deliverables=("Synthetic deliverable",),
+        )
+
+    def test_schema_seven_migration_is_passive_and_append_only(self):
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute("DROP TRIGGER task_execution_events_no_update")
+            connection.execute("DROP TRIGGER task_execution_events_no_delete")
+            connection.execute("DROP TRIGGER task_execution_results_no_update")
+            connection.execute("DROP TRIGGER task_execution_results_no_delete")
+            connection.execute("DROP INDEX task_execution_workflows_ready")
+            connection.execute("DROP TABLE task_execution_events")
+            connection.execute("DROP TABLE task_execution_results")
+            connection.execute("DROP TABLE task_execution_workflows")
+            connection.execute("PRAGMA user_version = 7")
+            connection.commit()
+
+        CandidateInbox(self.database, clock=self.clock).initialize()
+
+        with closing(sqlite3.connect(self.database)) as connection:
+            self.assertEqual(
+                connection.execute("PRAGMA user_version").fetchone()[0],
+                SCHEMA_VERSION,
+            )
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM task_execution_workflows"
+                ).fetchone()[0],
+                0,
+            )
+
+    def test_schedule_is_explicit_idempotent_and_task_version_fenced(self):
+        scheduled = self.service.schedule(1, expected_task_version=1)
+        self.assertEqual(scheduled.disposition, WorkflowDisposition.APPLIED)
+        self.assertEqual(scheduled.version, 1)
+        self.assertEqual(scheduled.status, WorkflowStatus.AWAITING_START)
+        self.assertEqual(self.service.event_count(), 1)
+
+        replay = self.service.schedule(1, expected_task_version=1)
+        self.assertEqual(replay.disposition, WorkflowDisposition.UNCHANGED)
+        self.assertEqual(self.service.event_count(), 1)
+        with closing(sqlite3.connect(self.database)) as connection:
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "UPDATE task_execution_workflows "
+                    "SET claim_token_digest=? WHERE task_id=1",
+                    ("a" * 64,),
+                )
+        stale = self.service.schedule(1, expected_task_version=2)
+        self.assertEqual(stale.refusal, WorkflowRefusal.STALE_TASK)
+        missing = self.service.schedule(99, expected_task_version=1)
+        self.assertEqual(missing.refusal, WorkflowRefusal.NOT_FOUND)
+
+        closed = TaskLedger(self.database, clock=self.clock).transition(
+            1, expected_version=1, action="done"
+        )
+        self.assertTrue(closed.accepted)
+        refused = self.service.schedule(1, expected_task_version=2)
+        self.assertEqual(refused.refusal, WorkflowRefusal.INVALID_STATE)
+
+    def test_start_gate_snooze_cancel_and_stale_taps_are_fenced(self):
+        scheduled = self.service.schedule(1, expected_task_version=1)
+        snoozed = self.service.start_action(
+            1, expected_version=scheduled.version, action="snooze"
+        )
+        self.assertEqual(snoozed.status, WorkflowStatus.SNOOZED)
+        self.assertIsNotNone(snoozed.wake_at)
+        early = self.service.start_action(
+            1, expected_version=snoozed.version, action="start"
+        )
+        self.assertEqual(early.refusal, WorkflowRefusal.INVALID_STATE)
+        self.clock.advance(days=1)
+        started = self.service.start_action(
+            1, expected_version=snoozed.version, action="start"
+        )
+        self.assertEqual(started.status, WorkflowStatus.QUEUED)
+        stale = self.service.start_action(
+            1, expected_version=snoozed.version, action="cancel"
+        )
+        self.assertEqual(stale.refusal, WorkflowRefusal.STALE_WORKFLOW)
+
+        claim = self._claim()
+        released = self.service.release(
+            1,
+            expected_version=claim.workflow_version,
+            claim_token=claim.token,
+        )
+        self.assertEqual(released.status, WorkflowStatus.QUEUED)
+
+    def test_claim_renew_release_and_capability_fences(self):
+        self._schedule_and_start()
+        claim = self._claim()
+        self.assertEqual(claim.phase, WorkflowPhase.PLAN)
+        self.assertEqual(claim.text, "Synthetic task")
+        self.assertIsNone(self.service.claim_next())
+
+        wrong = self.service.renew(
+            1,
+            expected_version=claim.workflow_version,
+            claim_token=OTHER_TOKEN,
+        )
+        self.assertEqual(wrong.refusal, WorkflowRefusal.CLAIM_MISMATCH)
+        self.clock.advance(seconds=30)
+        renewed = self.service.renew(
+            1,
+            expected_version=claim.workflow_version,
+            claim_token=claim.token,
+        )
+        self.assertEqual(renewed.status, WorkflowStatus.RUNNING)
+        self.assertEqual(renewed.version, claim.workflow_version)
+        released = self.service.release(
+            1,
+            expected_version=claim.workflow_version,
+            claim_token=claim.token,
+        )
+        self.assertEqual(released.status, WorkflowStatus.QUEUED)
+        repeated = self.service.release(
+            1,
+            expected_version=claim.workflow_version,
+            claim_token=claim.token,
+        )
+        self.assertEqual(repeated.refusal, WorkflowRefusal.STALE_WORKFLOW)
+
+    def test_cancel_is_fenced_and_terminal_workflow_can_be_rescheduled(self):
+        scheduled = self.service.schedule(1, expected_task_version=1)
+        cancelled = self.service.start_action(
+            1, expected_version=scheduled.version, action="cancel"
+        )
+        self.assertEqual(cancelled.status, WorkflowStatus.CANCELLED)
+        stale = self.service.start_action(
+            1, expected_version=scheduled.version, action="start"
+        )
+        self.assertEqual(stale.refusal, WorkflowRefusal.STALE_WORKFLOW)
+
+        rescheduled = self.service.schedule(1, expected_task_version=1)
+
+        self.assertEqual(rescheduled.status, WorkflowStatus.AWAITING_START)
+        self.assertGreater(rescheduled.version, cancelled.version)
+        self.assertIsNone(self.service.get(1).completed_at)
+
+    def test_result_progression_is_strict_private_and_idempotent(self):
+        self._schedule_and_start()
+        plan_claim = self._claim()
+        recorded = self.service.record_result(self._result(plan_claim))
+        self.assertEqual(recorded.status, WorkflowStatus.AWAITING_REVIEW)
+        self.assertEqual(recorded.phase, WorkflowPhase.PLAN)
+        event_count = self.service.event_count()
+        replay = self.service.record_result(self._result(plan_claim))
+        self.assertEqual(replay.disposition, WorkflowDisposition.UNCHANGED)
+        self.assertEqual(self.service.event_count(), event_count)
+        conflict = self.service.record_result(ExecutionResultEnvelope(
+            **{
+                **self._result(plan_claim).__dict__,
+                "summary": "Changed synthetic summary",
+            }
+        ))
+        self.assertEqual(conflict.refusal, WorkflowRefusal.RESULT_CONFLICT)
+
+        approved = self.service.review_action(
+            1, expected_version=recorded.version, action="approve"
+        )
+        self.assertEqual(approved.phase, WorkflowPhase.EXECUTE)
+        execute_claim = self._claim()
+        waiting = self.service.record_result(self._result(
+            execute_claim,
+            result_id="result-002",
+            outcome=ExecutionOutcome.AWAITING_EXTERNAL,
+        ))
+        self.assertEqual(waiting.status, WorkflowStatus.AWAITING_REVIEW)
+        external = self.service.review_action(
+            1, expected_version=waiting.version, action="approve"
+        )
+        self.assertEqual(external.phase, WorkflowPhase.EXTERNAL_ACTION)
+        external_claim = self._claim()
+        completed = self.service.record_result(self._result(
+            external_claim,
+            result_id="result-003",
+            outcome=ExecutionOutcome.COMPLETED,
+        ))
+        self.assertEqual(completed.status, WorkflowStatus.COMPLETED)
+        self.assertEqual(self.service.result_count(), 3)
+        task = TaskLedger(self.database, clock=self.clock).get(1)
+        self.assertEqual(task.status, "open")
+        self.assertEqual(task.version, 1)
+
+        with closing(sqlite3.connect(self.database)) as connection:
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "UPDATE task_execution_results SET summary='changed'"
+                )
+            connection.rollback()
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute("DELETE FROM task_execution_events")
+
+    def test_invalid_result_cannot_change_a_running_claim(self):
+        self._schedule_and_start()
+        claim = self._claim()
+        invalid_phase = self.service.record_result(self._result(
+            claim,
+            outcome=ExecutionOutcome.AWAITING_EXTERNAL,
+        ))
+        self.assertEqual(
+            invalid_phase.refusal, WorkflowRefusal.INVALID_ARGUMENT
+        )
+        oversized = self._result(claim)
+        oversized = ExecutionResultEnvelope(
+            **{**oversized.__dict__, "summary": "x" * 1201}
+        )
+        refused = self.service.record_result(oversized)
+        self.assertEqual(refused.refusal, WorkflowRefusal.INVALID_ARGUMENT)
+        self.assertEqual(self.service.get(1).status, WorkflowStatus.RUNNING)
+        self.assertEqual(self.service.result_count(), 0)
+
+    def test_failures_back_off_expire_park_and_retry(self):
+        self._schedule_and_start()
+        claim = self._claim()
+        first = self.service.fail(
+            1,
+            expected_version=claim.workflow_version,
+            claim_token=claim.token,
+            reason="process_exit",
+        )
+        self.assertEqual(first.status, WorkflowStatus.QUEUED)
+        self.assertIsNotNone(first.next_attempt_at)
+        self.assertEqual(self.service.readiness().cooling, 1)
+        self.clock.advance(seconds=60)
+
+        self._claim()
+        self.clock.advance(seconds=301)
+        third_claim = self.service.claim_next()
+        self.assertIsNone(third_claim)
+        state = self.service.get(1)
+        self.assertEqual(state.failure_count, 2)
+        self.assertEqual(state.last_failure_reason, "claim_expired")
+        self.assertEqual(state.status, WorkflowStatus.QUEUED)
+        self.clock.advance(seconds=120)
+
+        final_claim = self._claim()
+        parked = self.service.fail(
+            1,
+            expected_version=final_claim.workflow_version,
+            claim_token=final_claim.token,
+            reason="timeout",
+        )
+        self.assertEqual(parked.status, WorkflowStatus.PARKED)
+        health = self.service.readiness()
+        self.assertEqual((health.parked, health.running), (1, 0))
+        retried = self.service.retry(
+            1, expected_version=parked.version
+        )
+        self.assertEqual(retried.status, WorkflowStatus.QUEUED)
+        self.assertEqual(self.service.get(1).failure_count, 0)
+
+    def test_task_transition_cancels_stale_work_before_claim(self):
+        self._schedule_and_start()
+        transitioned = TaskLedger(self.database, clock=self.clock).transition(
+            1, expected_version=1, action="done"
+        )
+        self.assertTrue(transitioned.accepted)
+
+        self.assertIsNone(self.service.claim_next())
+
+        state = self.service.get(1)
+        self.assertEqual(state.status, WorkflowStatus.CANCELLED)
+        self.assertEqual(state.failure_count, 0)
+        self.assertEqual(self.service.readiness().cancelled, 1)
+
+    def test_task_transition_invalidates_an_active_claim(self):
+        self._schedule_and_start()
+        claim = self._claim()
+        transitioned = TaskLedger(self.database, clock=self.clock).transition(
+            1, expected_version=1, action="done"
+        )
+        self.assertTrue(transitioned.accepted)
+
+        released = self.service.release(
+            1,
+            expected_version=claim.workflow_version,
+            claim_token=claim.token,
+        )
+        failed = self.service.fail(
+            1,
+            expected_version=claim.workflow_version,
+            claim_token=claim.token,
+            reason="process_exit",
+        )
+        self.assertEqual(released.refusal, WorkflowRefusal.STALE_TASK)
+        self.assertEqual(failed.refusal, WorkflowRefusal.STALE_TASK)
+
+        self.assertIsNone(self.service.claim_next())
+        state = self.service.get(1)
+        self.assertEqual(state.status, WorkflowStatus.CANCELLED)
+        self.assertEqual(state.failure_count, 0)
+
+    def test_readiness_is_aggregate_only(self):
+        self.service.schedule(1, expected_task_version=1)
+        health = self.service.readiness()
+        self.assertEqual(health.awaiting_start, 1)
+        self.assertEqual(sum(health.__dict__.values()), 1)
+        self.assertNotIn("Synthetic", repr(health))
+        self.assertNotIn(TOKEN, repr(health))
+
+
+if __name__ == "__main__":
+    unittest.main()

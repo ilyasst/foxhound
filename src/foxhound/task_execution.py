@@ -1,0 +1,1294 @@
+"""Foxhound-owned durable task execution workflow state.
+
+This module owns scheduling, reader gates, fenced worker claims, retry state,
+and private execution results.  It launches no process, performs no network
+request, renders no card, and never changes task lifecycle status.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import secrets
+import sqlite3
+from contextlib import closing
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from enum import StrEnum
+from pathlib import Path
+from typing import Callable, Sequence
+
+from .candidate_inbox import CandidateInbox, InboxError, SCHEMA_VERSION
+from .task_ledger import TaskLedgerError, TaskStatus
+
+
+START_SNOOZE_INTERVAL = timedelta(days=1)
+DEFAULT_LEASE_SECONDS = 300
+MIN_LEASE_SECONDS = 5
+MAX_LEASE_SECONDS = 3_600
+DEFAULT_MAX_ATTEMPTS = 3
+MAX_ATTEMPTS = 20
+RETRY_BASE_SECONDS = 60
+RETRY_MAX_SECONDS = 3_600
+MAX_RESULT_BYTES = 256 * 1024
+MAX_SUMMARY_CHARS = 1_200
+MAX_WORK_MARKDOWN_CHARS = 131_072
+MAX_COLLECTION_ITEMS = 20
+MAX_QUESTION_CHARS = 1_000
+MAX_ACTION_CHARS = 4_000
+MAX_DELIVERABLE_CHARS = 16_000
+
+_RESULT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+FAILURE_REASONS = frozenset({
+    "startup_failed",
+    "process_exit",
+    "timeout",
+    "interrupted",
+    "claim_expired",
+    "lease_failed",
+    "result_invalid",
+})
+
+
+class WorkflowStatus(StrEnum):
+    AWAITING_START = "awaiting_start"
+    SNOOZED = "snoozed"
+    QUEUED = "queued"
+    RUNNING = "running"
+    AWAITING_REVIEW = "awaiting_review"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    PARKED = "parked"
+
+
+class WorkflowPhase(StrEnum):
+    PLAN = "plan"
+    EXECUTE = "execute"
+    EXTERNAL_ACTION = "external_action"
+
+
+class ExecutionOutcome(StrEnum):
+    AWAITING_PLAN = "awaiting_plan"
+    AWAITING_EXTERNAL = "awaiting_external"
+    COMPLETED = "completed"
+    DECLINED = "declined"
+    INELIGIBLE = "ineligible"
+
+
+class WorkflowDisposition(StrEnum):
+    APPLIED = "applied"
+    UNCHANGED = "unchanged"
+    REFUSED = "refused"
+
+
+class WorkflowRefusal(StrEnum):
+    INVALID_ARGUMENT = "invalid_argument"
+    INVALID_ACTION = "invalid_action"
+    INVALID_STATE = "invalid_state"
+    NOT_FOUND = "not_found"
+    STALE_TASK = "stale_task"
+    STALE_WORKFLOW = "stale_workflow"
+    CLAIM_MISMATCH = "claim_mismatch"
+    RESULT_CONFLICT = "result_conflict"
+
+
+@dataclass(frozen=True)
+class ExecutionWorkflow:
+    task_id: int
+    task_version: int
+    status: WorkflowStatus
+    phase: WorkflowPhase
+    version: int
+    due_at: str | None
+    failure_count: int
+    last_failure_reason: str | None
+    last_failure_at: str | None
+    next_attempt_at: str | None
+    parked_at: str | None
+    last_result_id: str | None
+    created_at: str
+    updated_at: str
+    completed_at: str | None
+
+
+@dataclass(frozen=True)
+class ExecutionClaim:
+    task_id: int
+    task_version: int
+    workflow_version: int
+    phase: WorkflowPhase
+    token: str = field(repr=False)
+    expires_at: str = ""
+    text: str = field(default="", repr=False)
+    owner: str | None = field(default=None, repr=False)
+    due: str | None = field(default=None, repr=False)
+
+
+@dataclass(frozen=True)
+class ExecutionResultEnvelope:
+    result_id: str
+    task_id: int
+    task_version: int
+    workflow_version: int
+    phase: str
+    claim_token: str = field(repr=False)
+    outcome: str = ""
+    summary: str = field(default="", repr=False)
+    work_markdown: str = field(default="", repr=False)
+    questions: Sequence[str] = field(default=(), repr=False)
+    external_actions: Sequence[str] = field(default=(), repr=False)
+    deliverables: Sequence[str] = field(default=(), repr=False)
+
+
+@dataclass(frozen=True)
+class WorkflowOperationResult:
+    disposition: WorkflowDisposition
+    task_id: int
+    version: int | None = None
+    status: WorkflowStatus | None = None
+    phase: WorkflowPhase | None = None
+    wake_at: str | None = None
+    next_attempt_at: str | None = None
+    refusal: WorkflowRefusal | None = None
+
+    @property
+    def accepted(self) -> bool:
+        return self.disposition is not WorkflowDisposition.REFUSED
+
+
+@dataclass(frozen=True)
+class ExecutionReadiness:
+    awaiting_start: int
+    snoozed: int
+    ready: int
+    cooling: int
+    running: int
+    expired: int
+    awaiting_review: int
+    parked: int
+    completed: int
+    cancelled: int
+
+
+class TaskExecutionService:
+    """Durable workflow operations over one initialized Foxhound database."""
+
+    def __init__(
+        self,
+        database_path: str | os.PathLike[str],
+        *,
+        clock: Callable[[], datetime] | None = None,
+        token_factory: Callable[[], str] | None = None,
+        max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    ) -> None:
+        if (isinstance(max_attempts, bool)
+                or not isinstance(max_attempts, int)
+                or not 1 <= max_attempts <= MAX_ATTEMPTS):
+            raise ValueError("maximum execution attempts are invalid")
+        self.database_path = Path(database_path)
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._token_factory = token_factory or (
+            lambda: secrets.token_urlsafe(32)
+        )
+        self._max_attempts = max_attempts
+
+    def initialize(self) -> None:
+        CandidateInbox(self.database_path, clock=self._clock).initialize()
+
+    def schedule(
+        self, task_id: int, *, expected_task_version: int
+    ) -> WorkflowOperationResult:
+        if not _valid_identity(task_id, expected_task_version):
+            return _refused(task_id, WorkflowRefusal.INVALID_ARGUMENT)
+        now = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                task = connection.execute(
+                    "SELECT status,version FROM tasks WHERE id=?", (task_id,)
+                ).fetchone()
+                refusal = _task_guard(task, expected_task_version)
+                if refusal is not None:
+                    connection.rollback()
+                    return _refused(task_id, refusal)
+                row = connection.execute(
+                    "SELECT * FROM task_execution_workflows WHERE task_id=?",
+                    (task_id,),
+                ).fetchone()
+                if (row is not None
+                        and int(row["task_version"]) == expected_task_version
+                        and row["status"] not in {
+                            WorkflowStatus.COMPLETED,
+                            WorkflowStatus.CANCELLED,
+                            WorkflowStatus.PARKED,
+                        }):
+                    connection.rollback()
+                    return _operation(row, WorkflowDisposition.UNCHANGED)
+                if row is None:
+                    version = 1
+                    connection.execute(
+                        "INSERT INTO task_execution_workflows("
+                        "task_id,task_version,status,phase,version,due_at,"
+                        "failure_count,created_at,updated_at) "
+                        "VALUES(?,?,'awaiting_start','plan',?,NULL,0,?,?)",
+                        (task_id, expected_task_version, version, now, now),
+                    )
+                else:
+                    version = int(row["version"]) + 1
+                    connection.execute(
+                        "UPDATE task_execution_workflows SET task_version=?,"
+                        "status='awaiting_start',phase='plan',version=?,"
+                        "due_at=NULL,claim_token_digest=NULL,claimed_at=NULL,"
+                        "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
+                        "failure_count=0,last_failure_reason=NULL,"
+                        "last_failure_at=NULL,next_attempt_at=NULL,"
+                        "parked_at=NULL,last_result_id=NULL,updated_at=?,"
+                        "completed_at=NULL WHERE task_id=?",
+                        (expected_task_version, version, now, task_id),
+                    )
+                self._event(
+                    connection, task_id, "scheduled", version,
+                    expected_task_version, WorkflowPhase.PLAN,
+                    WorkflowStatus.AWAITING_START, now,
+                )
+                connection.commit()
+                return WorkflowOperationResult(
+                    WorkflowDisposition.APPLIED,
+                    task_id,
+                    version,
+                    WorkflowStatus.AWAITING_START,
+                    WorkflowPhase.PLAN,
+                )
+            except Exception:
+                connection.rollback()
+                raise
+
+    def start_action(
+        self, task_id: int, *, expected_version: int, action: str
+    ) -> WorkflowOperationResult:
+        if not _valid_identity(task_id, expected_version):
+            return _refused(task_id, WorkflowRefusal.INVALID_ARGUMENT)
+        if action not in {"start", "snooze", "cancel"}:
+            return _refused(task_id, WorkflowRefusal.INVALID_ACTION)
+        stamp = self._clock_value()
+        now = stamp.isoformat(timespec="seconds")
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._workflow_with_task(connection, task_id)
+                refusal = _workflow_guard(
+                    row, expected_version,
+                    {WorkflowStatus.AWAITING_START, WorkflowStatus.SNOOZED},
+                )
+                if refusal is None:
+                    refusal = _task_guard(row, int(row["task_version"]))
+                if (refusal is None and row["status"] == WorkflowStatus.SNOOZED
+                        and action == "start" and row["due_at"] > now):
+                    refusal = WorkflowRefusal.INVALID_STATE
+                if refusal is not None:
+                    connection.rollback()
+                    return _refused_row(task_id, row, refusal)
+                version = expected_version + 1
+                if action == "start":
+                    status = WorkflowStatus.QUEUED
+                    wake = None
+                    completed = None
+                    kind = "start_approved"
+                elif action == "snooze":
+                    status = WorkflowStatus.SNOOZED
+                    wake = (stamp + START_SNOOZE_INTERVAL).isoformat(
+                        timespec="seconds"
+                    )
+                    completed = None
+                    kind = "snoozed"
+                else:
+                    status = WorkflowStatus.CANCELLED
+                    wake = None
+                    completed = now
+                    kind = "cancelled"
+                connection.execute(
+                    "UPDATE task_execution_workflows SET status=?,"
+                    "phase='plan',version=?,due_at=?,claim_token_digest=NULL,"
+                    "claimed_at=NULL,"
+                    "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
+                    "next_attempt_at=NULL,parked_at=NULL,updated_at=?,"
+                    "completed_at=? WHERE task_id=? AND version=?",
+                    (
+                        status, version, wake, now, completed, task_id,
+                        expected_version,
+                    ),
+                )
+                self._event(
+                    connection, task_id, kind, version,
+                    int(row["task_version"]), WorkflowPhase.PLAN,
+                    status, now,
+                )
+                connection.commit()
+                return WorkflowOperationResult(
+                    WorkflowDisposition.APPLIED,
+                    task_id,
+                    version,
+                    status,
+                    WorkflowPhase.PLAN,
+                    wake_at=wake,
+                )
+            except Exception:
+                connection.rollback()
+                raise
+
+    def review_action(
+        self, task_id: int, *, expected_version: int, action: str
+    ) -> WorkflowOperationResult:
+        if not _valid_identity(task_id, expected_version):
+            return _refused(task_id, WorkflowRefusal.INVALID_ARGUMENT)
+        if action not in {"approve", "revise", "cancel"}:
+            return _refused(task_id, WorkflowRefusal.INVALID_ACTION)
+        now = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._workflow_with_task(connection, task_id)
+                refusal = _workflow_guard(
+                    row, expected_version, {WorkflowStatus.AWAITING_REVIEW}
+                )
+                if refusal is None:
+                    refusal = _task_guard(row, int(row["task_version"]))
+                result = None
+                if refusal is None:
+                    result = connection.execute(
+                        "SELECT outcome FROM task_execution_results "
+                        "WHERE result_id=? AND task_id=?",
+                        (row["last_result_id"], task_id),
+                    ).fetchone()
+                    if result is None:
+                        refusal = WorkflowRefusal.INVALID_STATE
+                if refusal is not None:
+                    connection.rollback()
+                    return _refused_row(task_id, row, refusal)
+                if action == "cancel":
+                    phase = WorkflowPhase(row["phase"])
+                    status = WorkflowStatus.CANCELLED
+                    completed = now
+                    kind = "cancelled"
+                elif action == "revise":
+                    phase = WorkflowPhase.PLAN
+                    status = WorkflowStatus.QUEUED
+                    completed = None
+                    kind = "revision_requested"
+                else:
+                    targets = {
+                        ExecutionOutcome.AWAITING_PLAN:
+                            WorkflowPhase.EXECUTE,
+                        ExecutionOutcome.AWAITING_EXTERNAL:
+                            WorkflowPhase.EXTERNAL_ACTION,
+                    }
+                    phase = targets.get(
+                        ExecutionOutcome(result["outcome"])
+                    )
+                    if phase is None:
+                        connection.rollback()
+                        return _refused_row(
+                            task_id, row, WorkflowRefusal.INVALID_STATE
+                        )
+                    status = WorkflowStatus.QUEUED
+                    completed = None
+                    kind = "phase_approved"
+                version = expected_version + 1
+                connection.execute(
+                    "UPDATE task_execution_workflows SET status=?,phase=?,"
+                    "version=?,due_at=NULL,claim_token_digest=NULL,"
+                    "claimed_at=NULL,claim_heartbeat_at=NULL,"
+                    "claim_expires_at=NULL,failure_count=0,"
+                    "last_failure_reason=NULL,last_failure_at=NULL,"
+                    "next_attempt_at=NULL,parked_at=NULL,updated_at=?,"
+                    "completed_at=? WHERE task_id=? AND version=?",
+                    (
+                        status, phase, version, now, completed, task_id,
+                        expected_version,
+                    ),
+                )
+                self._event(
+                    connection, task_id, kind, version,
+                    int(row["task_version"]), phase, status, now,
+                )
+                connection.commit()
+                return WorkflowOperationResult(
+                    WorkflowDisposition.APPLIED,
+                    task_id,
+                    version,
+                    status,
+                    phase,
+                )
+            except Exception:
+                connection.rollback()
+                raise
+
+    def claim_next(
+        self, *, lease_seconds: int = DEFAULT_LEASE_SECONDS
+    ) -> ExecutionClaim | None:
+        if not _valid_lease(lease_seconds):
+            raise ValueError("execution lease is invalid")
+        stamp = self._clock_value()
+        now = stamp.isoformat(timespec="seconds")
+        expires = (stamp + timedelta(seconds=lease_seconds)).isoformat(
+            timespec="seconds"
+        )
+        token = self._token_factory()
+        if not _valid_secret(token):
+            raise TaskLedgerError("execution claim capability is invalid")
+        digest = _token_digest(token)
+        with closing(self._connect()) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._cancel_stale(connection, now)
+                self._recover_expired(connection, stamp)
+                row = connection.execute(
+                    "SELECT w.*,t.text,t.owner,t.due,t.status AS task_status,"
+                    "t.version AS current_task_version "
+                    "FROM task_execution_workflows AS w JOIN tasks AS t "
+                    "ON t.id=w.task_id WHERE w.status='queued' "
+                    "AND (w.next_attempt_at IS NULL OR w.next_attempt_at<=?) "
+                    "AND t.status='open' AND t.version=w.task_version "
+                    "ORDER BY CASE WHEN w.failure_count=0 THEN 0 ELSE 1 END,"
+                    "w.updated_at,w.task_id LIMIT 1",
+                    (now,),
+                ).fetchone()
+                if row is None:
+                    connection.commit()
+                    return None
+                version = int(row["version"]) + 1
+                updated = connection.execute(
+                    "UPDATE task_execution_workflows SET status='running',"
+                    "version=?,claim_token_digest=?,claimed_at=?,"
+                    "claim_heartbeat_at=?,claim_expires_at=?,updated_at=? "
+                    "WHERE task_id=? AND version=? AND status='queued'",
+                    (
+                        version, digest, now, now, expires, now,
+                        int(row["task_id"]), int(row["version"]),
+                    ),
+                )
+                if updated.rowcount != 1:
+                    connection.rollback()
+                    return None
+                self._event(
+                    connection, int(row["task_id"]), "claimed", version,
+                    int(row["task_version"]), WorkflowPhase(row["phase"]),
+                    WorkflowStatus.RUNNING, now,
+                )
+                connection.commit()
+                return ExecutionClaim(
+                    task_id=int(row["task_id"]),
+                    task_version=int(row["task_version"]),
+                    workflow_version=version,
+                    phase=WorkflowPhase(row["phase"]),
+                    token=token,
+                    expires_at=expires,
+                    text=row["text"],
+                    owner=row["owner"],
+                    due=row["due"],
+                )
+            except Exception:
+                connection.rollback()
+                raise
+
+    def renew(
+        self,
+        task_id: int,
+        *,
+        expected_version: int,
+        claim_token: str,
+        lease_seconds: int = DEFAULT_LEASE_SECONDS,
+    ) -> WorkflowOperationResult:
+        if (not _valid_identity(task_id, expected_version)
+                or not _valid_secret(claim_token)
+                or not _valid_lease(lease_seconds)):
+            return _refused(task_id, WorkflowRefusal.INVALID_ARGUMENT)
+        stamp = self._clock_value()
+        now = stamp.isoformat(timespec="seconds")
+        expires = (stamp + timedelta(seconds=lease_seconds)).isoformat(
+            timespec="seconds"
+        )
+        digest = _token_digest(claim_token)
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._workflow_with_task(connection, task_id)
+                refusal = _running_guard(row, expected_version, digest, now)
+                if refusal is None:
+                    refusal = _task_guard(row, int(row["task_version"]))
+                if refusal is not None:
+                    connection.rollback()
+                    return _refused_row(task_id, row, refusal)
+                connection.execute(
+                    "UPDATE task_execution_workflows SET "
+                    "claim_heartbeat_at=?,claim_expires_at=?,updated_at=? "
+                    "WHERE task_id=? AND version=? AND status='running' "
+                    "AND claim_token_digest=?",
+                    (now, expires, now, task_id, expected_version, digest),
+                )
+                self._event(
+                    connection, task_id, "claim_renewed", expected_version,
+                    int(row["task_version"]), WorkflowPhase(row["phase"]),
+                    WorkflowStatus.RUNNING, now,
+                )
+                connection.commit()
+                return WorkflowOperationResult(
+                    WorkflowDisposition.APPLIED,
+                    task_id,
+                    expected_version,
+                    WorkflowStatus.RUNNING,
+                    WorkflowPhase(row["phase"]),
+                    wake_at=expires,
+                )
+            except Exception:
+                connection.rollback()
+                raise
+
+    def release(
+        self, task_id: int, *, expected_version: int, claim_token: str
+    ) -> WorkflowOperationResult:
+        return self._finish_claim(
+            task_id,
+            expected_version=expected_version,
+            claim_token=claim_token,
+            failure_reason=None,
+        )
+
+    def fail(
+        self,
+        task_id: int,
+        *,
+        expected_version: int,
+        claim_token: str,
+        reason: str,
+    ) -> WorkflowOperationResult:
+        if reason not in FAILURE_REASONS or reason == "claim_expired":
+            return _refused(task_id, WorkflowRefusal.INVALID_ARGUMENT)
+        return self._finish_claim(
+            task_id,
+            expected_version=expected_version,
+            claim_token=claim_token,
+            failure_reason=reason,
+        )
+
+    def _finish_claim(
+        self,
+        task_id: int,
+        *,
+        expected_version: int,
+        claim_token: str,
+        failure_reason: str | None,
+    ) -> WorkflowOperationResult:
+        if (not _valid_identity(task_id, expected_version)
+                or not _valid_secret(claim_token)):
+            return _refused(task_id, WorkflowRefusal.INVALID_ARGUMENT)
+        stamp = self._clock_value()
+        now = stamp.isoformat(timespec="seconds")
+        digest = _token_digest(claim_token)
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._workflow_with_task(connection, task_id)
+                refusal = _running_guard(row, expected_version, digest, now)
+                if refusal is None:
+                    refusal = _task_guard(row, int(row["task_version"]))
+                if refusal is not None:
+                    connection.rollback()
+                    return _refused_row(task_id, row, refusal)
+                if failure_reason is None:
+                    version = expected_version + 1
+                    connection.execute(
+                        "UPDATE task_execution_workflows SET status='queued',"
+                        "version=?,claim_token_digest=NULL,claimed_at=NULL,"
+                        "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
+                        "updated_at=? WHERE task_id=? AND version=?",
+                        (version, now, task_id, expected_version),
+                    )
+                    self._event(
+                        connection, task_id, "released", version,
+                        int(row["task_version"]),
+                        WorkflowPhase(row["phase"]), WorkflowStatus.QUEUED,
+                        now,
+                    )
+                    result = WorkflowOperationResult(
+                        WorkflowDisposition.APPLIED,
+                        task_id,
+                        version,
+                        WorkflowStatus.QUEUED,
+                        WorkflowPhase(row["phase"]),
+                    )
+                else:
+                    result = self._defer_failure(
+                        connection, row, failure_reason, stamp,
+                        event_kind=None,
+                    )
+                connection.commit()
+                return result
+            except Exception:
+                connection.rollback()
+                raise
+
+    def record_result(
+        self, envelope: ExecutionResultEnvelope
+    ) -> WorkflowOperationResult:
+        try:
+            result = _validated_result(envelope)
+        except (TypeError, ValueError):
+            task_id = getattr(envelope, "task_id", 0)
+            return _refused(task_id, WorkflowRefusal.INVALID_ARGUMENT)
+        now = self._now()
+        digest = result["content_digest"]
+        with closing(self._connect()) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                existing = connection.execute(
+                    "SELECT task_id,content_digest "
+                    "FROM task_execution_results "
+                    "WHERE result_id=?",
+                    (result["result_id"],),
+                ).fetchone()
+                if existing is not None:
+                    connection.rollback()
+                    if (int(existing["task_id"]) == result["task_id"]
+                            and existing["content_digest"] == digest):
+                        row = self.get(result["task_id"])
+                        if row is None:
+                            return _refused(
+                                result["task_id"],
+                                WorkflowRefusal.INVALID_STATE,
+                            )
+                        return WorkflowOperationResult(
+                            WorkflowDisposition.UNCHANGED,
+                            row.task_id,
+                            row.version,
+                            row.status,
+                            row.phase,
+                        )
+                    return _refused(
+                        result["task_id"], WorkflowRefusal.RESULT_CONFLICT
+                    )
+                row = self._workflow_with_task(connection, result["task_id"])
+                refusal = _running_guard(
+                    row,
+                    result["workflow_version"],
+                    _token_digest(result["claim_token"]),
+                    now,
+                )
+                if refusal is None:
+                    refusal = _task_guard(row, result["task_version"])
+                if (refusal is None
+                        and row["phase"] != result["phase"]):
+                    refusal = WorkflowRefusal.INVALID_STATE
+                if refusal is not None:
+                    connection.rollback()
+                    return _refused_row(result["task_id"], row, refusal)
+                target = _result_target(
+                    WorkflowPhase(result["phase"]),
+                    ExecutionOutcome(result["outcome"]),
+                )
+                if target is None:
+                    connection.rollback()
+                    return _refused_row(
+                        result["task_id"], row,
+                        WorkflowRefusal.INVALID_STATE,
+                    )
+                connection.execute(
+                    "INSERT INTO task_execution_results("
+                    "result_id,task_id,workflow_version,task_version,phase,"
+                    "outcome,content_digest,summary,work_markdown,"
+                    "questions_json,external_actions_json,deliverables_json,"
+                    "created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        result["result_id"], result["task_id"],
+                        result["workflow_version"], result["task_version"],
+                        result["phase"], result["outcome"], digest,
+                        result["summary"], result["work_markdown"],
+                        result["questions_json"],
+                        result["external_actions_json"],
+                        result["deliverables_json"], now,
+                    ),
+                )
+                version = result["workflow_version"] + 1
+                completed = (
+                    now if target is WorkflowStatus.COMPLETED else None
+                )
+                connection.execute(
+                    "UPDATE task_execution_workflows SET status=?,version=?,"
+                    "claim_token_digest=NULL,claimed_at=NULL,"
+                    "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
+                    "failure_count=0,last_failure_reason=NULL,"
+                    "last_failure_at=NULL,next_attempt_at=NULL,parked_at=NULL,"
+                    "last_result_id=?,updated_at=?,completed_at=? "
+                    "WHERE task_id=? AND version=? AND status='running'",
+                    (
+                        target, version, result["result_id"], now, completed,
+                        result["task_id"], result["workflow_version"],
+                    ),
+                )
+                self._event(
+                    connection, result["task_id"], "result_recorded",
+                    version, result["task_version"],
+                    WorkflowPhase(result["phase"]), target, now,
+                )
+                connection.commit()
+                return WorkflowOperationResult(
+                    WorkflowDisposition.APPLIED,
+                    result["task_id"],
+                    version,
+                    target,
+                    WorkflowPhase(result["phase"]),
+                )
+            except Exception:
+                connection.rollback()
+                raise
+
+    def retry(
+        self, task_id: int, *, expected_version: int
+    ) -> WorkflowOperationResult:
+        if not _valid_identity(task_id, expected_version):
+            return _refused(task_id, WorkflowRefusal.INVALID_ARGUMENT)
+        now = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._workflow_with_task(connection, task_id)
+                refusal = _workflow_guard(
+                    row, expected_version,
+                    {WorkflowStatus.QUEUED, WorkflowStatus.PARKED},
+                )
+                if refusal is None:
+                    refusal = _task_guard(row, int(row["task_version"]))
+                if refusal is not None:
+                    connection.rollback()
+                    return _refused_row(task_id, row, refusal)
+                version = expected_version + 1
+                connection.execute(
+                    "UPDATE task_execution_workflows SET status='queued',"
+                    "version=?,failure_count=0,last_failure_reason=NULL,"
+                    "last_failure_at=NULL,next_attempt_at=NULL,parked_at=NULL,"
+                    "updated_at=? WHERE task_id=? AND version=?",
+                    (version, now, task_id, expected_version),
+                )
+                self._event(
+                    connection, task_id, "retry_scheduled", version,
+                    int(row["task_version"]), WorkflowPhase(row["phase"]),
+                    WorkflowStatus.QUEUED, now,
+                )
+                connection.commit()
+                return WorkflowOperationResult(
+                    WorkflowDisposition.APPLIED,
+                    task_id,
+                    version,
+                    WorkflowStatus.QUEUED,
+                    WorkflowPhase(row["phase"]),
+                )
+            except Exception:
+                connection.rollback()
+                raise
+
+    def get(self, task_id: int) -> ExecutionWorkflow | None:
+        if isinstance(task_id, bool) or not isinstance(task_id, int):
+            return None
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM task_execution_workflows WHERE task_id=?",
+                (task_id,),
+            ).fetchone()
+        return None if row is None else _workflow(row)
+
+    def readiness(self) -> ExecutionReadiness:
+        now = self._now()
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT "
+                "SUM(status='awaiting_start') AS awaiting_start,"
+                "SUM(status='snoozed') AS snoozed,"
+                "SUM(status='queued' AND (next_attempt_at IS NULL OR "
+                "next_attempt_at<=?)) AS ready,"
+                "SUM(status='queued' AND next_attempt_at>?) AS cooling,"
+                "SUM(status='running' AND claim_expires_at>?) AS running,"
+                "SUM(status='running' AND (claim_expires_at IS NULL OR "
+                "claim_expires_at<=?)) AS expired,"
+                "SUM(status='awaiting_review') AS awaiting_review,"
+                "SUM(status='parked') AS parked,"
+                "SUM(status='completed') AS completed,"
+                "SUM(status='cancelled') AS cancelled "
+                "FROM task_execution_workflows",
+                (now, now, now, now),
+            ).fetchone()
+        return ExecutionReadiness(*(
+            int(row[name] or 0)
+            for name in (
+                "awaiting_start", "snoozed", "ready", "cooling",
+                "running", "expired", "awaiting_review", "parked",
+                "completed", "cancelled",
+            )
+        ))
+
+    def event_count(self) -> int:
+        with closing(self._connect()) as connection:
+            return int(connection.execute(
+                "SELECT COUNT(*) FROM task_execution_events"
+            ).fetchone()[0])
+
+    def result_count(self) -> int:
+        with closing(self._connect()) as connection:
+            return int(connection.execute(
+                "SELECT COUNT(*) FROM task_execution_results"
+            ).fetchone()[0])
+
+    def _recover_expired(
+        self, connection: sqlite3.Connection, stamp: datetime
+    ) -> int:
+        now = stamp.isoformat(timespec="seconds")
+        rows = connection.execute(
+            "SELECT * FROM task_execution_workflows "
+            "WHERE status='running' AND (claim_expires_at IS NULL "
+            "OR claim_expires_at<=?) ORDER BY task_id",
+            (now,),
+        ).fetchall()
+        for row in rows:
+            self._defer_failure(
+                connection, row, "claim_expired", stamp,
+                event_kind="claim_expired",
+            )
+        return len(rows)
+
+    def _cancel_stale(
+        self, connection: sqlite3.Connection, now: str
+    ) -> int:
+        rows = connection.execute(
+            "SELECT w.* FROM task_execution_workflows AS w "
+            "JOIN tasks AS t ON t.id=w.task_id "
+            "WHERE w.status NOT IN ('completed','cancelled') "
+            "AND (t.status!='open' OR t.version!=w.task_version) "
+            "ORDER BY w.task_id"
+        ).fetchall()
+        for row in rows:
+            version = int(row["version"]) + 1
+            connection.execute(
+                "UPDATE task_execution_workflows SET status='cancelled',"
+                "version=?,claim_token_digest=NULL,claimed_at=NULL,"
+                "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
+                "next_attempt_at=NULL,parked_at=NULL,updated_at=?,"
+                "completed_at=? WHERE task_id=? AND version=?",
+                (
+                    version, now, now, int(row["task_id"]),
+                    int(row["version"]),
+                ),
+            )
+            self._event(
+                connection, int(row["task_id"]), "cancelled", version,
+                int(row["task_version"]), WorkflowPhase(row["phase"]),
+                WorkflowStatus.CANCELLED, now,
+            )
+        return len(rows)
+
+    def _defer_failure(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        reason: str,
+        stamp: datetime,
+        *,
+        event_kind: str | None,
+    ) -> WorkflowOperationResult:
+        if reason not in FAILURE_REASONS:
+            raise ValueError("execution failure reason is invalid")
+        now = stamp.isoformat(timespec="seconds")
+        failures = int(row["failure_count"]) + 1
+        version = int(row["version"]) + 1
+        if failures >= self._max_attempts:
+            status = WorkflowStatus.PARKED
+            next_attempt = None
+            parked = now
+            kind = "parked"
+        else:
+            status = WorkflowStatus.QUEUED
+            delay = min(
+                RETRY_MAX_SECONDS,
+                RETRY_BASE_SECONDS * (2 ** (failures - 1)),
+            )
+            next_attempt = (stamp + timedelta(seconds=delay)).isoformat(
+                timespec="seconds"
+            )
+            parked = None
+            kind = event_kind or "retry_scheduled"
+        connection.execute(
+            "UPDATE task_execution_workflows SET status=?,version=?,"
+            "claim_token_digest=NULL,claimed_at=NULL,"
+            "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
+            "failure_count=?,last_failure_reason=?,last_failure_at=?,"
+            "next_attempt_at=?,parked_at=?,updated_at=? "
+            "WHERE task_id=? AND version=?",
+            (
+                status, version, failures, reason, now, next_attempt, parked,
+                now, int(row["task_id"]), int(row["version"]),
+            ),
+        )
+        self._event(
+            connection, int(row["task_id"]), kind, version,
+            int(row["task_version"]), WorkflowPhase(row["phase"]),
+            status, now,
+        )
+        return WorkflowOperationResult(
+            WorkflowDisposition.APPLIED,
+            int(row["task_id"]),
+            version,
+            status,
+            WorkflowPhase(row["phase"]),
+            next_attempt_at=next_attempt,
+        )
+
+    @staticmethod
+    def _event(
+        connection: sqlite3.Connection,
+        task_id: int,
+        kind: str,
+        workflow_version: int,
+        task_version: int,
+        phase: WorkflowPhase,
+        status: WorkflowStatus,
+        now: str,
+    ) -> None:
+        connection.execute(
+            "INSERT INTO task_execution_events("
+            "task_id,kind,workflow_version,task_version,phase,status,"
+            "occurred_at) VALUES(?,?,?,?,?,?,?)",
+            (
+                task_id, kind, workflow_version, task_version, phase, status,
+                now,
+            ),
+        )
+
+    @staticmethod
+    def _workflow_with_task(
+        connection: sqlite3.Connection, task_id: int
+    ) -> sqlite3.Row | None:
+        return connection.execute(
+            "SELECT w.*,t.status AS task_status,t.version AS "
+            "current_task_version FROM task_execution_workflows AS w "
+            "JOIN tasks AS t ON t.id=w.task_id WHERE w.task_id=?",
+            (task_id,),
+        ).fetchone()
+
+    def _connect(self) -> sqlite3.Connection:
+        if not self.database_path.is_file() or self.database_path.is_symlink():
+            raise TaskLedgerError("task execution database is not initialized")
+        connection = sqlite3.connect(self.database_path, timeout=5)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 5000")
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if version != SCHEMA_VERSION:
+            connection.close()
+            raise TaskLedgerError(
+                "task execution database schema is not supported"
+            )
+        try:
+            CandidateInbox._require_schema(connection)
+        except InboxError as exc:
+            connection.close()
+            raise TaskLedgerError(
+                "task execution database schema is incomplete"
+            ) from exc
+        return connection
+
+    def _clock_value(self) -> datetime:
+        value = self._clock()
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise TaskLedgerError(
+                "task execution clock must include a timezone"
+            )
+        return value.astimezone(timezone.utc)
+
+    def _now(self) -> str:
+        return self._clock_value().isoformat(timespec="seconds")
+
+
+def _workflow(row: sqlite3.Row) -> ExecutionWorkflow:
+    try:
+        return ExecutionWorkflow(
+            task_id=int(row["task_id"]),
+            task_version=int(row["task_version"]),
+            status=WorkflowStatus(row["status"]),
+            phase=WorkflowPhase(row["phase"]),
+            version=int(row["version"]),
+            due_at=row["due_at"],
+            failure_count=int(row["failure_count"]),
+            last_failure_reason=row["last_failure_reason"],
+            last_failure_at=row["last_failure_at"],
+            next_attempt_at=row["next_attempt_at"],
+            parked_at=row["parked_at"],
+            last_result_id=row["last_result_id"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            completed_at=row["completed_at"],
+        )
+    except (IndexError, KeyError, TypeError, ValueError) as exc:
+        raise TaskLedgerError("task execution state is invalid") from exc
+
+
+def _operation(
+    row: sqlite3.Row, disposition: WorkflowDisposition
+) -> WorkflowOperationResult:
+    return WorkflowOperationResult(
+        disposition,
+        int(row["task_id"]),
+        int(row["version"]),
+        WorkflowStatus(row["status"]),
+        WorkflowPhase(row["phase"]),
+        wake_at=row["due_at"],
+        next_attempt_at=row["next_attempt_at"],
+    )
+
+
+def _refused(
+    task_id: object, refusal: WorkflowRefusal
+) -> WorkflowOperationResult:
+    return WorkflowOperationResult(
+        WorkflowDisposition.REFUSED,
+        task_id if isinstance(task_id, int) and not isinstance(task_id, bool)
+        else 0,
+        refusal=refusal,
+    )
+
+
+def _refused_row(
+    task_id: int, row: sqlite3.Row | None, refusal: WorkflowRefusal
+) -> WorkflowOperationResult:
+    if row is None:
+        return _refused(task_id, refusal)
+    return WorkflowOperationResult(
+        WorkflowDisposition.REFUSED,
+        task_id,
+        int(row["version"]),
+        WorkflowStatus(row["status"]),
+        WorkflowPhase(row["phase"]),
+        refusal=refusal,
+    )
+
+
+def _task_guard(
+    row: sqlite3.Row | None, expected_version: int
+) -> WorkflowRefusal | None:
+    if row is None:
+        return WorkflowRefusal.NOT_FOUND
+    version = (
+        int(row["current_task_version"])
+        if "current_task_version" in row.keys()
+        else int(row["version"])
+    )
+    status = (
+        row["task_status"] if "task_status" in row.keys()
+        else row["status"]
+    )
+    if version != expected_version:
+        return WorkflowRefusal.STALE_TASK
+    if status != TaskStatus.OPEN:
+        return WorkflowRefusal.INVALID_STATE
+    return None
+
+
+def _workflow_guard(
+    row: sqlite3.Row | None,
+    expected_version: int,
+    statuses: set[WorkflowStatus],
+) -> WorkflowRefusal | None:
+    if row is None:
+        return WorkflowRefusal.NOT_FOUND
+    if int(row["version"]) != expected_version:
+        return WorkflowRefusal.STALE_WORKFLOW
+    if row["status"] not in statuses:
+        return WorkflowRefusal.INVALID_STATE
+    return None
+
+
+def _running_guard(
+    row: sqlite3.Row | None,
+    expected_version: int,
+    digest: str,
+    now: str,
+) -> WorkflowRefusal | None:
+    refusal = _workflow_guard(
+        row, expected_version, {WorkflowStatus.RUNNING}
+    )
+    if refusal is not None:
+        return refusal
+    if row["claim_token_digest"] != digest:
+        return WorkflowRefusal.CLAIM_MISMATCH
+    if row["claim_expires_at"] is None or row["claim_expires_at"] <= now:
+        return WorkflowRefusal.INVALID_STATE
+    return None
+
+
+def _result_target(
+    phase: WorkflowPhase, outcome: ExecutionOutcome
+) -> WorkflowStatus | None:
+    allowed = {
+        WorkflowPhase.PLAN: {
+            ExecutionOutcome.AWAITING_PLAN,
+            ExecutionOutcome.COMPLETED,
+            ExecutionOutcome.INELIGIBLE,
+        },
+        WorkflowPhase.EXECUTE: {
+            ExecutionOutcome.AWAITING_EXTERNAL,
+            ExecutionOutcome.COMPLETED,
+            ExecutionOutcome.DECLINED,
+            ExecutionOutcome.INELIGIBLE,
+        },
+        WorkflowPhase.EXTERNAL_ACTION: {
+            ExecutionOutcome.COMPLETED,
+            ExecutionOutcome.DECLINED,
+            ExecutionOutcome.INELIGIBLE,
+        },
+    }
+    if outcome not in allowed[phase]:
+        return None
+    if outcome in {
+        ExecutionOutcome.AWAITING_PLAN,
+        ExecutionOutcome.AWAITING_EXTERNAL,
+    }:
+        return WorkflowStatus.AWAITING_REVIEW
+    return WorkflowStatus.COMPLETED
+
+
+def _validated_result(envelope: ExecutionResultEnvelope) -> dict[str, object]:
+    if not isinstance(envelope, ExecutionResultEnvelope):
+        raise TypeError("execution result envelope is invalid")
+    if not _RESULT_ID_RE.fullmatch(envelope.result_id):
+        raise ValueError("execution result identity is invalid")
+    if (not _valid_identity(envelope.task_id, envelope.task_version)
+            or isinstance(envelope.workflow_version, bool)
+            or not isinstance(envelope.workflow_version, int)
+            or envelope.workflow_version < 1
+            or not _valid_secret(envelope.claim_token)):
+        raise ValueError("execution result identity is invalid")
+    try:
+        phase = WorkflowPhase(envelope.phase)
+        outcome = ExecutionOutcome(envelope.outcome)
+    except (TypeError, ValueError):
+        raise ValueError("execution result state is invalid") from None
+    if _result_target(phase, outcome) is None:
+        raise ValueError("execution result transition is invalid")
+    summary = _bounded_text(
+        envelope.summary, "summary", MAX_SUMMARY_CHARS, single_line=True
+    )
+    work = _bounded_text(
+        envelope.work_markdown,
+        "work markdown",
+        MAX_WORK_MARKDOWN_CHARS,
+        single_line=False,
+    )
+    questions = _text_collection(
+        envelope.questions, "questions", MAX_QUESTION_CHARS,
+        single_line=True,
+    )
+    actions = _text_collection(
+        envelope.external_actions, "external actions", MAX_ACTION_CHARS,
+        single_line=False,
+    )
+    deliverables = _text_collection(
+        envelope.deliverables, "deliverables", MAX_DELIVERABLE_CHARS,
+        single_line=False,
+    )
+    document = {
+        "result_id": envelope.result_id,
+        "task_id": envelope.task_id,
+        "task_version": envelope.task_version,
+        "workflow_version": envelope.workflow_version,
+        "phase": phase.value,
+        "outcome": outcome.value,
+        "summary": summary,
+        "work_markdown": work,
+        "questions": questions,
+        "external_actions": actions,
+        "deliverables": deliverables,
+    }
+    raw = _canonical_json(document).encode("utf-8")
+    if len(raw) > MAX_RESULT_BYTES:
+        raise ValueError("execution result is too large")
+    digest = hashlib.sha256(raw).hexdigest()
+    if not _DIGEST_RE.fullmatch(digest):
+        raise ValueError("execution result digest is invalid")
+    return {
+        **document,
+        "content_digest": digest,
+        "questions_json": _canonical_json(questions),
+        "external_actions_json": _canonical_json(actions),
+        "deliverables_json": _canonical_json(deliverables),
+        "claim_token": envelope.claim_token,
+    }
+
+
+def _bounded_text(
+    value: object, label: str, maximum: int, *, single_line: bool
+) -> str:
+    if not isinstance(value, str) or not value or len(value) > maximum:
+        raise ValueError(f"execution result {label} is invalid")
+    if value != value.strip():
+        raise ValueError(f"execution result {label} is invalid")
+    if any(
+        (ord(char) < 32 and char not in {"\n", "\t"}) or ord(char) == 127
+        for char in value
+    ):
+        raise ValueError(f"execution result {label} is invalid")
+    if single_line and any(char in value for char in "\r\n"):
+        raise ValueError(f"execution result {label} is invalid")
+    return value
+
+
+def _text_collection(
+    value: Sequence[str], label: str, maximum: int, *, single_line: bool
+) -> tuple[str, ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise ValueError(f"execution result {label} are invalid")
+    items = tuple(value)
+    if len(items) > MAX_COLLECTION_ITEMS:
+        raise ValueError(f"execution result {label} are invalid")
+    return tuple(
+        _bounded_text(item, label, maximum, single_line=single_line)
+        for item in items
+    )
+
+
+def _canonical_json(value: object) -> str:
+    return json.dumps(
+        value, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+    )
+
+
+def _valid_identity(task_id: object, version: object) -> bool:
+    return (
+        not isinstance(task_id, bool)
+        and isinstance(task_id, int)
+        and task_id >= 1
+        and not isinstance(version, bool)
+        and isinstance(version, int)
+        and version >= 1
+    )
+
+
+def _valid_secret(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and 32 <= len(value) <= 512
+        and not any(char.isspace() for char in value)
+    )
+
+
+def _valid_lease(value: object) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, int)
+        and MIN_LEASE_SECONDS <= value <= MAX_LEASE_SECONDS
+    )
+
+
+def _token_digest(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()

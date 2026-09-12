@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -198,6 +198,52 @@ _SCHEMA_COLUMNS = {
         "action",
         "occurred_at",
     ),
+    "task_execution_workflows": (
+        "task_id",
+        "task_version",
+        "status",
+        "phase",
+        "version",
+        "due_at",
+        "claim_token_digest",
+        "claimed_at",
+        "claim_heartbeat_at",
+        "claim_expires_at",
+        "failure_count",
+        "last_failure_reason",
+        "last_failure_at",
+        "next_attempt_at",
+        "parked_at",
+        "last_result_id",
+        "created_at",
+        "updated_at",
+        "completed_at",
+    ),
+    "task_execution_results": (
+        "result_id",
+        "task_id",
+        "workflow_version",
+        "task_version",
+        "phase",
+        "outcome",
+        "content_digest",
+        "summary",
+        "work_markdown",
+        "questions_json",
+        "external_actions_json",
+        "deliverables_json",
+        "created_at",
+    ),
+    "task_execution_events": (
+        "sequence",
+        "task_id",
+        "kind",
+        "workflow_version",
+        "task_version",
+        "phase",
+        "status",
+        "occurred_at",
+    ),
 }
 
 _SCHEMA_OBJECTS = {
@@ -211,6 +257,11 @@ _SCHEMA_OBJECTS = {
     "task_review_cards_one_active": "index",
     "task_review_card_events_no_update": "trigger",
     "task_review_card_events_no_delete": "trigger",
+    "task_execution_workflows_ready": "index",
+    "task_execution_results_no_update": "trigger",
+    "task_execution_results_no_delete": "trigger",
+    "task_execution_events_no_update": "trigger",
+    "task_execution_events_no_delete": "trigger",
 }
 
 _SCHEMA_V1 = """
@@ -532,6 +583,140 @@ END;
 """,
 )
 
+_SCHEMA_V8 = (
+    """
+CREATE TABLE task_execution_workflows (
+    task_id                INTEGER PRIMARY KEY,
+    task_version           INTEGER NOT NULL CHECK(task_version >= 1),
+    status                 TEXT NOT NULL CHECK(status IN (
+                               'awaiting_start','snoozed','queued','running',
+                               'awaiting_review','completed','cancelled','parked'
+                           )),
+    phase                  TEXT NOT NULL CHECK(phase IN (
+                               'plan','execute','external_action'
+                           )),
+    version                INTEGER NOT NULL CHECK(version >= 1),
+    due_at                 TEXT,
+    claim_token_digest     TEXT,
+    claimed_at             TEXT,
+    claim_heartbeat_at     TEXT,
+    claim_expires_at       TEXT,
+    failure_count          INTEGER NOT NULL DEFAULT 0
+                               CHECK(failure_count >= 0),
+    last_failure_reason    TEXT CHECK(last_failure_reason IS NULL OR
+                               last_failure_reason IN (
+                                   'startup_failed','process_exit','timeout',
+                                   'interrupted','claim_expired','lease_failed',
+                                   'result_invalid'
+                               )),
+    last_failure_at        TEXT,
+    next_attempt_at        TEXT,
+    parked_at              TEXT,
+    last_result_id         TEXT,
+    created_at             TEXT NOT NULL,
+    updated_at             TEXT NOT NULL,
+    completed_at           TEXT,
+    CHECK(
+        (status = 'running' AND claim_token_digest IS NOT NULL
+         AND length(claim_token_digest) = 64 AND claimed_at IS NOT NULL
+         AND claim_heartbeat_at IS NOT NULL AND claim_expires_at IS NOT NULL)
+        OR
+        (status != 'running' AND claim_token_digest IS NULL
+         AND claimed_at IS NULL AND claim_heartbeat_at IS NULL
+         AND claim_expires_at IS NULL)
+    ),
+    CHECK(status != 'snoozed' OR due_at IS NOT NULL),
+    CHECK((status = 'parked') = (parked_at IS NOT NULL)),
+    CHECK(
+        (status IN ('completed','cancelled')) = (completed_at IS NOT NULL)
+    ),
+    FOREIGN KEY(task_id) REFERENCES tasks(id)
+);
+""",
+    """
+CREATE INDEX task_execution_workflows_ready
+    ON task_execution_workflows(status, next_attempt_at, due_at, updated_at);
+""",
+    """
+CREATE TABLE task_execution_results (
+    result_id             TEXT PRIMARY KEY CHECK(
+                              length(result_id) BETWEEN 1 AND 128
+                          ),
+    task_id               INTEGER NOT NULL,
+    workflow_version      INTEGER NOT NULL CHECK(workflow_version >= 1),
+    task_version          INTEGER NOT NULL CHECK(task_version >= 1),
+    phase                 TEXT NOT NULL CHECK(phase IN (
+                              'plan','execute','external_action'
+                          )),
+    outcome               TEXT NOT NULL CHECK(outcome IN (
+                              'awaiting_plan','awaiting_external','completed',
+                              'declined','ineligible'
+                          )),
+    content_digest        TEXT NOT NULL CHECK(length(content_digest) = 64),
+    summary               TEXT NOT NULL CHECK(length(summary) <= 1200),
+    work_markdown         TEXT NOT NULL CHECK(length(work_markdown) <= 131072),
+    questions_json        TEXT NOT NULL CHECK(length(questions_json) <= 65536),
+    external_actions_json TEXT NOT NULL
+                              CHECK(length(external_actions_json) <= 65536),
+    deliverables_json     TEXT NOT NULL
+                              CHECK(length(deliverables_json) <= 65536),
+    created_at            TEXT NOT NULL,
+    FOREIGN KEY(task_id) REFERENCES task_execution_workflows(task_id)
+);
+""",
+    """
+CREATE TRIGGER task_execution_results_no_update
+BEFORE UPDATE ON task_execution_results
+BEGIN
+    SELECT RAISE(ABORT, 'task execution results are append-only');
+END;
+""",
+    """
+CREATE TRIGGER task_execution_results_no_delete
+BEFORE DELETE ON task_execution_results
+BEGIN
+    SELECT RAISE(ABORT, 'task execution results are append-only');
+END;
+""",
+    """
+CREATE TABLE task_execution_events (
+    sequence         INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id          INTEGER NOT NULL,
+    kind             TEXT NOT NULL CHECK(kind IN (
+                         'scheduled','start_approved','snoozed','cancelled',
+                         'claimed','claim_renewed','released','claim_expired',
+                         'retry_scheduled','parked','result_recorded',
+                         'phase_approved','revision_requested'
+                     )),
+    workflow_version INTEGER NOT NULL CHECK(workflow_version >= 1),
+    task_version     INTEGER NOT NULL CHECK(task_version >= 1),
+    phase            TEXT NOT NULL CHECK(phase IN (
+                         'plan','execute','external_action'
+                     )),
+    status           TEXT NOT NULL CHECK(status IN (
+                         'awaiting_start','snoozed','queued','running',
+                         'awaiting_review','completed','cancelled','parked'
+                     )),
+    occurred_at      TEXT NOT NULL,
+    FOREIGN KEY(task_id) REFERENCES task_execution_workflows(task_id)
+);
+""",
+    """
+CREATE TRIGGER task_execution_events_no_update
+BEFORE UPDATE ON task_execution_events
+BEGIN
+    SELECT RAISE(ABORT, 'task execution events are append-only');
+END;
+""",
+    """
+CREATE TRIGGER task_execution_events_no_delete
+BEFORE DELETE ON task_execution_events
+BEGIN
+    SELECT RAISE(ABORT, 'task execution events are append-only');
+END;
+""",
+)
+
 
 class InboxError(RuntimeError):
     """The inbox cannot safely initialize or read its state."""
@@ -814,6 +999,38 @@ class CandidateInbox:
                     for statement in _SCHEMA_V7:
                         connection.execute(statement)
                     connection.execute("PRAGMA user_version = 7")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 7
+            if version == 7:
+                self._require_tables(
+                    connection,
+                    (
+                        "candidate_inbox",
+                        "candidate_feed_cursors",
+                        "candidate_feed_receipts",
+                        "candidate_revision_history",
+                        "task_shadow_observations",
+                        "task_shadow_feed_cursors",
+                        "task_shadow_feed_receipts",
+                        "tasks",
+                        "task_candidate_bindings",
+                        "task_bootstrap_correlations",
+                        "task_events",
+                        "shadow_import_cycles",
+                        "task_owner_equivalences",
+                        "task_review_cards",
+                        "task_review_card_events",
+                    ),
+                )
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V8:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 8")
                     connection.commit()
                 except Exception:
                     connection.rollback()

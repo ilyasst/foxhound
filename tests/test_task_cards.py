@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from foxhound import CandidateInbox
+from foxhound.candidate_inbox import SCHEMA_VERSION
 from foxhound.contracts import candidate_id_for, comparable_task_digest
 from foxhound.task_cards import (
     CardDisposition,
@@ -143,6 +144,14 @@ class TaskCardTests(unittest.TestCase):
 
     def test_schema_six_migration_is_passive(self):
         with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute("DROP TRIGGER task_execution_events_no_update")
+            connection.execute("DROP TRIGGER task_execution_events_no_delete")
+            connection.execute("DROP TRIGGER task_execution_results_no_update")
+            connection.execute("DROP TRIGGER task_execution_results_no_delete")
+            connection.execute("DROP INDEX task_execution_workflows_ready")
+            connection.execute("DROP TABLE task_execution_events")
+            connection.execute("DROP TABLE task_execution_results")
+            connection.execute("DROP TABLE task_execution_workflows")
             connection.execute("DROP TRIGGER task_review_card_events_no_update")
             connection.execute("DROP TRIGGER task_review_card_events_no_delete")
             connection.execute("DROP TABLE task_review_card_events")
@@ -154,7 +163,7 @@ class TaskCardTests(unittest.TestCase):
         with closing(sqlite3.connect(self.database)) as connection:
             self.assertEqual(connection.execute(
                 "PRAGMA user_version"
-            ).fetchone()[0], 7)
+            ).fetchone()[0], SCHEMA_VERSION)
             self.assertEqual(connection.execute(
                 "SELECT count(*) FROM tasks"
             ).fetchone()[0], 4)

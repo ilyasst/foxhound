@@ -200,6 +200,14 @@ class CandidateFeedInboxTests(unittest.TestCase):
         meeting = fixture("meeting-candidate-v1.json")
         self.inbox.import_document(meeting)
         with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute("DROP TRIGGER task_execution_events_no_update")
+            connection.execute("DROP TRIGGER task_execution_events_no_delete")
+            connection.execute("DROP TRIGGER task_execution_results_no_update")
+            connection.execute("DROP TRIGGER task_execution_results_no_delete")
+            connection.execute("DROP INDEX task_execution_workflows_ready")
+            connection.execute("DROP TABLE task_execution_events")
+            connection.execute("DROP TABLE task_execution_results")
+            connection.execute("DROP TABLE task_execution_workflows")
             connection.execute("DROP TRIGGER task_review_card_events_no_update")
             connection.execute("DROP TRIGGER task_review_card_events_no_delete")
             connection.execute("DROP TABLE task_review_card_events")
@@ -233,6 +241,14 @@ class CandidateFeedInboxTests(unittest.TestCase):
 
     def test_incomplete_version_one_database_is_not_migrated(self):
         with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute("DROP TRIGGER task_execution_events_no_update")
+            connection.execute("DROP TRIGGER task_execution_events_no_delete")
+            connection.execute("DROP TRIGGER task_execution_results_no_update")
+            connection.execute("DROP TRIGGER task_execution_results_no_delete")
+            connection.execute("DROP INDEX task_execution_workflows_ready")
+            connection.execute("DROP TABLE task_execution_events")
+            connection.execute("DROP TABLE task_execution_results")
+            connection.execute("DROP TABLE task_execution_workflows")
             connection.execute("DROP TRIGGER task_review_card_events_no_update")
             connection.execute("DROP TRIGGER task_review_card_events_no_delete")
             connection.execute("DROP TABLE task_review_card_events")
