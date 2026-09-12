@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -244,6 +244,36 @@ _SCHEMA_COLUMNS = {
         "status",
         "occurred_at",
     ),
+    "execution_review_cards": (
+        "id",
+        "task_id",
+        "task_version",
+        "workflow_version",
+        "kind",
+        "phase",
+        "result_id",
+        "status",
+        "version",
+        "claim_token_digest",
+        "claim_expires_at",
+        "transport",
+        "delivery_ref",
+        "delivered_at",
+        "resolution",
+        "created_at",
+        "updated_at",
+        "resolved_at",
+    ),
+    "execution_review_card_events": (
+        "sequence",
+        "card_id",
+        "task_id",
+        "kind",
+        "card_version",
+        "workflow_version",
+        "action",
+        "occurred_at",
+    ),
 }
 
 _SCHEMA_OBJECTS = {
@@ -262,6 +292,9 @@ _SCHEMA_OBJECTS = {
     "task_execution_results_no_delete": "trigger",
     "task_execution_events_no_update": "trigger",
     "task_execution_events_no_delete": "trigger",
+    "execution_review_cards_one_active": "index",
+    "execution_review_card_events_no_update": "trigger",
+    "execution_review_card_events_no_delete": "trigger",
 }
 
 _SCHEMA_V1 = """
@@ -717,6 +750,101 @@ END;
 """,
 )
 
+_SCHEMA_V9 = (
+    """
+CREATE TABLE execution_review_cards (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id            INTEGER NOT NULL,
+    task_version       INTEGER NOT NULL CHECK(task_version >= 1),
+    workflow_version   INTEGER NOT NULL CHECK(workflow_version >= 1),
+    kind               TEXT NOT NULL CHECK(kind IN (
+                           'start','plan_review','external_review'
+                       )),
+    phase              TEXT NOT NULL CHECK(phase IN (
+                           'plan','execute'
+                       )),
+    result_id          TEXT,
+    status             TEXT NOT NULL CHECK(status IN (
+                           'pending','delivering','delivered',
+                           'resolved','cancelled'
+                       )),
+    version            INTEGER NOT NULL CHECK(version >= 1),
+    claim_token_digest TEXT,
+    claim_expires_at   TEXT,
+    transport          TEXT,
+    delivery_ref       TEXT,
+    delivered_at       TEXT,
+    resolution         TEXT CHECK(resolution IS NULL OR resolution IN (
+                           'start','snooze','cancel','approve','revise'
+                       )),
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL,
+    resolved_at        TEXT,
+    CHECK(
+        (kind = 'start' AND phase = 'plan' AND result_id IS NULL)
+        OR (kind = 'plan_review' AND phase = 'plan' AND result_id IS NOT NULL)
+        OR (kind = 'external_review' AND phase = 'execute'
+            AND result_id IS NOT NULL)
+    ),
+    CHECK(
+        (status = 'delivering' AND claim_token_digest IS NOT NULL
+         AND length(claim_token_digest) = 64 AND claim_expires_at IS NOT NULL)
+        OR (status != 'delivering' AND claim_token_digest IS NULL
+            AND claim_expires_at IS NULL)
+    ),
+    CHECK(
+        (status = 'resolved' AND resolution IS NOT NULL
+         AND resolved_at IS NOT NULL)
+        OR (status = 'cancelled' AND resolution IS NULL
+            AND resolved_at IS NOT NULL)
+        OR (status IN ('pending','delivering','delivered')
+            AND resolution IS NULL AND resolved_at IS NULL)
+    ),
+    FOREIGN KEY(task_id) REFERENCES task_execution_workflows(task_id),
+    FOREIGN KEY(result_id) REFERENCES task_execution_results(result_id)
+);
+""",
+    """
+CREATE UNIQUE INDEX execution_review_cards_one_active
+    ON execution_review_cards(task_id)
+    WHERE status IN ('pending','delivering','delivered');
+""",
+    """
+CREATE TABLE execution_review_card_events (
+    sequence         INTEGER PRIMARY KEY AUTOINCREMENT,
+    card_id          INTEGER NOT NULL,
+    task_id          INTEGER NOT NULL,
+    kind             TEXT NOT NULL CHECK(kind IN (
+                         'scheduled','delivery_claimed','delivered',
+                         'delivery_failed','delivery_expired','resolved',
+                         'cancelled'
+                     )),
+    card_version     INTEGER NOT NULL CHECK(card_version >= 1),
+    workflow_version INTEGER NOT NULL CHECK(workflow_version >= 1),
+    action           TEXT CHECK(action IS NULL OR action IN (
+                         'start','snooze','cancel','approve','revise'
+                     )),
+    occurred_at      TEXT NOT NULL,
+    FOREIGN KEY(card_id) REFERENCES execution_review_cards(id),
+    FOREIGN KEY(task_id) REFERENCES task_execution_workflows(task_id)
+);
+""",
+    """
+CREATE TRIGGER execution_review_card_events_no_update
+BEFORE UPDATE ON execution_review_card_events
+BEGIN
+    SELECT RAISE(ABORT, 'execution review card events are append-only');
+END;
+""",
+    """
+CREATE TRIGGER execution_review_card_events_no_delete
+BEFORE DELETE ON execution_review_card_events
+BEGIN
+    SELECT RAISE(ABORT, 'execution review card events are append-only');
+END;
+""",
+)
+
 
 class InboxError(RuntimeError):
     """The inbox cannot safely initialize or read its state."""
@@ -1031,6 +1159,41 @@ class CandidateInbox:
                     for statement in _SCHEMA_V8:
                         connection.execute(statement)
                     connection.execute("PRAGMA user_version = 8")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 8
+            if version == 8:
+                self._require_tables(
+                    connection,
+                    (
+                        "candidate_inbox",
+                        "candidate_feed_cursors",
+                        "candidate_feed_receipts",
+                        "candidate_revision_history",
+                        "task_shadow_observations",
+                        "task_shadow_feed_cursors",
+                        "task_shadow_feed_receipts",
+                        "tasks",
+                        "task_candidate_bindings",
+                        "task_bootstrap_correlations",
+                        "task_events",
+                        "shadow_import_cycles",
+                        "task_owner_equivalences",
+                        "task_review_cards",
+                        "task_review_card_events",
+                        "task_execution_workflows",
+                        "task_execution_results",
+                        "task_execution_events",
+                    ),
+                )
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V9:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 9")
                     connection.commit()
                 except Exception:
                     connection.rollback()

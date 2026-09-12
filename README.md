@@ -122,7 +122,7 @@ explicitly scheduled open task stops at a reader start gate, then advances
 through separately approved plan, execution, and external-action phases under
 optimistic versions and digest-fenced expiring claims. Results are bounded,
 private, immutable records; failures cool down and eventually park. The ledger
-does not launch an agent, call GW, render execution cards, or close a task. See
+does not launch an agent, call GW, or close a task. See
 [ADR 0013](docs/architecture/0013-task-execution-workflows.md).
 
 The authenticated read-only GW client can also retrieve one digest-bound,
@@ -160,6 +160,17 @@ Starting this command with no queued workflow exits successfully without
 launching an agent. See
 [ADR 0015](docs/architecture/0015-supervised-execution-runner.md).
 
+Execution gates have their own transport-neutral durable review cards. An
+explicit scheduling pass projects only workflows currently awaiting start,
+plan review, or external-action review. Each card is bound to exact task,
+workflow, phase, and result state; delivery uses an expiring digest-fenced
+claim. A delivered action advances the workflow and resolves the card in one
+SQLite transaction, so a stale or failed tap changes neither. Card rendering
+is HTML-escaped and transport-bounded. If the complete private content cannot
+fit, approval is absent from the keyboard and a forged approval callback is
+also refused. These cards do not change task lifecycle. See
+[ADR 0016](docs/architecture/0016-execution-review-cards.md).
+
 Run the contract tests with:
 
 ```sh
@@ -196,3 +207,5 @@ See [ADR 0014](docs/architecture/0014-execution-context-client.md) for the
 strict allowlisted GW persona-variable boundary.
 See [ADR 0015](docs/architecture/0015-supervised-execution-runner.md) for the
 one-shot runner, private worker capability, and failure boundary.
+See [ADR 0016](docs/architecture/0016-execution-review-cards.md) for durable
+execution-gate delivery and atomic reader decisions.
