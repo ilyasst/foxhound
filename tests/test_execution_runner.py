@@ -348,6 +348,21 @@ class ExecutionRunnerTests(unittest.TestCase):
         argv = hermes_argv("hermes", max_turns=12, toolsets="terminal")
         rendered = json.dumps(argv)
         self.assertIn("foxhound-task-worker context", prompt)
+        self.assertIn(
+            "`summary` and `work_markdown` must each be one JSON string",
+            prompt,
+        )
+        self.assertIn(
+            "`questions`, `external_actions`, and `deliverables` must each "
+            "be a JSON array of strings",
+            prompt,
+        )
+        example = prompt.split("Shape example: ", 1)[1].splitlines()[0]
+        draft = json.loads(example)
+        self.assertIsInstance(draft["summary"], str)
+        self.assertIsInstance(draft["work_markdown"], str)
+        for field in ("questions", "external_actions", "deliverables"):
+            self.assertIsInstance(draft[field], list)
         self.assertNotIn("Synthetic task", prompt + rendered)
         self.assertNotIn("claim_token", prompt + rendered)
         self.assertNotIn(str(self.database), prompt + rendered)
