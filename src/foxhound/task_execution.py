@@ -385,10 +385,15 @@ class TaskExecutionService:
                 raise
 
     def claim_next(
-        self, *, lease_seconds: int = DEFAULT_LEASE_SECONDS
+        self,
+        *,
+        lease_seconds: int = DEFAULT_LEASE_SECONDS,
+        allowed_phases: Sequence[WorkflowPhase | str] | None = None,
     ) -> ExecutionClaim | None:
         if not _valid_lease(lease_seconds):
             raise ValueError("execution lease is invalid")
+        phases = _validated_phase_allowlist(allowed_phases)
+        placeholders = ",".join("?" for _ in phases)
         stamp = self._clock_value()
         now = stamp.isoformat(timespec="seconds")
         expires = (stamp + timedelta(seconds=lease_seconds)).isoformat(
@@ -410,10 +415,11 @@ class TaskExecutionService:
                     "FROM task_execution_workflows AS w JOIN tasks AS t "
                     "ON t.id=w.task_id WHERE w.status='queued' "
                     "AND (w.next_attempt_at IS NULL OR w.next_attempt_at<=?) "
+                    f"AND w.phase IN ({placeholders}) "
                     "AND t.status='open' AND t.version=w.task_version "
                     "ORDER BY CASE WHEN w.failure_count=0 THEN 0 ELSE 1 END,"
                     "w.updated_at,w.task_id LIMIT 1",
-                    (now,),
+                    (now, *(phase.value for phase in phases)),
                 ).fetchone()
                 if row is None:
                     connection.commit()
@@ -1421,6 +1427,22 @@ def _valid_lease(value: object) -> bool:
         and isinstance(value, int)
         and MIN_LEASE_SECONDS <= value <= MAX_LEASE_SECONDS
     )
+
+
+def _validated_phase_allowlist(
+    values: Sequence[WorkflowPhase | str] | None,
+) -> tuple[WorkflowPhase, ...]:
+    if values is None:
+        return tuple(WorkflowPhase)
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+        raise ValueError("execution phase allowlist is invalid")
+    try:
+        phases = tuple(WorkflowPhase(value) for value in values)
+    except (TypeError, ValueError):
+        raise ValueError("execution phase allowlist is invalid") from None
+    if not phases or len(set(phases)) != len(phases):
+        raise ValueError("execution phase allowlist is invalid")
+    return phases
 
 
 def _token_digest(token: str) -> str:
