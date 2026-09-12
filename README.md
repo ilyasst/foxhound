@@ -44,4 +44,6 @@ boundary and migration invariants. See
 [ADR 0002](docs/architecture/0002-offline-shadow-import.md) for the offline
 producer-outbox connection. See
 [ADR 0003](docs/architecture/0003-task-shadow-observation.md) for the passive
-candidate-to-legacy-task observation contract.
+candidate-to-legacy-task observation contract. See
+[ADR 0004](docs/architecture/0004-passive-shadow-inbox.md) for ordered durable
+observation ingestion and content-free comparison reports.
