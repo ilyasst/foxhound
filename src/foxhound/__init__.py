@@ -38,6 +38,18 @@ from .knowledge_client import (
     KnowledgeSearchResult,
     KnowledgeTransportError,
 )
+from .task_cards import (
+    CardDisposition,
+    CardOperationResult,
+    CardRefusal,
+    CardStatus,
+    DeliveryClaim,
+    ScheduleResult,
+    TaskCardService,
+    TaskReviewCard,
+    parse_task_review_callback,
+    render_task_review_card,
+)
 
 __version__ = "0.1.0"
 
@@ -74,4 +86,14 @@ __all__ = (
     "KnowledgeResponseError",
     "KnowledgeSearchResult",
     "KnowledgeTransportError",
+    "CardDisposition",
+    "CardOperationResult",
+    "CardRefusal",
+    "CardStatus",
+    "DeliveryClaim",
+    "ScheduleResult",
+    "TaskCardService",
+    "TaskReviewCard",
+    "parse_task_review_callback",
+    "render_task_review_card",
 )

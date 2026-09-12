@@ -16,6 +16,7 @@ from foxhound import (
     ShadowFeedImportRefusal,
 )
 from foxhound.contracts import comparable_task_digest
+from foxhound.candidate_inbox import SCHEMA_VERSION
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "contracts"
@@ -231,6 +232,10 @@ class TaskShadowFeedInboxTests(unittest.TestCase):
         meeting = fixture("meeting-candidate-v1.json")
         self.inbox.import_document(meeting)
         with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute("DROP TRIGGER task_review_card_events_no_update")
+            connection.execute("DROP TRIGGER task_review_card_events_no_delete")
+            connection.execute("DROP TABLE task_review_card_events")
+            connection.execute("DROP TABLE task_review_cards")
             connection.execute("DROP TRIGGER task_owner_equivalences_no_update")
             connection.execute("DROP TRIGGER task_owner_equivalences_no_delete")
             connection.execute("DROP TABLE task_owner_equivalences")
@@ -256,7 +261,7 @@ class TaskShadowFeedInboxTests(unittest.TestCase):
         self.assertEqual(self.inbox.shadow_report().agreed, 1)
         with closing(sqlite3.connect(self.database)) as connection, connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-        self.assertEqual(version, 6)
+        self.assertEqual(version, SCHEMA_VERSION)
 
     def test_invalid_contract_and_empty_page_do_not_write_receipts(self):
         invalid = self.observation_feed()
