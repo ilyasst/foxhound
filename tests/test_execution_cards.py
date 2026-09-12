@@ -33,6 +33,18 @@ from foxhound.task_ledger import TaskLedger, TaskStatus
 
 
 NOW = datetime(2030, 4, 5, 12, 0, tzinfo=timezone.utc)
+
+
+def _drop_native_intake_schema(connection: sqlite3.Connection) -> None:
+    connection.execute("DROP TRIGGER native_candidate_intake_events_no_update")
+    connection.execute("DROP TRIGGER native_candidate_intake_events_no_delete")
+    connection.execute("DROP TRIGGER candidate_feed_items_no_update")
+    connection.execute("DROP TRIGGER candidate_feed_items_no_delete")
+    connection.execute("DROP TABLE native_candidate_intake_events")
+    connection.execute("DROP TABLE native_candidate_intakes")
+    connection.execute("DROP TABLE candidate_feed_items")
+
+
 DELIVERY_TOKEN = "delivery-token-" + "d" * 32
 CLAIM_TOKEN = "execution-token-" + "c" * 32
 
@@ -165,6 +177,7 @@ class ExecutionCardTests(unittest.TestCase):
     def test_schema_eight_migration_is_passive_and_preserves_execution(self):
         self._schedule_workflow(1)
         with closing(sqlite3.connect(self.database)) as connection:
+            _drop_native_intake_schema(connection)
             connection.execute(
                 "DROP TRIGGER execution_review_card_events_no_update"
             )

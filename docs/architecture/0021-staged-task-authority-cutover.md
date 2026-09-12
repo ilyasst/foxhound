@@ -86,7 +86,8 @@ context, and projection of Foxhound outcomes.
 The final state has no producer-owned task lifecycle, task card, scheduler,
 agent runner, retry state, or durable task identity. Obsolete paths are removed
 through reviewed changes after the validation period rather than left as an
-accidental fallback.
+accidental fallback. The one-way activation and ordered acceptance rules are
+defined in [ADR 0022](0022-native-candidate-intake.md).
 
 ## Cutover gates
 

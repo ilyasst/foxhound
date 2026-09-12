@@ -28,6 +28,16 @@ def fixture(name: str = "candidate-feed-page-v1.json") -> dict:
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
 
 
+def _drop_native_intake_schema(connection: sqlite3.Connection) -> None:
+    connection.execute("DROP TRIGGER native_candidate_intake_events_no_update")
+    connection.execute("DROP TRIGGER native_candidate_intake_events_no_delete")
+    connection.execute("DROP TRIGGER candidate_feed_items_no_update")
+    connection.execute("DROP TRIGGER candidate_feed_items_no_delete")
+    connection.execute("DROP TABLE native_candidate_intake_events")
+    connection.execute("DROP TABLE native_candidate_intakes")
+    connection.execute("DROP TABLE candidate_feed_items")
+
+
 class CandidateFeedInboxTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -200,6 +210,7 @@ class CandidateFeedInboxTests(unittest.TestCase):
         meeting = fixture("meeting-candidate-v1.json")
         self.inbox.import_document(meeting)
         with closing(sqlite3.connect(self.database)) as connection, connection:
+            _drop_native_intake_schema(connection)
             connection.execute(
                 "DROP TRIGGER execution_review_card_events_no_update"
             )
@@ -250,6 +261,7 @@ class CandidateFeedInboxTests(unittest.TestCase):
 
     def test_incomplete_version_one_database_is_not_migrated(self):
         with closing(sqlite3.connect(self.database)) as connection, connection:
+            _drop_native_intake_schema(connection)
             connection.execute(
                 "DROP TRIGGER execution_review_card_events_no_update"
             )

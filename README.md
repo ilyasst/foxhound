@@ -99,6 +99,32 @@ foxhound-task-bootstrap \\
 It neither imports feeds nor schedules cards or execution. See
 [ADR 0018](docs/architecture/0018-one-shot-shadow-bootstrap.md).
 
+The final candidate boundary replaces that temporary legacy bootstrap with a
+one-way native intake activation. Activation fixes the exact reconciled feed
+cursor; every later contiguous candidate is then accepted by stable candidate
+identity without consulting producer task state:
+
+```sh
+foxhound-native-intake activate \
+  --database /srv/example/private-foxhound-state/foxhound.sqlite3 \
+  --stream-id pilot-alpha \
+  --expected-cursor 42
+
+foxhound-native-intake run \
+  --database /srv/example/private-foxhound-state/foxhound.sqlite3 \
+  --stream-id pilot-alpha \
+  --limit 100
+```
+
+Activation refuses an unreconciled historical prefix and permanently disables
+the legacy shadow bootstrap for that producer. A run advances one bounded,
+contiguous page in a transaction. New candidate identities create at most one
+task; later revisions update only the accepted open task and increment its
+version, making older cards and workflows stale. Producer task decisions,
+folded bindings, terminal tasks, gaps, and contradictory state fail closed
+without advancing the intake cursor. Both commands report aggregate metadata
+only. See [ADR 0022](docs/architecture/0022-native-candidate-intake.md).
+
 Correlated status transitions can be exported manually as a content-free,
 append-only offline feed for a knowledge system to project. Only tasks carrying
 the temporary GW bootstrap correlation enter this stream; native Foxhound
@@ -280,3 +306,7 @@ See [ADR 0019](docs/architecture/0019-new-task-execution-scheduler.md) for the
 bounded projection of new open tasks to the reader Start gate.
 See [ADR 0020](docs/architecture/0020-phase-restricted-runner.md) for the
 atomic phase allowlist used by plan-only parallel comparisons.
+See [ADR 0021](docs/architecture/0021-staged-task-authority-cutover.md) for the
+staged transfer of lifecycle, card, execution, and candidate authority.
+See [ADR 0022](docs/architecture/0022-native-candidate-intake.md) for the
+one-way producer-independent candidate acceptance boundary.
