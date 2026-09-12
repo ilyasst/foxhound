@@ -27,6 +27,16 @@ TOKEN = "execution-claim-token-000000000000000000000000"
 OTHER_TOKEN = "different-claim-token-000000000000000000000"
 
 
+def _drop_native_intake_schema(connection: sqlite3.Connection) -> None:
+    connection.execute("DROP TRIGGER native_candidate_intake_events_no_update")
+    connection.execute("DROP TRIGGER native_candidate_intake_events_no_delete")
+    connection.execute("DROP TRIGGER candidate_feed_items_no_update")
+    connection.execute("DROP TRIGGER candidate_feed_items_no_delete")
+    connection.execute("DROP TABLE native_candidate_intake_events")
+    connection.execute("DROP TABLE native_candidate_intakes")
+    connection.execute("DROP TABLE candidate_feed_items")
+
+
 class MutableClock:
     def __init__(self) -> None:
         self.value = datetime(2030, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
@@ -110,6 +120,7 @@ class TaskExecutionTests(unittest.TestCase):
 
     def test_schema_seven_migration_is_passive_and_append_only(self):
         with closing(sqlite3.connect(self.database)) as connection:
+            _drop_native_intake_schema(connection)
             connection.execute(
                 "DROP TRIGGER execution_review_card_events_no_update"
             )

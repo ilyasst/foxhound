@@ -23,6 +23,16 @@ FIXTURES = Path(__file__).parent / "fixtures" / "contracts"
 NOW = datetime(2030, 3, 1, 12, 0, tzinfo=timezone.utc)
 
 
+def _drop_native_intake_schema(connection: sqlite3.Connection) -> None:
+    connection.execute("DROP TRIGGER native_candidate_intake_events_no_update")
+    connection.execute("DROP TRIGGER native_candidate_intake_events_no_delete")
+    connection.execute("DROP TRIGGER candidate_feed_items_no_update")
+    connection.execute("DROP TRIGGER candidate_feed_items_no_delete")
+    connection.execute("DROP TABLE native_candidate_intake_events")
+    connection.execute("DROP TABLE native_candidate_intakes")
+    connection.execute("DROP TABLE candidate_feed_items")
+
+
 def fixture(name: str) -> dict:
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
 
@@ -232,6 +242,7 @@ class TaskShadowFeedInboxTests(unittest.TestCase):
         meeting = fixture("meeting-candidate-v1.json")
         self.inbox.import_document(meeting)
         with closing(sqlite3.connect(self.database)) as connection, connection:
+            _drop_native_intake_schema(connection)
             connection.execute(
                 "DROP TRIGGER execution_review_card_events_no_update"
             )

@@ -28,6 +28,16 @@ NOW = datetime(2030, 3, 1, 12, 0, tzinfo=timezone.utc)
 TOKEN = "a" * 43
 
 
+def _drop_native_intake_schema(connection: sqlite3.Connection) -> None:
+    connection.execute("DROP TRIGGER native_candidate_intake_events_no_update")
+    connection.execute("DROP TRIGGER native_candidate_intake_events_no_delete")
+    connection.execute("DROP TRIGGER candidate_feed_items_no_update")
+    connection.execute("DROP TRIGGER candidate_feed_items_no_delete")
+    connection.execute("DROP TABLE native_candidate_intake_events")
+    connection.execute("DROP TABLE native_candidate_intakes")
+    connection.execute("DROP TABLE candidate_feed_items")
+
+
 class Clock:
     def __init__(self):
         self.value = NOW
@@ -144,6 +154,7 @@ class TaskCardTests(unittest.TestCase):
 
     def test_schema_six_migration_is_passive(self):
         with closing(sqlite3.connect(self.database)) as connection:
+            _drop_native_intake_schema(connection)
             connection.execute(
                 "DROP TRIGGER execution_review_card_events_no_update"
             )
