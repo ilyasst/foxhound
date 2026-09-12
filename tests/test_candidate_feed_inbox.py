@@ -199,6 +199,9 @@ class CandidateFeedInboxTests(unittest.TestCase):
         meeting = fixture("meeting-candidate-v1.json")
         self.inbox.import_document(meeting)
         with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute("DROP TRIGGER shadow_import_cycles_no_update")
+            connection.execute("DROP TRIGGER shadow_import_cycles_no_delete")
+            connection.execute("DROP TABLE shadow_import_cycles")
             connection.execute("DROP TABLE task_events")
             connection.execute("DROP TABLE task_bootstrap_correlations")
             connection.execute("DROP TABLE task_candidate_bindings")
@@ -218,10 +221,13 @@ class CandidateFeedInboxTests(unittest.TestCase):
         self.assertEqual(self.inbox.feed_cursor("gw", "primary"), 0)
         with closing(sqlite3.connect(self.database)) as connection, connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-        self.assertEqual(version, 4)
+        self.assertEqual(version, 5)
 
     def test_incomplete_version_one_database_is_not_migrated(self):
         with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute("DROP TRIGGER shadow_import_cycles_no_update")
+            connection.execute("DROP TRIGGER shadow_import_cycles_no_delete")
+            connection.execute("DROP TABLE shadow_import_cycles")
             connection.execute("DROP TABLE task_events")
             connection.execute("DROP TABLE task_bootstrap_correlations")
             connection.execute("DROP TABLE task_candidate_bindings")

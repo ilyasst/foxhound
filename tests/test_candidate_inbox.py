@@ -40,7 +40,7 @@ class CandidateInboxTests(unittest.TestCase):
         self.assertEqual(os.stat(self.database).st_mode & 0o777, 0o600)
         with closing(sqlite3.connect(self.database)) as connection, connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-        self.assertEqual(version, 4)
+        self.assertEqual(version, 5)
         self.assertEqual(self.inbox.count(), 0)
 
     def test_first_import_inserts_candidate(self):
@@ -161,7 +161,7 @@ class CandidateInboxTests(unittest.TestCase):
 
     def test_newer_database_schema_is_refused(self):
         with closing(sqlite3.connect(self.database)) as connection, connection:
-            connection.execute("PRAGMA user_version = 5")
+            connection.execute("PRAGMA user_version = 6")
         with self.assertRaisesRegex(InboxError, "newer"):
             self.inbox.initialize()
 
