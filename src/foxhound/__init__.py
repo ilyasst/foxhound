@@ -26,6 +26,18 @@ from .task_ledger import (
     TransitionRefusal,
     TransitionResult,
 )
+from .knowledge_client import (
+    GwKnowledgeClient,
+    KnowledgeClientConfig,
+    KnowledgeClientError,
+    KnowledgeConfigError,
+    KnowledgeDocument,
+    KnowledgeLayer,
+    KnowledgeRequestError,
+    KnowledgeResponseError,
+    KnowledgeSearchResult,
+    KnowledgeTransportError,
+)
 
 __version__ = "0.1.0"
 
@@ -52,4 +64,14 @@ __all__ = (
     "TransitionDisposition",
     "TransitionRefusal",
     "TransitionResult",
+    "GwKnowledgeClient",
+    "KnowledgeClientConfig",
+    "KnowledgeClientError",
+    "KnowledgeConfigError",
+    "KnowledgeDocument",
+    "KnowledgeLayer",
+    "KnowledgeRequestError",
+    "KnowledgeResponseError",
+    "KnowledgeSearchResult",
+    "KnowledgeTransportError",
 )
