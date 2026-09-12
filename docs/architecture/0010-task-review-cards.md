@@ -40,6 +40,10 @@ Card content is private runtime data. Operation results and scheduler results
 contain only state, versions, timestamps, and aggregate counts suitable for
 content-free operational reporting.
 
+The aggregate can also report pending, delivering, delivered, snoozed, and
+total active counts from one read snapshot. It does not return card or task
+identifiers and does not change queue state.
+
 ## Activation and rollback
 
 Initializing an existing database only adds empty tables. Activation requires

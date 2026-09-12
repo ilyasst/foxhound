@@ -19,6 +19,11 @@ Foxhound exposes five fixed POST routes for a trusted local card gateway:
 - release a failed delivery; and
 - apply a version-fenced reader action.
 
+An additional read-only POST route returns aggregate pending, delivering,
+delivered, snoozed, and total active counts. A gateway computes its on-screen
+load as `delivering + delivered`; it never needs task/card identities merely
+to pace delivery.
+
 Every application route requires one bearer token loaded from a nonsymlink,
 owner-owned, mode-0600 regular file. Request contracts are versioned and exact:
 unknown or duplicate JSON fields, invalid types, extra headers that change body

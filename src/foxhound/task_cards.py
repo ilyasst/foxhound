@@ -64,6 +64,17 @@ class ScheduleResult:
 
 
 @dataclass(frozen=True)
+class CardStats:
+    """Aggregate-only queue state from one database snapshot."""
+
+    pending: int
+    delivering: int
+    delivered: int
+    snoozed: int
+    active: int
+
+
+@dataclass(frozen=True)
 class TaskReviewCard:
     """Private card projection; callers must not log or persist its content."""
 
@@ -508,6 +519,24 @@ class TaskCardService:
             return int(connection.execute(
                 "SELECT count(*) FROM task_review_cards"
             ).fetchone()[0])
+
+    def stats(self) -> CardStats:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT "
+                "SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,"
+                "SUM(CASE WHEN status='delivering' THEN 1 ELSE 0 END) AS delivering,"
+                "SUM(CASE WHEN status='delivered' THEN 1 ELSE 0 END) AS delivered,"
+                "SUM(CASE WHEN status='snoozed' THEN 1 ELSE 0 END) AS snoozed,"
+                "SUM(CASE WHEN status IN "
+                "('pending','delivering','delivered','snoozed') "
+                "THEN 1 ELSE 0 END) AS active "
+                "FROM task_review_cards"
+            ).fetchone()
+        return CardStats(*(
+            int(row[name] or 0)
+            for name in ("pending", "delivering", "delivered", "snoozed", "active")
+        ))
 
     def event_count(self) -> int:
         with closing(self._connect()) as connection:

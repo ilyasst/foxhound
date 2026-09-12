@@ -97,7 +97,8 @@ local card gateway. It exposes only scheduling, one leased claim, delivery
 acknowledgement/failure, and reader action. The database must already be
 migrated, every application request is strict and authenticated, and access
 logs contain no task/card identifiers or content. Starting the service creates
-no cards. See
+no cards. Its aggregate stats route lets a gateway cap on-screen delivery
+without listing private tasks or cards. See
 [ADR 0011](docs/architecture/0011-local-task-card-service.md).
 
 Run the contract tests with:
