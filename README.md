@@ -8,7 +8,9 @@ The implementation includes versioned candidate and passive shadow-observation
 contracts, a Foxhound-owned durable task ledger, and transport-neutral durable
 task review cards. Its only task-card network surface is an opt-in
 authenticated loopback service. It has no chat transport, recurring host
-scheduler, agent runner, or implicit production-data access.
+scheduler, or implicit production-data access. Its execution runner is an
+explicit one-shot command and performs no work unless a workflow has already
+passed its reader gate.
 
 Foxhound can retrieve bounded task context through an explicitly configured,
 authenticated, read-only GW search endpoint. The client accepts loopback HTTP
@@ -130,6 +132,34 @@ alias. It excludes task state, paths, environment variables, credentials,
 machine inventory, and producer configuration. See
 [ADR 0014](docs/architecture/0014-execution-context-client.md).
 
+Foxhound provides a one-shot supervised runner for one queued execution phase.
+It claims the durable workflow before starting a disposable agent, renews the
+lease, discards agent stdout and stderr, and maps process startup, exit,
+timeout, interruption, and lease failures into the workflow's retry policy.
+The agent receives no claim capability in its prompt, arguments, output, or
+result draft. It can obtain only the current private work context, bounded GW
+search, durable result recording, and claim release through the narrow
+`foxhound-task-worker` command. Result identity and all task/workflow fencing
+are injected from owner-only run state rather than trusted from agent output.
+
+The runner neither schedules itself nor advances reader gates. A deployment
+must keep the database, run directory, and knowledge token in approved private
+host-local state, initialize them separately, and invoke the runner only after
+the matching GW execution-context provider is available. A synthetic shape is:
+
+```sh
+foxhound-execution-runner \
+  --database /srv/example/private-foxhound-state/foxhound.sqlite3 \
+  --run-root /srv/example/private-foxhound-state/execution-runs \
+  --gw-endpoint http://127.0.0.1:8787 \
+  --gw-alias example-operator \
+  --gw-token-file /srv/example/private-foxhound-state/knowledge.token
+```
+
+Starting this command with no queued workflow exits successfully without
+launching an agent. See
+[ADR 0015](docs/architecture/0015-supervised-execution-runner.md).
+
 Run the contract tests with:
 
 ```sh
@@ -164,3 +194,5 @@ See [ADR 0013](docs/architecture/0013-task-execution-workflows.md) for durable
 execution scheduling, gates, claims, results, and retry state.
 See [ADR 0014](docs/architecture/0014-execution-context-client.md) for the
 strict allowlisted GW persona-variable boundary.
+See [ADR 0015](docs/architecture/0015-supervised-execution-runner.md) for the
+one-shot runner, private worker capability, and failure boundary.
