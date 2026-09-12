@@ -17,6 +17,7 @@ from foxhound.candidate_inbox import CandidateInbox
 from foxhound.execution_runner import (
     ExecutionRunnerConfig,
     ExecutionRunnerError,
+    ExecutionRunResult,
     _exclusive_lock,
     agent_prompt,
     hermes_argv,
@@ -28,6 +29,7 @@ from foxhound.task_execution import (
     ExecutionOutcome,
     ExecutionResultEnvelope,
     TaskExecutionService,
+    WorkflowPhase,
     WorkflowStatus,
 )
 from foxhound.task_ledger import TaskLedger
@@ -206,6 +208,42 @@ class ExecutionRunnerTests(unittest.TestCase):
             self.service.get(1).last_failure_reason, "startup_failed"
         )
 
+    def test_plan_only_runner_does_not_claim_execute_work(self):
+        self._ready()
+        claim = self.service.claim_next(lease_seconds=30)
+        self.assertIsNotNone(claim)
+        recorded = self.service.record_result(ExecutionResultEnvelope(
+            result_id=RESULT_ID,
+            task_id=claim.task_id,
+            task_version=claim.task_version,
+            workflow_version=claim.workflow_version,
+            phase=claim.phase,
+            claim_token=claim.token,
+            outcome=ExecutionOutcome.AWAITING_PLAN,
+            summary="Synthetic result",
+            work_markdown="Synthetic plan",
+        ))
+        queued = self.service.review_action(
+            1, expected_version=recorded.version, action="approve"
+        )
+        self.assertEqual(queued.phase, WorkflowPhase.EXECUTE)
+
+        launched = False
+
+        def popen(*_args, **_kwargs):
+            nonlocal launched
+            launched = True
+            return FakeProcess(exit_code=0)
+
+        before = self.service.get(1)
+        result = run_once(
+            self._config(allowed_phases=(WorkflowPhase.PLAN,)),
+            popen=popen,
+        )
+        self.assertEqual((result.outcome, result.exit_code), ("idle", 0))
+        self.assertFalse(launched)
+        self.assertEqual(self.service.get(1), before)
+
     def test_timeout_terminates_and_records_failure(self):
         self._ready()
         monotonic = MutableMonotonic()
@@ -333,6 +371,14 @@ class ExecutionRunnerTests(unittest.TestCase):
         self.run_root.chmod(0o700)
         with self.assertRaises(ValueError):
             self._config(heartbeat_seconds=10, lease_seconds=20)
+        for phases in (
+            (),
+            (WorkflowPhase.PLAN, WorkflowPhase.PLAN),
+            ("plan",),
+        ):
+            with self.subTest(phases=phases):
+                with self.assertRaises(ValueError):
+                    self._config(allowed_phases=phases)
 
         self.database.chmod(0o644)
         with self.assertRaises(ExecutionRunnerError):
@@ -386,6 +432,27 @@ class ExecutionRunnerTests(unittest.TestCase):
                 code = main(arguments)
         self.assertEqual(code, 70)
         self.assertNotIn(private_value, output.getvalue() + errors.getvalue())
+
+    def test_cli_passes_an_explicit_phase_allowlist(self):
+        output = StringIO()
+        arguments = [
+            "--database", str(self.database),
+            "--run-root", str(self.run_root),
+            "--gw-endpoint", "http://127.0.0.1:8787",
+            "--gw-alias", "primary",
+            "--gw-token-file", str(self.token_file),
+            "--allowed-phase", "plan",
+        ]
+        with redirect_stdout(output), mock.patch(
+            "foxhound.execution_runner.run_once",
+            return_value=ExecutionRunResult("idle", 0),
+        ) as run:
+            code = main(arguments)
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            run.call_args.args[0].allowed_phases,
+            (WorkflowPhase.PLAN,),
+        )
 
 
 if __name__ == "__main__":

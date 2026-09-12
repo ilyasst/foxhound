@@ -36,6 +36,7 @@ from .task_execution import (
     TaskExecutionService,
     WorkflowOperationResult,
     WorkflowDisposition,
+    WorkflowPhase,
     WorkflowStatus,
 )
 
@@ -70,6 +71,7 @@ class ExecutionRunnerConfig:
     gw_token_file: Path = field(repr=False)
     agent_argv: tuple[str, ...] = field(repr=False)
     worker_command: str = "foxhound-task-worker"
+    allowed_phases: tuple[WorkflowPhase, ...] = tuple(WorkflowPhase)
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
     lease_seconds: int = DEFAULT_LEASE_SECONDS
     heartbeat_seconds: float = DEFAULT_HEARTBEAT_SECONDS
@@ -98,6 +100,16 @@ class ExecutionRunnerConfig:
             raise ValueError("execution agent command is invalid")
         if not _COMMAND_NAME_RE.fullmatch(self.worker_command):
             raise ValueError("execution worker command is invalid")
+        if (
+            not isinstance(self.allowed_phases, tuple)
+            or not self.allowed_phases
+            or any(
+                not isinstance(phase, WorkflowPhase)
+                for phase in self.allowed_phases
+            )
+            or len(set(self.allowed_phases)) != len(self.allowed_phases)
+        ):
+            raise ValueError("execution phase allowlist is invalid")
         if (
             isinstance(self.lease_seconds, bool)
             or not isinstance(self.lease_seconds, int)
@@ -227,7 +239,10 @@ def run_once(
     with _exclusive_lock(root / ".runner.lock") as acquired:
         if not acquired:
             return ExecutionRunResult("already_running", 0)
-        claim = service.claim_next(lease_seconds=config.lease_seconds)
+        claim = service.claim_next(
+            lease_seconds=config.lease_seconds,
+            allowed_phases=config.allowed_phases,
+        )
         if claim is None:
             return ExecutionRunResult("idle", 0)
         return _run_claim(
@@ -684,6 +699,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--gw-token-file", required=True, type=Path)
     parser.add_argument("--agent-command", default="hermes")
     parser.add_argument("--worker-command", default="foxhound-task-worker")
+    parser.add_argument(
+        "--allowed-phase",
+        action="append",
+        choices=tuple(phase.value for phase in WorkflowPhase),
+        dest="allowed_phases",
+        help=(
+            "claim only this workflow phase; repeat to allow multiple phases "
+            "(default: all phases)"
+        ),
+    )
     parser.add_argument("--toolsets")
     parser.add_argument("--max-turns", type=int, default=12)
     parser.add_argument("--timeout-seconds", type=float, default=240)
@@ -710,6 +735,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             gw_token_file=args.gw_token_file,
             agent_argv=command,
             worker_command=args.worker_command,
+            allowed_phases=(
+                tuple(WorkflowPhase(value) for value in args.allowed_phases)
+                if args.allowed_phases
+                else tuple(WorkflowPhase)
+            ),
             timeout_seconds=args.timeout_seconds,
             lease_seconds=args.lease_seconds,
             heartbeat_seconds=args.heartbeat_seconds,

@@ -174,6 +174,25 @@ Starting this command with no queued workflow exits successfully without
 launching an agent. See
 [ADR 0015](docs/architecture/0015-supervised-execution-runner.md).
 
+For a parallel comparison in which Foxhound may prepare plans but must never
+execute work, restrict the runner's atomic claim selection:
+
+```sh
+foxhound-execution-runner \
+  --database /srv/example/private-foxhound-state/foxhound.sqlite3 \
+  --run-root /srv/example/private-foxhound-state/execution-runs \
+  --gw-endpoint http://127.0.0.1:8787 \
+  --gw-alias example-operator \
+  --gw-token-file /srv/example/private-foxhound-state/knowledge.token \
+  --allowed-phase plan
+```
+
+The option is repeatable. Omitting it preserves the normal all-phase runner.
+Disallowed queued work remains untouched and no agent is launched for it.
+Phase restriction does not change lifecycle or card authority; a shadow
+deployment must separately keep lifecycle projection disabled. See
+[ADR 0020](docs/architecture/0020-phase-restricted-runner.md).
+
 Newly accepted open tasks can be projected to the reader Start gate with an
 explicit bounded pass:
 
@@ -251,3 +270,5 @@ See [ADR 0018](docs/architecture/0018-one-shot-shadow-bootstrap.md) for the
 explicit deployment boundary around verified shadow activation.
 See [ADR 0019](docs/architecture/0019-new-task-execution-scheduler.md) for the
 bounded projection of new open tasks to the reader Start gate.
+See [ADR 0020](docs/architecture/0020-phase-restricted-runner.md) for the
+atomic phase allowlist used by plan-only parallel comparisons.

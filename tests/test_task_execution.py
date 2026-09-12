@@ -285,6 +285,87 @@ class TaskExecutionTests(unittest.TestCase):
         )
         self.assertEqual(repeated.refusal, WorkflowRefusal.STALE_WORKFLOW)
 
+    def test_claim_phase_allowlist_is_atomic_and_leaves_other_work_queued(self):
+        self._schedule_and_start()
+        plan_claim = self._claim()
+        recorded = self.service.record_result(self._result(plan_claim))
+        execute = self.service.review_action(
+            1, expected_version=recorded.version, action="approve"
+        )
+        self.assertEqual(execute.phase, WorkflowPhase.EXECUTE)
+
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "INSERT INTO tasks(id,status,text,owner,due,version,"
+                "created_at,updated_at,closed_at) VALUES(2,'open',"
+                "'Synthetic task 2','Person A',NULL,1,?,?,NULL)",
+                (self._now(), self._now()),
+            )
+            connection.commit()
+        scheduled = self.service.schedule(2, expected_task_version=1)
+        self.service.start_action(
+            2, expected_version=scheduled.version, action="start"
+        )
+
+        execute_before = self.service.get(1)
+        plan = self.service.claim_next(
+            lease_seconds=300,
+            allowed_phases=(WorkflowPhase.PLAN,),
+        )
+        self.assertIsNotNone(plan)
+        self.assertEqual((plan.task_id, plan.phase), (2, WorkflowPhase.PLAN))
+        execute_after = self.service.get(1)
+        self.assertEqual(execute_after, execute_before)
+
+        self.service.release(
+            plan.task_id,
+            expected_version=plan.workflow_version,
+            claim_token=plan.token,
+        )
+        selected = self.service.claim_next(
+            lease_seconds=300,
+            allowed_phases=(WorkflowPhase.EXECUTE,),
+        )
+        self.assertIsNotNone(selected)
+        self.assertEqual(
+            (selected.task_id, selected.phase),
+            (1, WorkflowPhase.EXECUTE),
+        )
+        waiting = self.service.record_result(self._result(
+            selected,
+            result_id="result-002",
+            outcome=ExecutionOutcome.AWAITING_EXTERNAL,
+        ))
+        external = self.service.review_action(
+            1, expected_version=waiting.version, action="approve"
+        )
+        self.assertEqual(external.phase, WorkflowPhase.EXTERNAL_ACTION)
+        external_before = self.service.get(1)
+
+        plan = self.service.claim_next(
+            lease_seconds=300,
+            allowed_phases=(WorkflowPhase.PLAN,),
+        )
+        self.assertIsNotNone(plan)
+        self.assertEqual((plan.task_id, plan.phase), (2, WorkflowPhase.PLAN))
+        self.assertEqual(self.service.get(1), external_before)
+
+    def test_claim_phase_allowlist_rejects_invalid_configuration(self):
+        self._schedule_and_start()
+        for phases in (
+            (),
+            (WorkflowPhase.PLAN, WorkflowPhase.PLAN),
+            ("unknown",),
+            "plan",
+        ):
+            with self.subTest(phases=phases):
+                with self.assertRaises(ValueError):
+                    self.service.claim_next(allowed_phases=phases)
+                self.assertEqual(
+                    self.service.get(1).status,
+                    WorkflowStatus.QUEUED,
+                )
+
     def test_cancel_is_fenced_and_terminal_workflow_can_be_rescheduled(self):
         scheduled = self.service.schedule(1, expected_task_version=1)
         cancelled = self.service.start_action(
