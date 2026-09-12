@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -170,6 +170,34 @@ _SCHEMA_COLUMNS = {
         "basis",
         "resolved_at",
     ),
+    "task_review_cards": (
+        "id",
+        "task_id",
+        "task_version",
+        "status",
+        "version",
+        "due_at",
+        "claim_token_digest",
+        "claim_expires_at",
+        "transport",
+        "delivery_ref",
+        "delivered_at",
+        "resolution",
+        "review_after",
+        "created_at",
+        "updated_at",
+        "resolved_at",
+    ),
+    "task_review_card_events": (
+        "sequence",
+        "card_id",
+        "task_id",
+        "kind",
+        "card_version",
+        "task_version",
+        "action",
+        "occurred_at",
+    ),
 }
 
 _SCHEMA_OBJECTS = {
@@ -180,6 +208,9 @@ _SCHEMA_OBJECTS = {
     "shadow_import_cycles_no_delete": "trigger",
     "task_owner_equivalences_no_update": "trigger",
     "task_owner_equivalences_no_delete": "trigger",
+    "task_review_cards_one_active": "index",
+    "task_review_card_events_no_update": "trigger",
+    "task_review_card_events_no_delete": "trigger",
 }
 
 _SCHEMA_V1 = """
@@ -429,6 +460,74 @@ CREATE TRIGGER task_owner_equivalences_no_delete
 BEFORE DELETE ON task_owner_equivalences
 BEGIN
     SELECT RAISE(ABORT, 'task owner equivalences are append-only');
+END;
+""",
+)
+
+_SCHEMA_V7 = (
+    """
+CREATE TABLE task_review_cards (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id            INTEGER NOT NULL,
+    task_version       INTEGER NOT NULL CHECK(task_version >= 1),
+    status             TEXT NOT NULL CHECK(status IN (
+                           'pending','delivering','delivered','snoozed',
+                           'resolved','cancelled'
+                       )),
+    version            INTEGER NOT NULL CHECK(version >= 1),
+    due_at             TEXT NOT NULL,
+    claim_token_digest TEXT,
+    claim_expires_at   TEXT,
+    transport          TEXT,
+    delivery_ref       TEXT,
+    delivered_at       TEXT,
+    resolution         TEXT CHECK(resolution IS NULL OR resolution IN (
+                           'done','keep_open','drop'
+                       )),
+    review_after       TEXT,
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL,
+    resolved_at        TEXT,
+    FOREIGN KEY(task_id) REFERENCES tasks(id)
+);
+""",
+    """
+CREATE UNIQUE INDEX task_review_cards_one_active
+    ON task_review_cards(task_id)
+    WHERE status IN ('pending','delivering','delivered','snoozed');
+""",
+    """
+CREATE TABLE task_review_card_events (
+    sequence     INTEGER PRIMARY KEY AUTOINCREMENT,
+    card_id      INTEGER NOT NULL,
+    task_id      INTEGER NOT NULL,
+    kind         TEXT NOT NULL CHECK(kind IN (
+                     'scheduled','delivery_claimed','delivered',
+                     'delivery_failed','delivery_expired','snoozed',
+                     'resolved','cancelled'
+                 )),
+    card_version INTEGER NOT NULL CHECK(card_version >= 1),
+    task_version INTEGER NOT NULL CHECK(task_version >= 1),
+    action       TEXT CHECK(action IS NULL OR action IN (
+                     'done','keep_open','drop','snooze'
+                 )),
+    occurred_at  TEXT NOT NULL,
+    FOREIGN KEY(card_id) REFERENCES task_review_cards(id),
+    FOREIGN KEY(task_id) REFERENCES tasks(id)
+);
+""",
+    """
+CREATE TRIGGER task_review_card_events_no_update
+BEFORE UPDATE ON task_review_card_events
+BEGIN
+    SELECT RAISE(ABORT, 'task review card events are append-only');
+END;
+""",
+    """
+CREATE TRIGGER task_review_card_events_no_delete
+BEFORE DELETE ON task_review_card_events
+BEGIN
+    SELECT RAISE(ABORT, 'task review card events are append-only');
 END;
 """,
 )
@@ -685,6 +784,36 @@ class CandidateInbox:
                     for statement in _SCHEMA_V6:
                         connection.execute(statement)
                     connection.execute("PRAGMA user_version = 6")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 6
+            if version == 6:
+                self._require_tables(
+                    connection,
+                    (
+                        "candidate_inbox",
+                        "candidate_feed_cursors",
+                        "candidate_feed_receipts",
+                        "candidate_revision_history",
+                        "task_shadow_observations",
+                        "task_shadow_feed_cursors",
+                        "task_shadow_feed_receipts",
+                        "tasks",
+                        "task_candidate_bindings",
+                        "task_bootstrap_correlations",
+                        "task_events",
+                        "shadow_import_cycles",
+                        "task_owner_equivalences",
+                    ),
+                )
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V7:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 7")
                     connection.commit()
                 except Exception:
                     connection.rollback()

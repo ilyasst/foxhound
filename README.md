@@ -5,8 +5,9 @@ remain responsible for discovering task candidates and organizing their source
 material.
 
 The implementation includes versioned candidate and passive shadow-observation
-contracts plus a Foxhound-owned durable task ledger. It has no service
-scheduler, card transport, agent runner, or implicit production-data access.
+contracts, a Foxhound-owned durable task ledger, and transport-neutral durable
+task review cards. It has no network service, chat transport, recurring host
+scheduler, agent runner, or implicit production-data access.
 
 Foxhound can retrieve bounded task context through an explicitly configured,
 authenticated, read-only GW search endpoint. The client accepts loopback HTTP
@@ -81,6 +82,15 @@ Lifecycle transitions are optimistic-version fenced and append immutable
 events. See [ADR 0006](docs/architecture/0006-durable-task-ledger.md) and
 [ADR 0009](docs/architecture/0009-owner-equivalence-bootstrap.md).
 
+An application may explicitly schedule review cards for open tasks, claim one
+due card under a bounded delivery lease, render it for a private card surface,
+and acknowledge delivery before accepting a reader action. Done and Drop are
+atomic with the task lifecycle transition; Still open schedules a later
+review; Snooze defers the same card for exactly three days. Card and task
+versions reject stale callbacks without partial writes. Schema initialization
+does not create or deliver cards. See
+[ADR 0010](docs/architecture/0010-task-review-cards.md).
+
 Run the contract tests with:
 
 ```sh
@@ -105,3 +115,5 @@ See [ADR 0008](docs/architecture/0008-shadow-import-cycle.md) for the ordered,
 overlap-safe passive import cycle and its durable success receipts.
 See [ADR 0009](docs/architecture/0009-owner-equivalence-bootstrap.md) for the
 bounded owner-equivalence attestation and fail-closed bootstrap rules.
+See [ADR 0010](docs/architecture/0010-task-review-cards.md) for durable card
+scheduling, delivery leases, reader actions, and activation rollback.

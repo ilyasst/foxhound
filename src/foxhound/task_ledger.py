@@ -549,92 +549,29 @@ class TaskLedger:
                 task_id=task_id,
                 refusal=TransitionRefusal.STALE_VERSION,
             )
-        targets = {
-            "done": (frozenset({TaskStatus.OPEN}), TaskStatus.DONE),
-            "drop": (frozenset({TaskStatus.OPEN}), TaskStatus.DROPPED),
-            "reopen": (
-                frozenset({TaskStatus.DONE, TaskStatus.DROPPED}),
-                TaskStatus.OPEN,
-            ),
-        }
-        if action not in targets:
+        if action not in {"done", "drop", "reopen"}:
             return TransitionResult(
                 TransitionDisposition.REFUSED,
                 task_id=task_id,
                 refusal=TransitionRefusal.INVALID_ACTION,
             )
-        sources, target = targets[action]
         now = self._now()
         with closing(self._connect()) as connection:
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("BEGIN IMMEDIATE")
             try:
-                row = connection.execute(
-                    "SELECT status,version FROM tasks WHERE id=?", (task_id,)
-                ).fetchone()
-                if row is None:
-                    connection.rollback()
-                    return TransitionResult(
-                        TransitionDisposition.REFUSED,
-                        task_id=task_id,
-                        refusal=TransitionRefusal.NOT_FOUND,
-                    )
-                current_version = int(row["version"])
-                if current_version != expected_version:
-                    connection.rollback()
-                    return TransitionResult(
-                        TransitionDisposition.REFUSED,
-                        task_id=task_id,
-                        version=current_version,
-                        status=TaskStatus(row["status"]),
-                        refusal=TransitionRefusal.STALE_VERSION,
-                    )
-                current_status = TaskStatus(row["status"])
-                if current_status not in sources:
-                    connection.rollback()
-                    return TransitionResult(
-                        TransitionDisposition.REFUSED,
-                        task_id=task_id,
-                        version=current_version,
-                        status=current_status,
-                        refusal=TransitionRefusal.INVALID_STATE,
-                    )
-                next_version = current_version + 1
-                closed_at = None if target is TaskStatus.OPEN else now
-                connection.execute(
-                    "UPDATE tasks SET status=?,version=?,updated_at=?,"
-                    "closed_at=? WHERE id=? AND version=?",
-                    (
-                        target,
-                        next_version,
-                        now,
-                        closed_at,
-                        task_id,
-                        current_version,
-                    ),
-                )
-                connection.execute(
-                    "INSERT INTO task_events("
-                    "task_id,kind,task_version,candidate_id,source_revision,"
-                    "from_status,to_status,occurred_at) VALUES(?,?,?,?,?,?,?,?)",
-                    (
-                        task_id,
-                        "status_changed",
-                        next_version,
-                        None,
-                        None,
-                        current_status,
-                        target,
-                        now,
-                    ),
-                )
-                connection.commit()
-                return TransitionResult(
-                    TransitionDisposition.APPLIED,
+                result = _apply_task_transition(
+                    connection,
                     task_id=task_id,
-                    version=next_version,
-                    status=target,
+                    expected_version=expected_version,
+                    action=action,
+                    now=now,
                 )
+                if result.accepted:
+                    connection.commit()
+                else:
+                    connection.rollback()
+                return result
             except Exception:
                 connection.rollback()
                 raise
@@ -748,3 +685,92 @@ def _valid_timestamp(value: object) -> bool:
     except ValueError:
         return False
     return parsed.tzinfo is not None and parsed.utcoffset() is not None
+
+
+def _apply_task_transition(
+    connection: sqlite3.Connection,
+    *,
+    task_id: int,
+    expected_version: int,
+    action: str,
+    now: str,
+) -> TransitionResult:
+    """Apply one lifecycle transition inside the caller's transaction."""
+    targets = {
+        "done": (frozenset({TaskStatus.OPEN}), TaskStatus.DONE),
+        "drop": (frozenset({TaskStatus.OPEN}), TaskStatus.DROPPED),
+        "reopen": (
+            frozenset({TaskStatus.DONE, TaskStatus.DROPPED}),
+            TaskStatus.OPEN,
+        ),
+    }
+    if action not in targets:
+        return TransitionResult(
+            TransitionDisposition.REFUSED,
+            task_id=task_id,
+            refusal=TransitionRefusal.INVALID_ACTION,
+        )
+    sources, target = targets[action]
+    row = connection.execute(
+        "SELECT status,version FROM tasks WHERE id=?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return TransitionResult(
+            TransitionDisposition.REFUSED,
+            task_id=task_id,
+            refusal=TransitionRefusal.NOT_FOUND,
+        )
+    current_version = int(row["version"])
+    current_status = TaskStatus(row["status"])
+    if current_version != expected_version:
+        return TransitionResult(
+            TransitionDisposition.REFUSED,
+            task_id=task_id,
+            version=current_version,
+            status=current_status,
+            refusal=TransitionRefusal.STALE_VERSION,
+        )
+    if current_status not in sources:
+        return TransitionResult(
+            TransitionDisposition.REFUSED,
+            task_id=task_id,
+            version=current_version,
+            status=current_status,
+            refusal=TransitionRefusal.INVALID_STATE,
+        )
+    next_version = current_version + 1
+    closed_at = None if target is TaskStatus.OPEN else now
+    cursor = connection.execute(
+        "UPDATE tasks SET status=?,version=?,updated_at=?,closed_at=? "
+        "WHERE id=? AND version=?",
+        (target, next_version, now, closed_at, task_id, current_version),
+    )
+    if cursor.rowcount != 1:
+        return TransitionResult(
+            TransitionDisposition.REFUSED,
+            task_id=task_id,
+            version=current_version,
+            status=current_status,
+            refusal=TransitionRefusal.STALE_VERSION,
+        )
+    connection.execute(
+        "INSERT INTO task_events("
+        "task_id,kind,task_version,candidate_id,source_revision,"
+        "from_status,to_status,occurred_at) VALUES(?,?,?,?,?,?,?,?)",
+        (
+            task_id,
+            "status_changed",
+            next_version,
+            None,
+            None,
+            current_status,
+            target,
+            now,
+        ),
+    )
+    return TransitionResult(
+        TransitionDisposition.APPLIED,
+        task_id=task_id,
+        version=next_version,
+        status=target,
+    )

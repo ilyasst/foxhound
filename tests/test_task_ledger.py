@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from foxhound import CandidateInbox, InboxError
+from foxhound.candidate_inbox import SCHEMA_VERSION
 from foxhound.contracts import (
     EQUIVALENCE_BASIS,
     OwnerEquivalenceResolutionError,
@@ -446,6 +447,10 @@ class TaskLedgerTests(unittest.TestCase):
         item = candidate(1)
         self.import_candidates(item)
         with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute("DROP TRIGGER task_review_card_events_no_update")
+            connection.execute("DROP TRIGGER task_review_card_events_no_delete")
+            connection.execute("DROP TABLE task_review_card_events")
+            connection.execute("DROP TABLE task_review_cards")
             connection.execute("DROP TRIGGER task_owner_equivalences_no_update")
             connection.execute("DROP TRIGGER task_owner_equivalences_no_delete")
             connection.execute("DROP TABLE task_owner_equivalences")
@@ -466,7 +471,8 @@ class TaskLedgerTests(unittest.TestCase):
         self.assertEqual(self.ledger.count(), 0)
         with closing(sqlite3.connect(self.database)) as connection:
             self.assertEqual(
-                connection.execute("PRAGMA user_version").fetchone()[0], 6
+                connection.execute("PRAGMA user_version").fetchone()[0],
+                SCHEMA_VERSION,
             )
 
     def test_missing_append_only_trigger_is_refused(self):

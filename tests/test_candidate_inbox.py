@@ -18,6 +18,7 @@ from foxhound import (
     ImportRefusal,
     InboxError,
 )
+from foxhound.candidate_inbox import SCHEMA_VERSION
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "contracts"
@@ -40,7 +41,7 @@ class CandidateInboxTests(unittest.TestCase):
         self.assertEqual(os.stat(self.database).st_mode & 0o777, 0o600)
         with closing(sqlite3.connect(self.database)) as connection, connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-        self.assertEqual(version, 6)
+        self.assertEqual(version, SCHEMA_VERSION)
         self.assertEqual(self.inbox.count(), 0)
 
     def test_first_import_inserts_candidate(self):
@@ -161,7 +162,7 @@ class CandidateInboxTests(unittest.TestCase):
 
     def test_newer_database_schema_is_refused(self):
         with closing(sqlite3.connect(self.database)) as connection, connection:
-            connection.execute("PRAGMA user_version = 7")
+            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
         with self.assertRaisesRegex(InboxError, "newer"):
             self.inbox.initialize()
 
