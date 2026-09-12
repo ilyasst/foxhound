@@ -27,7 +27,9 @@ canonical IPv4 loopback bind, body and response limits, request timeout,
 serialized application handling, no-store response policy, and content-free
 error boundary. Execution routes use distinct response schemas and delivery
 keys. Only a successful claim returns private rendered content and its
-short-lived delivery capability.
+short-lived delivery capability. A complete rendered body may exceed one chat
+message while remaining within the bounded response contract; safe transport
+chunking does not weaken the card's single versioned decision capability.
 
 The service audit record contains only the allowlisted route, HTTP method,
 status, and coarse duration. It contains no task/card identity, content,

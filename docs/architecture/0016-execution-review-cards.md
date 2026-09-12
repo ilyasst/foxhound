@@ -31,20 +31,34 @@ The three card kinds have closed action sets:
 | Card | Allowed reader actions |
 |---|---|
 | Start | Start planning, snooze one day, cancel execution |
-| Plan review | Approve plan, request revision, cancel execution |
-| External review | Approve the proposed external action, request revision, cancel execution |
+| Plan review | Execute plan, investigate further, cancel execution |
+| External review | Authorize the proposed external action, return for revision, cancel execution |
 
 A delivered action and its execution workflow transition occur in one
 `BEGIN IMMEDIATE` transaction. The card and workflow must both still match all
 bound versions and state. Any refusal or write failure rolls back both. These
 operations never alter task lifecycle.
 
-Card bodies are private, HTML-escaped projections with a strict byte ceiling
-and a distinct callback namespace. If the complete body does not fit, the
-projection clearly reports truncation, removes the affirmative Start or
-Approve button, and rejects a forged affirmative callback. Revision, snooze,
-and cancellation remain available as appropriate. This prevents approval of
-content the reader could not see.
+Card bodies are private, line-oriented HTML projections with a strict local
+service byte ceiling and a distinct callback namespace. A small Markdown
+subset in the immutable worker result becomes Telegram-compatible headings,
+emphasis, code, safe HTTP links, and bullets. Every dynamic non-markup value
+is escaped, and unsupported or unsafe links remain inert text.
+
+The ceiling is larger than one Telegram message but remains below the bounded
+local client and service response limits. The transport may split the complete
+line-oriented projection and attaches the keyboard only to its final chunk.
+If the complete body does not fit the local-service ceiling, the projection
+clearly reports truncation, removes the affirmative Start or Approve button,
+and rejects a forged affirmative callback. Revision, snooze, and cancellation
+remain available as appropriate. This prevents approval of content the reader
+could not see.
+
+If a transport acknowledgement succeeded but the resulting presentation is
+unreadable, a local operator may requeue that still-current delivered card.
+The repair clears only delivery metadata and increments the card version, so
+the old presentation becomes stale without advancing or rerunning workflow.
+This repair is intentionally absent from the remote transport API.
 
 Events are append-only and contain card/workflow identity, versions, action,
 and time but no task or result content. Operation and aggregate results are

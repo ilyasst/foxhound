@@ -6,8 +6,10 @@ import hashlib
 import html
 import json
 import os
+import re
 import secrets
 import sqlite3
+import urllib.parse
 from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -30,7 +32,9 @@ from .task_ledger import TaskLedgerError, TaskStatus
 
 CALLBACK_PREFIX = "fhe"
 CALLBACK_DATA_LIMIT = 64
-MAX_CARD_BODY_BYTES = 3_500
+MAX_CARD_BODY_BYTES = 24 * 1024
+MAX_RENDER_SOURCE_LINE_CHARS = 500
+MAX_TRUNCATED_CARD_BODY_BYTES = 3_500
 ACTIVE_STATUSES = ("pending", "delivering", "delivered")
 
 
@@ -468,6 +472,73 @@ class ExecutionCardService:
                 connection.rollback()
                 raise
 
+    def retry_delivery(
+        self, card_id: int, *, expected_version: int
+    ) -> ExecutionCardOperationResult:
+        """Requeue a current card whose acknowledged presentation failed.
+
+        This is a local operator repair, not part of the transport API. It
+        changes only delivery metadata and versions the card so callbacks on
+        the superseded presentation become stale.
+        """
+        if not _valid_identity(card_id, expected_version):
+            return _refused(card_id, ExecutionCardRefusal.INVALID_ARGUMENT)
+        now = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    self._card_select() + " WHERE c.id=?", (card_id,)
+                ).fetchone()
+                refusal = _card_guard(row, expected_version)
+                if (
+                    refusal is None
+                    and row["status"] != ExecutionCardStatus.DELIVERED
+                ):
+                    refusal = ExecutionCardRefusal.INVALID_STATE
+                if refusal is None and not _current_card(row):
+                    refusal = ExecutionCardRefusal.STALE_VERSION
+                if refusal is not None:
+                    connection.rollback()
+                    return _refused_row(card_id, row, refusal)
+                version = expected_version + 1
+                updated = connection.execute(
+                    "UPDATE execution_review_cards SET status='pending',"
+                    "version=?,claim_token_digest=NULL,claim_expires_at=NULL,"
+                    "transport=NULL,delivery_ref=NULL,delivered_at=NULL,"
+                    "updated_at=? WHERE id=? AND version=? "
+                    "AND status='delivered'",
+                    (version, now, card_id, expected_version),
+                )
+                if updated.rowcount != 1:
+                    raise TaskLedgerError("execution card state changed")
+                self._event(
+                    connection,
+                    card_id=card_id,
+                    task_id=int(row["task_id"]),
+                    kind="delivery_failed",
+                    card_version=version,
+                    workflow_version=int(row["workflow_version"]),
+                    action=None,
+                    now=now,
+                )
+                connection.commit()
+                values = dict(row)
+                values.update(
+                    status=ExecutionCardStatus.PENDING,
+                    version=version,
+                    claim_token_digest=None,
+                    claim_expires_at=None,
+                    transport=None,
+                    delivery_ref=None,
+                    delivered_at=None,
+                )
+                return _operation(values, ExecutionCardDisposition.APPLIED)
+            except Exception:
+                connection.rollback()
+                raise
+
     def act(
         self, card_id: int, *, expected_version: int, action: str
     ) -> ExecutionCardOperationResult:
@@ -710,23 +781,33 @@ def render_execution_review_card(
     if not isinstance(card, ExecutionReviewCard):
         raise TaskLedgerError("execution review card is invalid")
     plain = "\n".join(_card_lines(card))
-    approvable = _card_fits(card)
-    body = _escape_bounded(
-        plain,
-        MAX_CARD_BODY_BYTES,
-        suffix=(
-            "\n\nContent is too long to approve in this card. "
-            "Approval is disabled."
-        ),
+    complete = "\n".join(_html_card_lines(card))
+    approvable = len(complete.encode("utf-8")) <= MAX_CARD_BODY_BYTES
+    body = (
+        complete
+        if approvable
+        else _escape_bounded(
+            plain,
+            MAX_TRUNCATED_CARD_BODY_BYTES,
+            suffix=(
+                "\n\nContent is too long to approve in this card. "
+                "Approval is disabled."
+            ),
+        )
     )
     keyboard = {
-        "inline_keyboard": [[
-            {
-                "text": label,
-                "callback_data": _callback(card.id, card.version, action),
-            }
-            for label, action in _buttons(card.kind, approvable=approvable)
-        ]]
+        "inline_keyboard": [
+            [
+                {
+                    "text": label,
+                    "callback_data": _callback(
+                        card.id, card.version, action
+                    ),
+                }
+                for label, action in row
+            ]
+            for row in _button_rows(card.kind, approvable=approvable)
+        ]
     }
     return body, keyboard
 
@@ -909,26 +990,219 @@ def _listed(values: Sequence[str], *, empty: str = "None.") -> list[str]:
     return [f"- {value}" for value in values] if values else [empty]
 
 
-def _buttons(
-    kind: ExecutionCardKind, *, approvable: bool
-) -> tuple[tuple[str, str], ...]:
-    if kind is ExecutionCardKind.START:
-        safe = (
-            ("Snooze 1 day", "snooze"),
-            ("Cancel", "cancel"),
-        )
-        return (("Start planning", "start"), *safe) if approvable else safe
-    if kind is ExecutionCardKind.EXTERNAL_REVIEW:
-        safe = (
-            ("Revise", "revise"),
-            ("Cancel", "cancel"),
-        )
-        return (("Approve action", "approve"), *safe) if approvable else safe
-    safe = (
-        ("Revise", "revise"),
-        ("Cancel", "cancel"),
+def _html_card_lines(card: ExecutionReviewCard) -> list[str]:
+    details = _labelled_html_lines("Task", card.task_text)
+    if card.owner:
+        details.extend(_labelled_html_lines("Owner", card.owner))
+    if card.due:
+        details.extend(_labelled_html_lines("Due", card.due))
+    if card.kind is ExecutionCardKind.START:
+        return [
+            "<b>Foxhound execution request</b>",
+            "",
+            *details,
+            "",
+            "Start the planning phase? No task work or external action has run.",
+        ]
+    if card.kind is ExecutionCardKind.EXTERNAL_REVIEW:
+        lines = [
+            "<b>Foxhound external-action approval</b>",
+            "",
+            *details,
+            "",
+            "<b>Requested external actions:</b>",
+            *_html_listed(card.external_actions, empty="None supplied."),
+            "",
+            "Approve only if these exact external effects are intended.",
+            "",
+            *_labelled_html_lines("Summary", card.summary),
+        ]
+        if card.questions:
+            lines.extend((
+                "",
+                "<b>Questions:</b>",
+                *_html_listed(card.questions),
+            ))
+        return lines
+    lines = [
+        "<b>Foxhound plan review</b>",
+        "",
+        *details,
+        "",
+        *_labelled_html_lines("Summary", card.summary),
+    ]
+    if card.questions:
+        lines.extend((
+            "",
+            "<b>Questions:</b>",
+            *_html_listed(card.questions),
+        ))
+    if card.external_actions:
+        lines.extend((
+            "",
+            "<b>Potential external actions (not yet authorized):</b>",
+            *_html_listed(card.external_actions),
+        ))
+    if card.deliverables:
+        lines.extend((
+            "",
+            "<b>Deliverables:</b>",
+            *_html_listed(card.deliverables),
+        ))
+    if card.work_markdown:
+        lines.extend(("", "<b>Plan:</b>", *_markdown_lines(card.work_markdown)))
+    return lines
+
+
+def _html_listed(
+    values: Sequence[str], *, empty: str = "None."
+) -> list[str]:
+    if not values:
+        return [empty]
+    lines: list[str] = []
+    for value in values:
+        segments = _escaped_source_lines(value)
+        lines.append(f"• {segments[0]}")
+        lines.extend(f"  {segment}" for segment in segments[1:])
+    return lines
+
+
+def _labelled_html_lines(label: str, value: str) -> list[str]:
+    segments = _escaped_source_lines(value)
+    return [f"<b>{label}:</b> {segments[0]}", *segments[1:]]
+
+
+def _escaped_source_lines(value: str) -> list[str]:
+    return [
+        _escape(segment)
+        for line in value.split("\n")
+        for segment in _source_line_segments(line)
+    ]
+
+
+def _source_line_segments(value: str) -> list[str]:
+    if not value:
+        return [""]
+    return [
+        value[offset:offset + MAX_RENDER_SOURCE_LINE_CHARS]
+        for offset in range(0, len(value), MAX_RENDER_SOURCE_LINE_CHARS)
+    ]
+
+
+def _markdown_lines(value: str) -> list[str]:
+    lines: list[str] = []
+    for raw in value.split("\n"):
+        for index, line in enumerate(_source_line_segments(raw.rstrip())):
+            heading = re.match(r"^(#{1,6})\s+(.*)$", line) if not index else None
+            bullet = re.match(r"^\s*[-*+]\s+(.*)$", line) if not index else None
+            ordered = (
+                re.match(r"^\s*(\d+[.)])\s+(.*)$", line)
+                if not index
+                else None
+            )
+            if heading:
+                lines.append(f"<b>{_markdown_inline(heading.group(2))}</b>")
+            elif bullet:
+                lines.append(f"• {_markdown_inline(bullet.group(1))}")
+            elif ordered:
+                lines.append(
+                    f"{_escape(ordered.group(1))} "
+                    f"{_markdown_inline(ordered.group(2))}"
+                )
+            else:
+                lines.append(_markdown_inline(line))
+    return lines
+
+
+def _markdown_inline(value: str) -> str:
+    fragments: list[str] = []
+
+    def stash(fragment: str) -> str:
+        fragments.append(fragment)
+        return f"\x00{len(fragments) - 1}\x00"
+
+    value = re.sub(
+        r"`([^`\n]+)`",
+        lambda match: stash(f"<code>{_escape(match.group(1))}</code>"),
+        value,
     )
-    return (("Approve plan", "approve"), *safe) if approvable else safe
+
+    def link(match: re.Match[str]) -> str:
+        target = match.group(2)
+        if not _safe_link(target):
+            return stash(_escape(match.group(0)))
+        return stash(
+            f'<a href="{html.escape(target, quote=True)}">'
+            f"{_escape(match.group(1))}</a>"
+        )
+
+    value = re.sub(r"\[([^\]\n]+)\]\(([^)\s]+)\)", link, value)
+    value = _escape(value)
+    value = re.sub(
+        r"\*\*([^*\n]+)\*\*|__([^_\n]+)__",
+        lambda match: f"<b>{match.group(1) or match.group(2)}</b>",
+        value,
+    )
+    value = re.sub(
+        r"(?<!\*)\*(?!\s)([^*\n]+?)\*(?!\*)",
+        lambda match: f"<i>{match.group(1)}</i>",
+        value,
+    )
+    return re.sub(
+        r"\x00(\d+)\x00",
+        lambda match: fragments[int(match.group(1))],
+        value,
+    )
+
+
+def _safe_link(value: str) -> bool:
+    if (
+        not value
+        or len(value) > 2_048
+        or any(character.isspace() or ord(character) < 32 for character in value)
+    ):
+        return False
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme in {"http", "https"}
+        and parsed.hostname is not None
+        and parsed.username is None
+        and parsed.password is None
+        and (port is None or 1 <= port <= 65_535)
+    )
+
+
+def _escape(value: str) -> str:
+    return html.escape(value, quote=False)
+
+
+def _button_rows(
+    kind: ExecutionCardKind, *, approvable: bool
+) -> tuple[tuple[tuple[str, str], ...], ...]:
+    if kind is ExecutionCardKind.START:
+        rows = (
+            (("▶️ Start planning", "start"),),
+            (("🕒 Snooze 24h", "snooze"),),
+            (("⛔ Cancel workflow", "cancel"),),
+        )
+        return rows if approvable else rows[1:]
+    if kind is ExecutionCardKind.EXTERNAL_REVIEW:
+        rows = (
+            (("✅ Authorize action", "approve"),),
+            (("↩ Return for revision", "revise"),),
+            (("⛔ Cancel workflow", "cancel"),),
+        )
+        return rows if approvable else rows[1:]
+    rows = (
+        (("🔎 Investigate further", "revise"),),
+        (("▶️ Execute plan", "approve"),),
+        (("⛔ Cancel workflow", "cancel"),),
+    )
+    return rows if approvable else (rows[0], rows[2])
 
 
 def _actions_for_kind(kind: ExecutionCardKind) -> set[str]:
@@ -945,9 +1219,9 @@ def _callback(card_id: int, version: int, action: str) -> str:
 
 
 def _card_fits(card: ExecutionReviewCard) -> bool:
-    return len(
-        html.escape("\n".join(_card_lines(card)), quote=False).encode("utf-8")
-    ) <= MAX_CARD_BODY_BYTES
+    return len("\n".join(_html_card_lines(card)).encode("utf-8")) <= (
+        MAX_CARD_BODY_BYTES
+    )
 
 
 def _escape_bounded(value: str, maximum: int, *, suffix: str) -> str:
