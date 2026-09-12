@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -37,9 +38,9 @@ class CandidateInboxTests(unittest.TestCase):
 
     def test_initializes_private_versioned_database(self):
         self.assertEqual(os.stat(self.database).st_mode & 0o777, 0o600)
-        with sqlite3.connect(self.database) as connection:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-        self.assertEqual(version, 2)
+        self.assertEqual(version, 3)
         self.assertEqual(self.inbox.count(), 0)
 
     def test_first_import_inserts_candidate(self):
@@ -146,8 +147,8 @@ class CandidateInboxTests(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), "1 email")
 
     def test_newer_database_schema_is_refused(self):
-        with sqlite3.connect(self.database) as connection:
-            connection.execute("PRAGMA user_version = 3")
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute("PRAGMA user_version = 4")
         with self.assertRaisesRegex(InboxError, "newer"):
             self.inbox.initialize()
 
@@ -168,14 +169,14 @@ class CandidateInboxTests(unittest.TestCase):
             inbox.initialize()
 
     def test_incomplete_versioned_schema_is_refused(self):
-        with sqlite3.connect(self.database) as connection:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
             connection.execute("DROP TABLE candidate_inbox")
             connection.execute("CREATE TABLE candidate_inbox(candidate_id TEXT)")
         with self.assertRaisesRegex(InboxError, "incomplete"):
             self.inbox.initialize()
 
     def _stored_row(self, candidate_id: str) -> tuple:
-        with sqlite3.connect(self.database) as connection:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
             return connection.execute(
                 "SELECT source_revision,payload_json,created_at,"
                 "first_imported_at,updated_at FROM candidate_inbox "

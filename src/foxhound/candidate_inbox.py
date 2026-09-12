@@ -1,12 +1,14 @@
-"""Private, offline persistence for validated task candidates.
+"""Private, offline persistence for candidates and shadow observations.
 
 The inbox is deliberately transport-agnostic. Callers select the database path
-and deliver complete candidate documents; this module performs no discovery,
+and deliver complete contract documents; this module performs no discovery,
 networking, scheduling, logging, or task creation.
 
 Source revisions are content digests, not sequence numbers. The inbox detects a
 contradictory replay of one revision. Ordered producer feeds use a separate,
 monotonic cursor to decide delivery order without interpreting revisions.
+Candidate revision history lets passive observations bind to the exact payload
+that the producer handled without rolling the current candidate backward.
 """
 
 from __future__ import annotations
@@ -27,14 +29,21 @@ from .contracts import (
     CandidateFeed,
     ContractError,
     FeedContractError,
+    ShadowFeedContractError,
+    TaskShadowFeed,
     TaskCandidate,
+    TaskShadowObservation,
+    candidate_comparable_digest,
     parse_candidate_feed,
     parse_task_candidate,
+    parse_task_shadow_feed,
     task_candidate_document,
+    task_shadow_feed_document,
+    task_shadow_observation_document,
 )
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA_COLUMNS = {
     "candidate_inbox": (
@@ -56,6 +65,39 @@ _SCHEMA_COLUMNS = {
         "updated_at",
     ),
     "candidate_feed_receipts": (
+        "producer",
+        "stream_id",
+        "from_cursor",
+        "to_cursor",
+        "page_digest",
+        "imported_at",
+    ),
+    "candidate_revision_history": (
+        "candidate_id",
+        "source_revision",
+        "payload_json",
+        "created_at",
+        "imported_at",
+    ),
+    "task_shadow_observations": (
+        "candidate_id",
+        "source_revision",
+        "disposition",
+        "legacy_task_id",
+        "comparable_digest",
+        "reason_code",
+        "comparison",
+        "payload_json",
+        "observed_at",
+        "first_imported_at",
+    ),
+    "task_shadow_feed_cursors": (
+        "producer",
+        "stream_id",
+        "cursor",
+        "updated_at",
+    ),
+    "task_shadow_feed_receipts": (
         "producer",
         "stream_id",
         "from_cursor",
@@ -104,6 +146,63 @@ CREATE TABLE candidate_feed_receipts (
 """,
 )
 
+_SCHEMA_V3 = (
+    """
+CREATE TABLE candidate_revision_history (
+    candidate_id    TEXT NOT NULL,
+    source_revision TEXT NOT NULL,
+    payload_json    TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    imported_at     TEXT NOT NULL,
+    PRIMARY KEY(candidate_id, source_revision)
+);
+""",
+    """
+INSERT INTO candidate_revision_history(
+    candidate_id,source_revision,payload_json,created_at,imported_at
+)
+SELECT candidate_id,source_revision,payload_json,created_at,first_imported_at
+FROM candidate_inbox;
+""",
+    """
+CREATE TABLE task_shadow_observations (
+    candidate_id       TEXT NOT NULL,
+    source_revision    TEXT NOT NULL,
+    disposition        TEXT NOT NULL,
+    legacy_task_id     INTEGER,
+    comparable_digest  TEXT,
+    reason_code        TEXT,
+    comparison         TEXT NOT NULL,
+    payload_json       TEXT NOT NULL,
+    observed_at        TEXT NOT NULL,
+    first_imported_at  TEXT NOT NULL,
+    PRIMARY KEY(candidate_id, source_revision),
+    FOREIGN KEY(candidate_id, source_revision)
+        REFERENCES candidate_revision_history(candidate_id, source_revision)
+);
+""",
+    """
+CREATE TABLE task_shadow_feed_cursors (
+    producer   TEXT NOT NULL,
+    stream_id  TEXT NOT NULL,
+    cursor     INTEGER NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(producer, stream_id)
+);
+""",
+    """
+CREATE TABLE task_shadow_feed_receipts (
+    producer    TEXT NOT NULL,
+    stream_id   TEXT NOT NULL,
+    from_cursor INTEGER NOT NULL,
+    to_cursor   INTEGER NOT NULL,
+    page_digest TEXT NOT NULL,
+    imported_at TEXT NOT NULL,
+    PRIMARY KEY(producer, stream_id, from_cursor, to_cursor)
+);
+""",
+)
+
 
 class InboxError(RuntimeError):
     """The inbox cannot safely initialize or read its state."""
@@ -137,6 +236,23 @@ class FeedImportRefusal(StrEnum):
     CANDIDATE_CONFLICT = "candidate_conflict"
 
 
+class ShadowFeedImportDisposition(StrEnum):
+    APPLIED = "applied"
+    REPLAYED = "replayed"
+    EMPTY = "empty"
+    REFUSED = "refused"
+
+
+class ShadowFeedImportRefusal(StrEnum):
+    INVALID_CONTRACT = "invalid_contract"
+    CURSOR_GAP = "cursor_gap"
+    CURSOR_OVERLAP = "cursor_overlap"
+    CURSOR_REUSE = "cursor_reuse"
+    CANDIDATE_MISSING = "candidate_missing"
+    CANDIDATE_CONFLICT = "candidate_conflict"
+    OBSERVATION_CONFLICT = "observation_conflict"
+
+
 @dataclass(frozen=True)
 class ImportResult:
     """Content-free result safe for aggregate reporting."""
@@ -164,6 +280,31 @@ class FeedImportResult:
         return self.disposition is not FeedImportDisposition.REFUSED
 
 
+@dataclass(frozen=True)
+class ShadowFeedImportResult:
+    """Content-free aggregate result for one atomic observation page."""
+
+    disposition: ShadowFeedImportDisposition
+    inserted: int = 0
+    unchanged: int = 0
+    refusal: ShadowFeedImportRefusal | None = None
+
+    @property
+    def accepted(self) -> bool:
+        return self.disposition is not ShadowFeedImportDisposition.REFUSED
+
+
+@dataclass(frozen=True)
+class ShadowComparisonReport:
+    """Content-free aggregate status for all persisted observations."""
+
+    total: int
+    agreed: int
+    divergent: int
+    refused: int
+    unmapped: int
+
+
 class CandidateInbox:
     """A versioned SQLite inbox at one explicitly selected path."""
 
@@ -178,7 +319,9 @@ class CandidateInbox:
         with closing(self._connect()) as connection:
             version = self._schema_version(connection)
             if version > SCHEMA_VERSION:
-                raise InboxError("candidate inbox schema is newer than this application")
+                raise InboxError(
+                    "candidate inbox schema is newer than this application"
+                )
             if version == 0:
                 connection.execute("BEGIN IMMEDIATE")
                 try:
@@ -196,6 +339,25 @@ class CandidateInbox:
                     for statement in _SCHEMA_V2:
                         connection.execute(statement)
                     connection.execute("PRAGMA user_version = 2")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 2
+            if version == 2:
+                self._require_tables(
+                    connection,
+                    (
+                        "candidate_inbox",
+                        "candidate_feed_cursors",
+                        "candidate_feed_receipts",
+                    ),
+                )
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V3:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 3")
                     connection.commit()
                 except Exception:
                     connection.rollback()
@@ -327,6 +489,138 @@ class CandidateInbox:
                 connection.rollback()
                 raise
 
+    def import_shadow_feed(self, document: object) -> ShadowFeedImportResult:
+        """Validate and atomically import one ordered observation page."""
+        try:
+            feed = parse_task_shadow_feed(document)
+        except ShadowFeedContractError:
+            return ShadowFeedImportResult(
+                ShadowFeedImportDisposition.REFUSED,
+                refusal=ShadowFeedImportRefusal.INVALID_CONTRACT,
+            )
+
+        page_digest = _shadow_feed_digest(feed)
+        imported_at = self._now()
+        with closing(self._connect()) as connection:
+            self._require_current_schema(connection)
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT cursor FROM task_shadow_feed_cursors "
+                    "WHERE producer=? AND stream_id=?",
+                    (feed.producer, feed.stream_id),
+                ).fetchone()
+                current_cursor = 0 if row is None else int(row["cursor"])
+
+                if feed.from_cursor < current_cursor:
+                    receipt = connection.execute(
+                        "SELECT page_digest FROM task_shadow_feed_receipts "
+                        "WHERE producer=? AND stream_id=? AND from_cursor=? "
+                        "AND to_cursor=?",
+                        (feed.producer, feed.stream_id, feed.from_cursor,
+                         feed.to_cursor),
+                    ).fetchone()
+                    connection.rollback()
+                    if receipt is None:
+                        return ShadowFeedImportResult(
+                            ShadowFeedImportDisposition.REFUSED,
+                            refusal=ShadowFeedImportRefusal.CURSOR_OVERLAP,
+                        )
+                    if receipt["page_digest"] != page_digest:
+                        return ShadowFeedImportResult(
+                            ShadowFeedImportDisposition.REFUSED,
+                            refusal=ShadowFeedImportRefusal.CURSOR_REUSE,
+                        )
+                    return ShadowFeedImportResult(
+                        ShadowFeedImportDisposition.REPLAYED
+                    )
+
+                if feed.from_cursor > current_cursor:
+                    connection.rollback()
+                    return ShadowFeedImportResult(
+                        ShadowFeedImportDisposition.REFUSED,
+                        refusal=ShadowFeedImportRefusal.CURSOR_GAP,
+                    )
+
+                if feed.from_cursor == feed.to_cursor:
+                    connection.rollback()
+                    return ShadowFeedImportResult(
+                        ShadowFeedImportDisposition.EMPTY
+                    )
+
+                inserted = 0
+                unchanged = 0
+                for item in feed.items:
+                    was_inserted, refusal = self._apply_shadow_observation(
+                        connection, item.observation, imported_at
+                    )
+                    if refusal is not None:
+                        connection.rollback()
+                        return ShadowFeedImportResult(
+                            ShadowFeedImportDisposition.REFUSED,
+                            refusal=refusal,
+                        )
+                    if was_inserted:
+                        inserted += 1
+                    else:
+                        unchanged += 1
+
+                connection.execute(
+                    "INSERT INTO task_shadow_feed_receipts("
+                    "producer,stream_id,from_cursor,to_cursor,page_digest,"
+                    "imported_at) VALUES(?,?,?,?,?,?)",
+                    (feed.producer, feed.stream_id, feed.from_cursor,
+                     feed.to_cursor, page_digest, imported_at),
+                )
+                connection.execute(
+                    "INSERT INTO task_shadow_feed_cursors("
+                    "producer,stream_id,cursor,updated_at) VALUES(?,?,?,?) "
+                    "ON CONFLICT(producer,stream_id) DO UPDATE SET "
+                    "cursor=excluded.cursor,updated_at=excluded.updated_at",
+                    (feed.producer, feed.stream_id, feed.to_cursor,
+                     imported_at),
+                )
+                connection.commit()
+                return ShadowFeedImportResult(
+                    ShadowFeedImportDisposition.APPLIED,
+                    inserted=inserted,
+                    unchanged=unchanged,
+                )
+            except Exception:
+                connection.rollback()
+                raise
+
+    def shadow_feed_cursor(self, producer: str, stream_id: str) -> int:
+        """Return one content-free observation cursor, or zero initially."""
+        with closing(self._connect()) as connection:
+            self._require_current_schema(connection)
+            row = connection.execute(
+                "SELECT cursor FROM task_shadow_feed_cursors "
+                "WHERE producer=? AND stream_id=?",
+                (producer, stream_id),
+            ).fetchone()
+            return 0 if row is None else int(row["cursor"])
+
+    def shadow_report(self) -> ShadowComparisonReport:
+        """Return aggregate comparison counts without candidate content."""
+        with closing(self._connect()) as connection:
+            self._require_current_schema(connection)
+            rows = connection.execute(
+                "SELECT comparison,COUNT(*) AS total "
+                "FROM task_shadow_observations GROUP BY comparison"
+            ).fetchall()
+        counts = {row["comparison"]: int(row["total"]) for row in rows}
+        if set(counts) - {"agreed", "divergent", "refused", "unmapped"}:
+            raise InboxError("task shadow observations contain invalid state")
+        return ShadowComparisonReport(
+            total=sum(counts.values()),
+            agreed=counts.get("agreed", 0),
+            divergent=counts.get("divergent", 0),
+            refused=counts.get("refused", 0),
+            unmapped=counts.get("unmapped", 0),
+        )
+
     def feed_cursor(self, producer: str, stream_id: str) -> int:
         """Return one content-free feed cursor, or zero before first import."""
         with closing(self._connect()) as connection:
@@ -352,7 +646,9 @@ class CandidateInbox:
             document = json.loads(row["payload_json"])
             return parse_task_candidate(document)
         except (json.JSONDecodeError, ContractError) as exc:
-            raise InboxError("candidate inbox contains an invalid stored payload") from exc
+            raise InboxError(
+                "candidate inbox contains an invalid stored payload"
+            ) from exc
 
     def count(self) -> int:
         """Return a content-free candidate count."""
@@ -364,6 +660,65 @@ class CandidateInbox:
             return int(row["total"])
 
     @staticmethod
+    def _apply_shadow_observation(
+        connection: sqlite3.Connection,
+        observation: TaskShadowObservation,
+        imported_at: str,
+    ) -> tuple[bool, ShadowFeedImportRefusal | None]:
+        candidate = observation.candidate
+        candidate_payload = _canonical_payload(candidate)
+        revision = connection.execute(
+            "SELECT payload_json FROM candidate_revision_history "
+            "WHERE candidate_id=? AND source_revision=?",
+            (candidate.candidate_id, candidate.source.revision),
+        ).fetchone()
+        if revision is None:
+            return False, ShadowFeedImportRefusal.CANDIDATE_MISSING
+        if revision["payload_json"] != candidate_payload:
+            return False, ShadowFeedImportRefusal.CANDIDATE_CONFLICT
+
+        payload = _canonical_shadow_observation(observation)
+        existing = connection.execute(
+            "SELECT payload_json FROM task_shadow_observations "
+            "WHERE candidate_id=? AND source_revision=?",
+            (candidate.candidate_id, candidate.source.revision),
+        ).fetchone()
+        if existing is not None:
+            if existing["payload_json"] == payload:
+                return False, None
+            return False, ShadowFeedImportRefusal.OBSERVATION_CONFLICT
+
+        legacy = observation.legacy_task
+        if observation.disposition in {"minted", "folded"}:
+            comparison = (
+                "agreed"
+                if legacy.comparable_digest
+                == candidate_comparable_digest(candidate)
+                else "divergent"
+            )
+        else:
+            comparison = observation.disposition
+        connection.execute(
+            "INSERT INTO task_shadow_observations("
+            "candidate_id,source_revision,disposition,legacy_task_id,"
+            "comparable_digest,reason_code,comparison,payload_json,"
+            "observed_at,first_imported_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (
+                candidate.candidate_id,
+                candidate.source.revision,
+                observation.disposition,
+                None if legacy is None else legacy.task_id,
+                None if legacy is None else legacy.comparable_digest,
+                observation.reason_code,
+                comparison,
+                payload,
+                observation.observed_at,
+                imported_at,
+            ),
+        )
+        return True, None
+
+    @staticmethod
     def _apply_candidate(connection: sqlite3.Connection,
                          candidate: TaskCandidate, payload: str,
                          imported_at: str) -> ImportResult:
@@ -372,7 +727,14 @@ class CandidateInbox:
             "FROM candidate_inbox WHERE candidate_id=?",
             (candidate.candidate_id,),
         ).fetchone()
+        history = connection.execute(
+            "SELECT payload_json,created_at FROM candidate_revision_history "
+            "WHERE candidate_id=? AND source_revision=?",
+            (candidate.candidate_id, candidate.source.revision),
+        ).fetchone()
         if row is None:
+            if history is not None:
+                raise InboxError("candidate revision history is inconsistent")
             connection.execute(
                 "INSERT INTO candidate_inbox("
                 "candidate_id,source_system,source_kind,source_record_id,"
@@ -391,6 +753,18 @@ class CandidateInbox:
                     imported_at,
                 ),
             )
+            connection.execute(
+                "INSERT INTO candidate_revision_history("
+                "candidate_id,source_revision,payload_json,created_at,"
+                "imported_at) VALUES(?,?,?,?,?)",
+                (
+                    candidate.candidate_id,
+                    candidate.source.revision,
+                    payload,
+                    candidate.created_at,
+                    imported_at,
+                ),
+            )
             return ImportResult(ImportDisposition.INSERTED)
 
         if row["created_at"] != candidate.created_at:
@@ -398,14 +772,37 @@ class CandidateInbox:
                 ImportDisposition.REFUSED,
                 ImportRefusal.CREATED_AT_CONFLICT,
             )
-        if row["source_revision"] == candidate.source.revision:
-            if row["payload_json"] == payload:
-                return ImportResult(ImportDisposition.UNCHANGED)
-            return ImportResult(
-                ImportDisposition.REFUSED,
-                ImportRefusal.REVISION_CONFLICT,
-            )
+        if history is not None:
+            if history["created_at"] != candidate.created_at:
+                return ImportResult(
+                    ImportDisposition.REFUSED,
+                    ImportRefusal.CREATED_AT_CONFLICT,
+                )
+            if history["payload_json"] != payload:
+                return ImportResult(
+                    ImportDisposition.REFUSED,
+                    ImportRefusal.REVISION_CONFLICT,
+                )
+            if (row["source_revision"] == candidate.source.revision
+                    and row["payload_json"] != payload):
+                raise InboxError("candidate inbox and history are inconsistent")
+            return ImportResult(ImportDisposition.UNCHANGED)
 
+        if row["source_revision"] == candidate.source.revision:
+            raise InboxError("candidate revision history is incomplete")
+
+        connection.execute(
+            "INSERT INTO candidate_revision_history("
+            "candidate_id,source_revision,payload_json,created_at,imported_at) "
+            "VALUES(?,?,?,?,?)",
+            (
+                candidate.candidate_id,
+                candidate.source.revision,
+                payload,
+                candidate.created_at,
+                imported_at,
+            ),
+        )
         connection.execute(
             "UPDATE candidate_inbox SET source_revision=?,payload_json=?,"
             "updated_at=? WHERE candidate_id=?",
@@ -433,7 +830,9 @@ class CandidateInbox:
                 0o600,
             )
         except FileExistsError as exc:
-            raise InboxError("candidate inbox database path changed during creation") from exc
+            raise InboxError(
+                "candidate inbox database path changed during creation"
+            ) from exc
         else:
             os.close(descriptor)
 
@@ -511,6 +910,27 @@ def _feed_digest(feed: CandidateFeed) -> str:
     }
     payload = json.dumps(
         document,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _canonical_shadow_observation(
+    observation: TaskShadowObservation,
+) -> str:
+    return json.dumps(
+        task_shadow_observation_document(observation),
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _shadow_feed_digest(feed: TaskShadowFeed) -> str:
+    payload = json.dumps(
+        task_shadow_feed_document(feed),
         ensure_ascii=True,
         separators=(",", ":"),
         sort_keys=True,

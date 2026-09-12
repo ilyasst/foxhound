@@ -1,0 +1,82 @@
+{
+  "schema": "foxhound.task-shadow-observation-feed",
+  "schema_version": 1,
+  "producer": "gw",
+  "stream_id": "primary",
+  "from_cursor": 0,
+  "to_cursor": 2,
+  "items": [
+    {
+      "sequence": 1,
+      "observation": {
+        "schema": "foxhound.task-shadow-observation",
+        "schema_version": 1,
+        "candidate": {
+          "schema": "foxhound.task-candidate",
+          "schema_version": 1,
+          "candidate_id": "tc_4bbd8df4200fb56db3bbccb194c281c5067724edc631de6c6530278e65c4e1bc",
+          "source": {
+            "system": "gw",
+            "kind": "meeting",
+            "record_id": "record-001",
+            "item_id": "action-01",
+            "revision": "1111111111111111111111111111111111111111111111111111111111111111"
+          },
+          "task": {
+            "text": "Prepare the Project Alpha summary",
+            "project": "Project Alpha",
+            "owner": "Person A",
+            "due": "2030-01-15"
+          },
+          "evidence": {
+            "document_id": "document-001",
+            "locator": "action-item-01"
+          },
+          "created_at": "2030-01-01T12:00:00Z"
+        },
+        "disposition": "minted",
+        "legacy_task": {
+          "task_id": 101,
+          "comparable_digest": "733c8a5100c0e5dfc736b5c886a550b4ea0639a987596b8d24bfd77f4d91ccd3"
+        },
+        "reason_code": null,
+        "observed_at": "2030-01-01T12:01:00Z"
+      }
+    },
+    {
+      "sequence": 2,
+      "observation": {
+        "schema": "foxhound.task-shadow-observation",
+        "schema_version": 1,
+        "candidate": {
+          "schema": "foxhound.task-candidate",
+          "schema_version": 1,
+          "candidate_id": "tc_7e24141c4ba227eabbd784120568d8eb62836a3cb36ba4b2cc4494b080bc6831",
+          "source": {
+            "system": "gw",
+            "kind": "email",
+            "record_id": "thread-001",
+            "item_id": "action-01",
+            "revision": "2222222222222222222222222222222222222222222222222222222222222222"
+          },
+          "task": {
+            "text": "Send the Project Beta decision to Person B",
+            "project": "Project Beta",
+            "owner": null,
+            "due": null
+          },
+          "evidence": {
+            "document_id": "document-002",
+            "locator": "action-item-01"
+          },
+          "created_at": "2030-02-01T09:30:00+00:00"
+        },
+        "disposition": "unmapped",
+        "legacy_task": null,
+        "reason_code": "legacy_identity_absent",
+        "observed_at": "2030-02-01T09:31:00+00:00"
+      }
+    }
+  ],
+  "emitted_at": "2030-03-01T12:00:00Z"
+}
