@@ -17,9 +17,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from foxhound import CandidateInbox
+from foxhound.execution_cards import ExecutionCardService
 from foxhound.task_card_server import (
     CLAIM_SCHEMA,
     ERROR_SCHEMA,
+    EXECUTION_CLAIM_SCHEMA,
+    EXECUTION_OPERATION_SCHEMA,
+    EXECUTION_SCHEDULE_SCHEMA,
+    EXECUTION_STATS_SCHEMA,
     HEALTH_SCHEMA,
     OPERATION_SCHEMA,
     REQUEST_SCHEMA,
@@ -33,11 +38,19 @@ from foxhound.task_card_server import (
     make_server,
 )
 from foxhound.task_cards import TaskCardService
+from foxhound.task_execution import (
+    ExecutionOutcome,
+    ExecutionResultEnvelope,
+    TaskExecutionService,
+    WorkflowStatus,
+)
 
 
 NOW = datetime(2030, 3, 1, 12, 0, tzinfo=timezone.utc)
 TOKEN = "s" * 43
 CLAIM_TOKEN = "c" * 43
+EXECUTION_DELIVERY_TOKEN = "e" * 43
+WORKFLOW_TOKEN = "w" * 43
 
 
 class Clock:
@@ -123,7 +136,21 @@ class TaskCardServerTests(unittest.TestCase):
             clock=self.clock,
             token_factory=lambda: CLAIM_TOKEN,
         )
-        self.app = TaskCardApplication(self.cards, TOKEN)
+        self.execution = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: WORKFLOW_TOKEN,
+        )
+        self.execution_cards = ExecutionCardService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: EXECUTION_DELIVERY_TOKEN,
+        )
+        self.app = TaskCardApplication(
+            self.cards,
+            TOKEN,
+            execution_cards=self.execution_cards,
+        )
 
     def test_configuration_requires_private_token_and_canonical_loopback(self):
         token_path = Path(self.temporary.name) / "token"
@@ -225,6 +252,52 @@ class TaskCardServerTests(unittest.TestCase):
             )
             self.assertEqual(status, 401)
         self.assertEqual((self.cards.count(), self.cards.event_count()), before)
+
+    def test_execution_stats_and_missing_adapter_are_content_free(self):
+        before = (
+            self.execution_cards.count(),
+            self.execution_cards.event_count(),
+        )
+        with running_server(self.app) as endpoint:
+            status, _, body = request(
+                endpoint,
+                "/v1/execution-cards/stats",
+                request_document(),
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(body, {
+                "schema": EXECUTION_STATS_SCHEMA,
+                "schema_version": 1,
+                "ok": True,
+                "pending": 0,
+                "delivering": 0,
+                "delivered": 0,
+                "active": 0,
+            })
+            status, _, body = request(
+                endpoint,
+                "/v1/execution-cards/stats",
+                request_document(),
+                token=None,
+            )
+            self.assertEqual((status, body["error"]["code"]),
+                             (401, "unauthorized"))
+        self.assertEqual(
+            (self.execution_cards.count(), self.execution_cards.event_count()),
+            before,
+        )
+
+        unavailable = TaskCardApplication(self.cards, TOKEN)
+        with running_server(unavailable) as endpoint:
+            status, _, body = request(
+                endpoint,
+                "/v1/execution-cards/stats",
+                request_document(),
+            )
+        self.assertEqual(
+            (status, body["error"]["code"]),
+            (503, "service_unavailable"),
+        )
 
     def test_strict_request_parsing_and_limits_are_content_free(self):
         private = "Synthetic private request value"
@@ -361,6 +434,181 @@ class TaskCardServerTests(unittest.TestCase):
             self.assertEqual((done["card_status"], done["task_status"]),
                              ("resolved", "done"))
 
+    def test_execution_routes_drive_start_and_plan_review(self):
+        workflow = self.execution.schedule(1, expected_task_version=1)
+        self.assertEqual(workflow.status, WorkflowStatus.AWAITING_START)
+        with running_server(self.app) as endpoint:
+            status, _, scheduled = request(
+                endpoint,
+                "/v1/execution-cards/schedule",
+                request_document(limit=2),
+            )
+            self.assertEqual(
+                (status, scheduled["schema"], scheduled["created"]),
+                (200, EXECUTION_SCHEDULE_SCHEMA, 1),
+            )
+            _, _, claimed = request(
+                endpoint,
+                "/v1/execution-cards/claim",
+                request_document(lease_seconds=60),
+            )
+            self.assertEqual(
+                (claimed["schema"], claimed["claim"]["kind"]),
+                (EXECUTION_CLAIM_SCHEMA, "start"),
+            )
+            claim = claimed["claim"]
+            self.assertIn("&lt;private&gt;", claim["body"])
+
+            _, _, failed = request(
+                endpoint,
+                "/v1/execution-cards/delivery-failed",
+                request_document(
+                    card_id=claim["card_id"],
+                    card_version=claim["card_version"],
+                    claim_token=claim["claim_token"],
+                ),
+            )
+            self.assertEqual(
+                (failed["schema"], failed["card_status"]),
+                (EXECUTION_OPERATION_SCHEMA, "pending"),
+            )
+            _, _, claimed = request(
+                endpoint,
+                "/v1/execution-cards/claim",
+                request_document(lease_seconds=60),
+            )
+            claim = claimed["claim"]
+            delivery = request_document(
+                card_id=claim["card_id"],
+                card_version=claim["card_version"],
+                claim_token=claim["claim_token"],
+                transport="synthetic",
+                delivery_ref="execution-message-alpha",
+            )
+            _, _, delivered = request(
+                endpoint, "/v1/execution-cards/delivered", delivery
+            )
+            self.assertEqual(delivered["card_status"], "delivered")
+            action = request_document(
+                card_id=claim["card_id"],
+                card_version=claim["card_version"],
+                action="start",
+            )
+            _, _, started = request(
+                endpoint, "/v1/execution-cards/action", action
+            )
+            self.assertEqual(
+                (started["workflow_status"], started["workflow_phase"]),
+                ("queued", "plan"),
+            )
+            _, _, stale = request(
+                endpoint, "/v1/execution-cards/action", action
+            )
+            self.assertEqual(
+                (stale["ok"], stale["refusal"]),
+                (False, "stale_version"),
+            )
+
+            execution_claim = self.execution.claim_next(lease_seconds=300)
+            recorded = self.execution.record_result(ExecutionResultEnvelope(
+                result_id="synthetic-plan-result",
+                task_id=1,
+                task_version=1,
+                workflow_version=execution_claim.workflow_version,
+                phase="plan",
+                claim_token=execution_claim.token,
+                outcome=ExecutionOutcome.AWAITING_PLAN,
+                summary="Synthetic plan summary",
+                work_markdown="Synthetic plan body",
+            ))
+            self.assertTrue(recorded.accepted)
+            _, _, scheduled = request(
+                endpoint,
+                "/v1/execution-cards/schedule",
+                request_document(limit=2),
+            )
+            self.assertEqual(scheduled["created"], 1)
+            _, _, claimed = request(
+                endpoint,
+                "/v1/execution-cards/claim",
+                request_document(lease_seconds=60),
+            )
+            claim = claimed["claim"]
+            self.assertEqual(claim["kind"], "plan_review")
+            delivery.update(
+                card_id=claim["card_id"],
+                card_version=claim["card_version"],
+                claim_token=claim["claim_token"],
+                delivery_ref="execution-message-beta",
+            )
+            request(endpoint, "/v1/execution-cards/delivered", delivery)
+            _, _, approved = request(
+                endpoint,
+                "/v1/execution-cards/action",
+                request_document(
+                    card_id=claim["card_id"],
+                    card_version=claim["card_version"],
+                    action="approve",
+                ),
+            )
+            self.assertEqual(
+                (approved["workflow_status"], approved["workflow_phase"]),
+                ("queued", "execute"),
+            )
+
+    def test_execution_routes_reject_invalid_request_shapes(self):
+        with running_server(self.app) as endpoint:
+            status, _, body = request(
+                endpoint,
+                "/v1/execution-cards/schedule",
+                request_document(limit=1, extra="Synthetic private value"),
+            )
+            self.assertEqual(
+                (status, body["error"]["code"]),
+                (400, "invalid_request"),
+            )
+            status, _, body = request(
+                endpoint,
+                "/v1/execution-cards/schedule",
+                raw=b'{"schema":"x","schema":"y"}',
+            )
+            self.assertEqual(
+                (status, body["error"]["code"]),
+                (400, "invalid_json"),
+            )
+            status, _, body = request(
+                endpoint,
+                "/v1/execution-cards/schedule",
+                raw=b"{" + b"x" * (17 * 1024),
+            )
+            self.assertEqual(
+                (status, body["error"]["code"]),
+                (413, "request_too_large"),
+            )
+            status, headers, body = request(
+                endpoint,
+                "/v1/execution-cards/action",
+                request_document(card_id=1, card_version=1, action="cancel"),
+                method="PUT",
+            )
+            self.assertEqual(
+                (status, headers["Allow"], body["error"]["code"]),
+                (405, "GET, POST", "method_not_allowed"),
+            )
+            status, _, body = request(
+                endpoint,
+                "/v1/execution-cards/action",
+                request_document(
+                    card_id=1,
+                    card_version=1,
+                    action="invented",
+                ),
+            )
+            self.assertEqual(
+                (status, body["error"]["code"]),
+                (400, "invalid_request"),
+            )
+
     def test_access_logs_exclude_content_tokens_and_identifiers(self):
         stream = io.StringIO()
         handler = logging.StreamHandler(stream)
@@ -380,6 +628,17 @@ class TaskCardServerTests(unittest.TestCase):
                     "/v1/task-cards/claim",
                     request_document(lease_seconds=60),
                 )
+                self.execution.schedule(1, expected_task_version=1)
+                request(
+                    endpoint,
+                    "/v1/execution-cards/schedule",
+                    request_document(limit=1),
+                )
+                request(
+                    endpoint,
+                    "/v1/execution-cards/claim",
+                    request_document(lease_seconds=60),
+                )
                 request(
                     endpoint,
                     "/unknown?Synthetic-private-query",
@@ -391,10 +650,12 @@ class TaskCardServerTests(unittest.TestCase):
         output = stream.getvalue()
         self.assertIn("method=POST", output)
         self.assertIn("route=/v1/task-cards/claim", output)
+        self.assertIn("route=/v1/execution-cards/claim", output)
         self.assertIn("route=unknown", output)
         for forbidden in (
             "Synthetic task", TOKEN, CLAIM_TOKEN, "private-query",
-            "card_id", "delivery_ref",
+            EXECUTION_DELIVERY_TOKEN, WORKFLOW_TOKEN, "card_id",
+            "delivery_ref",
         ):
             self.assertNotIn(forbidden, output)
 
