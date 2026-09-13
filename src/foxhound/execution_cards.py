@@ -2331,8 +2331,21 @@ def _agent_options(
     tokens = [option.selection_token for option in options]
     if not options or len(tokens) != len(set(tokens)):
         raise TaskLedgerError("execution agent choices are unavailable")
-    if sum(option.selected for option in options) != 1:
+    selected = sum(option.selected for option in options)
+    if selected > 1:
         raise TaskLedgerError("selected execution agent is unavailable")
+    if selected == 0:
+        try:
+            historical = registry.resolve(
+                card.agent_profile_id, card.agent_profile_revision
+            )
+        except AgentProfileError as exc:
+            raise TaskLedgerError(
+                "selected execution agent is unavailable"
+            ) from exc
+        current = registry.get(card.agent_profile_id)
+        if current is None or historical.revision == current.revision:
+            raise TaskLedgerError("selected execution agent is unavailable")
     return options
 
 

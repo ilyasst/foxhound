@@ -121,17 +121,32 @@ class AgentProfile:
 class AgentProfileRegistry:
     """An immutable collection with exact ID and revision lookup."""
 
-    def __init__(self, profiles: Iterable[AgentProfile]) -> None:
+    def __init__(
+        self,
+        profiles: Iterable[AgentProfile],
+        *,
+        historical_profiles: Iterable[AgentProfile] = (),
+    ) -> None:
         indexed: dict[str, AgentProfile] = {}
+        revisions: dict[tuple[str, str], AgentProfile] = {}
         for profile in profiles:
             if not isinstance(profile, AgentProfile):
                 raise AgentProfileError("agent profile registry is invalid")
             if profile.profile_id in indexed:
                 raise AgentProfileError("agent profile ID is duplicated")
             indexed[profile.profile_id] = profile
+            revisions[(profile.profile_id, profile.revision)] = profile
         if not indexed:
             raise AgentProfileError("agent profile registry is empty")
+        for profile in historical_profiles:
+            if not isinstance(profile, AgentProfile):
+                raise AgentProfileError("agent profile registry is invalid")
+            key = (profile.profile_id, profile.revision)
+            if profile.profile_id not in indexed or key in revisions:
+                raise AgentProfileError("agent profile revision is duplicated")
+            revisions[key] = profile
         self._profiles = indexed
+        self._revisions = revisions
 
     def list(self) -> tuple[AgentProfile, ...]:
         return tuple(self._profiles[key] for key in sorted(self._profiles))
@@ -142,6 +157,19 @@ class AgentProfileRegistry:
         return self._profiles.get(profile_id)
 
     def resolve(self, profile_id: object, revision: object) -> AgentProfile:
+        if not isinstance(profile_id, str) or not isinstance(revision, str):
+            raise AgentProfileError("agent profile revision is unavailable")
+        try:
+            return self._revisions[(profile_id, revision)]
+        except KeyError:
+            raise AgentProfileError(
+                "agent profile revision is unavailable"
+            ) from None
+
+    def resolve_current(
+        self, profile_id: object, revision: object
+    ) -> AgentProfile:
+        """Resolve only a revision currently exposed for selection."""
         profile = self.get(profile_id)
         if (
             profile is None
@@ -153,19 +181,38 @@ class AgentProfileRegistry:
 
 
 def general_profile() -> AgentProfile:
-    """Return the behavior-compatible profile for the current runner."""
+    """Return the current built-in compatibility profile."""
     return AgentProfile(
         profile_id="general",
         display_name="General",
         runtime="hermes",
         prompt_template=_GENERAL_PROMPT_TEMPLATE,
         toolsets=("terminal", "file", "web"),
-        max_turns=12,
-        timeout_seconds=240,
-        claim_lease_seconds=900,
+        max_turns=50,
+        timeout_seconds=1_800,
+        claim_lease_seconds=2_700,
         heartbeat_seconds=60,
-        kill_grace_seconds=10,
+        kill_grace_seconds=30,
         allowed_phases=_PHASES,
+    )
+
+
+def _historical_general_profiles() -> tuple[AgentProfile, ...]:
+    """Return resolution-only built-in revisions for pinned workflows."""
+    return (
+        AgentProfile(
+            profile_id="general",
+            display_name="General",
+            runtime="hermes",
+            prompt_template=_GENERAL_PROMPT_TEMPLATE,
+            toolsets=("terminal", "file", "web"),
+            max_turns=12,
+            timeout_seconds=240,
+            claim_lease_seconds=900,
+            heartbeat_seconds=60,
+            kill_grace_seconds=10,
+            allowed_phases=_PHASES,
+        ),
     )
 
 
@@ -173,7 +220,10 @@ def load_registry(private_directory: Path | None = None) -> AgentProfileRegistry
     profiles = [general_profile()]
     if private_directory is not None:
         profiles.extend(_load_private_profiles(private_directory))
-    return AgentProfileRegistry(profiles)
+    return AgentProfileRegistry(
+        profiles,
+        historical_profiles=_historical_general_profiles(),
+    )
 
 
 def parse_profile(document: object) -> AgentProfile:

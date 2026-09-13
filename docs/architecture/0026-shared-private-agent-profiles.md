@@ -18,12 +18,14 @@ rather than inside any one project.
 
 ## Decision
 
-Foxhound ships only the `general` compatibility profile as a built-in agent.
-All actual role profiles and prompt templates are provisioned as JSON manifests
-in a single absolute owner-only directory outside every Git checkout. An
-approved private synchronization system may distribute that directory across
-machines and projects. Each deployment gives the identical directory to both
-the task-card service and execution runner with
+Foxhound ships only the `general` compatibility identity as a built-in agent.
+Its current revision is the only built-in revision exposed for selection; a
+former revision is retained solely to honor workflows already pinned to its
+exact policy. All actual role profiles and prompt templates are provisioned as
+JSON manifests in a single absolute owner-only directory outside every Git
+checkout. An approved private synchronization system may distribute that
+directory across machines and projects. Each deployment gives the identical
+directory to both the task-card service and execution runner with
 `--agent-profile-directory`.
 
 Directory permissions are `0700` and manifest permissions are `0600`. The
