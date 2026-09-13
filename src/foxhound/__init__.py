@@ -10,6 +10,7 @@ from .agent_profiles import (
     load_registry,
     parse_catalog,
     parse_profile,
+    render_bootstrap,
 )
 from .profile_store import (
     ProfileDraft,
@@ -129,6 +130,7 @@ __all__ = (
     "parse_catalog",
     "parse_draft",
     "parse_profile",
+    "render_bootstrap",
     "CandidateInbox",
     "FeedImportDisposition",
     "FeedImportRefusal",
