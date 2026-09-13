@@ -49,6 +49,7 @@ CALLBACK_PREFIX = "fhe"
 AGENT_CALLBACK_PREFIX = "fha"
 CALLBACK_DATA_LIMIT = 64
 AGENT_SELECTION_TOKEN_CHARS = 20
+MAX_REVISION_NOTE_CHARS = 400
 MAX_CARD_BODY_BYTES = 24 * 1024
 MAX_RENDER_SOURCE_LINE_CHARS = 500
 MAX_TRUNCATED_CARD_BODY_BYTES = 3_500
@@ -130,8 +131,10 @@ class ExecutionReviewCard:
     summary: str = field(default="", repr=False)
     work_markdown: str = field(default="", repr=False)
     questions: tuple[str, ...] = field(default=(), repr=False)
-    external_actions: tuple[str, ...] = field(default=(), repr=False)
-    deliverables: tuple[str, ...] = field(default=(), repr=False)
+    external_actions: tuple[CardRecord, ...] = field(default=(), repr=False)
+    deliverables: tuple[CardRecord, ...] = field(default=(), repr=False)
+    revisions: int = 0
+    revision_note: str = field(default="", repr=False)
     outcome: ExecutionOutcome | None = None
 
 
@@ -1107,7 +1110,17 @@ class ExecutionCardService:
             "r.task_id AS result_task_id,r.workflow_version AS result_version,"
             "r.task_version AS result_task_version,r.phase AS result_phase,"
             "r.outcome AS result_outcome,r.summary,r.work_markdown,"
-            "r.questions_json,r.external_actions_json,r.deliverables_json "
+            "r.questions_json,r.external_actions_json,r.deliverables_json,"
+            # How many plans this task has already produced, and the last
+            # thing the reader said. Counted rather than stored: a pass is a
+            # result, so the ledger already knows, and a second column would
+            # be a second thing to keep true.
+            "(SELECT count(*)-1 FROM task_execution_results AS prior "
+            " WHERE prior.task_id=c.task_id AND prior.phase=r.phase)"
+            " AS revision_count,"
+            "(SELECT i.value FROM execution_reader_inputs AS i "
+            " WHERE i.task_id=c.task_id AND i.kind='discussion' "
+            " ORDER BY i.sequence DESC LIMIT 1) AS revision_note "
             "FROM execution_review_cards AS c "
             "JOIN tasks AS t ON t.id=c.task_id "
             "JOIN task_execution_workflows AS w ON w.task_id=c.task_id "
@@ -1416,7 +1429,7 @@ def _card(
                 if row["work_markdown"] is None
                 else str(row["work_markdown"])
             ),
-            questions=_stored_collection(row["questions_json"]),
+            questions=_stored_lines(row["questions_json"]),
             external_actions=_stored_collection(row["external_actions_json"]),
             deliverables=_stored_collection(row["deliverables_json"]),
             outcome=(
@@ -1424,27 +1437,128 @@ def _card(
                 if row["result_outcome"] is None
                 else ExecutionOutcome(row["result_outcome"])
             ),
+            revisions=max(0, int(row["revision_count"] or 0)),
+            revision_note=str(row["revision_note"] or ""),
         )
     except (AgentProfileError, KeyError, TypeError, ValueError) as exc:
         raise TaskLedgerError("execution review card state is invalid") from exc
 
 
-def _stored_collection(value: object) -> tuple[str, ...]:
+@dataclass(frozen=True)
+class CardRecord:
+    """One thing an agent recorded, as much of it as a card can show.
+
+    A plain line an agent wrote arrives with `text` set and nothing else,
+    which is what every result written before records existed looks like.
+    A structured one fills the fields a reader needs in order to approve
+    it without opening anything: what the action needs before it can run,
+    or who a draft is addressed to and what it says.
+    """
+
+    text: str
+    requires: str = ""
+    channel: str = ""
+    label: str = ""
+    recipient: str = ""
+    subject: str = ""
+
+    @property
+    def structured(self) -> bool:
+        return bool(self.requires or self.channel or self.label
+                    or self.recipient or self.subject)
+
+
+def _stored_lines(value: object) -> tuple[str, ...]:
+    """Questions are prose, so a record is flattened back to its sentence."""
+    return tuple(record.text for record in _stored_collection(value))
+
+
+def _stored_collection(value: object) -> tuple[CardRecord, ...]:
     if value is None:
         return ()
     try:
         parsed = json.loads(value)
     except (TypeError, ValueError):
         raise TaskLedgerError("execution review card result is invalid") from None
-    if not isinstance(parsed, list) or any(
-        not isinstance(item, str) for item in parsed
-    ):
+    if not isinstance(parsed, list):
         raise TaskLedgerError("execution review card result is invalid")
-    return tuple(parsed)
+    records: list[CardRecord] = []
+    for item in parsed:
+        if isinstance(item, str):
+            records.append(CardRecord(item))
+            continue
+        if not isinstance(item, dict):
+            raise TaskLedgerError(
+                "execution review card result is invalid")
+        text = item.get("action") or item.get("body") or ""
+        fields = {
+            name: item.get(name) or ""
+            for name in ("requires", "channel", "label", "recipient",
+                         "subject")
+        }
+        if not isinstance(text, str) or not text or any(
+            not isinstance(field_value, str)
+            for field_value in fields.values()
+        ):
+            raise TaskLedgerError(
+                "execution review card result is invalid")
+        records.append(CardRecord(text, **fields))
+    return tuple(records)
+
+
+def _heading_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
+    """Identify the task before describing it.
+
+    A card the reader cannot name is a card they cannot refer to, ask about,
+    or find again. The identifier goes first for the same reason it does in
+    GW: on a phone the first line is often the whole notification.
+    """
+    handle = f"T{card.task_id}"
+    title = "Task workflow"
+    if html:
+        head = f"🤖 <b>{title}</b>  <code>{handle}</code>"
+        body = f"<b>{_escape(card.task_text)}</b>"
+    else:
+        head = f"🤖 {title}  {handle}"
+        body = card.task_text
+    lines = [head, body, ""]
+    phase = _phase_name(card.phase)
+    if card.kind is ExecutionCardKind.START:
+        # The phase names what WOULD run. Naming it here would read as
+        # though it already had, which is the one thing a start gate must
+        # not imply.
+        phase = "not started"
+    elif card.outcome is ExecutionOutcome.COMPLETED:
+        # Marked rather than renamed: the same card carrying its last
+        # update, recognisable at a glance as finished.
+        done = "✅ done — close it with Mark as done"
+        phase = f"{phase} {done}" if not html else f"{phase} <b>{done}</b>"
+    lines.append(f"<b>Phase:</b> {phase}" if html else f"Phase: {phase}")
+    if card.revisions:
+        revised = f"Revision {card.revisions}"
+        lines.append(f"<b>{revised}</b>" if html else revised)
+    return lines
+
+
+def _asked_for_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
+    """The reader's own words, quoted back.
+
+    Without them a third pass reads exactly like a first, and an hour later
+    the reader cannot recall what they asked this one to fix.
+    """
+    if not (card.revisions and card.revision_note):
+        return []
+    shown = card.revision_note
+    if len(shown) > MAX_REVISION_NOTE_CHARS:
+        shown = shown[:MAX_REVISION_NOTE_CHARS].rstrip() + "…"
+    if html:
+        return ["", "<b>You asked for:</b>",
+                "<blockquote>" + _escape(shown) + "</blockquote>"]
+    return ["", "You asked for:", shown]
 
 
 def _card_lines(card: ExecutionReviewCard) -> list[str]:
-    details = [f"Task: {card.task_text}"]
+    details = []
     if card.owner:
         details.append(f"Owner: {card.owner}")
     if card.due:
@@ -1452,53 +1566,55 @@ def _card_lines(card: ExecutionReviewCard) -> list[str]:
     if card.kind is ExecutionCardKind.START:
         details.append(f"Agent: {card.agent_display_name}")
         return [
-            "Foxhound execution request",
-            "",
+            *_heading_lines(card, html=False),
             *details,
             "",
             "Start the planning phase? No task work or external action has run.",
         ]
     if card.kind is ExecutionCardKind.EXTERNAL_REVIEW:
         lines = [
-            "Foxhound external-action approval",
-            "",
+            *_heading_lines(card, html=False),
             *details,
             "",
-            "Requested external actions:",
+            "External action awaiting your approval:",
             *_listed(card.external_actions, empty="None supplied."),
             "",
             "Approve only if these exact external effects are intended.",
             "",
             f"Summary: {card.summary}",
+            *_asked_for_lines(card, html=False),
         ]
         if card.questions:
-            lines.extend(("", "Questions:", *_listed(card.questions)))
+            lines.extend(("", "Needs your input:",
+                      *[f"- {q}" for q in card.questions]))
         return lines
     if card.kind is ExecutionCardKind.RESULT_REVIEW:
         lines = [
-            "Foxhound result review",
-            "",
+            *_heading_lines(card, html=False),
             *details,
             "",
             f"Outcome: {card.outcome}",
             f"Summary: {card.summary}",
+            *_asked_for_lines(card, html=False),
         ]
         if card.questions:
-            lines.extend(("", "Questions:", *_listed(card.questions)))
+            lines.extend(("", "Needs your input:",
+                      *[f"- {q}" for q in card.questions]))
         if card.deliverables:
-            lines.extend(("", "Deliverables:", *_listed(card.deliverables)))
+            lines.extend(("", "Deliverables:", *_drafted(card.deliverables)))
         if card.work_markdown:
             lines.extend(("", "Work:", card.work_markdown))
         return lines
     lines = [
-        "Foxhound plan review",
-        "",
+        *_heading_lines(card, html=False),
         *details,
         "",
         f"Summary: {card.summary}",
+        *_asked_for_lines(card, html=False),
     ]
     if card.questions:
-        lines.extend(("", "Questions:", *_listed(card.questions)))
+        lines.extend(("", "Needs your input:",
+                      *[f"- {q}" for q in card.questions]))
     if card.external_actions:
         lines.extend((
             "",
@@ -1506,18 +1622,69 @@ def _card_lines(card: ExecutionReviewCard) -> list[str]:
             *_listed(card.external_actions),
         ))
     if card.deliverables:
-        lines.extend(("", "Deliverables:", *_listed(card.deliverables)))
+        lines.extend(("", "Deliverables:", *_drafted(card.deliverables)))
     if card.work_markdown:
         lines.extend(("", "Plan:", card.work_markdown))
     return lines
 
 
-def _listed(values: Sequence[str], *, empty: str = "None.") -> list[str]:
-    return [f"- {value}" for value in values] if values else [empty]
+#: What a phase is called to a reader. The enum names the machinery; these
+#: name the thing the reader is being asked about.
+PHASE_NAMES = {
+    WorkflowPhase.PLAN: "plan refinement",
+    WorkflowPhase.EXECUTE: "plan execution",
+    WorkflowPhase.EXTERNAL_ACTION: "external action",
+}
+
+
+def _phase_name(phase: WorkflowPhase) -> str:
+    return PHASE_NAMES.get(phase, phase.value)
+
+
+def _record_detail_lines(record: CardRecord) -> list[str]:
+    """The sub-lines under one record: what it needs, and where it goes."""
+    details = []
+    if record.requires:
+        details.append("Needs: " + record.requires)
+    if record.channel and record.channel.casefold() not in record.text.casefold():
+        details.append("Channel: " + record.channel)
+    return details
+
+
+def _listed(values: Sequence[CardRecord], *, empty: str = "None.") -> list[str]:
+    if not values:
+        return [empty]
+    lines: list[str] = []
+    for record in values:
+        lines.append(f"- {record.text}")
+        lines.extend(f"  {detail}"
+                     for detail in _record_detail_lines(record))
+    return lines
+
+
+def _drafted(values: Sequence[CardRecord]) -> list[str]:
+    """A prepared draft, shown in full rather than named.
+
+    A deliverable a reader cannot read is a deliverable they cannot approve,
+    so the body goes on the card. Anything without one is just a line.
+    """
+    lines: list[str] = []
+    for record in values:
+        if not record.structured:
+            lines.append(f"- {record.text}")
+            continue
+        heading = record.label or "Prepared draft"
+        lines.extend(("", heading))
+        if record.recipient:
+            lines.append("To: " + record.recipient)
+        if record.subject:
+            lines.append("Subject: " + record.subject)
+        lines.append(record.text)
+    return lines
 
 
 def _html_card_lines(card: ExecutionReviewCard) -> list[str]:
-    details = _labelled_html_lines("Task", card.task_text)
+    details = []
     if card.owner:
         details.extend(_labelled_html_lines("Owner", card.owner))
     if card.due:
@@ -1525,60 +1692,61 @@ def _html_card_lines(card: ExecutionReviewCard) -> list[str]:
     if card.kind is ExecutionCardKind.START:
         details.extend(_labelled_html_lines("Agent", card.agent_display_name))
         return [
-            "<b>Foxhound execution request</b>",
-            "",
+            *_heading_lines(card, html=True),
             *details,
             "",
             "Start the planning phase? No task work or external action has run.",
         ]
     if card.kind is ExecutionCardKind.EXTERNAL_REVIEW:
         lines = [
-            "<b>Foxhound external-action approval</b>",
-            "",
+            *_heading_lines(card, html=True),
             *details,
             "",
-            "<b>Requested external actions:</b>",
+            "<b>External action awaiting your approval:</b>",
             *_html_listed(card.external_actions, empty="None supplied."),
             "",
             "Approve only if these exact external effects are intended.",
             "",
             *_labelled_html_lines("Summary", card.summary),
+            *_asked_for_lines(card, html=True),
         ]
         if card.questions:
             lines.extend((
                 "",
-                "<b>Questions:</b>",
-                *_html_listed(card.questions),
+                "<b>Needs your input:</b>",
+                *_html_question_lines(card.questions),
             ))
         return lines
     if card.kind is ExecutionCardKind.RESULT_REVIEW:
         lines = [
-            "<b>Foxhound result review</b>",
-            "",
+            *_heading_lines(card, html=True),
             *details,
             "",
             *_labelled_html_lines("Outcome", str(card.outcome)),
             *_labelled_html_lines("Summary", card.summary),
+            *_asked_for_lines(card, html=True),
         ]
         if card.questions:
-            lines.extend(("", "<b>Questions:</b>", *_html_listed(card.questions)))
+            lines.extend(("", "<b>Needs your input:</b>",
+                          *_html_question_lines(card.questions)))
         if card.deliverables:
-            lines.extend(("", "<b>Deliverables:</b>", *_html_listed(card.deliverables)))
+            lines.extend(("", "<b>Deliverables:</b>",
+                          *_html_drafted(card.deliverables)))
         if card.work_markdown:
             lines.extend(("", "<b>Work:</b>", *_markdown_lines(card.work_markdown)))
         return lines
     lines = [
-        "<b>Foxhound plan review</b>",
-        "",
+        *_heading_lines(card, html=True),
         *details,
         "",
         *_labelled_html_lines("Summary", card.summary),
+        *_asked_for_lines(card, html=True),
     ]
     if card.questions:
         lines.extend((
             "",
-            "<b>Questions:</b>",
-            *_html_listed(card.questions),
+            "<b>Needs your input:</b>",
+            *_html_question_lines(card.questions),
         ))
     if card.external_actions:
         lines.extend((
@@ -1590,7 +1758,7 @@ def _html_card_lines(card: ExecutionReviewCard) -> list[str]:
         lines.extend((
             "",
             "<b>Deliverables:</b>",
-            *_html_listed(card.deliverables),
+            *_html_drafted(card.deliverables),
         ))
     if card.work_markdown:
         lines.extend(("", "<b>Plan:</b>", *_markdown_lines(card.work_markdown)))
@@ -1598,15 +1766,52 @@ def _html_card_lines(card: ExecutionReviewCard) -> list[str]:
 
 
 def _html_listed(
-    values: Sequence[str], *, empty: str = "None."
+    values: Sequence[CardRecord], *, empty: str = "None."
 ) -> list[str]:
     if not values:
         return [empty]
+    lines: list[str] = []
+    for record in values:
+        segments = _escaped_source_lines(record.text)
+        lines.append(f"• {segments[0]}")
+        lines.extend(f"  {segment}" for segment in segments[1:])
+        lines.extend(
+            f"  {_escape(detail)}"
+            for detail in _record_detail_lines(record)
+        )
+    return lines
+
+
+def _html_question_lines(values: Sequence[str]) -> list[str]:
     lines: list[str] = []
     for value in values:
         segments = _escaped_source_lines(value)
         lines.append(f"• {segments[0]}")
         lines.extend(f"  {segment}" for segment in segments[1:])
+    return lines
+
+
+def _html_drafted(values: Sequence[CardRecord]) -> list[str]:
+    """A prepared draft in full, so it can be judged without opening a file.
+
+    The body goes in a <pre> block: it is someone else's text, often an
+    email, and re-flowing it would misrepresent what would actually be
+    sent.
+    """
+    lines: list[str] = []
+    for record in values:
+        if not record.structured:
+            segments = _escaped_source_lines(record.text)
+            lines.append(f"• {segments[0]}")
+            lines.extend(f"  {segment}" for segment in segments[1:])
+            continue
+        heading = _escape(record.label or "Prepared draft")
+        lines.extend(("", f"<b>{heading}</b>"))
+        if record.recipient:
+            lines.append("To: " + _escape(record.recipient))
+        if record.subject:
+            lines.append("Subject: " + _escape(record.subject))
+        lines.append("<pre>" + _escape(record.text) + "</pre>")
     return lines
 
 
