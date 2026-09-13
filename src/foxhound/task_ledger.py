@@ -412,6 +412,11 @@ class TaskLedger:
                     ):
                         raise _NativeIntakeConflict
 
+                    binding = connection.execute(
+                        "SELECT source_revision,task_id,relation "
+                        "FROM task_candidate_bindings WHERE candidate_id=?",
+                        (candidate.candidate_id,),
+                    ).fetchone()
                     producer_decision = connection.execute(
                         "SELECT 1 FROM task_shadow_observations "
                         "WHERE candidate_id=? AND source_revision=?",
@@ -421,13 +426,16 @@ class TaskLedger:
                         ),
                     ).fetchone()
                     if producer_decision is not None:
+                        if (
+                            binding is not None
+                            and binding["source_revision"]
+                            == candidate.source.revision
+                            and binding["relation"] == "accepted"
+                        ):
+                            candidates_unchanged += 1
+                            continue
                         raise _NativeIntakeConflict
 
-                    binding = connection.execute(
-                        "SELECT source_revision,task_id,relation "
-                        "FROM task_candidate_bindings WHERE candidate_id=?",
-                        (candidate.candidate_id,),
-                    ).fetchone()
                     if binding is None:
                         task_id = self._insert_task(
                             connection, candidate, candidate.task.owner, now

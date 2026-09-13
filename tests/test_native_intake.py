@@ -200,6 +200,54 @@ class NativeCandidateIntakeTests(unittest.TestCase):
         self.assertEqual(self._state(), before)
         self.assertEqual((self.ledger.count(), self.ledger.binding_count()), (2, 2))
 
+    def test_exact_historically_bound_candidate_advances_as_unchanged(self):
+        item = candidate(1)
+        legacy_feed = feed(0, item)
+        legacy_feed["stream_id"] = "legacy-shadow"
+        self.assertTrue(self.inbox.import_feed(legacy_feed).accepted)
+        self.inbox.import_shadow_feed(
+            shadow_feed(observation(item, disposition="minted", task_id=1001))
+        )
+        self.assertEqual(self.ledger.bootstrap_from_shadow().tasks_created, 1)
+        self.assertEqual(self.activate().disposition, NativeIntakeDisposition.APPLIED)
+        self.assertTrue(self.inbox.import_feed(feed(0, item)).accepted)
+
+        result = self.intake()
+
+        self.assertEqual(result.disposition, NativeIntakeDisposition.APPLIED)
+        self.assertEqual(
+            (
+                result.tasks_created,
+                result.tasks_revised,
+                result.candidates_unchanged,
+                result.previous_cursor,
+                result.current_cursor,
+            ),
+            (0, 0, 1, 0, 1),
+        )
+        self.assertEqual((self.ledger.count(), self.ledger.binding_count()), (1, 1))
+
+    def test_historically_bound_nonaccepted_candidate_fails_closed(self):
+        item = candidate(1)
+        legacy_feed = feed(0, item)
+        legacy_feed["stream_id"] = "legacy-shadow"
+        self.assertTrue(self.inbox.import_feed(legacy_feed).accepted)
+        self.inbox.import_shadow_feed(
+            shadow_feed(observation(item, disposition="minted", task_id=1001))
+        )
+        self.assertEqual(self.ledger.bootstrap_from_shadow().tasks_created, 1)
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "UPDATE task_candidate_bindings SET relation='folded'"
+            )
+        self.assertEqual(self.activate().disposition, NativeIntakeDisposition.APPLIED)
+        self.assertTrue(self.inbox.import_feed(feed(0, item)).accepted)
+
+        result = self.intake()
+
+        self.assertEqual(result.refusal, NativeIntakeRefusal.STATE_CONFLICT)
+        self.assertEqual(self._intake_cursor(), 0)
+
     def test_revision_updates_only_the_accepted_open_task_and_appends_event(self):
         self.activate()
         initial = candidate(1)
