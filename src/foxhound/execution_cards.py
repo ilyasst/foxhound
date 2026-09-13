@@ -1035,13 +1035,30 @@ class ExecutionCardService:
                 raise
 
     def stats(self) -> ExecutionCardStats:
+        """What is actually occupying the reader's surface.
+
+        A card counts only while it can still be answered. Once the work
+        behind it has moved on, its buttons are refused, so it is not
+        holding a place in any sense the reader would recognise — but it
+        used to be counted anyway. With room for one card, a single
+        superseded card meant no card could ever be scheduled again, and
+        the sweep that cancels it lives behind the scheduling call the
+        drip had already returned from. The surface simply went quiet and
+        stayed quiet.
+        """
         with closing(self._connect()) as connection:
-            rows = connection.execute(
-                "SELECT status,COUNT(*) AS total FROM execution_review_cards "
-                "WHERE status IN ('pending','delivering','delivered') "
-                "GROUP BY status"
-            ).fetchall()
-        counts = {row["status"]: int(row["total"]) for row in rows}
+            rows = [
+                row
+                for row in connection.execute(
+                    self._card_select()
+                    + " WHERE c.status IN ('pending','delivering','delivered')"
+                ).fetchall()
+                if _current_card(row)
+            ]
+        counts: dict[str, int] = {}
+        for row in rows:
+            status = str(row["status"])
+            counts[status] = counts.get(status, 0) + 1
         return ExecutionCardStats(
             pending=counts.get("pending", 0),
             delivering=counts.get("delivering", 0),
