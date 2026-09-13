@@ -166,6 +166,7 @@ def agent_prompt(worker_command: str = "foxhound-task-worker") -> str:
         "In `execute`, perform only approved reversible work and prepare any external action for separate review. Do not send, publish, deploy, push, purchase, or contact anyone.",
         "In `external_action`, perform only the explicitly approved external action represented by the current phase, then report what happened.",
         "`task.origin` names what the task is about, as identifiers. For `kind` `issue`, `record_id` is the repository and `item_id` the issue number; act on that issue and no other. A null origin means the task is not addressable — do not infer a target from its text.",
+        f"To write the change, call `{worker_command} act worktree`. It clones this task's repository on a branch derived from the issue and returns the path; work there and commit. The repository is not yours to choose, and you must not clone or check out another one.",
         f"To act in `external_action`, call `{worker_command} act pull-request --head <branch> --title <title> --body-file <file>`. The repository is taken from the task origin and is not yours to choose; write the body to a file beside the run state first. Do not open pull requests with the forge CLI directly.",
         "If workflow.reader_instruction is present, it is the reader's exact request for this next supervised pass. Address it without treating it as approval for an external effect.",
         "Task lifecycle is separate. A completed execution result does not authorize you to close or drop the task.",

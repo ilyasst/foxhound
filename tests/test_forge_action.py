@@ -7,7 +7,9 @@ feature.
 """
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from foxhound import forge_action
@@ -137,6 +139,80 @@ class Refusals(unittest.TestCase):
             self.assertNotIn(forbidden, flat)
 
 
+class PreparedWorktree(unittest.TestCase):
+    def test_the_branch_is_derived_not_chosen(self) -> None:
+        # One less thing an agent can get wrong, and a second attempt at the
+        # same issue reuses the branch instead of littering the repository.
+        self.assertEqual(forge_action.branch_for("42"), "foxhound/issue-42")
+
+    def test_a_non_issue_task_prepares_nothing(self) -> None:
+        with self.assertRaises(ForgeActionError):
+            forge_action.prepare_worktree(
+                origin_kind="meeting", repository="github.com/acme/widget",
+                issue="2", parent=Path("/tmp"))
+
+    def test_an_existing_tree_is_not_clobbered(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "repo-2").mkdir()
+            runner = _gh([OK_DEFAULT_BRANCH])
+            with mock.patch.object(forge_action, "_run", runner):
+                with self.assertRaises(ForgeActionError) as caught:
+                    forge_action.prepare_worktree(
+                        origin_kind="issue",
+                        repository="github.com/acme/widget", issue="2",
+                        parent=Path(td))
+            self.assertIn("already prepared", str(caught.exception))
+
+    def test_the_clone_is_blobless_not_shallow(self) -> None:
+        # A push from a shallow clone is refused by some forges, and finding
+        # that out at the push is finding out too late.
+        with tempfile.TemporaryDirectory() as td:
+            runner = _gh([OK_DEFAULT_BRANCH,
+                          (("gh", "repo", "clone"), (0, "", "")),
+                          (("git",), (0, "", ""))])
+            with mock.patch.object(forge_action, "_run", runner):
+                path, branch, base = forge_action.prepare_worktree(
+                    origin_kind="issue", repository="github.com/acme/widget",
+                    issue="2", parent=Path(td))
+            clone = next(c for c in runner.calls if c[:3] == ("gh", "repo", "clone"))
+            self.assertIn("--filter=blob:none", clone)
+            self.assertNotIn("--depth", " ".join(clone))
+            self.assertEqual(branch, "foxhound/issue-2")
+            self.assertEqual(base, "main")
+            self.assertEqual(path.name, "repo-2")
+
+
+class PushIsBounded(unittest.TestCase):
+    def test_the_refname_is_explicit_on_both_sides(self) -> None:
+        # A misconfigured local push default cannot redirect it.
+        runner = _gh([(("git",), (0, "", ""))])
+        with mock.patch.object(forge_action, "_run", runner):
+            forge_action.push_branch(
+                repository="github.com/acme/widget", path=Path("/tmp/x"),
+                head_branch="foxhound/issue-2", base="main")
+        push = runner.calls[0]
+        self.assertIn("refs/heads/foxhound/issue-2:refs/heads/foxhound/issue-2",
+                      push)
+
+    def test_pushing_the_base_is_refused(self) -> None:
+        runner = _gh([(("git",), (0, "", ""))])
+        with mock.patch.object(forge_action, "_run", runner):
+            with self.assertRaises(ForgeActionError):
+                forge_action.push_branch(
+                    repository="github.com/acme/widget", path=Path("/tmp/x"),
+                    head_branch="main", base="main")
+        self.assertEqual(runner.calls, [])
+
+    def test_a_rejected_push_is_surfaced(self) -> None:
+        runner = _gh([(("git",), (1, "", "protected branch hook declined"))])
+        with mock.patch.object(forge_action, "_run", runner):
+            with self.assertRaises(ForgeActionError) as caught:
+                forge_action.push_branch(
+                    repository="github.com/acme/widget", path=Path("/tmp/x"),
+                    head_branch="foxhound/issue-2", base="main")
+        self.assertIn("declined", str(caught.exception))
+
+
 class AgentGuidance(unittest.TestCase):
     def test_the_agent_is_pointed_at_the_bounded_action(self) -> None:
         from foxhound.execution_runner import agent_prompt
@@ -146,6 +222,8 @@ class AgentGuidance(unittest.TestCase):
         self.assertIn("not yours to choose", prompt)
         # Using the forge CLI directly would bypass every bound in this module.
         self.assertIn("Do not open pull requests with the forge CLI", prompt)
+        self.assertIn("act worktree", prompt)
+        self.assertIn("must not clone or check out another one", prompt)
 
     def test_the_worker_command_is_substituted(self) -> None:
         from foxhound.execution_runner import agent_prompt

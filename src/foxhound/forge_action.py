@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 
 #: The trailer appended to every body this module sends. An operator reading
 #: the pull request should be able to tell that an agent opened it, even when
@@ -43,7 +44,8 @@ PROVENANCE = (
     "#{issue}. Review before merging._\n"
 )
 
-_PUSH_TIMEOUT_S = 60
+_PUSH_TIMEOUT_S = 120
+_CLONE_TIMEOUT_S = 600
 
 
 class ForgeActionError(RuntimeError):
@@ -89,6 +91,88 @@ def default_branch(repository: str) -> str:
             f"{repository}: the forge did not name a default branch "
             f"({_detail(err)})")
     return out.strip()
+
+
+def branch_for(issue: str) -> str:
+    """The branch a task's work belongs on.
+
+    Derived, not chosen. A deterministic name makes a second attempt at the
+    same issue reuse its branch instead of littering the repository with
+    near-duplicates, and removes one more thing an agent can get wrong.
+    """
+    return f"foxhound/issue-{issue}"
+
+
+def prepare_worktree(
+    *,
+    origin_kind: str,
+    repository: str,
+    issue: str,
+    parent: Path,
+) -> tuple[Path, str, str]:
+    """Clone the task's repository into ``parent`` on a fresh branch.
+
+    Returns ``(path, branch, base)``. The agent is handed a working tree it
+    did not choose the contents of: the repository comes from the task's
+    binding, and the branch name is derived from the issue.
+
+    A blobless partial clone rather than a shallow one. Shallow is faster
+    still, but a push from a shallow clone is refused by some forges, and
+    discovering that at the push is discovering it too late.
+    """
+    if origin_kind != "issue":
+        raise ForgeActionError(
+            "this task does not originate from a forge issue, so there is no "
+            "repository to prepare"
+        )
+    if not repository or repository.count("/") != 2:
+        raise ForgeActionError("the task's repository is not a canonical locator")
+    host, _, name_with_owner = repository.partition("/")
+    if host != "github.com":
+        raise ForgeActionError(f"{host}: preparing a worktree is not supported here")
+
+    base = default_branch(repository)
+    branch = branch_for(issue)
+    path = Path(parent) / f"repo-{issue}"
+    if path.exists():
+        raise ForgeActionError(
+            "a working tree for this task already exists; the phase has "
+            "already prepared one"
+        )
+    rc, _out, err = _run(
+        "gh", "repo", "clone", name_with_owner, str(path), "--",
+        "--filter=blob:none", "--single-branch", "--branch", base,
+        timeout=_CLONE_TIMEOUT_S)
+    if rc != 0:
+        raise ForgeActionError(
+            f"{repository}: the repository could not be cloned ({_detail(err)})")
+    rc, _out, err = _run("git", "-C", str(path), "checkout", "-b", branch)
+    if rc != 0:
+        raise ForgeActionError(
+            f"{repository}: the work branch could not be created ({_detail(err)})")
+    return path, branch, base
+
+
+def push_branch(*, repository: str, path: Path, head_branch: str,
+                base: str) -> None:
+    """Push the prepared branch, and only that branch.
+
+    The refname is written explicitly on both sides so a misconfigured local
+    push default cannot redirect it, and the base is refused outright: a task
+    proposes a change, it does not update the branch it targets.
+    """
+    if head_branch == base:
+        raise ForgeActionError(
+            f"refusing to push {head_branch!r}: it is the branch the proposal "
+            "targets"
+        )
+    rc, _out, err = _run(
+        "git", "-C", str(path), "push", "--set-upstream", "origin",
+        f"refs/heads/{head_branch}:refs/heads/{head_branch}",
+        timeout=_PUSH_TIMEOUT_S)
+    if rc != 0:
+        raise ForgeActionError(
+            f"{repository}: the branch could not be pushed ({_detail(err)})")
 
 
 def open_pull_request(
