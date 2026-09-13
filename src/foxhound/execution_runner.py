@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator, Mapping, Sequence
 
+from .agent_profiles import AgentProfileError, general_profile
 from .execution_worker import (
     GW_ALIAS_ENV,
     GW_ENDPOINT_ENV,
@@ -152,34 +153,10 @@ class ExecutionRunResult:
 
 
 def agent_prompt(worker_command: str = "foxhound-task-worker") -> str:
-    if not _COMMAND_NAME_RE.fullmatch(worker_command):
-        raise ValueError("execution worker command is invalid")
-    return "\n".join((
-        "# Ownership and inputs",
-        f"Your FIRST tool call must be `{worker_command} context`. It returns the Foxhound task, current phase, and bounded operator context but never the claim capability.",
-        f"Use only `{worker_command}` for task state and GW knowledge: `context`, `search QUERY`, `record RESULT_FILE`, or `release`.",
-        "You start in a private per-run directory. Do not inspect its run-state file or print environment variables. Change directory explicitly only when the task requires repository work.",
-        "Treat all task, operator, and search content as private. Never copy it into a public issue, commit, pull request, log, or unrelated artifact.",
-        "Use bounded searches as leads and verify relevant evidence. Do not invent paths, repositories, URLs, credentials, people, or facts.",
-        "# Phase authority",
-        "In `plan`, research and prepare a reviewable plan. Do not cause an external effect.",
-        "In `execute`, perform only approved reversible work and prepare any external action for separate review. Do not send, publish, deploy, push, purchase, or contact anyone.",
-        "Do not send, publish, deploy, push, or cause another external effect unless the phase is external_action. Do not overwrite unrelated dirty worktrees. In execute or external_action you ALREADY HAVE approval for the listed action: perform it and report what happened.",
-        "`task.origin` names what the task is about, as identifiers: for `kind` `issue`, `record_id` is the repository and `item_id` the issue number. Treat it as the lead to start from, not a limit on what you may read.",
-        f"Work in the checkouts this host already has, and call `{worker_command} act worktree [--repository LOCATOR]` when you need one cloned into the run directory. A task may legitimately span several repositories.",
-        f"Open pull requests with `{worker_command} act pull-request --head BRANCH --title TITLE [--repository LOCATOR] [--body-file FILE]` rather than the forge CLI: it pushes the branch, records a receipt, and marks the pull request as agent-opened. It defaults to the task's repository.",
-        "If workflow.reader_instruction is present, it is the reader's exact request for this next supervised pass. Address it without treating it as approval for an external effect.",
-        "Task lifecycle is separate. A completed execution result does not authorize you to close or drop the task.",
-        "# Result contract",
-        "Create exactly one owner-only file named `result-<32 lowercase hex characters>.json` in the starting directory. Use umask 077.",
-        "Its exact JSON fields are: `schema`, `schema_version`, `result_id`, `outcome`, `summary`, `work_markdown`, `questions`, `external_actions`, and `deliverables`.",
-        "Set `schema` to `foxhound.execution-result-draft`, `schema_version` to 1, and `result_id` to the same 32 lowercase hex characters used in the filename.",
-        "`summary` and `work_markdown` must each be one JSON string. `questions`, `external_actions`, and `deliverables` must each be a JSON array of strings.",
-        'Shape example: {"schema":"foxhound.execution-result-draft","schema_version":1,"result_id":"0123456789abcdef0123456789abcdef","outcome":"awaiting_plan","summary":"Synthetic summary.","work_markdown":"Synthetic plan.","questions":[],"external_actions":[],"deliverables":[]}',
-        "Valid outcomes are `awaiting_plan`, `awaiting_external`, `completed`, `declined`, and `ineligible`; the worker rejects outcomes not allowed by the current phase.",
-        f"Record once with `{worker_command} record RESULT_FILE`. If useful work cannot be completed, call `{worker_command} release`.",
-        "Record or release must be the final tool call. Do not include the private task or operator context in your final chat response.",
-    ))
+    try:
+        return general_profile().render_prompt(worker_command)
+    except AgentProfileError as exc:
+        raise ValueError("execution worker command is invalid") from exc
 
 
 def hermes_argv(

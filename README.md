@@ -200,6 +200,22 @@ Starting this command with no queued workflow exits successfully without
 launching an agent. See
 [ADR 0015](docs/architecture/0015-supervised-execution-runner.md).
 
+Agent definitions are strict, revisioned Foxhound profiles. The built-in
+`general` profile preserves the existing Hermes policy. A deployment may load
+additional reviewed JSON manifests from an absolute owner-only directory
+outside Git, then inspect their content-free identity and policy metadata:
+
+```sh
+foxhound-agent-profiles --directory /srv/example/private-agent-profiles validate
+foxhound-agent-profiles --directory /srv/example/private-agent-profiles list
+foxhound-agent-profiles --directory /srv/example/private-agent-profiles show general
+```
+
+Private manifests cannot provide executable commands, environment variables,
+secrets, or arbitrary tool names. Prompts and private paths are never emitted
+by these commands. Profile selection is intentionally not inferred from task
+content. See [ADR 0023](docs/architecture/0023-agent-profile-registry.md).
+
 For a parallel comparison in which Foxhound may prepare plans but must never
 execute work, restrict the runner's atomic claim selection:
 
