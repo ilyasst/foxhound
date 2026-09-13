@@ -29,6 +29,12 @@ from foxhound.agent_profiles import (
 EXPECTED_GENERAL_PROMPT_SHA256 = (
     "9db37521f682499a999039fe3580c9c004c0b16378ed57758a8eaa6dd4adb9bb"
 )
+EXPECTED_GENERAL_REVISION = (
+    "5d841390306c6e53c452c00d6dab624378c58cd2f36b3228f66929fc9061a6b9"
+)
+LEGACY_GENERAL_REVISION = (
+    "f0171b0e9e09e547d9b344223d31b6de1bc0e6d13cb5b8c891fda9d0a7b0db94"
+)
 
 
 def profile_document(profile_id: str = "specialist") -> dict[str, object]:
@@ -80,8 +86,12 @@ class AgentProfileTests(unittest.TestCase):
 
         self.assertEqual(profile.profile_id, "general")
         self.assertEqual(profile.runtime, "hermes")
-        self.assertEqual(profile.max_turns, 12)
-        self.assertEqual(profile.timeout_seconds, 240)
+        self.assertEqual(profile.revision, EXPECTED_GENERAL_REVISION)
+        self.assertEqual(profile.max_turns, 50)
+        self.assertEqual(profile.timeout_seconds, 1_800)
+        self.assertEqual(profile.claim_lease_seconds, 2_700)
+        self.assertEqual(profile.heartbeat_seconds, 60)
+        self.assertEqual(profile.kill_grace_seconds, 30)
         self.assertEqual(
             hashlib.sha256(prompt.encode()).hexdigest(),
             EXPECTED_GENERAL_PROMPT_SHA256,
@@ -92,6 +102,33 @@ class AgentProfileTests(unittest.TestCase):
         ))
         with self.assertRaises(AgentProfileError):
             profile.render_prompt("worker; command")
+
+    def test_legacy_general_revision_is_resolution_only(self):
+        registry = load_registry()
+        current = general_profile()
+
+        self.assertEqual(registry.list(), (current,))
+        self.assertEqual(registry.get("general"), current)
+        legacy = registry.resolve("general", LEGACY_GENERAL_REVISION)
+        self.assertEqual(legacy.revision, LEGACY_GENERAL_REVISION)
+        with self.assertRaises(AgentProfileError):
+            registry.resolve_current("general", LEGACY_GENERAL_REVISION)
+        self.assertEqual(
+            registry.resolve_current("general", current.revision), current
+        )
+        self.assertEqual(
+            (
+                legacy.max_turns,
+                legacy.timeout_seconds,
+                legacy.claim_lease_seconds,
+                legacy.heartbeat_seconds,
+                legacy.kill_grace_seconds,
+            ),
+            (12, 240, 900, 60, 10),
+        )
+        self.assertEqual(legacy.prompt_template, current.prompt_template)
+        self.assertEqual(legacy.toolsets, current.toolsets)
+        self.assertEqual(legacy.allowed_phases, current.allowed_phases)
 
     def test_public_coder_example_is_synthetic_and_structurally_valid(self):
         path = (
@@ -158,6 +195,28 @@ class AgentProfileTests(unittest.TestCase):
                     registry.resolve(profile_id, revision)
         with self.assertRaises(AgentProfileError):
             AgentProfileRegistry((profile, profile))
+
+    def test_registry_refuses_ambiguous_historical_revisions(self):
+        current = general_profile()
+        historical = replace(current, max_turns=49)
+        registry = AgentProfileRegistry(
+            (current,), historical_profiles=(historical,)
+        )
+        self.assertEqual(
+            registry.resolve(historical.profile_id, historical.revision),
+            historical,
+        )
+
+        for invalid in (
+            (current,),
+            (historical, historical),
+            (replace(historical, profile_id="unlisted"),),
+        ):
+            with self.subTest(revisions=len(invalid)):
+                with self.assertRaises(AgentProfileError):
+                    AgentProfileRegistry(
+                        (current,), historical_profiles=invalid
+                    )
 
     def test_manifest_shape_refuses_missing_unknown_and_command_fields(self):
         base = profile_document()

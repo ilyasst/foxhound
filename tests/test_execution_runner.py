@@ -136,6 +136,7 @@ class ExecutionRunnerTests(unittest.TestCase):
 
             def record():
                 state = load_run_state(state_path)
+                launched["state"] = state
                 result = TaskExecutionService(state.database_path).record_result(
                     ExecutionResultEnvelope(
                         result_id=RESULT_ID,
@@ -165,6 +166,13 @@ class ExecutionRunnerTests(unittest.TestCase):
         self.assertFalse(launched["kwargs"]["shell"])
         self.assertIs(launched["kwargs"]["stdout"], subprocess.DEVNULL)
         self.assertIs(launched["kwargs"]["stderr"], subprocess.DEVNULL)
+        turn_index = launched["argv"].index("--max-turns")
+        self.assertEqual(launched["argv"][turn_index + 1], "50")
+        self.assertEqual(launched["state"].lease_seconds, 2_700)
+        self.assertEqual(
+            launched["state"].agent_profile_revision,
+            general_profile().revision,
+        )
         state_path = Path(
             launched["kwargs"]["env"]["FOXHOUND_EXECUTION_STATE"]
         )
@@ -284,6 +292,58 @@ class ExecutionRunnerTests(unittest.TestCase):
             specialist.revision,
         )
 
+    def test_runner_honors_a_pinned_historical_general_policy(self):
+        current = general_profile()
+        historical_document = current.document()
+        historical_document.update({
+            "max_turns": 12,
+            "timeout_seconds": 240,
+            "claim_lease_seconds": 900,
+            "kill_grace_seconds": 10,
+        })
+        historical = parse_profile(historical_document)
+        old_service = TaskExecutionService(
+            self.database,
+            profile_registry=AgentProfileRegistry((historical,)),
+        )
+        scheduled = old_service.schedule(1, expected_task_version=1)
+        old_service.start_action(
+            1, expected_version=scheduled.version, action="start"
+        )
+        launched = {}
+
+        def popen(argv, **kwargs):
+            launched["argv"] = argv
+            state = load_run_state(
+                Path(kwargs["env"]["FOXHOUND_EXECUTION_STATE"])
+            )
+            launched["state"] = state
+
+            def release():
+                TaskExecutionService(state.database_path).release(
+                    state.task_id,
+                    expected_version=state.workflow_version,
+                    claim_token=state.claim_token,
+                )
+
+            return FakeProcess(callback=release)
+
+        result = run_once(
+            self._config(),
+            popen=popen,
+            run_id_factory=lambda: "9" * 32,
+            terminate=self._terminator,
+        )
+
+        self.assertEqual(result.outcome, "released")
+        turn_index = launched["argv"].index("--max-turns")
+        self.assertEqual(launched["argv"][turn_index + 1], "12")
+        self.assertEqual(launched["state"].lease_seconds, 900)
+        self.assertEqual(
+            launched["state"].agent_profile_revision,
+            historical.revision,
+        )
+
     def test_runner_refuses_a_selected_revision_missing_from_its_registry(self):
         specialist = parse_profile({
             **general_profile().document(),
@@ -358,6 +418,7 @@ class ExecutionRunnerTests(unittest.TestCase):
             terminate=self._terminator,
         )
         self.assertEqual((result.outcome, result.exit_code), ("timeout", 124))
+        self.assertEqual(monotonic.value, 1_800)
         self.assertTrue(process.terminated)
         self.assertEqual(self.service.get(1).last_failure_reason, "timeout")
 
