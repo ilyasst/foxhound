@@ -103,6 +103,7 @@ class ExecutionRunState:
     lease_seconds: int
     agent_profile_id: str
     agent_profile_revision: str
+    knowledge_root: str | None = None
 
 
 class ExecutionWorker:
@@ -152,6 +153,12 @@ class ExecutionWorker:
                     "record_id": origin.record_id,
                     "item_id": origin.item_id,
                 },
+            },
+            "knowledge": {
+                # The agent reads this directory with its ordinary file
+                # tools. Search finds the fragment; the directory is how it
+                # reads the discussion the fragment came from.
+                "root": state.knowledge_root,
             },
             "workflow": {
                 "version": state.workflow_version,
@@ -445,7 +452,7 @@ def load_run_state(path: str | os.PathLike[str]) -> ExecutionRunState:
             "schema", "schema_version", "run_id", "database_path",
             "task_id", "task_version", "workflow_version", "phase",
             "claim_token", "lease_seconds", "agent_profile_id",
-            "agent_profile_revision",
+            "agent_profile_revision", "knowledge_root",
         },
         "execution run state",
     )
@@ -504,7 +511,25 @@ def load_run_state(path: str | os.PathLike[str]) -> ExecutionRunState:
         lease_seconds=lease,
         agent_profile_id=profile_id,
         agent_profile_revision=profile_revision,
+        knowledge_root=_knowledge_root(document["knowledge_root"]),
     )
+
+
+def _knowledge_root(value: object) -> str | None:
+    """Where this machine keeps its knowledge base, if it has one.
+
+    None is ordinary: a host may run an agent without one. It is a
+    directory the agent reads and never writes, and the path is per host
+    because the sync roots differ across the fleet.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ExecutionWorkerConfigError("execution run state is invalid")
+    path = Path(value)
+    if not path.is_absolute() or not path.is_dir():
+        raise ExecutionWorkerConfigError("execution run state is invalid")
+    return str(path)
 
 
 def load_result_draft(

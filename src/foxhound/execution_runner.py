@@ -78,6 +78,9 @@ class ExecutionRunnerConfig:
         default_factory=load_registry, repr=False
     )
     worker_command: str = "foxhound-task-worker"
+    #: Where this machine keeps the knowledge base. Per host, never derived:
+    #: the sync roots differ across the fleet.
+    knowledge_root: Path | None = field(default=None, repr=False)
     allowed_phases: tuple[WorkflowPhase, ...] = tuple(WorkflowPhase)
     poll_seconds: float = 0.1
 
@@ -638,6 +641,10 @@ def _write_state(
         "lease_seconds": profile.claim_lease_seconds,
         "agent_profile_id": claim.agent_profile_id,
         "agent_profile_revision": claim.agent_profile_revision,
+        "knowledge_root": (
+            None if config.knowledge_root is None
+            else str(config.knowledge_root)
+        ),
     }
     payload = (
         json.dumps(
@@ -751,6 +758,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--agent-profile-directory", type=Path)
     parser.add_argument("--worker-command", default="foxhound-task-worker")
     parser.add_argument(
+        "--knowledge-root",
+        type=Path,
+        help=(
+            "directory holding this machine's knowledge base; the agent "
+            "reads it and never writes to it"
+        ),
+    )
+    parser.add_argument(
         "--allowed-phase",
         action="append",
         choices=tuple(phase.value for phase in WorkflowPhase),
@@ -775,6 +790,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             agent_command=args.agent_command,
             profile_registry=load_registry(args.agent_profile_directory),
             worker_command=args.worker_command,
+            knowledge_root=args.knowledge_root,
             allowed_phases=(
                 tuple(WorkflowPhase(value) for value in args.allowed_phases)
                 if args.allowed_phases
