@@ -193,7 +193,8 @@ foxhound-execution-runner \
   --run-root /srv/example/private-foxhound-state/execution-runs \
   --gw-endpoint http://127.0.0.1:8787 \
   --gw-alias example-operator \
-  --gw-token-file /srv/example/private-foxhound-state/knowledge.token
+  --gw-token-file /srv/example/private-foxhound-state/knowledge.token \
+  --agent-profile-directory /srv/example/private-agent-profiles
 ```
 
 Starting this command with no queued workflow exits successfully without
@@ -215,6 +216,14 @@ Private manifests cannot provide executable commands, environment variables,
 secrets, or arbitrary tool names. Prompts and private paths are never emitted
 by these commands. Profile selection is intentionally not inferred from task
 content. See [ADR 0023](docs/architecture/0023-agent-profile-registry.md).
+
+Every execution workflow stores the selected profile ID and exact revision.
+The runner resolves that immutable evidence within atomic claim selection,
+then derives the Hermes prompt, tools, turn limit, timeout, lease, heartbeat,
+and shutdown grace from the profile. Missing, changed, or phase-ineligible
+profiles fail closed without claiming or launching an agent. There are no
+runner-level overrides for those profile policies. See
+[ADR 0024](docs/architecture/0024-workflow-agent-binding.md).
 
 For a parallel comparison in which Foxhound may prepare plans but must never
 execute work, restrict the runner's atomic claim selection:

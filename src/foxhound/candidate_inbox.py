@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -246,6 +246,8 @@ _SCHEMA_COLUMNS = {
         "created_at",
         "updated_at",
         "completed_at",
+        "agent_profile_id",
+        "agent_profile_revision",
     ),
     "task_execution_results": (
         "result_id",
@@ -261,6 +263,8 @@ _SCHEMA_COLUMNS = {
         "external_actions_json",
         "deliverables_json",
         "created_at",
+        "agent_profile_id",
+        "agent_profile_revision",
     ),
     "task_execution_events": (
         "sequence",
@@ -271,6 +275,8 @@ _SCHEMA_COLUMNS = {
         "phase",
         "status",
         "occurred_at",
+        "agent_profile_id",
+        "agent_profile_revision",
     ),
     "execution_review_cards": (
         "id",
@@ -324,6 +330,15 @@ _SCHEMA_COLUMNS = {
         "to_owner",
         "occurred_at",
     ),
+}
+
+_SCHEMA_V11_COLUMNS = {
+    name: tuple(
+        column
+        for column in columns
+        if column not in {"agent_profile_id", "agent_profile_revision"}
+    )
+    for name, columns in _SCHEMA_COLUMNS.items()
 }
 
 _SCHEMA_OBJECTS = {
@@ -1198,6 +1213,69 @@ FROM task_execution_events_v10;
     _SCHEMA_V8[7],
 )
 
+_V12_COMPATIBILITY_PROFILE_ID = "general"
+_V12_COMPATIBILITY_PROFILE_REVISION = (
+    "f0171b0e9e09e547d9b344223d31b6de1bc0e6d13cb5b8c891fda9d0a7b0db94"
+)
+_SCHEMA_V12_EXECUTION_EVENT_TABLE = _SCHEMA_V11_EXECUTION_EVENT_TABLE.replace(
+    "'task_completed','task_dropped','reassigned'",
+    "'task_completed','task_dropped','reassigned','agent_selected'",
+).replace(
+    "    occurred_at      TEXT NOT NULL,",
+    f"    occurred_at      TEXT NOT NULL,\n"
+    f"    agent_profile_id  TEXT NOT NULL DEFAULT "
+    f"'{_V12_COMPATIBILITY_PROFILE_ID}' CHECK(\n"
+    f"                          length(agent_profile_id) BETWEEN 1 AND 32\n"
+    f"                          AND agent_profile_id GLOB '[a-z]*'\n"
+    f"                          AND agent_profile_id NOT GLOB "
+    f"'*[^a-z0-9-]*'\n"
+    f"                      ),\n"
+    f"    agent_profile_revision TEXT NOT NULL DEFAULT "
+    f"'{_V12_COMPATIBILITY_PROFILE_REVISION}' CHECK(\n"
+    f"                          length(agent_profile_revision) = 64\n"
+    f"                          AND agent_profile_revision NOT GLOB "
+    f"'*[^0-9a-f]*'\n"
+    f"                      ),",
+)
+
+_SCHEMA_V12 = (
+    "ALTER TABLE task_execution_workflows ADD COLUMN agent_profile_id "
+    f"TEXT NOT NULL DEFAULT '{_V12_COMPATIBILITY_PROFILE_ID}' "
+    "CHECK(length(agent_profile_id) BETWEEN 1 AND 32 "
+    "AND agent_profile_id GLOB '[a-z]*' "
+    "AND agent_profile_id NOT GLOB '*[^a-z0-9-]*');",
+    "ALTER TABLE task_execution_workflows ADD COLUMN agent_profile_revision "
+    f"TEXT NOT NULL DEFAULT '{_V12_COMPATIBILITY_PROFILE_REVISION}' "
+    "CHECK(length(agent_profile_revision) = 64 "
+    "AND agent_profile_revision NOT GLOB '*[^0-9a-f]*');",
+    "ALTER TABLE task_execution_results ADD COLUMN agent_profile_id "
+    f"TEXT NOT NULL DEFAULT '{_V12_COMPATIBILITY_PROFILE_ID}' "
+    "CHECK(length(agent_profile_id) BETWEEN 1 AND 32 "
+    "AND agent_profile_id GLOB '[a-z]*' "
+    "AND agent_profile_id NOT GLOB '*[^a-z0-9-]*');",
+    "ALTER TABLE task_execution_results ADD COLUMN agent_profile_revision "
+    f"TEXT NOT NULL DEFAULT '{_V12_COMPATIBILITY_PROFILE_REVISION}' "
+    "CHECK(length(agent_profile_revision) = 64 "
+    "AND agent_profile_revision NOT GLOB '*[^0-9a-f]*');",
+    "DROP TRIGGER task_execution_events_no_update;",
+    "DROP TRIGGER task_execution_events_no_delete;",
+    "ALTER TABLE task_execution_events RENAME TO task_execution_events_v11;",
+    _SCHEMA_V12_EXECUTION_EVENT_TABLE,
+    f"""
+INSERT INTO task_execution_events(
+    sequence,task_id,kind,workflow_version,task_version,phase,status,
+    occurred_at,agent_profile_id,agent_profile_revision
+)
+SELECT sequence,task_id,kind,workflow_version,task_version,phase,status,
+       occurred_at,'{_V12_COMPATIBILITY_PROFILE_ID}',
+       '{_V12_COMPATIBILITY_PROFILE_REVISION}'
+FROM task_execution_events_v11;
+""",
+    "DROP TABLE task_execution_events_v11;",
+    _SCHEMA_V8[6],
+    _SCHEMA_V8[7],
+)
+
 
 class InboxError(RuntimeError):
     """The inbox cannot safely initialize or read its state."""
@@ -1540,6 +1618,7 @@ class CandidateInbox:
                         "task_execution_results",
                         "task_execution_events",
                     ),
+                    columns=_SCHEMA_V11_COLUMNS,
                 )
                 connection.execute("PRAGMA foreign_keys = ON")
                 connection.execute("BEGIN IMMEDIATE")
@@ -1577,6 +1656,7 @@ class CandidateInbox:
                         "execution_review_cards",
                         "execution_review_card_events",
                     ),
+                    columns=_SCHEMA_V11_COLUMNS,
                 )
                 connection.execute("PRAGMA foreign_keys = ON")
                 connection.execute("BEGIN IMMEDIATE")
@@ -1602,6 +1682,7 @@ class CandidateInbox:
                         "native_candidate_intakes",
                         "native_candidate_intake_events",
                     ),
+                    columns=_SCHEMA_V11_COLUMNS,
                 )
                 connection.execute("PRAGMA foreign_keys = ON")
                 connection.execute("BEGIN IMMEDIATE")
@@ -1609,6 +1690,32 @@ class CandidateInbox:
                     for statement in _SCHEMA_V11:
                         connection.execute(statement)
                     connection.execute("PRAGMA user_version = 11")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 11
+            if version == 11:
+                self._require_tables(
+                    connection,
+                    (
+                        "tasks",
+                        "task_execution_workflows",
+                        "task_execution_results",
+                        "task_execution_events",
+                        "execution_review_cards",
+                        "execution_review_card_events",
+                        "execution_reader_inputs",
+                        "task_owner_events",
+                    ),
+                    columns=_SCHEMA_V11_COLUMNS,
+                )
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V12:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 12")
                     connection.commit()
                 except Exception:
                     connection.rollback()
@@ -2174,10 +2281,15 @@ class CandidateInbox:
                 raise InboxError("candidate inbox schema is incomplete")
 
     @staticmethod
-    def _require_tables(connection: sqlite3.Connection,
-                        tables: tuple[str, ...]) -> None:
+    def _require_tables(
+        connection: sqlite3.Connection,
+        tables: tuple[str, ...],
+        *,
+        columns: dict[str, tuple[str, ...]] | None = None,
+    ) -> None:
+        expected_schema = _SCHEMA_COLUMNS if columns is None else columns
         for table in tables:
-            expected_columns = _SCHEMA_COLUMNS[table]
+            expected_columns = expected_schema[table]
             row = connection.execute(
                 "SELECT type FROM sqlite_master WHERE name=?", (table,)
             ).fetchone()

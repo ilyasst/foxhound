@@ -20,6 +20,12 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Callable, Sequence
 
+from .agent_profiles import (
+    AgentProfile,
+    AgentProfileError,
+    AgentProfileRegistry,
+    load_registry,
+)
 from .candidate_inbox import CandidateInbox, InboxError, SCHEMA_VERSION
 from .task_ledger import TaskLedgerError, TaskStatus
 
@@ -47,6 +53,7 @@ MAX_ACTION_CHARS = 4_000
 MAX_DELIVERABLE_CHARS = 16_000
 
 _RESULT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_PROFILE_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 FAILURE_REASONS = frozenset({
     "startup_failed",
@@ -99,6 +106,7 @@ class WorkflowRefusal(StrEnum):
     STALE_WORKFLOW = "stale_workflow"
     CLAIM_MISMATCH = "claim_mismatch"
     RESULT_CONFLICT = "result_conflict"
+    AGENT_PROFILE_UNAVAILABLE = "agent_profile_unavailable"
 
 
 @dataclass(frozen=True)
@@ -118,6 +126,8 @@ class ExecutionWorkflow:
     created_at: str
     updated_at: str
     completed_at: str | None
+    agent_profile_id: str
+    agent_profile_revision: str
 
 
 @dataclass(frozen=True)
@@ -131,6 +141,9 @@ class ExecutionClaim:
     text: str = field(default="", repr=False)
     owner: str | None = field(default=None, repr=False)
     due: str | None = field(default=None, repr=False)
+    agent_profile_id: str = ""
+    agent_profile_revision: str = ""
+    lease_seconds: int = DEFAULT_LEASE_SECONDS
 
 
 @dataclass(frozen=True)
@@ -159,6 +172,8 @@ class WorkflowOperationResult:
     wake_at: str | None = None
     next_attempt_at: str | None = None
     refusal: WorkflowRefusal | None = None
+    agent_profile_id: str | None = None
+    agent_profile_revision: str | None = None
 
     @property
     def accepted(self) -> bool:
@@ -187,6 +202,19 @@ class ExecutionScheduleResult:
     remaining: int
 
 
+@dataclass(frozen=True)
+class ExecutionProfileHealth:
+    """Content-free aggregate state for one exact agent profile revision."""
+
+    agent_profile_id: str
+    agent_profile_revision: str
+    workflows: int
+    ready: int
+    running: int
+    parked: int
+    available: bool
+
+
 class TaskExecutionService:
     """Durable workflow operations over one initialized Foxhound database."""
 
@@ -197,6 +225,8 @@ class TaskExecutionService:
         clock: Callable[[], datetime] | None = None,
         token_factory: Callable[[], str] | None = None,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        profile_registry: AgentProfileRegistry | None = None,
+        default_profile_id: str = "general",
     ) -> None:
         if (isinstance(max_attempts, bool)
                 or not isinstance(max_attempts, int)
@@ -208,6 +238,17 @@ class TaskExecutionService:
             lambda: secrets.token_urlsafe(32)
         )
         self._max_attempts = max_attempts
+        registry = profile_registry or load_registry()
+        if not isinstance(registry, AgentProfileRegistry):
+            raise ValueError("agent profile registry is invalid")
+        profile = registry.get(default_profile_id)
+        if (
+            profile is None
+            or WorkflowPhase.PLAN.value not in profile.allowed_phases
+        ):
+            raise ValueError("default agent profile is unavailable")
+        self._profile_registry = registry
+        self._default_profile = profile
 
     def initialize(self) -> None:
         CandidateInbox(self.database_path, clock=self._clock).initialize()
@@ -244,9 +285,14 @@ class TaskExecutionService:
                     connection.execute(
                         "INSERT INTO task_execution_workflows("
                         "task_id,task_version,status,phase,version,due_at,"
-                        "failure_count,created_at,updated_at) "
-                        "VALUES(?,?,'awaiting_start','plan',1,NULL,0,?,?)",
-                        (task_id, task_version, now, now),
+                        "failure_count,created_at,updated_at,agent_profile_id,"
+                        "agent_profile_revision) "
+                        "VALUES(?,?,'awaiting_start','plan',1,NULL,0,?,?,?,?)",
+                        (
+                            task_id, task_version, now, now,
+                            self._default_profile.profile_id,
+                            self._default_profile.revision,
+                        ),
                     )
                     self._event(
                         connection,
@@ -302,9 +348,14 @@ class TaskExecutionService:
                     connection.execute(
                         "INSERT INTO task_execution_workflows("
                         "task_id,task_version,status,phase,version,due_at,"
-                        "failure_count,created_at,updated_at) "
-                        "VALUES(?,?,'awaiting_start','plan',?,NULL,0,?,?)",
-                        (task_id, expected_task_version, version, now, now),
+                        "failure_count,created_at,updated_at,agent_profile_id,"
+                        "agent_profile_revision) "
+                        "VALUES(?,?,'awaiting_start','plan',?,NULL,0,?,?,?,?)",
+                        (
+                            task_id, expected_task_version, version, now, now,
+                            self._default_profile.profile_id,
+                            self._default_profile.revision,
+                        ),
                     )
                 else:
                     version = int(row["version"]) + 1
@@ -324,14 +375,12 @@ class TaskExecutionService:
                     expected_task_version, WorkflowPhase.PLAN,
                     WorkflowStatus.AWAITING_START, now,
                 )
+                updated_row = connection.execute(
+                    "SELECT * FROM task_execution_workflows WHERE task_id=?",
+                    (task_id,),
+                ).fetchone()
                 connection.commit()
-                return WorkflowOperationResult(
-                    WorkflowDisposition.APPLIED,
-                    task_id,
-                    version,
-                    WorkflowStatus.AWAITING_START,
-                    WorkflowPhase.PLAN,
-                )
+                return _operation(updated_row, WorkflowDisposition.APPLIED)
             except Exception:
                 connection.rollback()
                 raise
@@ -359,6 +408,94 @@ class TaskExecutionService:
                     return result
                 connection.commit()
                 return result
+            except Exception:
+                connection.rollback()
+                raise
+
+    def select_agent(
+        self,
+        task_id: int,
+        *,
+        expected_version: int,
+        profile_id: str,
+        profile_revision: str,
+    ) -> WorkflowOperationResult:
+        """Apply one explicit reader selection before the Start gate."""
+        if not _valid_identity(task_id, expected_version):
+            return _refused(task_id, WorkflowRefusal.INVALID_ARGUMENT)
+        try:
+            profile = self._profile_registry.resolve(
+                profile_id, profile_revision
+            )
+        except AgentProfileError:
+            return _refused(
+                task_id, WorkflowRefusal.AGENT_PROFILE_UNAVAILABLE
+            )
+        if WorkflowPhase.PLAN.value not in profile.allowed_phases:
+            return _refused(
+                task_id, WorkflowRefusal.AGENT_PROFILE_UNAVAILABLE
+            )
+        now = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._workflow_with_task(connection, task_id)
+                refusal = _workflow_guard(
+                    row,
+                    expected_version,
+                    {WorkflowStatus.AWAITING_START},
+                )
+                if refusal is None:
+                    refusal = _task_guard(row, int(row["task_version"]))
+                if refusal is not None:
+                    connection.rollback()
+                    return _refused_row(task_id, row, refusal)
+                if (
+                    row["agent_profile_id"] == profile.profile_id
+                    and row["agent_profile_revision"] == profile.revision
+                ):
+                    connection.rollback()
+                    return _operation(row, WorkflowDisposition.UNCHANGED)
+                version = expected_version + 1
+                updated = connection.execute(
+                    "UPDATE task_execution_workflows SET version=?,"
+                    "agent_profile_id=?,agent_profile_revision=?,updated_at=? "
+                    "WHERE task_id=? AND version=? "
+                    "AND status='awaiting_start'",
+                    (
+                        version,
+                        profile.profile_id,
+                        profile.revision,
+                        now,
+                        task_id,
+                        expected_version,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    connection.rollback()
+                    return _refused_row(
+                        task_id, row, WorkflowRefusal.STALE_WORKFLOW
+                    )
+                self._event(
+                    connection,
+                    task_id,
+                    "agent_selected",
+                    version,
+                    int(row["task_version"]),
+                    WorkflowPhase.PLAN,
+                    WorkflowStatus.AWAITING_START,
+                    now,
+                )
+                connection.commit()
+                return WorkflowOperationResult(
+                    WorkflowDisposition.APPLIED,
+                    task_id,
+                    version,
+                    WorkflowStatus.AWAITING_START,
+                    WorkflowPhase.PLAN,
+                    agent_profile_id=profile.profile_id,
+                    agent_profile_revision=profile.revision,
+                )
             except Exception:
                 connection.rollback()
                 raise
@@ -395,18 +532,12 @@ class TaskExecutionService:
     def claim_next(
         self,
         *,
-        lease_seconds: int = DEFAULT_LEASE_SECONDS,
         allowed_phases: Sequence[WorkflowPhase | str] | None = None,
     ) -> ExecutionClaim | None:
-        if not _valid_lease(lease_seconds):
-            raise ValueError("execution lease is invalid")
         phases = _validated_phase_allowlist(allowed_phases)
         placeholders = ",".join("?" for _ in phases)
         stamp = self._clock_value()
         now = stamp.isoformat(timespec="seconds")
-        expires = (stamp + timedelta(seconds=lease_seconds)).isoformat(
-            timespec="seconds"
-        )
         token = self._token_factory()
         if not _valid_secret(token):
             raise TaskLedgerError("execution claim capability is invalid")
@@ -432,6 +563,14 @@ class TaskExecutionService:
                 if row is None:
                     connection.commit()
                     return None
+                profile = self._resolve_profile(row)
+                if row["phase"] not in profile.allowed_phases:
+                    raise TaskLedgerError(
+                        "execution agent profile is unavailable"
+                    )
+                expires = (
+                    stamp + timedelta(seconds=profile.claim_lease_seconds)
+                ).isoformat(timespec="seconds")
                 version = int(row["version"]) + 1
                 updated = connection.execute(
                     "UPDATE task_execution_workflows SET status='running',"
@@ -462,6 +601,9 @@ class TaskExecutionService:
                     text=row["text"],
                     owner=row["owner"],
                     due=row["due"],
+                    agent_profile_id=profile.profile_id,
+                    agent_profile_revision=profile.revision,
+                    lease_seconds=profile.claim_lease_seconds,
                 )
             except Exception:
                 connection.rollback()
@@ -515,6 +657,8 @@ class TaskExecutionService:
                     WorkflowStatus.RUNNING,
                     WorkflowPhase(row["phase"]),
                     wake_at=expires,
+                    agent_profile_id=row["agent_profile_id"],
+                    agent_profile_revision=row["agent_profile_revision"],
                 )
             except Exception:
                 connection.rollback()
@@ -592,6 +736,8 @@ class TaskExecutionService:
                         version,
                         WorkflowStatus.QUEUED,
                         WorkflowPhase(row["phase"]),
+                        agent_profile_id=row["agent_profile_id"],
+                        agent_profile_revision=row["agent_profile_revision"],
                     )
                 else:
                     result = self._defer_failure(
@@ -640,6 +786,8 @@ class TaskExecutionService:
                             row.version,
                             row.status,
                             row.phase,
+                            agent_profile_id=row.agent_profile_id,
+                            agent_profile_revision=row.agent_profile_revision,
                         )
                     return _refused(
                         result["task_id"], WorkflowRefusal.RESULT_CONFLICT
@@ -674,7 +822,8 @@ class TaskExecutionService:
                     "result_id,task_id,workflow_version,task_version,phase,"
                     "outcome,content_digest,summary,work_markdown,"
                     "questions_json,external_actions_json,deliverables_json,"
-                    "created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "created_at,agent_profile_id,agent_profile_revision) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         result["result_id"], result["task_id"],
                         result["workflow_version"], result["task_version"],
@@ -683,6 +832,8 @@ class TaskExecutionService:
                         result["questions_json"],
                         result["external_actions_json"],
                         result["deliverables_json"], now,
+                        row["agent_profile_id"],
+                        row["agent_profile_revision"],
                     ),
                 )
                 version = result["workflow_version"] + 1
@@ -714,6 +865,8 @@ class TaskExecutionService:
                     version,
                     target,
                     WorkflowPhase(result["phase"]),
+                    agent_profile_id=row["agent_profile_id"],
+                    agent_profile_revision=row["agent_profile_revision"],
                 )
             except Exception:
                 connection.rollback()
@@ -758,6 +911,8 @@ class TaskExecutionService:
                     version,
                     WorkflowStatus.QUEUED,
                     WorkflowPhase(row["phase"]),
+                    agent_profile_id=row["agent_profile_id"],
+                    agent_profile_revision=row["agent_profile_revision"],
                 )
             except Exception:
                 connection.rollback()
@@ -840,6 +995,42 @@ class TaskExecutionService:
             )
         ))
 
+    def profile_health(self) -> tuple[ExecutionProfileHealth, ...]:
+        """Return aggregate workflow counts by exact profile revision."""
+        now = self._now()
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT agent_profile_id,agent_profile_revision,"
+                "COUNT(*) AS workflows,"
+                "SUM(status='queued' AND (next_attempt_at IS NULL OR "
+                "next_attempt_at<=?)) AS ready,"
+                "SUM(status='running') AS running,"
+                "SUM(status='parked') AS parked "
+                "FROM task_execution_workflows "
+                "GROUP BY agent_profile_id,agent_profile_revision "
+                "ORDER BY agent_profile_id,agent_profile_revision",
+                (now,),
+            ).fetchall()
+        health: list[ExecutionProfileHealth] = []
+        for row in rows:
+            try:
+                self._profile_registry.resolve(
+                    row["agent_profile_id"], row["agent_profile_revision"]
+                )
+                available = True
+            except AgentProfileError:
+                available = False
+            health.append(ExecutionProfileHealth(
+                agent_profile_id=str(row["agent_profile_id"]),
+                agent_profile_revision=str(row["agent_profile_revision"]),
+                workflows=int(row["workflows"]),
+                ready=int(row["ready"] or 0),
+                running=int(row["running"] or 0),
+                parked=int(row["parked"] or 0),
+                available=available,
+            ))
+        return tuple(health)
+
     def event_count(self) -> int:
         with closing(self._connect()) as connection:
             return int(connection.execute(
@@ -868,6 +1059,16 @@ class TaskExecutionService:
                 event_kind="claim_expired",
             )
         return len(rows)
+
+    def _resolve_profile(self, row: sqlite3.Row) -> AgentProfile:
+        try:
+            return self._profile_registry.resolve(
+                row["agent_profile_id"], row["agent_profile_revision"]
+            )
+        except (AgentProfileError, IndexError, KeyError, TypeError) as exc:
+            raise TaskLedgerError(
+                "execution agent profile is unavailable"
+            ) from exc
 
     def _cancel_stale(
         self, connection: sqlite3.Connection, now: str
@@ -953,6 +1154,8 @@ class TaskExecutionService:
             status,
             WorkflowPhase(row["phase"]),
             next_attempt_at=next_attempt,
+            agent_profile_id=row["agent_profile_id"],
+            agent_profile_revision=row["agent_profile_revision"],
         )
 
     @staticmethod
@@ -966,13 +1169,22 @@ class TaskExecutionService:
         status: WorkflowStatus,
         now: str,
     ) -> None:
+        profile = connection.execute(
+            "SELECT agent_profile_id,agent_profile_revision "
+            "FROM task_execution_workflows WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if profile is None:
+            raise TaskLedgerError("execution workflow is unavailable")
         connection.execute(
             "INSERT INTO task_execution_events("
             "task_id,kind,workflow_version,task_version,phase,status,"
-            "occurred_at) VALUES(?,?,?,?,?,?,?)",
+            "occurred_at,agent_profile_id,agent_profile_revision) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
             (
                 task_id, kind, workflow_version, task_version, phase, status,
-                now,
+                now, profile["agent_profile_id"],
+                profile["agent_profile_revision"],
             ),
         )
 
@@ -1103,6 +1315,8 @@ def _apply_start_action(
         status,
         WorkflowPhase.PLAN,
         wake_at=wake,
+        agent_profile_id=row["agent_profile_id"],
+        agent_profile_revision=row["agent_profile_revision"],
     )
 
 
@@ -1226,11 +1440,22 @@ def _apply_review_action(
         status,
         phase,
         wake_at=wake,
+        agent_profile_id=row["agent_profile_id"],
+        agent_profile_revision=row["agent_profile_revision"],
     )
 
 
 def _workflow(row: sqlite3.Row) -> ExecutionWorkflow:
     try:
+        profile_id = row["agent_profile_id"]
+        profile_revision = row["agent_profile_revision"]
+        if (
+            not isinstance(profile_id, str)
+            or not _PROFILE_ID_RE.fullmatch(profile_id)
+            or not isinstance(profile_revision, str)
+            or not _DIGEST_RE.fullmatch(profile_revision)
+        ):
+            raise ValueError("execution agent profile evidence is invalid")
         return ExecutionWorkflow(
             task_id=int(row["task_id"]),
             task_version=int(row["task_version"]),
@@ -1247,6 +1472,8 @@ def _workflow(row: sqlite3.Row) -> ExecutionWorkflow:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             completed_at=row["completed_at"],
+            agent_profile_id=profile_id,
+            agent_profile_revision=profile_revision,
         )
     except (IndexError, KeyError, TypeError, ValueError) as exc:
         raise TaskLedgerError("task execution state is invalid") from exc
@@ -1263,6 +1490,8 @@ def _operation(
         WorkflowPhase(row["phase"]),
         wake_at=row["due_at"],
         next_attempt_at=row["next_attempt_at"],
+        agent_profile_id=row["agent_profile_id"],
+        agent_profile_revision=row["agent_profile_revision"],
     )
 
 
@@ -1289,6 +1518,8 @@ def _refused_row(
         WorkflowStatus(row["status"]),
         WorkflowPhase(row["phase"]),
         refusal=refusal,
+        agent_profile_id=row["agent_profile_id"],
+        agent_profile_revision=row["agent_profile_revision"],
     )
 
 

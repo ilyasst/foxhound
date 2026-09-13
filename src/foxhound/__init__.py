@@ -67,6 +67,7 @@ from .task_cards import (
 from .task_execution import (
     ExecutionClaim,
     ExecutionOutcome,
+    ExecutionProfileHealth,
     ExecutionReadiness,
     ExecutionResultEnvelope,
     ExecutionWorkflow,
@@ -97,6 +98,7 @@ from .execution_runner import (
     ExecutionRunResult,
     agent_prompt,
     hermes_argv,
+    profile_argv,
     run_once,
 )
 
@@ -159,6 +161,7 @@ __all__ = (
     "render_task_review_card",
     "ExecutionClaim",
     "ExecutionOutcome",
+    "ExecutionProfileHealth",
     "ExecutionReadiness",
     "ExecutionResultEnvelope",
     "ExecutionWorkflow",
@@ -185,5 +188,6 @@ __all__ = (
     "ExecutionRunResult",
     "agent_prompt",
     "hermes_argv",
+    "profile_argv",
     "run_once",
 )

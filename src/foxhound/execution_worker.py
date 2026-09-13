@@ -35,7 +35,9 @@ from .task_ledger import TaskLedger, TaskLedgerError, TaskStatus
 
 
 RUN_STATE_SCHEMA = "foxhound.execution-run-state"
+RUN_STATE_SCHEMA_VERSION = 2
 WORK_CONTEXT_SCHEMA = "foxhound.execution-work-context"
+WORK_CONTEXT_SCHEMA_VERSION = 2
 WORKER_SEARCH_SCHEMA = "foxhound.execution-worker-search"
 RESULT_DRAFT_SCHEMA = "foxhound.execution-result-draft"
 RESULT_RECEIPT_SCHEMA = "foxhound.execution-result-receipt"
@@ -50,6 +52,8 @@ MAX_STATE_BYTES = 16 * 1024
 MAX_DRAFT_BYTES = 256 * 1024
 _RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _RESULT_NAME_RE = re.compile(r"^result-([0-9a-f]{32})\.json$")
+_PROFILE_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+_REVISION_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class ExecutionWorkerError(RuntimeError):
@@ -78,6 +82,8 @@ class ExecutionRunState:
     phase: WorkflowPhase
     claim_token: str = field(repr=False)
     lease_seconds: int
+    agent_profile_id: str
+    agent_profile_revision: str
 
 
 class ExecutionWorker:
@@ -108,7 +114,7 @@ class ExecutionWorker:
             raise ExecutionWorkerClaimError("execution claim is unavailable")
         return {
             "schema": WORK_CONTEXT_SCHEMA,
-            "schema_version": WORKER_SCHEMA_VERSION,
+            "schema_version": WORK_CONTEXT_SCHEMA_VERSION,
             "task": {
                 "id": task.id,
                 "version": task.version,
@@ -119,6 +125,8 @@ class ExecutionWorker:
             "workflow": {
                 "version": state.workflow_version,
                 "phase": state.phase.value,
+                "agent_profile_id": state.agent_profile_id,
+                "agent_profile_revision": state.agent_profile_revision,
                 "reader_instruction": service.reader_instruction(
                     state.task_id,
                     expected_version=state.workflow_version,
@@ -335,13 +343,14 @@ def load_run_state(path: str | os.PathLike[str]) -> ExecutionRunState:
         {
             "schema", "schema_version", "run_id", "database_path",
             "task_id", "task_version", "workflow_version", "phase",
-            "claim_token", "lease_seconds",
+            "claim_token", "lease_seconds", "agent_profile_id",
+            "agent_profile_revision",
         },
         "execution run state",
     )
     if (
         document["schema"] != RUN_STATE_SCHEMA
-        or document["schema_version"] != WORKER_SCHEMA_VERSION
+        or document["schema_version"] != RUN_STATE_SCHEMA_VERSION
         or isinstance(document["schema_version"], bool)
         or not isinstance(document["run_id"], str)
         or not _RUN_ID_RE.fullmatch(document["run_id"])
@@ -368,6 +377,15 @@ def load_run_state(path: str | os.PathLike[str]) -> ExecutionRunState:
         or any(char.isspace() for char in token)
     ):
         raise ExecutionWorkerConfigError("execution run state is invalid")
+    profile_id = document["agent_profile_id"]
+    profile_revision = document["agent_profile_revision"]
+    if (
+        not isinstance(profile_id, str)
+        or not _PROFILE_ID_RE.fullmatch(profile_id)
+        or not isinstance(profile_revision, str)
+        or not _REVISION_RE.fullmatch(profile_revision)
+    ):
+        raise ExecutionWorkerConfigError("execution run state is invalid")
     try:
         phase = WorkflowPhase(document["phase"])
     except (TypeError, ValueError):
@@ -383,6 +401,8 @@ def load_run_state(path: str | os.PathLike[str]) -> ExecutionRunState:
         phase=phase,
         claim_token=token,
         lease_seconds=lease,
+        agent_profile_id=profile_id,
+        agent_profile_revision=profile_revision,
     )
 
 
