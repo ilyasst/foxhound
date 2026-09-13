@@ -28,7 +28,12 @@ SOURCE_SYSTEMS = frozenset({"gw"})
 #: repository's canonical locator and its ``item_id`` the issue number, so the
 #: inbox's uniqueness constraint admits one task per issue and re-emitting an
 #: unchanged issue is a no-op.
-SOURCE_KINDS = frozenset({"meeting", "email", "issue"})
+#:
+#: ``legacy`` is intentionally explicit: it names an open task carried across
+#: a bounded authority cutover. Calling that record a meeting, email, or issue
+#: would give an execution agent a false origin. It receives no special
+#: lifecycle or execution authority and is not a permanent producer registry.
+SOURCE_KINDS = frozenset({"meeting", "email", "issue", "legacy"})
 
 #: Identifiers are opaque to this parser: it checks their shape, never their
 #: meaning. ``/`` is accepted because forge identifiers are path-shaped — a

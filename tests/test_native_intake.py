@@ -68,6 +68,34 @@ def candidate(
     }
 
 
+def legacy_candidate(index: int) -> dict:
+    """A fictional open task offered only for a bounded cutover."""
+    item = candidate(
+        index,
+        text=f"Prepare migrated synthetic summary {index}",
+        owner="Person B",
+        due="2030-03-20",
+    )
+    item["schema_version"] = 1
+    item["source"].update({
+        "kind": "legacy",
+        "record_id": "example-task-ledger",
+        "item_id": f"task-{index:03d}",
+    })
+    item["candidate_id"] = candidate_id_for(
+        system="gw",
+        kind="legacy",
+        record_id=item["source"]["record_id"],
+        item_id=item["source"]["item_id"],
+    )
+    item["task"]["project"] = "Project Alpha"
+    item["evidence"] = {
+        "document_id": "example-task-ledger",
+        "locator": f"task-{index:03d}",
+    }
+    return item
+
+
 def feed(from_cursor: int, *items: dict) -> dict:
     return {
         "schema": "foxhound.task-candidate-feed",
@@ -199,6 +227,33 @@ class NativeCandidateIntakeTests(unittest.TestCase):
         self.assertEqual(replay.disposition, NativeIntakeDisposition.UNCHANGED)
         self.assertEqual(self._state(), before)
         self.assertEqual((self.ledger.count(), self.ledger.binding_count()), (2, 2))
+
+    def test_legacy_candidate_uses_ordinary_exactly_once_intake(self):
+        self.activate()
+        item = legacy_candidate(17)
+        self.assertTrue(self.inbox.import_feed(feed(0, item)).accepted)
+
+        applied = self.intake()
+
+        self.assertEqual(applied.tasks_created, 1)
+        task = self.ledger.get(1)
+        self.assertEqual(
+            (task.text, task.owner, task.due),
+            (
+                "Prepare migrated synthetic summary 17",
+                "Person B",
+                "2030-03-20",
+            ),
+        )
+        origin = self.ledger.origin(1)
+        self.assertEqual(
+            (origin.kind, origin.record_id, origin.item_id),
+            ("legacy", "example-task-ledger", "task-017"),
+        )
+        self.assertEqual(
+            self.intake().disposition, NativeIntakeDisposition.UNCHANGED
+        )
+        self.assertEqual(self.ledger.count(), 1)
 
     def test_exact_historically_bound_candidate_advances_as_unchanged(self):
         item = candidate(1)
