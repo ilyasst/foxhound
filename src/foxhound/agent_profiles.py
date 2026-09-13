@@ -4,6 +4,13 @@ Profiles select a prompt and bounded Hermes policy. They never carry an
 executable command, environment value, capability, task, or secret. Built-in
 and host-private profiles pass through the same validator; private manifests
 must live outside Git in an owner-only directory.
+
+An installed private directory holds either a flat manifest per profile or a
+versioned store: one catalog naming the revision each active profile offers for
+new selection, plus immutable revision manifests. Revisions that the catalog no
+longer offers stay resolvable for workflows already pinned to them, but are
+never listed or selectable. The editable source of that store, its composition
+and its management commands live in ``foxhound.profile_store``.
 """
 
 from __future__ import annotations
@@ -25,9 +32,17 @@ PROFILE_SCHEMA_VERSION = 1
 WORKER_COMMAND_TOKEN = "{{FOXHOUND_WORKER_COMMAND}}"
 MAX_PRIVATE_PROFILES = 32
 MAX_MANIFEST_BYTES = 256 * 1024
+MAX_CATALOG_BYTES = 64 * 1024
 MAX_PROMPT_CHARS = 131_072
+MAX_REVISIONS_PER_PROFILE = 32
+CATALOG_SCHEMA = "foxhound.agent-profile-catalog"
+CATALOG_SCHEMA_VERSION = 1
+CATALOG_NAME = "catalog.json"
+REVISIONS_DIRECTORY = "revisions"
+BUILT_IN_PROFILE_IDS = frozenset({"general"})
 
 _PROFILE_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+_REVISION_RE = re.compile(r"^[0-9a-f]{64}$")
 _COMMAND_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _APPROVED_TOOLSETS = frozenset({
     "browser", "file", "terminal", "vision", "web",
@@ -39,6 +54,9 @@ _FIELDS = frozenset({
     "claim_lease_seconds", "heartbeat_seconds", "kill_grace_seconds",
     "allowed_phases",
 })
+_CATALOG_FIELDS = frozenset({"schema", "schema_version", "profiles"})
+_CATALOG_ENTRY_FIELDS = frozenset({"state", "revision", "history"})
+_CATALOG_STATES = frozenset({"active", "disabled"})
 
 
 class AgentProfileError(RuntimeError):
@@ -118,8 +136,35 @@ class AgentProfile:
         return result
 
 
+@dataclass(frozen=True)
+class CatalogEntry:
+    """One profile's catalog state: its offered revision and its history."""
+
+    profile_id: str
+    state: str
+    revision: str
+    history: tuple[str, ...]
+
+    @property
+    def is_active(self) -> bool:
+        return self.state == "active"
+
+    def document(self) -> dict[str, Any]:
+        return {
+            "state": self.state,
+            "revision": self.revision,
+            "history": list(self.history),
+        }
+
+
 class AgentProfileRegistry:
-    """An immutable collection with exact ID and revision lookup."""
+    """An immutable collection with exact ID and revision lookup.
+
+    Listing and ordinary lookup expose only the profiles offered for new
+    selection. Historical revisions, including every revision of a profile that
+    is no longer offered at all, resolve exactly and never appear in a
+    selector.
+    """
 
     def __init__(
         self,
@@ -142,7 +187,7 @@ class AgentProfileRegistry:
             if not isinstance(profile, AgentProfile):
                 raise AgentProfileError("agent profile registry is invalid")
             key = (profile.profile_id, profile.revision)
-            if profile.profile_id not in indexed or key in revisions:
+            if key in revisions:
                 raise AgentProfileError("agent profile revision is duplicated")
             revisions[key] = profile
         self._profiles = indexed
@@ -150,6 +195,10 @@ class AgentProfileRegistry:
 
     def list(self) -> tuple[AgentProfile, ...]:
         return tuple(self._profiles[key] for key in sorted(self._profiles))
+
+    def revisions(self) -> tuple[tuple[str, str], ...]:
+        """Return every exactly resolvable profile ID and revision pair."""
+        return tuple(sorted(self._revisions))
 
     def get(self, profile_id: object) -> AgentProfile | None:
         if not isinstance(profile_id, str):
@@ -218,12 +267,12 @@ def _historical_general_profiles() -> tuple[AgentProfile, ...]:
 
 def load_registry(private_directory: Path | None = None) -> AgentProfileRegistry:
     profiles = [general_profile()]
+    historical = list(_historical_general_profiles())
     if private_directory is not None:
-        profiles.extend(_load_private_profiles(private_directory))
-    return AgentProfileRegistry(
-        profiles,
-        historical_profiles=_historical_general_profiles(),
-    )
+        selectable, resolvable = _load_private_profiles(private_directory)
+        profiles.extend(selectable)
+        historical.extend(resolvable)
+    return AgentProfileRegistry(profiles, historical_profiles=historical)
 
 
 def parse_profile(document: object) -> AgentProfile:
@@ -326,8 +375,54 @@ def _string_tuple(value: object, label: str) -> tuple[str, ...]:
     return tuple(value)
 
 
-def _load_private_profiles(directory: Path) -> list[AgentProfile]:
+def _load_private_profiles(
+    directory: Path,
+) -> tuple[list[AgentProfile], list[AgentProfile]]:
+    """Return the selectable and the resolution-only private profiles."""
     root = _private_directory(directory)
+    if os.path.lexists(root / CATALOG_NAME):
+        return _load_catalog_store(root)
+    return _load_flat_profiles(root), []
+
+
+def _load_catalog_store(
+    root: Path,
+) -> tuple[list[AgentProfile], list[AgentProfile]]:
+    """Load one catalog of active revisions plus its immutable history.
+
+    Revision files the catalog does not name are never read. They are reported
+    by the store management commands instead of failing an unrelated run.
+    """
+    entries = parse_catalog(
+        _read_manifest(root / CATALOG_NAME, maximum=MAX_CATALOG_BYTES)
+    )
+    selectable: list[AgentProfile] = []
+    resolvable: list[AgentProfile] = []
+    if not entries:
+        return selectable, resolvable
+    revisions_root = _private_subdirectory(root, REVISIONS_DIRECTORY)
+    for profile_id in sorted(entries):
+        entry = entries[profile_id]
+        directory = _private_subdirectory(revisions_root, profile_id)
+        for revision in entry.history:
+            profile = _read_revision(directory, profile_id, revision)
+            if entry.is_active and revision == entry.revision:
+                selectable.append(profile)
+            else:
+                resolvable.append(profile)
+    return selectable, resolvable
+
+
+def _read_revision(
+    directory: Path, profile_id: str, revision: str
+) -> AgentProfile:
+    profile = parse_profile(_read_manifest(directory / f"{revision}.json"))
+    if profile.profile_id != profile_id or profile.revision != revision:
+        raise AgentProfileError("private agent profile revision is invalid")
+    return profile
+
+
+def _load_flat_profiles(root: Path) -> list[AgentProfile]:
     try:
         entries = sorted(root.iterdir(), key=lambda path: os.fsencode(path.name))
     except OSError as exc:
@@ -346,7 +441,76 @@ def _load_private_profiles(directory: Path) -> list[AgentProfile]:
     return profiles
 
 
-def _private_directory(path: Path) -> Path:
+def parse_catalog(document: object) -> dict[str, CatalogEntry]:
+    """Validate one catalog document into exact per-profile entries."""
+    if not isinstance(document, dict) or set(document) != _CATALOG_FIELDS:
+        raise AgentProfileError("agent profile catalog shape is invalid")
+    if (
+        document.get("schema") != CATALOG_SCHEMA
+        or document.get("schema_version") != CATALOG_SCHEMA_VERSION
+        or isinstance(document.get("schema_version"), bool)
+    ):
+        raise AgentProfileError("agent profile catalog version is invalid")
+    profiles = document["profiles"]
+    if not isinstance(profiles, dict) or len(profiles) > MAX_PRIVATE_PROFILES:
+        raise AgentProfileError("agent profile catalog shape is invalid")
+    entries: dict[str, CatalogEntry] = {}
+    for profile_id, entry in profiles.items():
+        if (
+            not isinstance(profile_id, str)
+            or not _PROFILE_ID_RE.fullmatch(profile_id)
+            or profile_id in BUILT_IN_PROFILE_IDS
+        ):
+            raise AgentProfileError("agent profile catalog ID is invalid")
+        entries[profile_id] = _parse_catalog_entry(profile_id, entry)
+    return entries
+
+
+def _parse_catalog_entry(profile_id: str, entry: object) -> CatalogEntry:
+    if not isinstance(entry, dict) or set(entry) != _CATALOG_ENTRY_FIELDS:
+        raise AgentProfileError("agent profile catalog entry is invalid")
+    state = entry["state"]
+    revision = entry["revision"]
+    history = entry["history"]
+    if not isinstance(state, str) or state not in _CATALOG_STATES:
+        raise AgentProfileError("agent profile catalog state is invalid")
+    if (
+        not isinstance(history, list)
+        or not 1 <= len(history) <= MAX_REVISIONS_PER_PROFILE
+        or any(
+            not isinstance(item, str) or not _REVISION_RE.fullmatch(item)
+            for item in history
+        )
+        or len(set(history)) != len(history)
+    ):
+        raise AgentProfileError("agent profile catalog history is invalid")
+    if (
+        not isinstance(revision, str)
+        or not _REVISION_RE.fullmatch(revision)
+        or revision != history[-1]
+    ):
+        raise AgentProfileError("agent profile catalog revision is invalid")
+    return CatalogEntry(
+        profile_id=profile_id,
+        state=state,
+        revision=revision,
+        history=tuple(history),
+    )
+
+
+def catalog_document(entries: Mapping[str, CatalogEntry]) -> dict[str, Any]:
+    """Render one catalog document from validated entries."""
+    return {
+        "schema": CATALOG_SCHEMA,
+        "schema_version": CATALOG_SCHEMA_VERSION,
+        "profiles": {
+            profile_id: entries[profile_id].document()
+            for profile_id in sorted(entries)
+        },
+    }
+
+
+def _private_directory(path: Path, *, owner_only: bool = True) -> Path:
     if not isinstance(path, Path) or not path.is_absolute():
         raise AgentProfileError("private agent profile directory is invalid")
     try:
@@ -359,7 +523,7 @@ def _private_directory(path: Path) -> Path:
     if (
         stat.S_ISLNK(info.st_mode)
         or not stat.S_ISDIR(info.st_mode)
-        or stat.S_IMODE(info.st_mode) & 0o077
+        or (owner_only and stat.S_IMODE(info.st_mode) & 0o077)
         or info.st_uid != os.getuid()
         or Path(os.path.abspath(path)) != resolved
     ):
@@ -372,7 +536,42 @@ def _private_directory(path: Path) -> Path:
     return resolved
 
 
-def _read_manifest(path: Path) -> dict[str, Any]:
+def _private_subdirectory(
+    parent: Path, name: str, *, owner_only: bool = True
+) -> Path:
+    path = parent / name
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise AgentProfileError(
+            "private agent profile directory is unavailable"
+        ) from exc
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISDIR(info.st_mode)
+        or (owner_only and stat.S_IMODE(info.st_mode) & 0o077)
+        or info.st_uid != os.getuid()
+    ):
+        raise AgentProfileError("private agent profile directory is unsafe")
+    return path
+
+
+def _read_manifest(
+    path: Path, *, maximum: int = MAX_MANIFEST_BYTES, owner_only: bool = True
+) -> dict[str, Any]:
+    raw = _read_bytes(path, maximum=maximum, owner_only=owner_only)
+    try:
+        document = json.loads(raw, object_pairs_hook=_unique_object)
+    except (UnicodeDecodeError, json.JSONDecodeError, _DuplicateKey):
+        raise AgentProfileError(
+            "private agent profile manifest is invalid"
+        ) from None
+    if not isinstance(document, dict):
+        raise AgentProfileError("private agent profile manifest is invalid")
+    return document
+
+
+def _read_bytes(path: Path, *, maximum: int, owner_only: bool = True) -> bytes:
     descriptor: int | None = None
     try:
         descriptor = os.open(
@@ -384,13 +583,13 @@ def _read_manifest(path: Path) -> dict[str, Any]:
         info = os.fstat(descriptor)
         if (
             not stat.S_ISREG(info.st_mode)
-            or stat.S_IMODE(info.st_mode) & 0o077
+            or (owner_only and stat.S_IMODE(info.st_mode) & 0o077)
             or info.st_uid != os.getuid()
-            or info.st_size > MAX_MANIFEST_BYTES
+            or info.st_size > maximum
         ):
             raise AgentProfileError("private agent profile manifest is unsafe")
         chunks: list[bytes] = []
-        remaining = MAX_MANIFEST_BYTES + 1
+        remaining = maximum + 1
         while remaining:
             chunk = os.read(descriptor, min(65_536, remaining))
             if not chunk:
@@ -407,17 +606,9 @@ def _read_manifest(path: Path) -> dict[str, Any]:
     finally:
         if descriptor is not None:
             os.close(descriptor)
-    if len(raw) > MAX_MANIFEST_BYTES:
+    if len(raw) > maximum:
         raise AgentProfileError("private agent profile manifest is too large")
-    try:
-        document = json.loads(raw, object_pairs_hook=_unique_object)
-    except (UnicodeDecodeError, json.JSONDecodeError, _DuplicateKey):
-        raise AgentProfileError(
-            "private agent profile manifest is invalid"
-        ) from None
-    if not isinstance(document, dict):
-        raise AgentProfileError("private agent profile manifest is invalid")
-    return document
+    return raw
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -490,6 +681,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "ok": True,
                 "count": len(registry.list()),
                 "revisions": [profile.revision for profile in registry.list()],
+                "resolvable": len(registry.revisions()),
             }
     except AgentProfileError:
         print("foxhound agent profiles: configuration unavailable", file=sys.stderr)

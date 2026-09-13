@@ -36,19 +36,22 @@ The former built-in `general` revision remains available only for exact
 resolution by workflows already pinned to it. Registry listing, ordinary ID
 lookup, and agent selection expose only the current revision. A historical
 Start card can still offer the current revision for an explicit reader
-reselection. Historical revisions must correspond to a current profile ID and
-cannot duplicate another exact ID/revision pair. This narrow compatibility
-history does not change private-manifest behavior: replacing a private
-manifest still makes its prior revision unavailable and fails closed.
+reselection. A historical revision cannot duplicate another exact ID/revision
+pair, and it does not need a currently listed profile ID: a profile that is no
+longer offered at all still resolves exactly for work already pinned to it,
+without appearing in any selector.
 
-Actual role profiles are JSON manifests in one explicitly configured,
-absolute, owner-only directory outside every Git checkout. A deployment may
-share that directory across projects through an approved private
-synchronization system. The directory and regular manifest files must be owned
-by the current user; symlinks and group/world permissions are refused. JSON
-shape and duplicate keys are checked strictly. Manifests cannot specify
-commands, arguments, environment variables, secrets, arbitrary tools, or
-unknown fields.
+Actual role profiles live in one explicitly configured, absolute, owner-only
+directory outside every Git checkout. A deployment may share the editable
+source of that directory across projects through an approved private
+synchronization system. The directory holds either one flat manifest per
+profile or the versioned store of
+[ADR 0027](0027-versioned-private-profile-store.md): a catalog of the revisions
+currently offered plus the immutable revision manifests it names. Directories
+and regular manifest files must be owned by the current user; symlinks and
+group/world permissions are refused. JSON shape and duplicate keys are checked
+strictly. Manifests cannot specify commands, arguments, environment variables,
+secrets, arbitrary tools, or unknown fields.
 
 The repository may contain visibly fictional example manifests for contract
 documentation and tests. Examples are not built-in agents and must not be used
@@ -68,6 +71,8 @@ Workflow selection and runner consumption are defined separately in
 - A deployment can prepare reviewed, host-private agent prompts without adding
   private material to the repository.
 - Profile changes create new revisions and can be fenced by durable workflows.
+- A private profile that is withdrawn from selection keeps resolving for the
+  work already pinned to it.
 - Existing workflows pinned to the retained former `general` revision keep its
   exact execution policy until explicitly reselected.
 - The first registry change does not alter which profile executes existing
