@@ -126,6 +126,40 @@ class ExecutionRunnerTests(unittest.TestCase):
         process.terminated = True
         return False
 
+    def test_a_failed_run_leaves_something_that_explains_it(self):
+        """Two runs of one task each produced a complete result file, each
+        failed to record it, and neither could be explained: the agent's
+        output went to /dev/null, so the refusal it was given, the command
+        it tried and the budget it spent were all gone. The transcript is
+        owner-only and sits beside the result, which already holds the same
+        private content.
+        """
+        self._ready()
+        launched = {}
+
+        def popen(argv, **kwargs):
+            launched["kwargs"] = kwargs
+            handle = kwargs["stdout"]
+            handle.write(b"synthetic agent output\n")
+            handle.flush()
+            launched["path"] = Path(handle.name)
+            # Exits without recording: the case that used to be unexplainable.
+            return FakeProcess(exit_code=1)
+
+        run_once(
+            self._config(),
+            base_environment={"PATH": "/usr/bin"},
+            popen=popen,
+            run_id_factory=lambda: "b" * 32,
+            terminate=self._terminator,
+        )
+        path = launched["path"]
+        self.assertEqual(path.name, "agent-output.log")
+        self.assertEqual(path.read_bytes(), b"synthetic agent output\n")
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        # Beside the run's own state, never outside the run directory.
+        self.assertTrue((path.parent / "run-state.json").exists())
+
     def test_runner_records_and_scrubs_capability_without_shell_or_output(self):
         self._ready()
         launched = {}
@@ -164,8 +198,11 @@ class ExecutionRunnerTests(unittest.TestCase):
 
         self.assertEqual((result.outcome, result.exit_code), ("recorded", 0))
         self.assertFalse(launched["kwargs"]["shell"])
-        self.assertIs(launched["kwargs"]["stdout"], subprocess.DEVNULL)
-        self.assertIs(launched["kwargs"]["stderr"], subprocess.DEVNULL)
+        # Kept, not discarded: a supervised run that fails must leave
+        # something behind that explains it. Owner-only, beside the result.
+        self.assertIsNot(launched["kwargs"]["stdout"], subprocess.DEVNULL)
+        self.assertIs(launched["kwargs"]["stderr"], subprocess.STDOUT)
+        self.assertIs(launched["kwargs"]["stdin"], subprocess.DEVNULL)
         turn_index = launched["argv"].index("--max-turns")
         self.assertEqual(launched["argv"][turn_index + 1], "50")
         self.assertEqual(launched["state"].lease_seconds, 2_700)

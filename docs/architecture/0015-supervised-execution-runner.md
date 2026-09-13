@@ -17,7 +17,10 @@ owner-local lock, it claims at most one ready workflow and creates a private,
 disposable run directory. It writes the capability and authoritative task,
 workflow, and phase identity to an owner-only run-state file, then starts the
 configured agent with an argument vector, a new process group, no shell, no
-stdin, and discarded stdout and stderr.
+stdin, and its output captured to an owner-only file inside the run
+directory. That output was discarded until a run that produced a complete
+result file, failed to record it, and left nothing behind that could explain
+why. It is as private as the result beside it and never leaves the host.
 
 The agent's fixed prompt names the authority of each phase. Planning cannot
 cause an external effect, execution cannot perform an external action, and
