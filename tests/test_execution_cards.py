@@ -357,7 +357,7 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertEqual(
             [parse_execution_review_callback(value)[2] for value in callbacks],
             ["start", "agent", "discuss", "snooze", "cancel",
-             "reassign", "drop"],
+             "drop"],
         )
         self.assertTrue(all(
             len(value.encode("utf-8")) <= CALLBACK_DATA_LIMIT
@@ -789,7 +789,7 @@ class ExecutionCardTests(unittest.TestCase):
                  for value in callbacks],
                 [
                     "revise", "discuss", "approve", "snooze", "done",
-                    "reassign", "drop",
+                    "drop",
                 ],
             )
             self.assertEqual(
@@ -799,7 +799,7 @@ class ExecutionCardTests(unittest.TestCase):
                     ["🔎 Investigate further", "💬 Discuss"],
                     ["▶️ Execute plan", "🕒 Snooze"],
                     ["✅ Mark as done"],
-                    ["👥 Reassign", "🗑 Drop task"],
+                    ["🗑 Drop task"],
                 ],
             )
             result = self.cards.act(
@@ -828,7 +828,7 @@ class ExecutionCardTests(unittest.TestCase):
             for button in row
         ]
         self.assertEqual(
-            actions, ["revise", "discuss", "snooze", "reassign", "drop"]
+            actions, ["revise", "discuss", "snooze", "drop"]
         )
         before = self.execution.get(1)
         refused = self.cards.act(
@@ -1277,7 +1277,7 @@ class ExecutionCardTests(unittest.TestCase):
                 for row in keyboard["inline_keyboard"]
                 for button in row
             ],
-            ["done", "discuss", "snooze", "reassign", "drop"],
+            ["done", "discuss", "snooze", "drop"],
         )
         self.cards.complete_delivery(
             claim.card.id,
