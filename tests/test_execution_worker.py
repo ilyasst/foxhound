@@ -138,6 +138,8 @@ class ExecutionWorkerTests(unittest.TestCase):
         self.claim = service.claim_next()
         self.assertIsNotNone(self.claim)
         self.run_directory = self.root / f"run-{RUN_ID}"
+        self.knowledge_root = self.root / "knowledge"
+        self.knowledge_root.mkdir()
         self.run_directory.mkdir(mode=0o700)
         self.state_path = self.run_directory / "run-state.json"
         self._write_state()
@@ -156,6 +158,7 @@ class ExecutionWorkerTests(unittest.TestCase):
             "lease_seconds": self.claim.lease_seconds,
             "agent_profile_id": self.claim.agent_profile_id,
             "agent_profile_revision": self.claim.agent_profile_revision,
+            "knowledge_root": str(self.knowledge_root),
         }), encoding="utf-8")
         self.state_path.chmod(0o600)
 
@@ -257,6 +260,28 @@ class ExecutionWorkerTests(unittest.TestCase):
         # A state, not content: nothing from the task may appear here.
         self.assertNotIn("Synthetic", caught.exception.reason)
         self.assertNotIn(" ", caught.exception.reason)
+
+    def test_the_context_says_where_the_knowledge_base_is(self):
+        """Search returns a fragment; the directory is how the agent reads
+        the discussion that fragment came from. Across three supervised
+        runs the agent made no knowledge query at all and planned from
+        repository history alone, which says what the code is and never
+        why it is that way.
+        """
+        with knowledge_server() as endpoint:
+            context = self._worker(endpoint).context()
+        self.assertEqual(
+            context["knowledge"]["root"], str(self.knowledge_root))
+
+    def test_a_machine_without_a_knowledge_base_is_ordinary(self):
+        # Not every host keeps one. The agent must be able to tell that
+        # apart from one it was simply not told about.
+        document = json.loads(self.state_path.read_text(encoding="utf-8"))
+        document["knowledge_root"] = None
+        self.state_path.write_text(json.dumps(document), encoding="utf-8")
+        with knowledge_server() as endpoint:
+            context = self._worker(endpoint).context()
+        self.assertIsNone(context["knowledge"]["root"])
 
     def test_the_context_names_the_thing_the_task_is_about(self):
         """The agent is told to take repository identity from here, and told
