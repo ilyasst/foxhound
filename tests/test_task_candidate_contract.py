@@ -41,6 +41,26 @@ class TaskCandidateContractTests(unittest.TestCase):
         self.assertIsNone(candidate.task.project)
         self.assertEqual(task_candidate_document(candidate), document)
 
+    def test_accepts_and_round_trips_a_synthetic_legacy_candidate(self):
+        document = fixture("meeting-candidate-v1.json")
+        document["source"].update({
+            "kind": "legacy",
+            "record_id": "example-task-ledger",
+            "item_id": "task-17",
+        })
+        document["candidate_id"] = candidate_id_for(
+            system="gw",
+            kind="legacy",
+            record_id="example-task-ledger",
+            item_id="task-17",
+        )
+
+        candidate = parse_task_candidate(document)
+
+        self.assertEqual(candidate.source.kind, "legacy")
+        self.assertEqual(candidate.task.project, "Project Alpha")
+        self.assertEqual(task_candidate_document(candidate), document)
+
     def test_versions_have_distinct_strict_task_shapes(self):
         version_1 = fixture("meeting-candidate-v1.json")
         version_1["task"].pop("project")
@@ -145,6 +165,15 @@ class TaskCandidateContractTests(unittest.TestCase):
             version_2["properties"]["task"]["additionalProperties"]
         )
         self.assertNotIn("project", version_2["properties"]["task"]["properties"])
+        expected_kinds = {"meeting", "email", "issue", "legacy"}
+        self.assertEqual(
+            set(schema["properties"]["source"]["properties"]["kind"]["enum"]),
+            expected_kinds,
+        )
+        self.assertEqual(
+            set(version_2["properties"]["source"]["properties"]["kind"]["enum"]),
+            expected_kinds,
+        )
 
 
 if __name__ == "__main__":

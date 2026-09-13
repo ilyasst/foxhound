@@ -49,6 +49,14 @@ sequence and exact candidate revision history. In one transaction it:
   owner, and due value and incrementing the task version; and
 - advances the native cursor and appends an aggregate intake event.
 
+A guarded cutover may have a finite open backlog that predates source-level
+candidate handoffs. The producer may offer those records once with the
+explicit `legacy` source kind. This prevents a migrated task from masquerading
+as a meeting, email action, or forge issue. It still crosses the same immutable
+feed and ordered native-intake transaction, receives no pre-authorization, and
+starts behind the ordinary lifecycle and execution gates. The kind is a
+migration origin, not permission for the producer to retain a task registry.
+
 A post-boundary producer task observation, missing provenance, non-contiguous
 sequence, missing task, folded binding, terminal task, malformed stored
 candidate, or any other contradiction refuses and rolls back the complete
