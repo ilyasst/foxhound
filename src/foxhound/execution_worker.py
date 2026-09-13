@@ -30,6 +30,7 @@ from .task_execution import (
     WorkflowPhase,
     WorkflowStatus,
 )
+from . import forge_action
 from .task_ledger import TaskLedger, TaskLedgerError, TaskStatus
 
 
@@ -152,6 +153,56 @@ class ExecutionWorker:
         )
         self._renew(service, state)
         return _search_document(result)
+
+    def act_pull_request(self, *, head: str, title: str,
+                         body_file: str | None) -> dict[str, Any]:
+        """Open a pull request against this task's own origin.
+
+        Refused outside `external_action`: the phase IS the approval. A reader
+        approved an action for this phase, and performing forge writes while
+        planning or executing would bypass the gate that makes the approval
+        mean anything.
+        """
+        state, service = self._active()
+        if state.phase is not WorkflowPhase.EXTERNAL_ACTION:
+            raise ExecutionWorkerClaimError(
+                "an external action is only available in the external_action "
+                "phase"
+            )
+        origin = TaskLedger(state.database_path).origin(state.task_id)
+        if origin is None:
+            raise ExecutionWorkerClaimError(
+                "this task has no origin, so it names nothing to act on"
+            )
+        body = ""
+        if body_file:
+            body = _read_private_text(
+                self._state_path.parent / body_file,
+                maximum=60_000, label="pull request body")
+        try:
+            receipt = forge_action.open_pull_request(
+                origin_kind=origin.kind,
+                repository=origin.record_id,
+                issue=origin.item_id,
+                task_id=state.task_id,
+                head=head,
+                title=title,
+                body=body,
+            )
+        except forge_action.ForgeActionError as exc:
+            raise ExecutionWorkerClaimError(str(exc)) from exc
+        # Renewed only after the action succeeded: a lease that lapses mid-write
+        # must not be extended by the attempt itself.
+        self._renew(service, state)
+        return {
+            "kind": "pull-request",
+            "repository": receipt.repository,
+            "issue": receipt.issue,
+            "number": receipt.number,
+            "url": receipt.url,
+            "head": receipt.head,
+            "base": receipt.base,
+        }
 
     def record(self, draft_name: str) -> dict[str, Any]:
         state = load_run_state(self._state_path)
@@ -530,6 +581,16 @@ def _parser() -> argparse.ArgumentParser:
     search.add_argument("--context-lines", type=int, default=0)
     search.add_argument("--max-matches-per-document", type=int)
     search.add_argument("--max-results-per-layer", type=int, default=10)
+    act = subcommands.add_parser(
+        "act", help="perform the approved external action for this phase")
+    act_kinds = act.add_subparsers(dest="action_kind", required=True)
+    pull_request = act_kinds.add_parser("pull-request")
+    pull_request.add_argument("--head", required=True,
+                              help="branch holding the proposed change")
+    pull_request.add_argument("--title", required=True)
+    pull_request.add_argument(
+        "--body-file",
+        help="file beside the run state holding the pull request body")
     record = subcommands.add_parser("record")
     record.add_argument("draft")
     subcommands.add_parser("release")
@@ -550,6 +611,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 max_matches_per_document=args.max_matches_per_document,
                 max_results_per_layer=args.max_results_per_layer,
             )
+        elif args.operation == "act":
+            result = worker.act_pull_request(
+                head=args.head, title=args.title, body_file=args.body_file)
         elif args.operation == "record":
             result = worker.record(args.draft)
         else:
