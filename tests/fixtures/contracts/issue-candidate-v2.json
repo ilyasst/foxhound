@@ -1,0 +1,22 @@
+{
+  "schema": "foxhound.task-candidate",
+  "schema_version": 2,
+  "candidate_id": "tc_ec4e40ab066c78b0daffd0a29df5ea4e98212498ba7b5a8aa3afef0545d8f9fb",
+  "source": {
+    "system": "gw",
+    "kind": "issue",
+    "record_id": "forge.example/acme/widget",
+    "item_id": "42",
+    "revision": "cd91bb1aecb7c987ceabded9e9886888baf7b175116875f96f09874b17ad162b"
+  },
+  "task": {
+    "text": "Add a README",
+    "owner": "Person A",
+    "due": null
+  },
+  "evidence": {
+    "document_id": "forge.example/acme/widget/issues/42",
+    "locator": "forge.example/acme/widget/issues/42"
+  },
+  "created_at": "2030-01-01T12:00:00Z"
+}
