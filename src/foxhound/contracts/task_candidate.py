@@ -24,9 +24,24 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset({
     PROJECTLESS_SCHEMA_VERSION,
 })
 SOURCE_SYSTEMS = frozenset({"gw"})
-SOURCE_KINDS = frozenset({"meeting", "email"})
+#: ``issue`` is a forge issue nominated for work. Its ``record_id`` is the
+#: repository's canonical locator and its ``item_id`` the issue number, so the
+#: inbox's uniqueness constraint admits one task per issue and re-emitting an
+#: unchanged issue is a no-op.
+SOURCE_KINDS = frozenset({"meeting", "email", "issue"})
 
-_OPAQUE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
+#: Identifiers are opaque to this parser: it checks their shape, never their
+#: meaning. ``/`` is accepted because forge identifiers are path-shaped — a
+#: repository is ``host/owner/name`` and an issue reference carries it — and
+#: refusing the separator would force producers to invent an encoding, which
+#: is a worse failure mode than accepting the character.
+#:
+#: Accepting ``/`` cannot enable traversal here: these values are only ever
+#: stored as SQLite column values and compared in the
+#: ``UNIQUE(source_system, source_kind, source_record_id, source_item_id)``
+#: constraint. No code path builds a filesystem path from them. Widening also
+#: only ever accepts MORE, so no previously valid candidate becomes invalid.
+_OPAQUE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$")
 _REVISION_RE = re.compile(r"^[0-9a-f]{64}$")
 _CANDIDATE_ID_RE = re.compile(r"^tc_[0-9a-f]{64}$")
 
