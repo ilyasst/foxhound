@@ -16,6 +16,7 @@ foxhound-task-bootstrap = "foxhound.task_bootstrap:main"
 foxhound-execution-schedule = "foxhound.execution_schedule:main"
 foxhound-native-intake = "foxhound.native_intake:main"
 foxhound-scheduler-cutover = "foxhound.scheduler_cutover:main"
+foxhound-agent-profiles = "foxhound.agent_profiles:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
