@@ -117,9 +117,11 @@ class WorkerContextGuidance(unittest.TestCase):
 
         prompt = agent_prompt()
         self.assertIn("task.origin", prompt)
-        self.assertIn("act on that issue and no other", prompt)
-        # A null origin must not be treated as licence to guess.
-        self.assertIn("do not infer a target from its text", prompt)
+        # The origin tells the agent where to START. It is not a restriction
+        # on what may be read: real work spans repositories, and an agent that
+        # cannot look at a second one cannot do the task.
+        self.assertIn("the lead to start from", prompt)
+        self.assertIn("not a limit on what you may read", prompt)
 
 
 if __name__ == "__main__":
