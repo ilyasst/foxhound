@@ -995,6 +995,35 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertIn("Subject: Synthetic subject", body)
         self.assertIn("<pre>First line.\nSecond line.</pre>", body)
 
+    def test_a_superseded_card_stops_holding_the_surface(self):
+        """The reader must get the next card without anyone intervening.
+
+        A delivered card whose work has moved on can no longer be answered
+        — its buttons are refused. It used to keep counting as the one
+        card on screen anyway, so nothing further was ever scheduled, and
+        the sweep that cancels it runs inside the scheduling call the drip
+        had already returned from. The surface went quiet permanently.
+        """
+        task_id = 6
+        scheduled = self._schedule_workflow(task_id)
+        self.assertEqual(self.cards.schedule().created, 1)
+        claim = self.cards.claim_next()
+        self.cards.complete_delivery(
+            claim.card.id, expected_version=claim.card.version,
+            claim_token=claim.token, transport="synthetic",
+            delivery_ref="1")
+        self.assertEqual(self.cards.stats().delivered, 1)
+
+        # The reader starts the work from somewhere else, so the gate that
+        # is still on screen now asks a question that has been answered.
+        self.execution.start_action(
+            task_id, expected_version=scheduled.version, action="start")
+
+        self.assertEqual(self.cards.stats().delivered, 0)
+        self.assertEqual(self.cards.stats().active, 0)
+        # And the surface refills on its own, cancelling what it replaced.
+        self.assertEqual(self.cards.schedule().cancelled, 1)
+
     def test_a_gate_says_which_issue_it_is_asking_about(self):
         """Naming the task is not naming the thing.
 
