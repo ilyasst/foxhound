@@ -93,6 +93,40 @@ class AgentProfileTests(unittest.TestCase):
         with self.assertRaises(AgentProfileError):
             profile.render_prompt("worker; command")
 
+    def test_public_coder_example_is_synthetic_and_structurally_valid(self):
+        path = (
+            Path(__file__).parents[1]
+            / "examples"
+            / "agent-profiles"
+            / "example-coder.json"
+        )
+        profile = parse_profile(json.loads(path.read_text(encoding="utf-8")))
+
+        self.assertEqual(
+            (profile.profile_id, profile.display_name, profile.runtime),
+            ("example-coder", "Example Coder", "hermes"),
+        )
+        self.assertEqual(
+            (
+                profile.toolsets,
+                profile.max_turns,
+                profile.timeout_seconds,
+                profile.claim_lease_seconds,
+                profile.allowed_phases,
+            ),
+            (
+                ("terminal", "file", "web", "vision"),
+                50,
+                1_800,
+                2_700,
+                ("plan", "execute", "external_action"),
+            ),
+        )
+        prompt = profile.render_prompt("synthetic-worker")
+        self.assertIn("Synthetic example only", prompt)
+        self.assertIn("synthetic-worker context", prompt)
+        self.assertNotIn(WORKER_COMMAND_TOKEN, prompt)
+
     def test_revision_is_stable_complete_and_prompt_is_not_public(self):
         first = parse_profile(profile_document())
         second = parse_profile(profile_document())

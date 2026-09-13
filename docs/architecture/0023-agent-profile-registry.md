@@ -24,12 +24,19 @@ timing, and an explicit phase allowlist. The complete execution-relevant
 document has a stable SHA-256 revision.
 
 The built-in `general` profile reproduces the existing runner prompt and
-limits. Additional profiles are JSON manifests in an explicitly configured,
-absolute, owner-only directory outside every Git checkout. The directory and
-regular manifest files must be owned by the current user; symlinks and
-group/world permissions are refused. JSON shape and duplicate keys are checked
-strictly. Manifests cannot specify commands, arguments, environment variables,
-secrets, arbitrary tools, or unknown fields.
+limits. Actual role profiles are JSON manifests in one explicitly configured,
+absolute, owner-only directory outside every Git checkout. A deployment may
+share that directory across projects through an approved private
+synchronization system. The directory and regular manifest files must be owned
+by the current user; symlinks and group/world permissions are refused. JSON
+shape and duplicate keys are checked strictly. Manifests cannot specify
+commands, arguments, environment variables, secrets, arbitrary tools, or
+unknown fields.
+
+The repository may contain visibly fictional example manifests for contract
+documentation and tests. Examples are not built-in agents and must not be used
+as deployment policy. The shared private deployment contract is recorded in
+[ADR 0026](0026-shared-private-agent-profiles.md).
 
 The inspection command lists IDs, display names, runtimes, and revisions. It
 may show bounded policy fields, but it never emits prompt text, private paths,

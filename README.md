@@ -202,9 +202,15 @@ launching an agent. See
 [ADR 0015](docs/architecture/0015-supervised-execution-runner.md).
 
 Agent definitions are strict, revisioned Foxhound profiles. The built-in
-`general` profile preserves the existing Hermes policy. A deployment may load
-additional reviewed JSON manifests from an absolute owner-only directory
-outside Git, then inspect their content-free identity and policy metadata:
+`general` profile preserves the existing Hermes compatibility policy. Actual
+role profiles and prompts belong in one explicitly configured, owner-only
+directory outside every Git checkout. That private directory can be shared
+across projects through an approved synchronization system, so one coding
+agent definition can serve multiple repositories without being copied into
+them. The card service and execution runner must receive the same directory.
+The repository provides only a clearly fictional example manifest at
+`examples/agent-profiles/example-coder.json`. A deployment can inspect
+content-free identity and policy metadata for its private manifests:
 
 ```sh
 foxhound-agent-profiles --directory /srv/example/private-agent-profiles validate
@@ -216,6 +222,8 @@ Private manifests cannot provide executable commands, environment variables,
 secrets, or arbitrary tool names. Prompts and private paths are never emitted
 by these commands. Profile selection is intentionally not inferred from task
 content. See [ADR 0023](docs/architecture/0023-agent-profile-registry.md).
+See [ADR 0026](docs/architecture/0026-shared-private-agent-profiles.md) for the
+shared private-profile deployment contract.
 
 Every execution workflow stores the selected profile ID and exact revision.
 The runner resolves that immutable evidence within atomic claim selection,
@@ -396,3 +404,5 @@ See [ADR 0024](docs/architecture/0024-workflow-agent-binding.md) for exact
 profile evidence throughout execution.
 See [ADR 0025](docs/architecture/0025-start-card-agent-selector.md) for the
 reader-controlled Start-card selection protocol.
+See [ADR 0026](docs/architecture/0026-shared-private-agent-profiles.md) for
+shared private role profiles and the synthetic public example.
