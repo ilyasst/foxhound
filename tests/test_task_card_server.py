@@ -17,10 +17,21 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from foxhound import CandidateInbox
-from foxhound.execution_cards import ExecutionCardService
+from foxhound.agent_profiles import (
+    AgentProfileRegistry,
+    general_profile,
+    parse_profile,
+)
+from foxhound.execution_cards import (
+    ExecutionCardService,
+    parse_execution_agent_callback,
+    parse_execution_review_callback,
+)
 from foxhound.task_card_server import (
     CLAIM_SCHEMA,
     ERROR_SCHEMA,
+    EXECUTION_AGENT_OPTIONS_SCHEMA,
+    EXECUTION_AGENT_SELECTION_SCHEMA,
     EXECUTION_CLAIM_SCHEMA,
     EXECUTION_OPERATION_SCHEMA,
     EXECUTION_SCHEDULE_SCHEMA,
@@ -490,6 +501,41 @@ class TaskCardServerTests(unittest.TestCase):
                 endpoint, "/v1/execution-cards/delivered", delivery
             )
             self.assertEqual(delivered["card_status"], "delivered")
+            _, _, agent_options = request(
+                endpoint,
+                "/v1/execution-cards/agent-options",
+                request_document(
+                    card_id=claim["card_id"],
+                    card_version=claim["card_version"],
+                ),
+            )
+            self.assertEqual(
+                (agent_options["schema"], agent_options["ok"]),
+                (EXECUTION_AGENT_OPTIONS_SCHEMA, True),
+            )
+            agent_callback = agent_options["presentation"]["reply_markup"][
+                "inline_keyboard"
+            ][0][0]["callback_data"]
+            agent_card_id, agent_card_version, selection_token = (
+                parse_execution_agent_callback(agent_callback)
+            )
+            _, _, agent_selection = request(
+                endpoint,
+                "/v1/execution-cards/agent-selection",
+                request_document(
+                    card_id=agent_card_id,
+                    card_version=agent_card_version,
+                    selection_token=selection_token,
+                ),
+            )
+            self.assertEqual(
+                (
+                    agent_selection["schema"],
+                    agent_selection["disposition"],
+                    agent_selection["agent_display_name"],
+                ),
+                (EXECUTION_AGENT_SELECTION_SCHEMA, "unchanged", "General"),
+            )
             action = request_document(
                 card_id=claim["card_id"],
                 card_version=claim["card_version"],
@@ -609,6 +655,112 @@ class TaskCardServerTests(unittest.TestCase):
                 (status, body["error"]["code"]),
                 (400, "invalid_request"),
             )
+
+    def test_agent_adapter_contract_returns_refreshed_start_card(self):
+        profile_document = general_profile().document()
+        profile_document.update({
+            "profile_id": "specialist",
+            "display_name": "Synthetic Specialist",
+            "max_turns": 50,
+        })
+        specialist = parse_profile(profile_document)
+        registry = AgentProfileRegistry((general_profile(), specialist))
+        execution = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            profile_registry=registry,
+        )
+        cards = ExecutionCardService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: EXECUTION_DELIVERY_TOKEN,
+            profile_registry=registry,
+        )
+        app = TaskCardApplication(self.cards, TOKEN, execution_cards=cards)
+        workflow = execution.schedule(1, expected_task_version=1)
+        cards.schedule()
+        claim = cards.claim_next()
+        cards.complete_delivery(
+            claim.card.id,
+            expected_version=claim.card.version,
+            claim_token=claim.token,
+            transport="synthetic",
+            delivery_ref="synthetic-agent-message",
+        )
+
+        options = app.dispatch("execution_agent_options", request_document(
+            card_id=claim.card.id,
+            card_version=claim.card.version,
+        ))
+        self.assertEqual(options["schema"], EXECUTION_AGENT_OPTIONS_SCHEMA)
+        specialist_callback = next(
+            row[0]["callback_data"]
+            for row in options["presentation"]["reply_markup"][
+                "inline_keyboard"
+            ]
+            if row[0]["text"] == "Synthetic Specialist"
+        )
+        card_id, card_version, selection_token = (
+            parse_execution_agent_callback(specialist_callback)
+        )
+        selected = app.dispatch("execution_agent_selection", request_document(
+            card_id=card_id,
+            card_version=card_version,
+            selection_token=selection_token,
+        ))
+
+        self.assertEqual(
+            (
+                selected["schema"],
+                selected["disposition"],
+                selected["card_version"],
+                selected["agent_profile_id"],
+            ),
+            (
+                EXECUTION_AGENT_SELECTION_SCHEMA,
+                "applied",
+                claim.card.version + 1,
+                "specialist",
+            ),
+        )
+        self.assertIn(
+            "<b>Agent:</b> Synthetic Specialist",
+            selected["presentation"]["body"],
+        )
+        callbacks = [
+            button["callback_data"]
+            for row in selected["presentation"]["reply_markup"][
+                "inline_keyboard"
+            ]
+            for button in row
+        ]
+        self.assertTrue(all(
+            parse_execution_review_callback(value)[1]
+            == selected["card_version"]
+            for value in callbacks
+        ))
+        self.assertEqual(
+            (execution.get(1).status, execution.get(1).version),
+            (WorkflowStatus.AWAITING_START, workflow.version + 1),
+        )
+        stale = app.dispatch("execution_agent_selection", request_document(
+            card_id=card_id,
+            card_version=card_version,
+            selection_token=selection_token,
+        ))
+        unknown = app.dispatch("execution_agent_selection", request_document(
+            card_id=card_id,
+            card_version=selected["card_version"],
+            selection_token="0" * 20,
+        ))
+        self.assertEqual(stale["refusal"], "stale_version")
+        self.assertEqual(unknown["refusal"], "invalid_argument")
+        with self.assertRaises(TaskCardServerRequestError):
+            app.dispatch("execution_agent_selection", request_document(
+                card_id=card_id,
+                card_version=selected["card_version"],
+                selection_token="a" * 21,
+            ))
 
     def test_execution_input_route_is_strict_and_version_bound(self):
         workflow = self.execution.schedule(1, expected_task_version=1)

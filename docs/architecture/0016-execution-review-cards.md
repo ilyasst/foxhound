@@ -30,7 +30,7 @@ The four card kinds have closed action sets:
 
 | Card | Allowed reader actions |
 |---|---|
-| Start | Start planning, snooze one day, cancel execution |
+| Start | Choose agent, start planning, snooze one day, cancel execution |
 | Plan review | Investigate, discuss, execute, snooze, complete, reassign, or drop |
 | External review | Authorize the exact action, return for revision, discuss, snooze, complete, reassign, or drop |
 | Result review | Discuss, snooze, complete, reassign, or drop |
@@ -42,6 +42,14 @@ failure rolls back all of them. Completion and drop write the ordinary task
 lifecycle event, making the existing outcome feed authoritative. Reassignment
 versions the task, records an append-only owner event, discards the obsolete
 result binding, and returns execution to a fresh Start gate.
+
+Every Start projection resolves and displays the workflow's exact installed
+profile revision. Only a current delivered card whose workflow remains
+`awaiting_start` exposes Agent. Selecting a different eligible profile updates
+the workflow binding and the same delivered card in one transaction, versions
+both, appends content-free workflow and card events, and returns the refreshed
+presentation. Selecting the current exact revision is unchanged. No selection
+queues work or changes task lifecycle.
 
 Discussion and reassignment use a separate bounded input operation because
 their values cannot safely fit in callback data. The gateway may collect text,
@@ -72,9 +80,10 @@ the old presentation becomes stale without advancing or rerunning workflow.
 This repair is intentionally absent from the remote transport API.
 
 Events are append-only and contain card/workflow identity, versions, action,
-and time but no task or result content. Operation and aggregate results are
-content-free. Private card dataclasses exclude all content fields from their
-representations.
+and time but no task or result content. Agent refresh events contain no name,
+profile ID, or revision; the workflow event remains the authoritative profile
+evidence. Operation and aggregate results are content-free. Private card
+dataclasses exclude all content fields from their representations.
 
 ## Failure and rollback
 
@@ -86,6 +95,6 @@ bound workflow changes.
 
 ## Out of scope
 
-This slice adds no HTTP route, chat transport, recurring scheduler, agent
-launch, production configuration, backlog migration, GW write, or automatic
-workflow scheduling.
+This component adds no chat transport, recurring scheduler, agent launch,
+production configuration, backlog migration, GW write, or automatic workflow
+scheduling.
