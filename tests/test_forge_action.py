@@ -42,7 +42,7 @@ class TargetIsNotTheAgentsToChoose(unittest.TestCase):
         runner = _gh([OK_DEFAULT_BRANCH, OK_CREATE, OK_VIEW])
         with mock.patch.object(forge_action, "_run", runner):
             receipt = open_pull_request(
-                origin_kind="issue", repository="github.com/acme/widget",
+                repository="github.com/acme/widget",
                 issue="2", task_id=4, head="fix/thing", title="Fix the thing",
                 body="Body.")
         self.assertEqual(receipt.repository, "github.com/acme/widget")
@@ -59,7 +59,7 @@ class TargetIsNotTheAgentsToChoose(unittest.TestCase):
         runner = _gh([OK_DEFAULT_BRANCH, OK_CREATE, OK_VIEW])
         with mock.patch.object(forge_action, "_run", runner):
             open_pull_request(
-                origin_kind="issue", repository="github.com/acme/widget",
+                repository="github.com/acme/widget",
                 issue="2", task_id=4, head="fix/thing", title="T", body="Body.")
         create = next(c for c in runner.calls if c[:3] == ("gh", "pr", "create"))
         body = create[create.index("--body") + 1]
@@ -69,19 +69,13 @@ class TargetIsNotTheAgentsToChoose(unittest.TestCase):
 
 
 class Refusals(unittest.TestCase):
-    def test_a_task_that_is_not_a_forge_issue_is_refused(self) -> None:
-        with self.assertRaises(ForgeActionError):
-            open_pull_request(
-                origin_kind="meeting", repository="github.com/acme/widget",
-                issue="2", task_id=4, head="h", title="T", body="")
-
     def test_a_head_equal_to_base_is_refused(self) -> None:
         # Almost always means the work was done on the default branch.
         runner = _gh([OK_DEFAULT_BRANCH])
         with mock.patch.object(forge_action, "_run", runner):
             with self.assertRaises(ForgeActionError) as caught:
                 open_pull_request(
-                    origin_kind="issue", repository="github.com/acme/widget",
+                    repository="github.com/acme/widget",
                     issue="2", task_id=4, head="main", title="T", body="")
         self.assertIn("must propose a branch", str(caught.exception))
         self.assertFalse(any(c[:3] == ("gh", "pr", "create")
@@ -90,13 +84,13 @@ class Refusals(unittest.TestCase):
     def test_an_unsupported_forge_is_refused(self) -> None:
         with self.assertRaises(ForgeActionError):
             open_pull_request(
-                origin_kind="issue", repository="bitbucket.org/acme/widget",
+                repository="bitbucket.org/acme/widget",
                 issue="2", task_id=4, head="h", title="T", body="")
 
     def test_a_non_canonical_repository_is_refused(self) -> None:
         with self.assertRaises(ForgeActionError):
             open_pull_request(
-                origin_kind="issue", repository="widget", issue="2",
+                repository="widget", issue="2",
                 task_id=4, head="h", title="T", body="")
 
     def test_a_missing_head_or_title_is_refused(self) -> None:
@@ -104,7 +98,7 @@ class Refusals(unittest.TestCase):
             with self.subTest(head=head, title=title):
                 with self.assertRaises(ForgeActionError):
                     open_pull_request(
-                        origin_kind="issue",
+                        
                         repository="github.com/acme/widget", issue="2",
                         task_id=4, head=head, title=title, body="")
 
@@ -114,7 +108,7 @@ class Refusals(unittest.TestCase):
         with mock.patch.object(forge_action, "_run", runner):
             with self.assertRaises(ForgeActionError) as caught:
                 open_pull_request(
-                    origin_kind="issue", repository="github.com/acme/widget",
+                    repository="github.com/acme/widget",
                     issue="2", task_id=4, head="fix/thing", title="T", body="")
         self.assertIn("already exists", str(caught.exception))
 
@@ -123,7 +117,7 @@ class Refusals(unittest.TestCase):
         with mock.patch.object(forge_action, "_run", runner):
             with self.assertRaises(ForgeActionError):
                 open_pull_request(
-                    origin_kind="issue", repository="github.com/acme/widget",
+                    repository="github.com/acme/widget",
                     issue="2", task_id=4, head="fix/thing", title="T", body="")
         self.assertFalse(any(c[:3] == ("gh", "pr", "create")
                              for c in runner.calls))
@@ -132,7 +126,7 @@ class Refusals(unittest.TestCase):
         runner = _gh([OK_DEFAULT_BRANCH, OK_CREATE, OK_VIEW])
         with mock.patch.object(forge_action, "_run", runner):
             open_pull_request(
-                origin_kind="issue", repository="github.com/acme/widget",
+                repository="github.com/acme/widget",
                 issue="2", task_id=4, head="fix/thing", title="T", body="")
         flat = " ".join(" ".join(call) for call in runner.calls)
         for forbidden in (" push", "--force", "-f ", "merge"):
@@ -145,20 +139,30 @@ class PreparedWorktree(unittest.TestCase):
         # same issue reuses the branch instead of littering the repository.
         self.assertEqual(forge_action.branch_for("42"), "foxhound/issue-42")
 
-    def test_a_non_issue_task_prepares_nothing(self) -> None:
-        with self.assertRaises(ForgeActionError):
-            forge_action.prepare_worktree(
-                origin_kind="meeting", repository="github.com/acme/widget",
-                issue="2", parent=Path("/tmp"))
+    def test_another_repository_may_be_prepared(self) -> None:
+        # Real work spans repositories. The task's own is the default, not a
+        # limit on what the agent may read.
+        with tempfile.TemporaryDirectory() as td:
+            runner = _gh([OK_DEFAULT_BRANCH,
+                          (("gh", "repo", "clone"), (0, "", "")),
+                          (("git",), (0, "", ""))])
+            with mock.patch.object(forge_action, "_run", runner):
+                path, _branch, _base = forge_action.prepare_worktree(
+                    repository="github.com/acme/other", issue="2",
+                    parent=Path(td))
+            clone = next(c for c in runner.calls
+                         if c[:3] == ("gh", "repo", "clone"))
+            self.assertIn("acme/other", clone)
+            self.assertIn("other", path.name)
 
     def test_an_existing_tree_is_not_clobbered(self) -> None:
         with tempfile.TemporaryDirectory() as td:
-            (Path(td) / "repo-2").mkdir()
+            (Path(td) / "repo-widget-2").mkdir()
             runner = _gh([OK_DEFAULT_BRANCH])
             with mock.patch.object(forge_action, "_run", runner):
                 with self.assertRaises(ForgeActionError) as caught:
                     forge_action.prepare_worktree(
-                        origin_kind="issue",
+                        
                         repository="github.com/acme/widget", issue="2",
                         parent=Path(td))
             self.assertIn("already prepared", str(caught.exception))
@@ -172,14 +176,14 @@ class PreparedWorktree(unittest.TestCase):
                           (("git",), (0, "", ""))])
             with mock.patch.object(forge_action, "_run", runner):
                 path, branch, base = forge_action.prepare_worktree(
-                    origin_kind="issue", repository="github.com/acme/widget",
+                    repository="github.com/acme/widget",
                     issue="2", parent=Path(td))
             clone = next(c for c in runner.calls if c[:3] == ("gh", "repo", "clone"))
             self.assertIn("--filter=blob:none", clone)
             self.assertNotIn("--depth", " ".join(clone))
             self.assertEqual(branch, "foxhound/issue-2")
             self.assertEqual(base, "main")
-            self.assertEqual(path.name, "repo-2")
+            self.assertEqual(path.name, "repo-widget-2")
 
 
 class PushIsBounded(unittest.TestCase):
@@ -219,11 +223,20 @@ class AgentGuidance(unittest.TestCase):
 
         prompt = agent_prompt()
         self.assertIn("act pull-request", prompt)
-        self.assertIn("not yours to choose", prompt)
-        # Using the forge CLI directly would bypass every bound in this module.
-        self.assertIn("Do not open pull requests with the forge CLI", prompt)
         self.assertIn("act worktree", prompt)
-        self.assertIn("must not clone or check out another one", prompt)
+        # The bound that matters is the EFFECT and its phase, which is the
+        # same sentence GW's own agent runs under — not a restriction on what
+        # the agent may read or where it may work.
+        self.assertIn("unless the phase is external_action", prompt)
+        self.assertIn("Do not overwrite unrelated dirty worktrees", prompt)
+
+    def test_the_origin_is_a_lead_not_a_limit(self) -> None:
+        from foxhound.execution_runner import agent_prompt
+
+        prompt = agent_prompt()
+        self.assertIn("not a limit on what you may read", prompt)
+        # A task may legitimately need more than one repository.
+        self.assertIn("span several repositories", prompt)
 
     def test_the_worker_command_is_substituted(self) -> None:
         from foxhound.execution_runner import agent_prompt

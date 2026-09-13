@@ -105,26 +105,22 @@ def branch_for(issue: str) -> str:
 
 def prepare_worktree(
     *,
-    origin_kind: str,
     repository: str,
     issue: str,
     parent: Path,
 ) -> tuple[Path, str, str]:
-    """Clone the task's repository into ``parent`` on a fresh branch.
+    """Clone a repository into ``parent`` on a fresh branch.
 
-    Returns ``(path, branch, base)``. The agent is handed a working tree it
-    did not choose the contents of: the repository comes from the task's
-    binding, and the branch name is derived from the issue.
+    Returns ``(path, branch, base)``. A convenience, not a gate: the task's
+    own repository is the default, but real work spans repositories, and an
+    agent that needs a second one should be able to say so rather than be
+    unable to do the task. What stays bounded is the EFFECT — nothing is
+    pushed here — not which source the agent may read.
 
     A blobless partial clone rather than a shallow one. Shallow is faster
     still, but a push from a shallow clone is refused by some forges, and
     discovering that at the push is discovering it too late.
     """
-    if origin_kind != "issue":
-        raise ForgeActionError(
-            "this task does not originate from a forge issue, so there is no "
-            "repository to prepare"
-        )
     if not repository or repository.count("/") != 2:
         raise ForgeActionError("the task's repository is not a canonical locator")
     host, _, name_with_owner = repository.partition("/")
@@ -133,7 +129,7 @@ def prepare_worktree(
 
     base = default_branch(repository)
     branch = branch_for(issue)
-    path = Path(parent) / f"repo-{issue}"
+    path = Path(parent) / f"repo-{repository.rsplit('/', 1)[-1]}-{issue}"
     if path.exists():
         raise ForgeActionError(
             "a working tree for this task already exists; the phase has "
@@ -177,7 +173,6 @@ def push_branch(*, repository: str, path: Path, head_branch: str,
 
 def open_pull_request(
     *,
-    origin_kind: str,
     repository: str,
     issue: str,
     task_id: int,
@@ -191,11 +186,6 @@ def open_pull_request(
     ``repository`` and ``issue`` come from the task's binding. Everything a
     caller supplies is content, not reach.
     """
-    if origin_kind != "issue":
-        raise ForgeActionError(
-            "this task does not originate from a forge issue, so there is "
-            "nothing to open a pull request against"
-        )
     if not repository or repository.count("/") != 2:
         raise ForgeActionError("the task's repository is not a canonical locator")
     host, _, name_with_owner = repository.partition("/")

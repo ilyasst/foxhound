@@ -154,7 +154,7 @@ class ExecutionWorker:
         self._renew(service, state)
         return _search_document(result)
 
-    def act_worktree(self) -> dict[str, Any]:
+    def act_worktree(self, *, repository: str | None = None) -> dict[str, Any]:
         """Prepare a working tree for this task's repository.
 
         Available from `execute` onward: the change has to be written before
@@ -172,8 +172,7 @@ class ExecutionWorker:
             )
         try:
             path, branch, base = forge_action.prepare_worktree(
-                origin_kind=origin.kind,
-                repository=origin.record_id,
+                repository=repository or origin.record_id,
                 issue=origin.item_id,
                 parent=self._state_path.parent,
             )
@@ -181,7 +180,7 @@ class ExecutionWorker:
             raise ExecutionWorkerClaimError(str(exc)) from exc
         self._renew(service, state)
         return {
-            "repository": origin.record_id,
+            "repository": repository or origin.record_id,
             "issue": origin.item_id,
             "path": str(path),
             "branch": branch,
@@ -189,7 +188,8 @@ class ExecutionWorker:
         }
 
     def act_pull_request(self, *, head: str, title: str,
-                         body_file: str | None) -> dict[str, Any]:
+                         body_file: str | None,
+                         repository: str | None = None) -> dict[str, Any]:
         """Open a pull request against this task's own origin.
 
         Refused outside `external_action`: the phase IS the approval. A reader
@@ -213,17 +213,18 @@ class ExecutionWorker:
             body = _read_private_text(
                 self._state_path.parent / body_file,
                 maximum=60_000, label="pull request body")
-        worktree = self._state_path.parent / f"repo-{origin.item_id}"
+        target = repository or origin.record_id
+        worktree = (self._state_path.parent
+                    / f"repo-{target.rsplit('/', 1)[-1]}-{origin.item_id}")
         try:
             if worktree.is_dir():
                 # The branch is pushed from the tree this phase prepared, so
                 # what is proposed is what was written here.
                 forge_action.push_branch(
-                    repository=origin.record_id, path=worktree, head_branch=head,
-                    base=forge_action.default_branch(origin.record_id))
+                    repository=target, path=worktree, head_branch=head,
+                    base=forge_action.default_branch(target))
             receipt = forge_action.open_pull_request(
-                origin_kind=origin.kind,
-                repository=origin.record_id,
+                repository=repository or origin.record_id,
                 issue=origin.item_id,
                 task_id=state.task_id,
                 head=head,
@@ -625,12 +626,18 @@ def _parser() -> argparse.ArgumentParser:
     act = subcommands.add_parser(
         "act", help="perform the approved external action for this phase")
     act_kinds = act.add_subparsers(dest="action_kind", required=True)
-    act_kinds.add_parser(
-        "worktree", help="prepare a working tree for this task's repository")
+    worktree = act_kinds.add_parser(
+        "worktree", help="clone a repository to work in (defaults to the task's)")
+    worktree.add_argument(
+        "--repository",
+        help="canonical locator; defaults to the task origin. Real work spans "
+             "repositories.")
     pull_request = act_kinds.add_parser("pull-request")
     pull_request.add_argument("--head", required=True,
                               help="branch holding the proposed change")
     pull_request.add_argument("--title", required=True)
+    pull_request.add_argument(
+        "--repository", help="canonical locator; defaults to the task origin")
     pull_request.add_argument(
         "--body-file",
         help="file beside the run state holding the pull request body")
@@ -655,10 +662,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 max_results_per_layer=args.max_results_per_layer,
             )
         elif args.operation == "act" and args.action_kind == "worktree":
-            result = worker.act_worktree()
+            result = worker.act_worktree(repository=args.repository)
         elif args.operation == "act":
             result = worker.act_pull_request(
-                head=args.head, title=args.title, body_file=args.body_file)
+                head=args.head, title=args.title, body_file=args.body_file,
+                repository=args.repository)
         elif args.operation == "record":
             result = worker.record(args.draft)
         else:
