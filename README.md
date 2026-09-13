@@ -247,6 +247,21 @@ foxhound-scheduler-cutover verify \
 
 The command does not inspect or install the active scheduler. Installing the
 candidate and restoring the rollback artifact remain explicit operator steps.
+After native candidate intake has been activated, capture the then-current
+Stage 1 scheduler and explicitly prepare Stage 2. This mode refuses any
+remaining Stage 1 writer and removes the temporary creation registry exactly
+once:
+
+```sh
+foxhound-scheduler-cutover prepare --stage stage2 \
+  --snapshot /srv/example/private-cutover/scheduler.stage2-current \
+  --candidate /srv/example/private-cutover/scheduler.stage2 \
+  --rollback /srv/example/private-cutover/scheduler.stage2-rollback
+foxhound-scheduler-cutover verify --stage stage2 \
+  --snapshot /srv/example/private-cutover/scheduler.stage2-current \
+  --candidate /srv/example/private-cutover/scheduler.stage2 \
+  --rollback /srv/example/private-cutover/scheduler.stage2-rollback
+```
 
 Newly accepted open tasks can be projected to the reader Start gate with an
 explicit bounded pass:

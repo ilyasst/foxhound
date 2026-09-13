@@ -16,6 +16,7 @@ import stat
 import sys
 import uuid
 from dataclasses import asdict, dataclass
+from enum import StrEnum
 from pathlib import Path
 
 
@@ -24,6 +25,13 @@ MAX_SNAPSHOT_BYTES = 1024 * 1024
 
 class SchedulerCutoverError(RuntimeError):
     """A scheduler snapshot cannot be transformed safely."""
+
+
+class CutoverStage(StrEnum):
+    """The exact authority boundary represented by the input snapshot."""
+
+    STAGE1 = "stage1"
+    STAGE2 = "stage2"
 
 
 @dataclass(frozen=True)
@@ -77,10 +85,11 @@ def prepare_cutover(
     *,
     candidate_path: Path,
     rollback_path: Path,
+    stage: CutoverStage | str = CutoverStage.STAGE1,
 ) -> CutoverReport:
     """Create non-overwriting, owner-only candidate and rollback artifacts."""
     snapshot = _read_private_file(Path(snapshot_path), "scheduler snapshot")
-    candidate, report = _transform(snapshot)
+    candidate, report = _transform(snapshot, _stage(stage))
     candidate_target = Path(candidate_path)
     rollback_target = Path(rollback_path)
     _require_distinct_paths(
@@ -112,12 +121,13 @@ def verify_cutover(
     *,
     candidate_path: Path,
     rollback_path: Path,
+    stage: CutoverStage | str = CutoverStage.STAGE1,
 ) -> CutoverReport:
     """Verify artifacts against the exact current snapshot without mutation."""
     snapshot = _read_private_file(Path(snapshot_path), "scheduler snapshot")
     candidate = _read_private_file(Path(candidate_path), "candidate")
     rollback = _read_private_file(Path(rollback_path), "rollback")
-    expected, report = _transform(snapshot)
+    expected, report = _transform(snapshot, _stage(stage))
     if candidate != expected:
         raise SchedulerCutoverError(
             "candidate differs from the byte-preserving transformation"
@@ -129,7 +139,9 @@ def verify_cutover(
     return report
 
 
-def _transform(snapshot: bytes) -> tuple[bytes, CutoverReport]:
+def _transform(
+    snapshot: bytes, stage: CutoverStage
+) -> tuple[bytes, CutoverReport]:
     if not snapshot:
         raise SchedulerCutoverError("scheduler snapshot is empty")
     if b"\x00" in snapshot:
@@ -147,16 +159,27 @@ def _transform(snapshot: bytes) -> tuple[bytes, CutoverReport]:
             raise SchedulerCutoverError(
                 "scheduler line ambiguously identifies multiple task jobs"
             )
+        registry_match = active and _CREATION_REGISTRY.matches(line)
+        if matches and registry_match:
+            raise SchedulerCutoverError(
+                "scheduler line ambiguously identifies multiple task jobs"
+            )
         if matches:
             counts[matches[0].label] += 1
-            continue
-        retained.append(line)
-        if active and _CREATION_REGISTRY.matches(line):
+        if registry_match:
             registry_count += 1
+        remove = bool(matches) if stage is CutoverStage.STAGE1 else registry_match
+        if not remove:
+            retained.append(line)
 
-    if any(count != 1 for count in counts.values()):
+    if stage is CutoverStage.STAGE1:
+        if any(count != 1 for count in counts.values()):
+            raise SchedulerCutoverError(
+                "each legacy task writer must appear exactly once"
+            )
+    elif any(count != 0 for count in counts.values()):
         raise SchedulerCutoverError(
-            "each legacy task writer must appear exactly once"
+            "legacy task writers must already be absent at Stage 2"
         )
     if registry_count != 1:
         raise SchedulerCutoverError(
@@ -164,12 +187,7 @@ def _transform(snapshot: bytes) -> tuple[bytes, CutoverReport]:
         )
 
     candidate = b"".join(retained)
-    retained_bytes = b"".join(
-        line
-        for line in snapshot.splitlines(keepends=True)
-        if (line.lstrip().startswith(b"#")
-            or not any(job.matches(line) for job in REMOVED_JOBS))
-    )
+    retained_bytes = _retained_bytes(snapshot, stage)
     if candidate != retained_bytes:
         raise SchedulerCutoverError("retained scheduler bytes changed")
     report = CutoverReport(
@@ -180,10 +198,36 @@ def _transform(snapshot: bytes) -> tuple[bytes, CutoverReport]:
         source_bytes=len(snapshot),
         candidate_bytes=len(candidate),
         retained_bytes=len(retained_bytes),
-        removed_jobs=sum(counts.values()),
-        retained_creation_registry=registry_count,
+        removed_jobs=(
+            sum(counts.values())
+            if stage is CutoverStage.STAGE1
+            else registry_count
+        ),
+        retained_creation_registry=(
+            registry_count if stage is CutoverStage.STAGE1 else 0
+        ),
     )
     return candidate, report
+
+
+def _retained_bytes(snapshot: bytes, stage: CutoverStage) -> bytes:
+    retained = []
+    for line in snapshot.splitlines(keepends=True):
+        active = bool(line.strip()) and not line.lstrip().startswith(b"#")
+        if stage is CutoverStage.STAGE1:
+            remove = active and any(job.matches(line) for job in REMOVED_JOBS)
+        else:
+            remove = active and _CREATION_REGISTRY.matches(line)
+        if not remove:
+            retained.append(line)
+    return b"".join(retained)
+
+
+def _stage(value: CutoverStage | str) -> CutoverStage:
+    try:
+        return CutoverStage(value)
+    except (TypeError, ValueError) as exc:
+        raise SchedulerCutoverError("cutover stage is invalid") from exc
 
 
 def _read_private_file(path: Path, description: str) -> bytes:
@@ -294,6 +338,11 @@ def _parser() -> argparse.ArgumentParser:
         child.add_argument("--snapshot", type=Path, required=True)
         child.add_argument("--candidate", type=Path, required=True)
         child.add_argument("--rollback", type=Path, required=True)
+        child.add_argument(
+            "--stage",
+            choices=tuple(stage.value for stage in CutoverStage),
+            default=CutoverStage.STAGE1.value,
+        )
     return parser
 
 
@@ -305,6 +354,7 @@ def main(argv: list[str] | None = None) -> int:
             args.snapshot,
             candidate_path=args.candidate,
             rollback_path=args.rollback,
+            stage=args.stage,
         )
     except SchedulerCutoverError:
         print("scheduler cutover preparation failed", file=sys.stderr)
