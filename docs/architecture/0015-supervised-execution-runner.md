@@ -22,12 +22,19 @@ directory. That output was discarded until a run that produced a complete
 result file, failed to record it, and left nothing behind that could explain
 why. It is as private as the result beside it and never leaves the host.
 
-The agent's fixed prompt names the authority of each phase. Planning cannot
+The agent's instructions name the authority of each phase. Planning cannot
 cause an external effect, execution cannot perform an external action, and
 the external-action phase is usable only after its separate durable reader
 approval. Execution never changes task lifecycle state.
 
-The selected workflow profile now supplies that prompt as well as the Hermes
+Those instructions are not in the argument vector. The launch carries only a
+public bootstrap requiring the first worker `context` call; the instructions of
+the pinned revision are written to an owner-only file in the run directory,
+returned by that call, and removed when supervision ends. Ambient rule, memory,
+and skill injection is disabled so a recorded revision means one thing. See
+[ADR 0028](0028-fenced-instruction-delivery.md).
+
+The selected workflow profile supplies those instructions as well as the Hermes
 tool allowlist, turn limit, timeout, claim lease, heartbeat, and shutdown
 grace. The runner resolves the exact recorded revision from its reviewed
 registry before the claim and has no command-line overrides for those policy

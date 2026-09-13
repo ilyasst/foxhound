@@ -24,13 +24,14 @@ from .agent_profiles import (
     AgentProfile,
     AgentProfileError,
     AgentProfileRegistry,
-    general_profile,
     load_registry,
+    render_bootstrap,
 )
 from .execution_worker import (
     GW_ALIAS_ENV,
     GW_ENDPOINT_ENV,
     GW_TOKEN_FILE_ENV,
+    INSTRUCTIONS_NAME,
     RUN_STATE_SCHEMA,
     RUN_STATE_SCHEMA_VERSION,
     STATE_ENV,
@@ -130,8 +131,9 @@ class ExecutionRunResult:
 
 
 def agent_prompt(worker_command: str = "foxhound-task-worker") -> str:
+    """Return the public bootstrap placed in the agent's arguments."""
     try:
-        return general_profile().render_prompt(worker_command)
+        return render_bootstrap(worker_command)
     except AgentProfileError as exc:
         raise ValueError("execution worker command is invalid") from exc
 
@@ -160,6 +162,7 @@ def hermes_argv(
         str(max_turns),
         "--source",
         "tool",
+        "--ignore-rules",
     ]
     if toolsets:
         if not isinstance(toolsets, str) or "\0" in toolsets:
@@ -174,24 +177,28 @@ def profile_argv(
     *,
     worker_command: str = "foxhound-task-worker",
 ) -> tuple[str, ...]:
-    """Build the exact Hermes invocation for one validated profile."""
+    """Build the exact Hermes invocation for one validated profile.
+
+    The profile's own instructions are not passed here. Process arguments are
+    readable outside this run, so they carry only the public bootstrap; the
+    instructions reach the agent through the fenced worker instead.
+    `--ignore-rules` keeps ambient rule, memory, and skill injection from
+    changing behavior behind an already recorded revision.
+    """
     if not isinstance(profile, AgentProfile) or profile.runtime != "hermes":
         raise ValueError("execution agent profile is invalid")
     base = _agent_command_argv(command)
-    try:
-        prompt = profile.render_prompt(worker_command)
-    except AgentProfileError as exc:
-        raise ValueError("execution worker command is invalid") from exc
     return (
         *base,
         "chat",
         "--quiet",
         "--query",
-        prompt,
+        agent_prompt(worker_command),
         "--max-turns",
         str(profile.max_turns),
         "--source",
         "tool",
+        "--ignore-rules",
         "--toolsets",
         ",".join(profile.toolsets),
     )
@@ -293,7 +300,9 @@ def _run_claim(
     try:
         directory.mkdir(mode=0o700)
         state_path = directory / "run-state.json"
+        instructions_path = directory / INSTRUCTIONS_NAME
         _write_state(state_path, config, claim, profile, run_id)
+        _write_instructions(instructions_path, profile)
     except OSError:
         _fail_claim(service, claim, "startup_failed")
         return ExecutionRunResult("startup_failed", STARTUP_EXIT_CODE, claim.task_id)
@@ -460,6 +469,8 @@ def _run_claim(
             with contextlib.suppress(OSError):
                 transcript.close()
         _scrub_state_receipt(state_path, run_id, claim.task_id)
+        with contextlib.suppress(OSError):
+            instructions_path.unlink(missing_ok=True)
 
 
 def _terminal_result(
@@ -645,6 +656,7 @@ def _write_state(
             None if config.knowledge_root is None
             else str(config.knowledge_root)
         ),
+        "worker_command": config.worker_command,
     }
     payload = (
         json.dumps(
@@ -670,6 +682,36 @@ def _write_state(
                 os.unlink(path)
             except OSError:
                 pass
+            raise
+    finally:
+        os.close(descriptor)
+
+
+def _write_instructions(path: Path, profile: AgentProfile) -> None:
+    """Leave this run's exact instructions where only its worker reads them."""
+    payload = (
+        json.dumps(
+            profile.document(),
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ) + "\n"
+    ).encode("utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        try:
+            with os.fdopen(descriptor, "wb", closefd=False) as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.ftruncate(descriptor, 0)
+            with contextlib.suppress(OSError):
+                os.unlink(path)
             raise
     finally:
         os.close(descriptor)

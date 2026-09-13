@@ -176,10 +176,18 @@ Foxhound provides a one-shot supervised runner for one queued execution phase.
 It claims the durable workflow before starting a disposable agent, renews the
 lease, discards agent stdout and stderr, and maps process startup, exit,
 timeout, interruption, and lease failures into the workflow's retry policy.
-The agent receives no claim capability in its prompt, arguments, output, or
-result draft. It can obtain only the current private work context, bounded GW
-search, durable result recording, and claim release through the narrow
-`foxhound-task-worker` command. Result identity and all task/workflow fencing
+The agent receives no claim capability in its instructions, arguments, output,
+or result draft, and no instructions in its arguments either. Its command line
+carries only a public bootstrap requiring the first `foxhound-task-worker
+context` call; that call returns the instructions of the revision the claim is
+pinned to, from an owner-only file the runner writes into the run directory and
+removes when supervision ends. Hermes is launched with `--ignore-rules`, so
+ambient rule, memory, and skill injection cannot change what a recorded
+revision means, and the agent is told to read each checkout's own contributor
+instructions after a worktree is prepared. It can obtain only the current
+private work context, bounded GW search, durable result recording, and claim
+release through the narrow `foxhound-task-worker` command. See
+[ADR 0028](docs/architecture/0028-fenced-instruction-delivery.md). Result identity and all task/workflow fencing
 are injected from owner-only run state rather than trusted from agent output.
 Before recording, the worker can construct a correctly named draft from fixed
 owner-only summary, work, and optional string-array files beside that run
@@ -262,6 +270,11 @@ therefore changes every active profile, so republish them together:
 foxhound-agent-profile-store --source /srv/example/private-agent-source   publish --all-active
 foxhound-agent-profile-store --source /srv/example/private-agent-source   install --target /srv/example/private-agent-profiles
 ```
+
+Instructions that several agents share, including approved reusable Hermes
+prompt material, belong in the store's shared component rather than in this
+repository or in ambient host configuration: publication composes them into
+each profile, where the effective revision covers them.
 
 `initialize`, `validate`, `list`, `publish`, `disable`, `enable`, `install`,
 `doctor`, `delete`, and `migrate` are the available operations. Only an active

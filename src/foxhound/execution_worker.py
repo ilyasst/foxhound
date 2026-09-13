@@ -32,11 +32,17 @@ from .task_execution import (
     _validated_result,
 )
 from . import forge_action
+from .agent_profiles import (
+    MAX_MANIFEST_BYTES,
+    AgentProfileError,
+    parse_profile,
+)
 from .task_ledger import TaskLedger, TaskLedgerError, TaskStatus
 
 
 RUN_STATE_SCHEMA = "foxhound.execution-run-state"
-RUN_STATE_SCHEMA_VERSION = 2
+RUN_STATE_SCHEMA_VERSION = 3
+INSTRUCTIONS_NAME = "agent-instructions.json"
 WORK_CONTEXT_SCHEMA = "foxhound.execution-work-context"
 WORK_CONTEXT_SCHEMA_VERSION = 2
 WORKER_SEARCH_SCHEMA = "foxhound.execution-worker-search"
@@ -51,11 +57,13 @@ GW_ALIAS_ENV = "FOXHOUND_GW_ALIAS"
 GW_TOKEN_FILE_ENV = "FOXHOUND_GW_TOKEN_FILE"
 
 MAX_STATE_BYTES = 16 * 1024
+MAX_INSTRUCTIONS_BYTES = MAX_MANIFEST_BYTES
 MAX_DRAFT_BYTES = 256 * 1024
 _RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _RESULT_NAME_RE = re.compile(r"^result-([0-9a-f]{32})\.json$")
 _PROFILE_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 _REVISION_RE = re.compile(r"^[0-9a-f]{64}$")
+_WORKER_COMMAND_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _RESULT_INPUTS = (
     "result-summary.txt",
     "result-work.md",
@@ -103,6 +111,7 @@ class ExecutionRunState:
     lease_seconds: int
     agent_profile_id: str
     agent_profile_revision: str
+    worker_command: str
     knowledge_root: str | None = None
 
 
@@ -123,6 +132,7 @@ class ExecutionWorker:
 
     def context(self) -> dict[str, Any]:
         state, service = self._active()
+        instructions = self._instructions(state)
         context = GwKnowledgeClient(self._knowledge_config).execution_context()
         self._renew(service, state)
         task = TaskLedger(state.database_path).get(state.task_id)
@@ -154,6 +164,7 @@ class ExecutionWorker:
                     "item_id": origin.item_id,
                 },
             },
+            "agent": instructions,
             "knowledge": {
                 # The agent reads this directory with its ordinary file
                 # tools. Search finds the fragment; the directory is how it
@@ -178,6 +189,37 @@ class ExecutionWorker:
                 "self_aliases": list(context.self_aliases),
                 "institution_domains": list(context.institution_domains),
             },
+        }
+
+    def _instructions(self, state: ExecutionRunState) -> dict[str, Any]:
+        """Return the instructions of the revision this claim is pinned to.
+
+        The runner leaves the effective manifest beside the run state. Its
+        digest is the revision, so instructions that were substituted, edited,
+        or left over from another profile cannot be presented as this one's.
+        """
+        document = _read_private_json(
+            self._state_path.parent / INSTRUCTIONS_NAME,
+            maximum=MAX_INSTRUCTIONS_BYTES,
+            label="execution instructions",
+        )
+        try:
+            profile = parse_profile(document)
+            if (
+                profile.profile_id != state.agent_profile_id
+                or profile.revision != state.agent_profile_revision
+            ):
+                raise AgentProfileError("agent profile revision is unavailable")
+            rendered = profile.render_prompt(state.worker_command)
+        except AgentProfileError:
+            raise ExecutionWorkerConfigError(
+                "execution instructions are unavailable"
+            ) from None
+        return {
+            "profile_id": profile.profile_id,
+            "revision": profile.revision,
+            "display_name": profile.display_name,
+            "instructions": rendered,
         }
 
     def search(
@@ -452,7 +494,7 @@ def load_run_state(path: str | os.PathLike[str]) -> ExecutionRunState:
             "schema", "schema_version", "run_id", "database_path",
             "task_id", "task_version", "workflow_version", "phase",
             "claim_token", "lease_seconds", "agent_profile_id",
-            "agent_profile_revision", "knowledge_root",
+            "agent_profile_revision", "knowledge_root", "worker_command",
         },
         "execution run state",
     )
@@ -487,11 +529,14 @@ def load_run_state(path: str | os.PathLike[str]) -> ExecutionRunState:
         raise ExecutionWorkerConfigError("execution run state is invalid")
     profile_id = document["agent_profile_id"]
     profile_revision = document["agent_profile_revision"]
+    worker_command = document["worker_command"]
     if (
         not isinstance(profile_id, str)
         or not _PROFILE_ID_RE.fullmatch(profile_id)
         or not isinstance(profile_revision, str)
         or not _REVISION_RE.fullmatch(profile_revision)
+        or not isinstance(worker_command, str)
+        or not _WORKER_COMMAND_RE.fullmatch(worker_command)
     ):
         raise ExecutionWorkerConfigError("execution run state is invalid")
     try:
@@ -511,6 +556,7 @@ def load_run_state(path: str | os.PathLike[str]) -> ExecutionRunState:
         lease_seconds=lease,
         agent_profile_id=profile_id,
         agent_profile_revision=profile_revision,
+        worker_command=worker_command,
         knowledge_root=_knowledge_root(document["knowledge_root"]),
     )
 
