@@ -141,6 +141,27 @@ class NativeIntakeResult:
 
 
 @dataclass(frozen=True)
+class TaskOrigin:
+    """Where a task came from, as identifiers only.
+
+    An execution agent cannot act on a thing it cannot name. A task carries
+    its text and nothing else, so an issue-derived task reads as a sentence
+    with no way back to the issue it describes — and an agent asked to act on
+    it would have to guess the repository from prose.
+
+    Deliberately identifiers, never content: the kind, the record the producer
+    named, and the item within it. For a forge issue that is the repository
+    locator and the issue number, which is exactly enough to address it and
+    nothing more.
+    """
+
+    system: str
+    kind: str
+    record_id: str
+    item_id: str
+
+
+@dataclass(frozen=True)
 class TaskRecord:
     id: int
     status: TaskStatus
@@ -981,6 +1002,31 @@ class TaskLedger:
                 "SELECT * FROM tasks WHERE id=?", (task_id,)
             ).fetchone()
         return None if row is None else _task_record(row)
+
+    def origin(self, task_id: int) -> TaskOrigin | None:
+        """The accepted candidate a task was materialized from, or None.
+
+        None is an ordinary answer: a task may predate candidate binding, or
+        have been created by a path that binds nothing. A caller must treat
+        an absent origin as "not addressable", never as an error.
+        """
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT i.source_system, i.source_kind, i.source_record_id, "
+                "i.source_item_id "
+                "FROM task_candidate_bindings AS b "
+                "JOIN candidate_inbox AS i ON i.candidate_id=b.candidate_id "
+                "WHERE b.task_id=? AND b.relation='accepted'",
+                (task_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return TaskOrigin(
+            system=str(row["source_system"]),
+            kind=str(row["source_kind"]),
+            record_id=str(row["source_record_id"]),
+            item_id=str(row["source_item_id"]),
+        )
 
     def count(self) -> int:
         with closing(self._connect()) as connection:
