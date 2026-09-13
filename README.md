@@ -181,6 +181,10 @@ result draft. It can obtain only the current private work context, bounded GW
 search, durable result recording, and claim release through the narrow
 `foxhound-task-worker` command. Result identity and all task/workflow fencing
 are injected from owner-only run state rather than trusted from agent output.
+Before recording, the worker can construct a correctly named draft from fixed
+owner-only summary, work, and optional string-array files beside that run
+state. Private result content is never passed in command-line arguments, and
+the existing strict hand-authored draft path remains compatible.
 
 The runner neither schedules itself nor advances reader gates. A deployment
 must keep the database, run directory, and knowledge token in approved private

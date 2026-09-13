@@ -125,6 +125,8 @@ class AgentProfileTests(unittest.TestCase):
         prompt = profile.render_prompt("synthetic-worker")
         self.assertIn("Synthetic example only", prompt)
         self.assertIn("synthetic-worker context", prompt)
+        self.assertIn("synthetic-worker draft --outcome OUTCOME", prompt)
+        self.assertIn("synthetic-worker record RESULT_FILE", prompt)
         self.assertNotIn(WORKER_COMMAND_TOKEN, prompt)
 
     def test_revision_is_stable_complete_and_prompt_is_not_public(self):
