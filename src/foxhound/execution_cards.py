@@ -2161,12 +2161,10 @@ def _button_rows(
         rows += (
             (("💬 Discuss", "discuss"), ("🕒 Snooze 24h", "snooze")),
             (("⛔ Cancel workflow", "cancel"),),
-            # Present at every phase, as on the surface this replaces. Drop
-            # says the work should not happen; Reassign says it should
-            # happen to someone else. Offering only Cancel made "not mine"
-            # indistinguishable from "not real", and lost the task for
-            # whoever it actually belonged to.
-            (("👥 Reassign", "reassign"), ("🗑 Drop task", "drop")),
+            # Present at every phase. Cancel stops the agent and leaves the
+            # task open; Drop says the task should not happen at all. A gate
+            # offering only Cancel could not express the second.
+            (("🗑 Drop task", "drop"),),
         )
         return rows if approvable else rows[1:]
     if kind is ExecutionCardKind.EXTERNAL_REVIEW:
@@ -2174,20 +2172,20 @@ def _button_rows(
             (("✅ Authorize action", "approve"), ("⛔ Not now", "revise")),
             (("🕒 Snooze", "snooze"),),
             (("💬 Discuss", "discuss"), ("✅ Mark as done", "done")),
-            (("👥 Reassign", "reassign"), ("🗑 Drop task", "drop")),
+            (("🗑 Drop task", "drop"),),
         )
     elif kind is ExecutionCardKind.RESULT_REVIEW:
         rows = (
             (("✅ Mark as done", "done"),),
             (("💬 Discuss", "discuss"), ("🕒 Snooze", "snooze")),
-            (("👥 Reassign", "reassign"), ("🗑 Drop task", "drop")),
+            (("🗑 Drop task", "drop"),),
         )
     else:
         rows = (
             (("🔎 Investigate further", "revise"), ("💬 Discuss", "discuss")),
             (("▶️ Execute plan", "approve"), ("🕒 Snooze", "snooze")),
             (("✅ Mark as done", "done"),),
-            (("👥 Reassign", "reassign"), ("🗑 Drop task", "drop")),
+            (("🗑 Drop task", "drop"),),
         )
     if approvable:
         return rows
