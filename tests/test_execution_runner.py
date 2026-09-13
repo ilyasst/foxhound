@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -17,6 +18,7 @@ from foxhound.agent_profiles import (
     AgentProfileRegistry,
     WORKER_COMMAND_TOKEN,
     general_profile,
+    load_registry,
     parse_profile,
 )
 from foxhound.candidate_inbox import CandidateInbox
@@ -31,7 +33,7 @@ from foxhound.execution_runner import (
     profile_argv,
     run_once,
 )
-from foxhound.execution_worker import load_run_state
+from foxhound.execution_worker import INSTRUCTIONS_NAME, load_run_state
 from foxhound.task_execution import (
     ExecutionOutcome,
     ExecutionResultEnvelope,
@@ -295,6 +297,14 @@ class ExecutionRunnerTests(unittest.TestCase):
                 Path(kwargs["env"]["FOXHOUND_EXECUTION_STATE"])
             )
             launched["state"] = state
+            instructions = Path(kwargs["cwd"]) / INSTRUCTIONS_NAME
+            launched["instructions"] = json.loads(
+                instructions.read_text(encoding="utf-8")
+            )
+            launched["instructions_mode"] = stat.S_IMODE(
+                instructions.lstat().st_mode
+            )
+            launched["instructions_path"] = instructions
 
             def release():
                 TaskExecutionService(state.database_path).release(
@@ -317,9 +327,15 @@ class ExecutionRunnerTests(unittest.TestCase):
             tuple(launched["argv"]),
             profile_argv("synthetic-agent run", specialist),
         )
-        self.assertIn(
-            "Synthetic role",
-            launched["argv"][launched["argv"].index("--query") + 1],
+        # The instructions belong to this run, not to its arguments: another
+        # user reading the process table learns the profile's limits, never
+        # its role.
+        self.assertNotIn("Synthetic role", json.dumps(launched["argv"]))
+        self.assertEqual(launched["instructions"], specialist.document())
+        self.assertEqual(launched["instructions_mode"], 0o600)
+        self.assertFalse(launched["instructions_path"].exists())
+        self.assertEqual(
+            launched["state"].worker_command, "foxhound-task-worker"
         )
         self.assertIn("50", launched["argv"])
         self.assertIn("terminal,file", launched["argv"])
@@ -330,15 +346,15 @@ class ExecutionRunnerTests(unittest.TestCase):
         )
 
     def test_runner_honors_a_pinned_historical_general_policy(self):
+        registry = load_registry()
         current = general_profile()
-        historical_document = current.document()
-        historical_document.update({
-            "max_turns": 12,
-            "timeout_seconds": 240,
-            "claim_lease_seconds": 900,
-            "kill_grace_seconds": 10,
-        })
-        historical = parse_profile(historical_document)
+        historical = next(
+            profile
+            for _, revision in registry.revisions()
+            if revision != current.revision
+            and (profile := registry.resolve("general", revision)).max_turns
+            == 12
+        )
         old_service = TaskExecutionService(
             self.database,
             profile_registry=AgentProfileRegistry((historical,)),
@@ -588,19 +604,25 @@ class ExecutionRunnerTests(unittest.TestCase):
         self.assertNotIn("primary", rendered)
 
     def test_public_agent_prompt_and_argv_have_no_task_or_capability(self):
-        prompt = agent_prompt()
+        bootstrap = agent_prompt()
         argv = hermes_argv("hermes", max_turns=12, toolsets="terminal")
         rendered = json.dumps(argv)
-        self.assertIn("foxhound-task-worker context", prompt)
-        self.assertIn(
+        instructions = general_profile().render_prompt("foxhound-task-worker")
+        self.assertIn("foxhound-task-worker context", bootstrap)
+        self.assertIn("--ignore-rules", argv)
+        # The bootstrap says how to ask for the instructions. It is not a
+        # short copy of them: process arguments are readable outside the run.
+        self.assertLess(len(bootstrap), len(instructions) // 2)
+        self.assertNotIn(bootstrap, rendered.replace(json.dumps(bootstrap), ""))
+        for sentence in (
             "`summary` and `work_markdown` must each be one JSON string",
-            prompt,
-        )
-        self.assertIn(
             "`questions`, `external_actions`, and `deliverables` must each "
             "be a JSON array of strings",
-            prompt,
-        )
+        ):
+            with self.subTest(sentence=sentence[:32]):
+                self.assertIn(sentence, instructions)
+                self.assertNotIn(sentence, bootstrap)
+        prompt = instructions
         example = prompt.split("Shape example: ", 1)[1].splitlines()[0]
         draft = json.loads(example)
         self.assertIsInstance(draft["summary"], str)
@@ -619,28 +641,32 @@ class ExecutionRunnerTests(unittest.TestCase):
             / "example-coder.json"
         )
         profile = parse_profile(json.loads(path.read_text(encoding="utf-8")))
-        prompt = profile.render_prompt("synthetic-worker")
+        argv = profile_argv(
+            "synthetic-hermes --local",
+            profile,
+            worker_command="synthetic-worker",
+        )
 
         self.assertEqual(
-            profile_argv(
-                "synthetic-hermes --local",
-                profile,
-                worker_command="synthetic-worker",
-            ),
+            argv,
             (
                 "synthetic-hermes",
                 "--local",
                 "chat",
                 "--quiet",
                 "--query",
-                prompt,
+                agent_prompt("synthetic-worker"),
                 "--max-turns",
                 "50",
                 "--source",
                 "tool",
+                "--ignore-rules",
                 "--toolsets",
                 "terminal,file,web,vision",
             ),
+        )
+        self.assertNotIn(
+            profile.render_prompt("synthetic-worker"), json.dumps(argv)
         )
         for phase in WorkflowPhase:
             with self.subTest(phase=phase):

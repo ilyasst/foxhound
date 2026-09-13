@@ -27,9 +27,12 @@ from foxhound.agent_profiles import (
 
 
 EXPECTED_GENERAL_PROMPT_SHA256 = (
-    "9db37521f682499a999039fe3580c9c004c0b16378ed57758a8eaa6dd4adb9bb"
+    "05fd19d75ce8263c1fc4d884bc34cce0472953366927b3a2eb405d90479ff563"
 )
 EXPECTED_GENERAL_REVISION = (
+    "1143d16a81afd8ad52240ca92c6a66ac8d9e95d822b807bba53bdb8385629523"
+)
+SUPERSEDED_GENERAL_REVISION = (
     "5d841390306c6e53c452c00d6dab624378c58cd2f36b3228f66929fc9061a6b9"
 )
 LEGACY_GENERAL_REVISION = (
@@ -143,18 +146,31 @@ class AgentProfileTests(unittest.TestCase):
         with self.assertRaises(AgentProfileError):
             profile.render_prompt("worker; command")
 
-    def test_legacy_general_revision_is_resolution_only(self):
+    def test_superseded_general_revisions_are_resolution_only(self):
         registry = load_registry()
         current = general_profile()
 
         self.assertEqual(registry.list(), (current,))
         self.assertEqual(registry.get("general"), current)
-        legacy = registry.resolve("general", LEGACY_GENERAL_REVISION)
-        self.assertEqual(legacy.revision, LEGACY_GENERAL_REVISION)
-        with self.assertRaises(AgentProfileError):
-            registry.resolve_current("general", LEGACY_GENERAL_REVISION)
         self.assertEqual(
             registry.resolve_current("general", current.revision), current
+        )
+        legacy = registry.resolve("general", LEGACY_GENERAL_REVISION)
+        superseded = registry.resolve("general", SUPERSEDED_GENERAL_REVISION)
+
+        for retained in (legacy, superseded):
+            with self.subTest(revision=retained.revision):
+                with self.assertRaises(AgentProfileError):
+                    registry.resolve_current("general", retained.revision)
+                self.assertEqual(retained.toolsets, current.toolsets)
+                # A retained revision keeps the prompt it was published with.
+                # Rebuilding it from the current text would change its digest
+                # and strand the workflows pinned to it.
+                self.assertNotEqual(
+                    retained.prompt_template, current.prompt_template
+                )
+        self.assertEqual(
+            legacy.prompt_template, superseded.prompt_template
         )
         self.assertEqual(
             (
@@ -166,8 +182,10 @@ class AgentProfileTests(unittest.TestCase):
             ),
             (12, 240, 900, 60, 10),
         )
-        self.assertEqual(legacy.prompt_template, current.prompt_template)
-        self.assertEqual(legacy.toolsets, current.toolsets)
+        self.assertEqual(
+            (superseded.max_turns, superseded.timeout_seconds),
+            (50, 1_800),
+        )
         self.assertEqual(legacy.allowed_phases, current.allowed_phases)
 
     def test_public_coder_example_is_synthetic_and_structurally_valid(self):

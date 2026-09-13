@@ -113,9 +113,9 @@ class TaskOriginRead(unittest.TestCase):
 
 class WorkerContextGuidance(unittest.TestCase):
     def test_the_agent_is_told_to_act_only_on_the_named_target(self) -> None:
-        from foxhound.execution_runner import agent_prompt
+        from foxhound.agent_profiles import general_profile
 
-        prompt = agent_prompt()
+        prompt = general_profile().render_prompt("foxhound-task-worker")
         self.assertIn("task.origin", prompt)
         # The origin tells the agent where to START. It is not a restriction
         # on what may be read: real work spans repositories, and an agent that

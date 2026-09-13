@@ -17,8 +17,10 @@ from pathlib import Path
 from typing import Iterator
 from unittest import mock
 
+from foxhound.agent_profiles import general_profile
 from foxhound.candidate_inbox import CandidateInbox
 from foxhound.execution_worker import (
+    INSTRUCTIONS_NAME,
     ExecutionWorker,
     ExecutionWorkerConfigError,
     ExecutionWorkerDraftError,
@@ -33,6 +35,7 @@ TOKEN = "synthetic-knowledge-token-with-sufficient-length"
 CLAIM_TOKEN = "synthetic-claim-token-000000000000000000000000"
 RUN_ID = "a" * 32
 RESULT_ID = "b" * 32
+WORKER_COMMAND = "foxhound-task-worker"
 
 
 @contextmanager
@@ -143,11 +146,12 @@ class ExecutionWorkerTests(unittest.TestCase):
         self.run_directory.mkdir(mode=0o700)
         self.state_path = self.run_directory / "run-state.json"
         self._write_state()
+        self._write_instructions()
 
     def _write_state(self) -> None:
         self.state_path.write_text(json.dumps({
             "schema": "foxhound.execution-run-state",
-            "schema_version": 2,
+            "schema_version": 3,
             "run_id": RUN_ID,
             "database_path": str(self.database),
             "task_id": 1,
@@ -159,8 +163,17 @@ class ExecutionWorkerTests(unittest.TestCase):
             "agent_profile_id": self.claim.agent_profile_id,
             "agent_profile_revision": self.claim.agent_profile_revision,
             "knowledge_root": str(self.knowledge_root),
+            "worker_command": WORKER_COMMAND,
         }), encoding="utf-8")
         self.state_path.chmod(0o600)
+
+    def _write_instructions(self, document: object | None = None) -> Path:
+        path = self.run_directory / INSTRUCTIONS_NAME
+        if document is None:
+            document = general_profile().document()
+        path.write_text(json.dumps(document), encoding="utf-8")
+        path.chmod(0o600)
+        return path
 
     def _worker(self, endpoint: str) -> ExecutionWorker:
         return ExecutionWorker(self.state_path, KnowledgeClientConfig(
@@ -224,6 +237,53 @@ class ExecutionWorkerTests(unittest.TestCase):
         self.assertEqual(result["layers"][0]["documents"][0]["excerpt"],
                          "Synthetic evidence.")
         self.assertNotIn(CLAIM_TOKEN, repr(load_run_state(self.state_path)))
+
+    def test_instructions_come_from_the_pinned_revision_or_not_at_all(self):
+        """The launch arguments say how to ask for instructions, not what
+        they are. What comes back must be the revision the claim already
+        recorded, so a bundle that was substituted, edited, or left behind by
+        another profile cannot quietly become this run's policy."""
+        with knowledge_server() as endpoint:
+            context = self._worker(endpoint).context()
+
+            self.assertEqual(
+                context["agent"]["revision"],
+                self.claim.agent_profile_revision,
+            )
+            self.assertEqual(
+                context["agent"]["profile_id"], self.claim.agent_profile_id
+            )
+            self.assertEqual(
+                context["agent"]["instructions"],
+                general_profile().render_prompt(WORKER_COMMAND),
+            )
+            self.assertNotIn(
+                "{{FOXHOUND_WORKER_COMMAND}}",
+                context["agent"]["instructions"],
+            )
+
+            edited = general_profile().document()
+            edited["max_turns"] = 12
+            foreign = general_profile().document()
+            foreign["profile_id"] = "other-agent"
+            for case, document in (
+                ("edited", edited),
+                ("foreign", foreign),
+                ("unparseable", {"schema": "foxhound.agent-profile"}),
+            ):
+                with self.subTest(case=case):
+                    self._write_instructions(document)
+                    with self.assertRaises(ExecutionWorkerConfigError):
+                        self._worker(endpoint).context()
+
+            (self.run_directory / INSTRUCTIONS_NAME).unlink()
+            with self.assertRaises(ExecutionWorkerConfigError):
+                self._worker(endpoint).context()
+
+            self._write_instructions()
+            (self.run_directory / INSTRUCTIONS_NAME).chmod(0o644)
+            with self.assertRaises(ExecutionWorkerConfigError):
+                self._worker(endpoint).context()
 
     def test_a_refused_result_says_why_it_was_refused(self):
         """An agent told only "refused" cannot tell a fixable state from a

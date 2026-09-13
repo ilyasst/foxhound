@@ -40,11 +40,13 @@ only IDs, revisions, availability, and counts.
 The supervised runner loads the reviewed registry. Its atomic claim operation
 resolves the recorded evidence before changing durable state, and the runner
 constructs the Hermes invocation from that resolved profile. The profile is
-the sole source of prompt, tool families, turn limit, internal timeout, claim
-lease, heartbeat, and shutdown grace. The runtime command and private profile
-directory remain deployment inputs; task content cannot set either. The
-worker's owner-only run state carries profile evidence and the profile-derived
-lease, but no prompt.
+the sole source of instructions, tool families, turn limit, internal timeout,
+claim lease, heartbeat, and shutdown grace. Only the policy fields reach the
+invocation: the instructions are delivered through the fenced worker instead,
+as [ADR 0028](0028-fenced-instruction-delivery.md) describes. The runtime
+command and private profile directory remain deployment inputs; task content
+cannot set either. The worker's owner-only run state carries profile evidence,
+the profile-derived lease, and the worker command, but no instructions.
 
 ## Consequences
 

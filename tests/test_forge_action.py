@@ -218,10 +218,15 @@ class PushIsBounded(unittest.TestCase):
 
 
 class AgentGuidance(unittest.TestCase):
-    def test_the_agent_is_pointed_at_the_bounded_action(self) -> None:
-        from foxhound.execution_runner import agent_prompt
+    """The agent reads these through the fenced worker, not its arguments."""
 
-        prompt = agent_prompt()
+    def _instructions(self, worker_command: str = "foxhound-task-worker"):
+        from foxhound.agent_profiles import general_profile
+
+        return general_profile().render_prompt(worker_command)
+
+    def test_the_agent_is_pointed_at_the_bounded_action(self) -> None:
+        prompt = self._instructions()
         self.assertIn("act pull-request", prompt)
         self.assertIn("act worktree", prompt)
         # The bound that matters is the EFFECT and its phase, which is the
@@ -231,9 +236,7 @@ class AgentGuidance(unittest.TestCase):
         self.assertIn("Do not overwrite unrelated dirty worktrees", prompt)
 
     def test_the_origin_is_a_lead_not_a_limit(self) -> None:
-        from foxhound.execution_runner import agent_prompt
-
-        prompt = agent_prompt()
+        prompt = self._instructions()
         self.assertIn("not a limit on what you may read", prompt)
         # A task may legitimately need more than one repository.
         self.assertIn("span several repositories", prompt)
@@ -241,9 +244,12 @@ class AgentGuidance(unittest.TestCase):
     def test_the_worker_command_is_substituted(self) -> None:
         from foxhound.execution_runner import agent_prompt
 
-        prompt = agent_prompt("other-worker")
+        prompt = self._instructions("other-worker")
         self.assertIn("other-worker act pull-request", prompt)
         self.assertNotIn("{worker", prompt)
+        bootstrap = agent_prompt("other-worker")
+        self.assertIn("other-worker context", bootstrap)
+        self.assertNotIn("{worker", bootstrap)
 
 
 if __name__ == "__main__":
