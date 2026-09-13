@@ -273,7 +273,12 @@ class TaskExecutionService:
                     "AND w.task_id IS NULL"
                 ).fetchone()[0])
                 rows = connection.execute(
-                    "SELECT t.id,t.version FROM tasks AS t "
+                    "SELECT t.id,t.version,("
+                    " SELECT o.source_kind FROM task_candidate_bindings AS b "
+                    " JOIN candidate_inbox AS o "
+                    " ON o.candidate_id=b.candidate_id "
+                    " WHERE b.task_id=t.id AND b.relation='accepted'"
+                    ") AS origin_kind FROM tasks AS t "
                     "LEFT JOIN task_execution_workflows AS w "
                     "ON w.task_id=t.id WHERE t.status='open' "
                     "AND w.task_id IS NULL ORDER BY t.id LIMIT ?",
@@ -282,14 +287,15 @@ class TaskExecutionService:
                 for row in rows:
                     task_id = int(row["id"])
                     task_version = int(row["version"])
+                    status = _initial_status(row["origin_kind"])
                     connection.execute(
                         "INSERT INTO task_execution_workflows("
                         "task_id,task_version,status,phase,version,due_at,"
                         "failure_count,created_at,updated_at,agent_profile_id,"
                         "agent_profile_revision) "
-                        "VALUES(?,?,'awaiting_start','plan',1,NULL,0,?,?,?,?)",
+                        "VALUES(?,?,?,'plan',1,NULL,0,?,?,?,?)",
                         (
-                            task_id, task_version, now, now,
+                            task_id, task_version, status.value, now, now,
                             self._default_profile.profile_id,
                             self._default_profile.revision,
                         ),
@@ -301,7 +307,7 @@ class TaskExecutionService:
                         1,
                         task_version,
                         WorkflowPhase.PLAN,
-                        WorkflowStatus.AWAITING_START,
+                        status,
                         now,
                     )
                 connection.commit()
@@ -1694,6 +1700,29 @@ def _validated_result(envelope: ExecutionResultEnvelope) -> dict[str, object]:
         "deliverables_json": _canonical_json(deliverables),
         "claim_token": envelope.claim_token,
     }
+
+
+#: An origin that already carries the reader's permission to spend a
+#: planning pass on it.
+PRE_AUTHORIZED_ORIGINS = frozenset({"issue"})
+
+
+def _initial_status(origin_kind: object) -> WorkflowStatus:
+    """Whether this task needs to be asked about before it is planned.
+
+    A gate exists so no agent time is spent on a task the reader never
+    wanted. That question is already answered for an issue from a
+    repository they enrolled: enrolling it was the permission, and the
+    gate then asks again about every issue in it, using a card that can
+    only name the issue's title because nothing has looked at it yet.
+
+    Planning is read-only and produces no external effect, so going
+    straight to it costs one agent pass and yields a card that can
+    actually be judged. Everything after the plan is still gated.
+    """
+    if isinstance(origin_kind, str) and origin_kind in PRE_AUTHORIZED_ORIGINS:
+        return WorkflowStatus.QUEUED
+    return WorkflowStatus.AWAITING_START
 
 
 def _bounded_text(
