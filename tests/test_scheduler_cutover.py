@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 from foxhound.scheduler_cutover import (
+    CutoverStage,
     SchedulerCutoverError,
     prepare_cutover,
     verify_cutover,
@@ -76,6 +77,64 @@ class SchedulerCutoverTests(unittest.TestCase):
             ),
             report,
         )
+
+    def test_stage_two_removes_only_the_creation_registry(self) -> None:
+        stage_one = RETAINED_PREFIX + RETAINED_SUFFIX
+        self._write_snapshot(stage_one)
+        report = prepare_cutover(
+            self.snapshot,
+            candidate_path=self.candidate,
+            rollback_path=self.rollback,
+            stage=CutoverStage.STAGE2,
+        )
+        registry = (
+            b"23 * * * * python -m gw.task_registry "
+            b"--persona demo --apply\r\n"
+        )
+        expected = stage_one.replace(registry, b"")
+        self.assertEqual(self.candidate.read_bytes(), expected)
+        self.assertEqual(self.rollback.read_bytes(), stage_one)
+        self.assertEqual(report.removed_jobs, 1)
+        self.assertEqual(report.retained_creation_registry, 0)
+        self.assertEqual(report.candidate_sha256, report.retained_sha256)
+        self.assertEqual(
+            verify_cutover(
+                self.snapshot,
+                candidate_path=self.candidate,
+                rollback_path=self.rollback,
+                stage="stage2",
+            ),
+            report,
+        )
+
+    def test_stage_two_refuses_wrong_boundary_or_registry_count(self) -> None:
+        stage_one = RETAINED_PREFIX + RETAINED_SUFFIX
+        cases = (
+            self.payload,
+            stage_one.replace(
+                b"23 * * * * python -m gw.task_registry "
+                b"--persona demo --apply\r\n",
+                b"",
+            ),
+            stage_one + b"\n" + (
+                b"24 * * * * python -m gw.task_registry "
+                b"--persona demo --apply\n"
+            ),
+        )
+        for payload in cases:
+            with self.subTest(payload_size=len(payload)):
+                self.candidate.unlink(missing_ok=True)
+                self.rollback.unlink(missing_ok=True)
+                self._write_snapshot(payload)
+                with self.assertRaises(SchedulerCutoverError):
+                    prepare_cutover(
+                        self.snapshot,
+                        candidate_path=self.candidate,
+                        rollback_path=self.rollback,
+                        stage=CutoverStage.STAGE2,
+                    )
+                self.assertFalse(self.candidate.exists())
+                self.assertFalse(self.rollback.exists())
 
     def test_missing_duplicate_and_ambiguous_jobs_fail_closed(self) -> None:
         cases = (
@@ -164,6 +223,8 @@ class SchedulerCutoverTests(unittest.TestCase):
                 "-m",
                 "foxhound.scheduler_cutover",
                 "prepare",
+                "--stage",
+                "stage1",
                 "--snapshot",
                 str(self.snapshot),
                 "--candidate",
