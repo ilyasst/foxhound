@@ -29,6 +29,7 @@ from .task_execution import (
     WorkflowDisposition,
     WorkflowPhase,
     WorkflowStatus,
+    _validated_result,
 )
 from . import forge_action
 from .task_ledger import TaskLedger, TaskLedgerError, TaskStatus
@@ -40,6 +41,7 @@ WORK_CONTEXT_SCHEMA = "foxhound.execution-work-context"
 WORK_CONTEXT_SCHEMA_VERSION = 2
 WORKER_SEARCH_SCHEMA = "foxhound.execution-worker-search"
 RESULT_DRAFT_SCHEMA = "foxhound.execution-result-draft"
+RESULT_DRAFT_READY_SCHEMA = "foxhound.execution-result-draft-ready"
 RESULT_RECEIPT_SCHEMA = "foxhound.execution-result-receipt"
 WORKER_SCHEMA_VERSION = 1
 
@@ -54,6 +56,13 @@ _RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _RESULT_NAME_RE = re.compile(r"^result-([0-9a-f]{32})\.json$")
 _PROFILE_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 _REVISION_RE = re.compile(r"^[0-9a-f]{64}$")
+_RESULT_INPUTS = (
+    "result-summary.txt",
+    "result-work.md",
+    "result-questions.json",
+    "result-external-actions.json",
+    "result-deliverables.json",
+)
 
 
 class ExecutionWorkerError(RuntimeError):
@@ -87,7 +96,7 @@ class ExecutionRunState:
 
 
 class ExecutionWorker:
-    """Four operations available to a disposable task agent."""
+    """Narrow operations available to a disposable task agent."""
 
     def __init__(
         self,
@@ -288,11 +297,74 @@ class ExecutionWorker:
         }
         try:
             _replace_private_json(draft_path, receipt)
+            _remove_result_inputs(self._state_path.parent)
         except (OSError, ExecutionWorkerError):
             # The durable database result is authoritative. A private draft
             # left behind is safer than reporting a false execution failure.
             pass
         return receipt
+
+    def draft(self, *, outcome: str) -> dict[str, Any]:
+        """Build one schema-valid draft without exposing result text in argv."""
+        state, service = self._active()
+        run_directory = self._state_path.parent
+        result_id = state.run_id
+        envelope = ExecutionResultEnvelope(
+            result_id=result_id,
+            task_id=state.task_id,
+            task_version=state.task_version,
+            workflow_version=state.workflow_version,
+            phase=state.phase.value,
+            claim_token=state.claim_token,
+            outcome=outcome,
+            summary=_read_result_text(
+                run_directory / "result-summary.txt",
+                label="execution result summary",
+            ),
+            work_markdown=_read_result_text(
+                run_directory / "result-work.md",
+                label="execution result work",
+            ),
+            questions=_read_optional_string_array(
+                run_directory / "result-questions.json",
+                label="execution result questions",
+            ),
+            external_actions=_read_optional_string_array(
+                run_directory / "result-external-actions.json",
+                label="execution result external actions",
+            ),
+            deliverables=_read_optional_string_array(
+                run_directory / "result-deliverables.json",
+                label="execution result deliverables",
+            ),
+        )
+        try:
+            validated = _validated_result(envelope)
+        except (TypeError, ValueError):
+            raise ExecutionWorkerDraftError(
+                "execution result inputs are invalid"
+            ) from None
+        self._renew(service, state)
+        draft_name = f"result-{result_id}.json"
+        _write_new_private_json(
+            run_directory / draft_name,
+            {
+                "schema": RESULT_DRAFT_SCHEMA,
+                "schema_version": WORKER_SCHEMA_VERSION,
+                "result_id": result_id,
+                "outcome": validated["outcome"],
+                "summary": validated["summary"],
+                "work_markdown": validated["work_markdown"],
+                "questions": list(validated["questions"]),
+                "external_actions": list(validated["external_actions"]),
+                "deliverables": list(validated["deliverables"]),
+            },
+        )
+        return {
+            "schema": RESULT_DRAFT_READY_SCHEMA,
+            "schema_version": WORKER_SCHEMA_VERSION,
+            "draft": draft_name,
+        }
 
     def release(self) -> dict[str, Any]:
         state = load_run_state(self._state_path)
@@ -515,6 +587,42 @@ def _read_private_json(
     return value
 
 
+def _read_result_text(path: Path, *, label: str) -> str:
+    try:
+        value = _read_private_text(path, maximum=MAX_DRAFT_BYTES, label=label)
+    except ExecutionWorkerConfigError as exc:
+        raise ExecutionWorkerDraftError(f"{label} is invalid") from exc
+    if value.endswith("\n"):
+        value = value[:-1]
+        if value.endswith("\r"):
+            value = value[:-1]
+    return value
+
+
+def _read_optional_string_array(path: Path, *, label: str) -> list[str]:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise ExecutionWorkerDraftError(f"{label} is unavailable") from exc
+    try:
+        raw = _read_private_bytes(path, maximum=MAX_DRAFT_BYTES, label=label)
+        value = json.loads(raw, object_pairs_hook=_strict_object)
+    except (
+        ExecutionWorkerConfigError,
+        UnicodeDecodeError,
+        ValueError,
+        TypeError,
+    ) as exc:
+        raise ExecutionWorkerDraftError(f"{label} is invalid") from exc
+    if not isinstance(value, list) or any(
+        not isinstance(item, str) for item in value
+    ):
+        raise ExecutionWorkerDraftError(f"{label} is invalid")
+    return value
+
+
 def _read_private_text(path: Path, *, maximum: int, label: str) -> str:
     raw = _read_private_bytes(path, maximum=maximum, label=label)
     try:
@@ -608,6 +716,49 @@ def _replace_private_json(path: Path, document: dict[str, Any]) -> None:
         os.close(descriptor)
 
 
+def _write_new_private_json(path: Path, document: dict[str, Any]) -> None:
+    payload = (
+        json.dumps(
+            document, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+        ) + "\n"
+    ).encode("utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError:
+        raise ExecutionWorkerDraftError(
+            "execution result draft is unavailable"
+        ) from None
+    try:
+        try:
+            with os.fdopen(descriptor, "wb", closefd=False) as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except BaseException:
+            try:
+                os.ftruncate(descriptor, 0)
+            except OSError:
+                pass
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise
+    finally:
+        os.close(descriptor)
+
+
+def _remove_result_inputs(run_directory: Path) -> None:
+    for name in _RESULT_INPUTS:
+        try:
+            (run_directory / name).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _exact_fields(
     value: Mapping[str, Any],
     fields: set[str],
@@ -663,6 +814,12 @@ def _parser() -> argparse.ArgumentParser:
         help="file beside the run state holding the pull request body")
     record = subcommands.add_parser("record")
     record.add_argument("draft")
+    draft = subcommands.add_parser(
+        "draft", help="build a validated draft from private result inputs"
+    )
+    draft.add_argument(
+        "--outcome", required=True, help="result outcome for the current phase"
+    )
     subcommands.add_parser("release")
     return parser
 
@@ -687,6 +844,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = worker.act_pull_request(
                 head=args.head, title=args.title, body_file=args.body_file,
                 repository=args.repository)
+        elif args.operation == "draft":
+            result = worker.draft(outcome=args.outcome)
         elif args.operation == "record":
             result = worker.record(args.draft)
         else:

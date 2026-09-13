@@ -182,6 +182,21 @@ class ExecutionWorkerTests(unittest.TestCase):
         path.chmod(0o600)
         return path
 
+    def _write_result_input(self, name: str, value: object) -> Path:
+        path = self.run_directory / name
+        content = value if isinstance(value, str) else json.dumps(value)
+        path.write_text(content, encoding="utf-8")
+        path.chmod(0o600)
+        return path
+
+    def _write_result_inputs(self) -> None:
+        self._write_result_input(
+            "result-summary.txt", "Synthetic result summary\n"
+        )
+        self._write_result_input(
+            "result-work.md", "# Synthetic work\n\nNo private evidence.\n"
+        )
+
     def test_context_and_search_are_bounded_and_hide_the_capability(self):
         with knowledge_server() as endpoint:
             worker = self._worker(endpoint)
@@ -220,6 +235,108 @@ class ExecutionWorkerTests(unittest.TestCase):
         self.assertNotIn(CLAIM_TOKEN, scrubbed)
         self.assertNotIn("Synthetic result summary", scrubbed)
         self.assertNotIn("work_markdown", scrubbed)
+
+    def test_draft_builds_private_schema_and_record_accepts_it(self):
+        self._write_result_inputs()
+        self._write_result_input(
+            "result-questions.json", ["Should Example A proceed?"]
+        )
+        self._write_result_input(
+            "result-external-actions.json", ["Prepare a synthetic draft."]
+        )
+        self._write_result_input(
+            "result-deliverables.json", ["Synthetic deliverable"]
+        )
+        with knowledge_server() as endpoint:
+            worker = self._worker(endpoint)
+            ready = worker.draft(outcome="awaiting_plan")
+
+            self.assertEqual(ready, {
+                "schema": "foxhound.execution-result-draft-ready",
+                "schema_version": 1,
+                "draft": f"result-{RUN_ID}.json",
+            })
+            draft = self.run_directory / ready["draft"]
+            self.assertEqual(draft.stat().st_mode & 0o777, 0o600)
+            document = json.loads(draft.read_text(encoding="utf-8"))
+            self.assertEqual(document, {
+                "schema": "foxhound.execution-result-draft",
+                "schema_version": 1,
+                "result_id": RUN_ID,
+                "outcome": "awaiting_plan",
+                "summary": "Synthetic result summary",
+                "work_markdown": "# Synthetic work\n\nNo private evidence.",
+                "questions": ["Should Example A proceed?"],
+                "external_actions": ["Prepare a synthetic draft."],
+                "deliverables": ["Synthetic deliverable"],
+            })
+            self.assertNotIn(CLAIM_TOKEN, draft.read_text(encoding="utf-8"))
+            with self.assertRaises(ExecutionWorkerDraftError):
+                worker.draft(outcome="awaiting_plan")
+            receipt = worker.record(draft.name)
+
+        self.assertEqual(receipt["status"], "awaiting_review")
+        for name in (
+            "result-summary.txt",
+            "result-work.md",
+            "result-questions.json",
+            "result-external-actions.json",
+            "result-deliverables.json",
+        ):
+            self.assertFalse((self.run_directory / name).exists())
+
+    def test_draft_rejects_invalid_inputs_before_writing(self):
+        self._write_result_inputs()
+        with knowledge_server() as endpoint:
+            worker = self._worker(endpoint)
+            with self.assertRaises(ExecutionWorkerDraftError):
+                worker.draft(outcome="awaiting_external")
+            self.assertEqual(list(self.run_directory.glob("result-*.json")), [])
+
+            questions = self._write_result_input(
+                "result-questions.json", [{"text": "not a string"}]
+            )
+            with self.assertRaises(ExecutionWorkerDraftError):
+                worker.draft(outcome="awaiting_plan")
+            questions.unlink()
+
+            summary = self.run_directory / "result-summary.txt"
+            summary.chmod(0o644)
+            with self.assertRaises(ExecutionWorkerDraftError):
+                worker.draft(outcome="awaiting_plan")
+            summary.chmod(0o600)
+            summary.unlink()
+            summary.symlink_to(self.run_directory / "result-work.md")
+            with self.assertRaises(ExecutionWorkerDraftError):
+                worker.draft(outcome="awaiting_plan")
+
+        self.assertEqual(list(self.run_directory.glob("result-*.json")), [])
+
+    def test_draft_defaults_missing_collection_files_to_empty_arrays(self):
+        self._write_result_inputs()
+        with knowledge_server() as endpoint:
+            ready = self._worker(endpoint).draft(outcome="awaiting_plan")
+        document = json.loads(
+            (self.run_directory / ready["draft"]).read_text(encoding="utf-8")
+        )
+        for name in ("questions", "external_actions", "deliverables"):
+            self.assertEqual(document[name], [])
+
+    def test_draft_cli_errors_are_content_free(self):
+        private_value = "synthetic-private-outcome-value"
+        self._write_result_inputs()
+        output = StringIO()
+        errors = StringIO()
+        with knowledge_server() as endpoint:
+            with redirect_stdout(output), redirect_stderr(errors):
+                with mock.patch(
+                    "foxhound.execution_worker.load_worker_from_environment",
+                    return_value=self._worker(endpoint),
+                ):
+                    code = main(["draft", "--outcome", private_value])
+        self.assertEqual(code, 65)
+        self.assertEqual(output.getvalue(), "")
+        self.assertNotIn(private_value, errors.getvalue())
 
     def test_invalid_or_permissive_drafts_write_nothing(self):
         draft = self._write_draft(claim_token=CLAIM_TOKEN)
