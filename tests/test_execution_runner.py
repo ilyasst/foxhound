@@ -513,6 +513,41 @@ class ExecutionRunnerTests(unittest.TestCase):
         self.assertNotIn("claim_token", prompt + rendered)
         self.assertNotIn(str(self.database), prompt + rendered)
 
+    def test_public_coder_example_builds_exact_hermes_argv(self):
+        path = (
+            Path(__file__).parents[1]
+            / "examples"
+            / "agent-profiles"
+            / "example-coder.json"
+        )
+        profile = parse_profile(json.loads(path.read_text(encoding="utf-8")))
+        prompt = profile.render_prompt("synthetic-worker")
+
+        self.assertEqual(
+            profile_argv(
+                "synthetic-hermes --local",
+                profile,
+                worker_command="synthetic-worker",
+            ),
+            (
+                "synthetic-hermes",
+                "--local",
+                "chat",
+                "--quiet",
+                "--query",
+                prompt,
+                "--max-turns",
+                "50",
+                "--source",
+                "tool",
+                "--toolsets",
+                "terminal,file,web,vision",
+            ),
+        )
+        for phase in WorkflowPhase:
+            with self.subTest(phase=phase):
+                self.assertIn(phase.value, profile.allowed_phases)
+
     def test_cli_internal_failure_is_content_free(self):
         private_value = "synthetic-private-runtime-value"
         output = StringIO()

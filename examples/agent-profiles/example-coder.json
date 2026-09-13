@@ -1,0 +1,24 @@
+{
+  "schema": "foxhound.agent-profile",
+  "schema_version": 1,
+  "profile_id": "example-coder",
+  "display_name": "Example Coder",
+  "runtime": "hermes",
+  "prompt_template": "Synthetic example only; do not use as deployment policy. First call {{FOXHOUND_WORKER_COMMAND}} context. Read applicable repository instructions, keep changes scoped, use fictional test data, respect phase gates, validate the result, and finish with {{FOXHOUND_WORKER_COMMAND}} record RESULT_FILE.",
+  "toolsets": [
+    "terminal",
+    "file",
+    "web",
+    "vision"
+  ],
+  "max_turns": 50,
+  "timeout_seconds": 1800,
+  "claim_lease_seconds": 2700,
+  "heartbeat_seconds": 60,
+  "kill_grace_seconds": 30,
+  "allowed_phases": [
+    "plan",
+    "execute",
+    "external_action"
+  ]
+}
