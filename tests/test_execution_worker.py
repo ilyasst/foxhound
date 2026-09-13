@@ -222,6 +222,42 @@ class ExecutionWorkerTests(unittest.TestCase):
                          "Synthetic evidence.")
         self.assertNotIn(CLAIM_TOKEN, repr(load_run_state(self.state_path)))
 
+    def test_a_refused_result_says_why_it_was_refused(self):
+        """An agent told only "refused" cannot tell a fixable state from a
+        hopeless one, so it does the safe thing and gives up. One did:
+        three attempts, three bare refusals, and a complete and correct
+        result released instead of recorded. The reason is an enum token
+        naming a state, never task content.
+        """
+        draft = self._write_draft()
+        # Record once so the claim is spent, then try again on a claim that
+        # is no longer running.
+        with knowledge_server() as endpoint:
+            self._worker(endpoint).record(draft.name)
+
+        second_id = "d" * 32
+        second = self.run_directory / f"result-{second_id}.json"
+        second.write_text(json.dumps({
+            "schema": "foxhound.execution-result-draft",
+            "schema_version": 1,
+            "result_id": second_id,
+            "outcome": "awaiting_plan",
+            "summary": "Synthetic second summary",
+            "work_markdown": "# Synthetic work\n\nNo private evidence.",
+            "questions": [],
+            "external_actions": [],
+            "deliverables": [],
+        }), encoding="utf-8")
+        second.chmod(0o600)
+        with knowledge_server() as endpoint:
+            with self.assertRaises(ExecutionWorkerDraftError) as caught:
+                self._worker(endpoint).record(second.name)
+
+        self.assertIsNotNone(caught.exception.reason)
+        # A state, not content: nothing from the task may appear here.
+        self.assertNotIn("Synthetic", caught.exception.reason)
+        self.assertNotIn(" ", caught.exception.reason)
+
     def test_the_context_names_the_thing_the_task_is_about(self):
         """The agent is told to take repository identity from here, and told
         to infer nothing from the task text. Omitting it did not make the
