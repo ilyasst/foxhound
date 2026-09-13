@@ -135,6 +135,9 @@ class ExecutionReviewCard:
     deliverables: tuple[CardRecord, ...] = field(default=(), repr=False)
     revisions: int = 0
     revision_note: str = field(default="", repr=False)
+    origin_kind: str = field(default="", repr=False)
+    origin_record: str = field(default="", repr=False)
+    origin_item: str = field(default="", repr=False)
     outcome: ExecutionOutcome | None = None
 
 
@@ -872,12 +875,11 @@ class ExecutionCardService:
                     refusal = ExecutionCardRefusal.INVALID_STATE
                 if refusal is None and not _current_card(row):
                     refusal = ExecutionCardRefusal.STALE_VERSION
-                if (
-                    refusal is None
-                    and ExecutionCardKind(row["kind"])
-                    is ExecutionCardKind.START
-                ):
-                    refusal = ExecutionCardRefusal.INVALID_ACTION
+                # A gate used to refuse both, on the reasoning that there
+                # was no work yet to talk about. But the note a reader wants
+                # to leave is most useful BEFORE the first pass, not after
+                # reading a plan that ignored it, and a task is most often
+                # noticed as someone else's at the moment it is offered.
                 if (
                     refusal is None
                     and kind == "reassignment"
@@ -1120,7 +1122,21 @@ class ExecutionCardService:
             " AS revision_count,"
             "(SELECT i.value FROM execution_reader_inputs AS i "
             " WHERE i.task_id=c.task_id AND i.kind='discussion' "
-            " ORDER BY i.sequence DESC LIMIT 1) AS revision_note "
+            " ORDER BY i.sequence DESC LIMIT 1) AS revision_note,"
+            # Where the task came from. A reader asked to authorise work on
+            # an issue cannot answer without being told which issue.
+            "(SELECT o.source_kind FROM task_candidate_bindings AS b "
+            " JOIN candidate_inbox AS o ON o.candidate_id=b.candidate_id "
+            " WHERE b.task_id=c.task_id AND b.relation='accepted') "
+            " AS origin_kind,"
+            "(SELECT o.source_record_id FROM task_candidate_bindings AS b "
+            " JOIN candidate_inbox AS o ON o.candidate_id=b.candidate_id "
+            " WHERE b.task_id=c.task_id AND b.relation='accepted') "
+            " AS origin_record,"
+            "(SELECT o.source_item_id FROM task_candidate_bindings AS b "
+            " JOIN candidate_inbox AS o ON o.candidate_id=b.candidate_id "
+            " WHERE b.task_id=c.task_id AND b.relation='accepted') "
+            " AS origin_item "
             "FROM execution_review_cards AS c "
             "JOIN tasks AS t ON t.id=c.task_id "
             "JOIN task_execution_workflows AS w ON w.task_id=c.task_id "
@@ -1439,6 +1455,9 @@ def _card(
             ),
             revisions=max(0, int(row["revision_count"] or 0)),
             revision_note=str(row["revision_note"] or ""),
+            origin_kind=str(row["origin_kind"] or ""),
+            origin_record=str(row["origin_record"] or ""),
+            origin_item=str(row["origin_item"] or ""),
         )
     except (AgentProfileError, KeyError, TypeError, ValueError) as exc:
         raise TaskLedgerError("execution review card state is invalid") from exc
@@ -1506,6 +1525,33 @@ def _stored_collection(value: object) -> tuple[CardRecord, ...]:
     return tuple(records)
 
 
+#: Only a forge we know how to address. An origin we cannot build a link
+#: for is still named, just not linked — a wrong link is worse than none.
+_LINKABLE_HOSTS = ("github.com",)
+
+
+def _origin_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
+    """Say where the work came from, and make it reachable.
+
+    A gate asks the reader to authorise work on something. Naming the task
+    is not the same as naming the thing: two issues can share a title, and
+    an issue number is what the reader will search for afterwards.
+    """
+    if not (card.origin_record and card.origin_item):
+        return []
+    record, item = card.origin_record, card.origin_item
+    if card.origin_kind != "issue" or "/" not in record:
+        return [f"<b>From:</b> {_escape(record)}" if html
+                else f"From: {record}"]
+    name = record.rsplit("/", 1)[-1]
+    shown = f"{name} #{item}"
+    if not html or not record.startswith(_LINKABLE_HOSTS):
+        return [f"<b>From:</b> {_escape(shown)}" if html
+                else f"From: {shown}"]
+    url = f"https://{record}/issues/{item}"
+    return [f'<b>From:</b> <a href="{_escape(url)}">{_escape(shown)}</a>']
+
+
 def _heading_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
     """Identify the task before describing it.
 
@@ -1537,6 +1583,7 @@ def _heading_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
     if card.revisions:
         revised = f"Revision {card.revisions}"
         lines.append(f"<b>{revised}</b>" if html else revised)
+    lines.extend(_origin_lines(card, html=html))
     return lines
 
 
@@ -2095,8 +2142,14 @@ def _button_rows(
         if card.workflow_status is WorkflowStatus.AWAITING_START:
             rows += ((("🤖 Agent", "agent"),),)
         rows += (
-            (("🕒 Snooze 24h", "snooze"),),
+            (("💬 Discuss", "discuss"), ("🕒 Snooze 24h", "snooze")),
             (("⛔ Cancel workflow", "cancel"),),
+            # Present at every phase, as on the surface this replaces. Drop
+            # says the work should not happen; Reassign says it should
+            # happen to someone else. Offering only Cancel made "not mine"
+            # indistinguishable from "not real", and lost the task for
+            # whoever it actually belonged to.
+            (("👥 Reassign", "reassign"), ("🗑 Drop task", "drop")),
         )
         return rows if approvable else rows[1:]
     if kind is ExecutionCardKind.EXTERNAL_REVIEW:
@@ -2130,7 +2183,7 @@ def _button_rows(
 
 def _direct_actions_for_kind(kind: ExecutionCardKind) -> set[str]:
     if kind is ExecutionCardKind.START:
-        return {"start", "snooze", "cancel"}
+        return {"start", "snooze", "cancel", "drop"}
     if kind is ExecutionCardKind.RESULT_REVIEW:
         return {"done", "drop", *REVIEW_SNOOZE_INTERVALS}
     return {
