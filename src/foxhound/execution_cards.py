@@ -17,6 +17,12 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
+from .agent_profiles import (
+    AgentProfile,
+    AgentProfileError,
+    AgentProfileRegistry,
+    load_registry,
+)
 from .candidate_inbox import CandidateInbox, InboxError, SCHEMA_VERSION
 from .task_execution import (
     ExecutionOutcome,
@@ -27,6 +33,7 @@ from .task_execution import (
     WorkflowPhase,
     WorkflowRefusal,
     WorkflowStatus,
+    _apply_agent_selection,
     _apply_review_action,
     _apply_start_action,
 )
@@ -39,7 +46,9 @@ from .task_ledger import (
 
 
 CALLBACK_PREFIX = "fhe"
+AGENT_CALLBACK_PREFIX = "fha"
 CALLBACK_DATA_LIMIT = 64
+AGENT_SELECTION_TOKEN_CHARS = 20
 MAX_CARD_BODY_BYTES = 24 * 1024
 MAX_RENDER_SOURCE_LINE_CHARS = 500
 MAX_TRUNCATED_CARD_BODY_BYTES = 3_500
@@ -111,6 +120,10 @@ class ExecutionReviewCard:
     status: ExecutionCardStatus
     version: int
     created_at: str
+    workflow_status: WorkflowStatus
+    agent_profile_id: str
+    agent_profile_revision: str = field(repr=False)
+    agent_display_name: str = field(repr=False)
     task_text: str = field(repr=False)
     owner: str | None = field(repr=False)
     due: str | None = field(repr=False)
@@ -146,6 +159,27 @@ class ExecutionCardOperationResult:
         return self.disposition is not ExecutionCardDisposition.REFUSED
 
 
+@dataclass(frozen=True)
+class ExecutionAgentOption:
+    display_name: str = field(repr=False)
+    selection_token: str = field(repr=False)
+    selected: bool = False
+
+
+@dataclass(frozen=True)
+class ExecutionAgentSelectorResult:
+    disposition: ExecutionCardDisposition
+    card_id: int
+    card_version: int | None = None
+    card: ExecutionReviewCard | None = field(default=None, repr=False)
+    options: tuple[ExecutionAgentOption, ...] = ()
+    refusal: ExecutionCardRefusal | None = None
+
+    @property
+    def accepted(self) -> bool:
+        return self.disposition is not ExecutionCardDisposition.REFUSED
+
+
 class ExecutionCardService:
     """Durable delivery and atomic reader actions for execution gates."""
 
@@ -155,12 +189,17 @@ class ExecutionCardService:
         *,
         clock: Callable[[], datetime] | None = None,
         token_factory: Callable[[], str] | None = None,
+        profile_registry: AgentProfileRegistry | None = None,
     ) -> None:
         self.database_path = Path(database_path)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._token_factory = token_factory or (
             lambda: secrets.token_urlsafe(32)
         )
+        registry = profile_registry or load_registry()
+        if not isinstance(registry, AgentProfileRegistry):
+            raise ValueError("agent profile registry is invalid")
+        self._profile_registry = registry
 
     def initialize(self) -> None:
         CandidateInbox(self.database_path, clock=self._clock).initialize()
@@ -303,6 +342,7 @@ class ExecutionCardService:
                     return None
                 if not _current_card(row):
                     raise TaskLedgerError("execution card state is invalid")
+                _card(row, self._profile_registry)
                 version = int(row["version"]) + 1
                 updated = connection.execute(
                     "UPDATE execution_review_cards SET status='delivering',"
@@ -335,7 +375,7 @@ class ExecutionCardService:
                 values = dict(row)
                 values.update(status=ExecutionCardStatus.DELIVERING, version=version)
                 return ExecutionCardDeliveryClaim(
-                    _card(values), token, expires
+                    _card(values, self._profile_registry), token, expires
                 )
             except Exception:
                 connection.rollback()
@@ -586,7 +626,7 @@ class ExecutionCardService:
                 if (
                     refusal is None
                     and action in {"start", "approve", "done"}
-                    and not _card_fits(_card(row))
+                    and not _card_fits(_card(row, self._profile_registry))
                 ):
                     refusal = ExecutionCardRefusal.INVALID_STATE
                 if refusal is not None:
@@ -661,6 +701,137 @@ class ExecutionCardService:
                     workflow_status=workflow.status,
                     workflow_phase=workflow.phase,
                     wake_at=workflow.wake_at,
+                )
+            except Exception:
+                connection.rollback()
+                raise
+
+    def agent_options(
+        self, card_id: int, *, expected_version: int
+    ) -> ExecutionAgentSelectorResult:
+        """Return bounded installed choices for one current Start card."""
+        if not _valid_identity(card_id, expected_version):
+            return _agent_refused(
+                card_id, ExecutionCardRefusal.INVALID_ARGUMENT
+            )
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                self._card_select() + " WHERE c.id=?", (card_id,)
+            ).fetchone()
+            refusal = _agent_card_refusal(row, expected_version)
+            if refusal is not None:
+                return _agent_refused_row(card_id, row, refusal)
+            card = _card(row, self._profile_registry)
+            options = _agent_options(self._profile_registry, card)
+            return ExecutionAgentSelectorResult(
+                ExecutionCardDisposition.UNCHANGED,
+                card_id,
+                card_version=expected_version,
+                card=card,
+                options=options,
+            )
+
+    def select_agent(
+        self,
+        card_id: int,
+        *,
+        expected_version: int,
+        selection_token: str,
+    ) -> ExecutionAgentSelectorResult:
+        """Select an eligible exact profile and refresh the Start card."""
+        if (
+            not _valid_identity(card_id, expected_version)
+            or not _valid_agent_selection_token(selection_token)
+        ):
+            return _agent_refused(
+                card_id, ExecutionCardRefusal.INVALID_ARGUMENT
+            )
+        matches = [
+            profile
+            for profile in _eligible_profiles(self._profile_registry)
+            if _agent_selection_token(profile) == selection_token
+        ]
+        if len(matches) != 1:
+            return _agent_refused(
+                card_id, ExecutionCardRefusal.INVALID_ARGUMENT
+            )
+        profile = matches[0]
+        stamp = self._clock_value()
+        now = stamp.isoformat(timespec="seconds")
+        with closing(self._connect()) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    self._card_select() + " WHERE c.id=?", (card_id,)
+                ).fetchone()
+                refusal = _agent_card_refusal(row, expected_version)
+                if refusal is not None:
+                    connection.rollback()
+                    return _agent_refused_row(card_id, row, refusal)
+                current = _card(row, self._profile_registry)
+                workflow = _apply_agent_selection(
+                    connection,
+                    int(row["task_id"]),
+                    expected_version=int(row["workflow_version"]),
+                    profile=profile,
+                    stamp=stamp,
+                )
+                if workflow.disposition is WorkflowDisposition.REFUSED:
+                    connection.rollback()
+                    return _agent_refused_row(
+                        card_id,
+                        row,
+                        _workflow_refusal(workflow.refusal),
+                    )
+                if workflow.disposition is WorkflowDisposition.UNCHANGED:
+                    connection.rollback()
+                    return ExecutionAgentSelectorResult(
+                        ExecutionCardDisposition.UNCHANGED,
+                        card_id,
+                        card_version=expected_version,
+                        card=current,
+                    )
+                card_version = expected_version + 1
+                updated = connection.execute(
+                    "UPDATE execution_review_cards SET version=?,"
+                    "workflow_version=?,updated_at=? WHERE id=? AND version=? "
+                    "AND status='delivered'",
+                    (
+                        card_version,
+                        workflow.version,
+                        now,
+                        card_id,
+                        expected_version,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise TaskLedgerError("execution card state changed")
+                self._event(
+                    connection,
+                    card_id=card_id,
+                    task_id=int(row["task_id"]),
+                    kind="refreshed",
+                    card_version=card_version,
+                    workflow_version=int(workflow.version),
+                    action="agent",
+                    now=now,
+                )
+                values = dict(row)
+                values.update(
+                    version=card_version,
+                    workflow_version=workflow.version,
+                    workflow_version_current=workflow.version,
+                    workflow_agent_profile_id=profile.profile_id,
+                    workflow_agent_profile_revision=profile.revision,
+                )
+                card = _card(values, self._profile_registry)
+                connection.commit()
+                return ExecutionAgentSelectorResult(
+                    ExecutionCardDisposition.APPLIED,
+                    card_id,
+                    card_version=card_version,
+                    card=card,
                 )
             except Exception:
                 connection.rollback()
@@ -930,6 +1101,8 @@ class ExecutionCardService:
             "w.phase AS workflow_phase_current,"
             "w.version AS workflow_version_current,"
             "w.task_version AS workflow_task_version_current,"
+            "w.agent_profile_id AS workflow_agent_profile_id,"
+            "w.agent_profile_revision AS workflow_agent_profile_revision,"
             "w.last_result_id AS workflow_result_id,"
             "r.task_id AS result_task_id,r.workflow_version AS result_version,"
             "r.task_version AS result_task_version,r.phase AS result_phase,"
@@ -1032,10 +1205,47 @@ def render_execution_review_card(
                 }
                 for label, action in row
             ]
-            for row in _button_rows(card.kind, approvable=approvable)
+            for row in _button_rows(card, approvable=approvable)
         ]
     }
     return body, keyboard
+
+
+def render_execution_agent_selector(
+    result: ExecutionAgentSelectorResult,
+) -> tuple[str, dict[str, list[list[dict[str, str]]]]]:
+    """Render one bounded Telegram-compatible agent choice view."""
+    if not isinstance(result, ExecutionAgentSelectorResult):
+        raise TaskLedgerError("execution agent selector is invalid")
+    if not result.accepted or result.card is None or not result.options:
+        raise TaskLedgerError("execution agent selector is unavailable")
+    body, _ = render_execution_review_card(result.card)
+    suffix = "\n\n<b>Choose the agent for planning:</b>"
+    if len((body + suffix).encode("utf-8")) > MAX_CARD_BODY_BYTES:
+        body = _escape_bounded(
+            "\n".join(_card_lines(result.card)),
+            MAX_TRUNCATED_CARD_BODY_BYTES,
+            suffix="\n\nChoose the agent for planning:",
+        )
+        suffix = ""
+    keyboard = {
+        "inline_keyboard": [
+            [{
+                "text": (
+                    f"✓ {option.display_name}"
+                    if option.selected
+                    else option.display_name
+                ),
+                "callback_data": _agent_callback(
+                    result.card.id,
+                    result.card.version,
+                    option.selection_token,
+                ),
+            }]
+            for option in result.options
+        ]
+    }
+    return body + suffix, keyboard
 
 
 def parse_execution_review_callback(
@@ -1057,8 +1267,30 @@ def parse_execution_review_callback(
         return None
     if parts[3] not in {
         "start", "snooze", "cancel", "approve", "revise", "discuss",
-        "done", "reassign", "drop", *REVIEW_SNOOZE_INTERVALS,
+        "done", "reassign", "drop", "agent", *REVIEW_SNOOZE_INTERVALS,
     }:
+        return None
+    return card_id, version, parts[3]
+
+
+def parse_execution_agent_callback(
+    value: object,
+) -> tuple[int, int, str] | None:
+    if not isinstance(value, str) or not 1 <= len(value) <= CALLBACK_DATA_LIMIT:
+        return None
+    parts = value.split("|")
+    if len(parts) != 4 or parts[0] != AGENT_CALLBACK_PREFIX:
+        return None
+    try:
+        card_id = int(parts[1])
+        version = int(parts[2])
+    except ValueError:
+        return None
+    if not _valid_identity(card_id, version):
+        return None
+    if parts[1] != str(card_id) or parts[2] != str(version):
+        return None
+    if not _valid_agent_selection_token(parts[3]):
         return None
     return card_id, version, parts[3]
 
@@ -1146,19 +1378,35 @@ def _current_card(row: Mapping[str, object]) -> bool:
         return False
 
 
-def _card(row: Mapping[str, object]) -> ExecutionReviewCard:
+def _card(
+    row: Mapping[str, object], registry: AgentProfileRegistry
+) -> ExecutionReviewCard:
     try:
+        kind = ExecutionCardKind(row["kind"])
+        profile_id = str(row["workflow_agent_profile_id"])
+        profile_revision = str(row["workflow_agent_profile_revision"])
+        try:
+            profile = registry.resolve(profile_id, profile_revision)
+            profile_name = profile.display_name
+        except AgentProfileError:
+            if kind is ExecutionCardKind.START:
+                raise
+            profile_name = profile_id
         return ExecutionReviewCard(
             id=int(row["id"]),
             task_id=int(row["task_id"]),
             task_version=int(row["task_version"]),
             workflow_version=int(row["workflow_version"]),
-            kind=ExecutionCardKind(row["kind"]),
+            kind=kind,
             phase=WorkflowPhase(row["phase"]),
             result_id=row["result_id"],
             status=ExecutionCardStatus(row["status"]),
             version=int(row["version"]),
             created_at=str(row["created_at"]),
+            workflow_status=WorkflowStatus(row["workflow_status_current"]),
+            agent_profile_id=profile_id,
+            agent_profile_revision=profile_revision,
+            agent_display_name=profile_name,
             task_text=str(row["task_text"]),
             owner=row["owner"],
             due=row["due"],
@@ -1177,7 +1425,7 @@ def _card(row: Mapping[str, object]) -> ExecutionReviewCard:
                 else ExecutionOutcome(row["result_outcome"])
             ),
         )
-    except (KeyError, TypeError, ValueError) as exc:
+    except (AgentProfileError, KeyError, TypeError, ValueError) as exc:
         raise TaskLedgerError("execution review card state is invalid") from exc
 
 
@@ -1202,6 +1450,7 @@ def _card_lines(card: ExecutionReviewCard) -> list[str]:
     if card.due:
         details.append(f"Due: {card.due}")
     if card.kind is ExecutionCardKind.START:
+        details.append(f"Agent: {card.agent_display_name}")
         return [
             "Foxhound execution request",
             "",
@@ -1274,6 +1523,7 @@ def _html_card_lines(card: ExecutionReviewCard) -> list[str]:
     if card.due:
         details.extend(_labelled_html_lines("Due", card.due))
     if card.kind is ExecutionCardKind.START:
+        details.extend(_labelled_html_lines("Agent", card.agent_display_name))
         return [
             "<b>Foxhound execution request</b>",
             "",
@@ -1630,11 +1880,16 @@ def _escape(value: str) -> str:
 
 
 def _button_rows(
-    kind: ExecutionCardKind, *, approvable: bool
+    card: ExecutionReviewCard, *, approvable: bool
 ) -> tuple[tuple[tuple[str, str], ...], ...]:
+    kind = card.kind
     if kind is ExecutionCardKind.START:
-        rows = (
+        rows: tuple[tuple[tuple[str, str], ...], ...] = (
             (("▶️ Start planning", "start"),),
+        )
+        if card.workflow_status is WorkflowStatus.AWAITING_START:
+            rows += ((("🤖 Agent", "agent"),),)
+        rows += (
             (("🕒 Snooze 24h", "snooze"),),
             (("⛔ Cancel workflow", "cancel"),),
         )
@@ -1768,6 +2023,61 @@ def _callback(card_id: int, version: int, action: str) -> str:
     return value
 
 
+def _agent_callback(card_id: int, version: int, token: str) -> str:
+    if not _valid_agent_selection_token(token):
+        raise TaskLedgerError("execution agent callback is invalid")
+    value = f"{AGENT_CALLBACK_PREFIX}|{card_id}|{version}|{token}"
+    if len(value.encode("utf-8")) > CALLBACK_DATA_LIMIT:
+        raise TaskLedgerError("execution agent callback is too large")
+    return value
+
+
+def _agent_selection_token(profile: AgentProfile) -> str:
+    source = f"{profile.profile_id}\0{profile.revision}".encode("utf-8")
+    return hashlib.sha256(source).hexdigest()[:AGENT_SELECTION_TOKEN_CHARS]
+
+
+def _valid_agent_selection_token(value: object) -> bool:
+    return bool(
+        isinstance(value, str)
+        and re.fullmatch(
+            rf"[0-9a-f]{{{AGENT_SELECTION_TOKEN_CHARS}}}", value
+        )
+    )
+
+
+def _eligible_profiles(
+    registry: AgentProfileRegistry,
+) -> tuple[AgentProfile, ...]:
+    return tuple(
+        profile
+        for profile in registry.list()
+        if WorkflowPhase.PLAN.value in profile.allowed_phases
+    )
+
+
+def _agent_options(
+    registry: AgentProfileRegistry, card: ExecutionReviewCard
+) -> tuple[ExecutionAgentOption, ...]:
+    options = tuple(
+        ExecutionAgentOption(
+            profile.display_name,
+            _agent_selection_token(profile),
+            selected=(
+                profile.profile_id == card.agent_profile_id
+                and profile.revision == card.agent_profile_revision
+            ),
+        )
+        for profile in _eligible_profiles(registry)
+    )
+    tokens = [option.selection_token for option in options]
+    if not options or len(tokens) != len(set(tokens)):
+        raise TaskLedgerError("execution agent choices are unavailable")
+    if sum(option.selected for option in options) != 1:
+        raise TaskLedgerError("selected execution agent is unavailable")
+    return options
+
+
 def _card_fits(card: ExecutionReviewCard) -> bool:
     return len("\n".join(_html_card_lines(card)).encode("utf-8")) <= (
         MAX_CARD_BODY_BYTES
@@ -1799,6 +2109,23 @@ def _card_guard(
         return ExecutionCardRefusal.NOT_FOUND
     if int(row["version"]) != expected_version:
         return ExecutionCardRefusal.STALE_VERSION
+    return None
+
+
+def _agent_card_refusal(
+    row: Mapping[str, object] | None, expected_version: int
+) -> ExecutionCardRefusal | None:
+    refusal = _card_guard(row, expected_version)
+    if refusal is not None:
+        return refusal
+    if row["status"] != ExecutionCardStatus.DELIVERED:
+        return ExecutionCardRefusal.INVALID_STATE
+    if not _current_card(row):
+        return ExecutionCardRefusal.STALE_VERSION
+    if ExecutionCardKind(row["kind"]) is not ExecutionCardKind.START:
+        return ExecutionCardRefusal.INVALID_ACTION
+    if row["workflow_status_current"] != WorkflowStatus.AWAITING_START:
+        return ExecutionCardRefusal.INVALID_STATE
     return None
 
 
@@ -1845,6 +2172,31 @@ def _refused_row(
         card_version=int(row["version"]),
         card_status=ExecutionCardStatus(row["status"]),
         workflow_version=int(row["workflow_version"]),
+        refusal=refusal,
+    )
+
+
+def _agent_refused(
+    card_id: object, refusal: ExecutionCardRefusal
+) -> ExecutionAgentSelectorResult:
+    return ExecutionAgentSelectorResult(
+        ExecutionCardDisposition.REFUSED,
+        card_id if isinstance(card_id, int) and not isinstance(card_id, bool) else 0,
+        refusal=refusal,
+    )
+
+
+def _agent_refused_row(
+    card_id: int,
+    row: Mapping[str, object] | None,
+    refusal: ExecutionCardRefusal,
+) -> ExecutionAgentSelectorResult:
+    if row is None:
+        return _agent_refused(card_id, refusal)
+    return ExecutionAgentSelectorResult(
+        ExecutionCardDisposition.REFUSED,
+        card_id,
+        card_version=int(row["version"]),
         refusal=refusal,
     )
 

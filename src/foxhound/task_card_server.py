@@ -18,10 +18,14 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
 
+from .agent_profiles import AgentProfileError, load_registry
 from .execution_cards import (
+    AGENT_SELECTION_TOKEN_CHARS,
     ExecutionCardOperationResult,
     ExecutionCardScheduleResult,
     ExecutionCardService,
+    ExecutionAgentSelectorResult,
+    render_execution_agent_selector,
     render_execution_review_card,
 )
 from .task_cards import (
@@ -47,6 +51,12 @@ EXECUTION_SCHEDULE_SCHEMA = "foxhound.execution-card-service.schedule"
 EXECUTION_CLAIM_SCHEMA = "foxhound.execution-card-service.claim"
 EXECUTION_OPERATION_SCHEMA = "foxhound.execution-card-service.operation"
 EXECUTION_STATS_SCHEMA = "foxhound.execution-card-service.stats"
+EXECUTION_AGENT_OPTIONS_SCHEMA = (
+    "foxhound.execution-card-service.agent-options"
+)
+EXECUTION_AGENT_SELECTION_SCHEMA = (
+    "foxhound.execution-card-service.agent-selection"
+)
 
 ROUTES = {
     "/v1/task-cards/stats": "stats",
@@ -62,6 +72,8 @@ ROUTES = {
     "/v1/execution-cards/delivery-failed": "execution_delivery_failed",
     "/v1/execution-cards/action": "execution_action",
     "/v1/execution-cards/input": "execution_input",
+    "/v1/execution-cards/agent-options": "execution_agent_options",
+    "/v1/execution-cards/agent-selection": "execution_agent_selection",
 }
 
 
@@ -361,6 +373,35 @@ class TaskCardApplication:
                     ),
                     kind=kind,
                     value=value,
+                )
+            )
+        if operation == "execution_agent_options":
+            request = _request(
+                payload, required={"card_id", "card_version"}
+            )
+            return _execution_agent_options_document(
+                self._execution_cards().agent_options(
+                    _integer(request["card_id"], minimum=1),
+                    expected_version=_integer(
+                        request["card_version"], minimum=1
+                    ),
+                )
+            )
+        if operation == "execution_agent_selection":
+            request = _request(
+                payload,
+                required={"card_id", "card_version", "selection_token"},
+            )
+            return _execution_agent_selection_document(
+                self._execution_cards().select_agent(
+                    _integer(request["card_id"], minimum=1),
+                    expected_version=_integer(
+                        request["card_version"], minimum=1
+                    ),
+                    selection_token=_opaque(
+                        request["selection_token"],
+                        maximum=AGENT_SELECTION_TOKEN_CHARS,
+                    ),
                 )
             )
         raise TaskCardServerRequestError(
@@ -743,6 +784,53 @@ def _execution_operation_document(
     }
 
 
+def _execution_agent_options_document(
+    result: ExecutionAgentSelectorResult,
+) -> dict[str, Any]:
+    document: dict[str, Any] = {
+        "schema": EXECUTION_AGENT_OPTIONS_SCHEMA,
+        "schema_version": SERVICE_VERSION,
+        "ok": result.accepted,
+        "disposition": result.disposition.value,
+        "card_id": result.card_id,
+        "card_version": result.card_version,
+        "presentation": None,
+        "refusal": None if result.refusal is None else result.refusal.value,
+    }
+    if result.accepted:
+        body, reply_markup = render_execution_agent_selector(result)
+        document["presentation"] = {
+            "body": body,
+            "reply_markup": reply_markup,
+        }
+    return document
+
+
+def _execution_agent_selection_document(
+    result: ExecutionAgentSelectorResult,
+) -> dict[str, Any]:
+    document: dict[str, Any] = {
+        "schema": EXECUTION_AGENT_SELECTION_SCHEMA,
+        "schema_version": SERVICE_VERSION,
+        "ok": result.accepted,
+        "disposition": result.disposition.value,
+        "card_id": result.card_id,
+        "card_version": result.card_version,
+        "agent_profile_id": None,
+        "agent_display_name": None,
+        "presentation": None,
+        "refusal": None if result.refusal is None else result.refusal.value,
+    }
+    if result.accepted and result.card is not None:
+        body, reply_markup = render_execution_review_card(result.card)
+        document.update(
+            agent_profile_id=result.card.agent_profile_id,
+            agent_display_name=result.card.agent_display_name,
+            presentation={"body": body, "reply_markup": reply_markup},
+        )
+    return document
+
+
 def load_token(path: str | os.PathLike[str]) -> str:
     token_path = Path(path).expanduser()
     if token_path.is_symlink():
@@ -823,11 +911,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--bind", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8790)
     parser.add_argument("--request-timeout", type=float, default=5.0)
+    parser.add_argument("--agent-profile-directory", type=Path)
     arguments = parser.parse_args(argv)
     try:
         cards = TaskCardService(arguments.database)
         cards.count()
-        execution_cards = ExecutionCardService(arguments.database)
+        registry = load_registry(arguments.agent_profile_directory)
+        execution_cards = ExecutionCardService(
+            arguments.database, profile_registry=registry
+        )
         execution_cards.count()
         app = TaskCardApplication(
             cards,
@@ -838,7 +930,12 @@ def main(argv: list[str] | None = None) -> int:
             ),
         )
         serve(arguments.bind, arguments.port, app)
-    except (OSError, TaskLedgerError, TaskCardServerConfigError) as exc:
+    except (
+        AgentProfileError,
+        OSError,
+        TaskLedgerError,
+        TaskCardServerConfigError,
+    ) as exc:
         print(f"foxhound task-card-server: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:

@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -1276,6 +1276,34 @@ FROM task_execution_events_v11;
     _SCHEMA_V8[7],
 )
 
+_SCHEMA_V13_CARD_EVENT_TABLE = (
+    _SCHEMA_V11_CARD_EVENT_TABLE
+    .replace(
+        "'cancelled'\n                     )),",
+        "'cancelled','refreshed'\n                     )),",
+    )
+    .replace("'reassign','drop'", "'reassign','drop','agent'")
+)
+_SCHEMA_V13 = (
+    "DROP TRIGGER execution_review_card_events_no_update;",
+    "DROP TRIGGER execution_review_card_events_no_delete;",
+    "ALTER TABLE execution_review_card_events "
+    "RENAME TO execution_review_card_events_v12;",
+    _SCHEMA_V13_CARD_EVENT_TABLE,
+    """
+INSERT INTO execution_review_card_events(
+    sequence,card_id,task_id,kind,card_version,workflow_version,action,
+    occurred_at
+)
+SELECT sequence,card_id,task_id,kind,card_version,workflow_version,action,
+       occurred_at
+FROM execution_review_card_events_v12;
+""",
+    "DROP TABLE execution_review_card_events_v12;",
+    _SCHEMA_V9[3],
+    _SCHEMA_V9[4],
+)
+
 
 class InboxError(RuntimeError):
     """The inbox cannot safely initialize or read its state."""
@@ -1716,6 +1744,30 @@ class CandidateInbox:
                     for statement in _SCHEMA_V12:
                         connection.execute(statement)
                     connection.execute("PRAGMA user_version = 12")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 12
+            if version == 12:
+                self._require_tables(
+                    connection,
+                    (
+                        "tasks",
+                        "task_execution_workflows",
+                        "task_execution_results",
+                        "task_execution_events",
+                        "execution_review_cards",
+                        "execution_review_card_events",
+                    ),
+                    columns=_SCHEMA_COLUMNS,
+                )
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V13:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 13")
                     connection.commit()
                 except Exception:
                     connection.rollback()

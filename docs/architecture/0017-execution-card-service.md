@@ -21,7 +21,9 @@ as task-review cards:
 - one digest-fenced delivery claim;
 - delivery acknowledgement or failure;
 - one versioned reader action; and
-- one bounded, versioned discussion or reassignment input.
+- one bounded, versioned discussion or reassignment input;
+- bounded eligible-agent options for a current Start card; and
+- one opaque-token agent selection that returns a refreshed presentation.
 
 Each route uses the existing exact request contract, bearer authentication,
 canonical IPv4 loopback bind, body and response limits, request timeout,
@@ -35,10 +37,27 @@ Free-text input is accepted only at `/v1/execution-cards/input`; prompt-only
 callbacks make no durable change, and stale or malformed responses fail
 without partial task, workflow, card, or event writes.
 
+The Agent button uses the ordinary execution callback namespace only to open
+the selector. Each choice uses a separate namespace and an opaque 20-character
+digest of the exact profile ID and revision. Even with maximum SQLite integer
+identities, the complete callback is at most Telegram's 64-byte limit. The
+service maps the token only against installed profiles eligible for planning;
+unknown, ambiguous, malformed, oversized, stale, or phase-ineligible choices
+change nothing. A successful changed selection updates the workflow and the
+same delivered card atomically, then returns its new body and keyboard so the
+gateway can edit the existing message. Exact replay returns the current
+presentation unchanged.
+
 The service audit record contains only the allowlisted route, HTTP method,
 status, and coarse duration. It contains no task/card identity, content,
 delivery reference, or capability. The ordinary `/v1/task-cards/*` routes and
 responses remain unchanged.
+
+The packaged server loads the same strict registry format as the runner via
+`--agent-profile-directory`. A deployment that installs private profiles must
+pass the same owner-only directory to both processes. An unavailable selected
+revision fails Start-card materialization rather than silently falling back;
+later review cards remain deliverable so completed work cannot become trapped.
 
 The execution-card adapter is explicitly supplied to the application. If it
 is absent, execution routes return a content-free service-unavailable response
