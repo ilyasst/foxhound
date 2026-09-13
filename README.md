@@ -227,6 +227,27 @@ captured from current state; an older candidate may omit unrelated ingestion
 jobs added later. See
 [ADR 0021](docs/architecture/0021-staged-task-authority-cutover.md).
 
+Before Stage 1, prepare the scheduler candidate from a freshly captured,
+owner-only snapshot. The command refuses to continue unless all six legacy
+task-writer jobs and the retained temporary creation registry each appear
+exactly once. It emits only counts and digests; the snapshot and both artifacts
+remain outside the repository:
+
+```sh
+install -d -m 700 /srv/example/private-cutover
+foxhound-scheduler-cutover prepare \
+  --snapshot /srv/example/private-cutover/scheduler.current \
+  --candidate /srv/example/private-cutover/scheduler.stage1 \
+  --rollback /srv/example/private-cutover/scheduler.rollback
+foxhound-scheduler-cutover verify \
+  --snapshot /srv/example/private-cutover/scheduler.current \
+  --candidate /srv/example/private-cutover/scheduler.stage1 \
+  --rollback /srv/example/private-cutover/scheduler.rollback
+```
+
+The command does not inspect or install the active scheduler. Installing the
+candidate and restoring the rollback artifact remain explicit operator steps.
+
 Newly accepted open tasks can be projected to the reader Start gate with an
 explicit bounded pass:
 
