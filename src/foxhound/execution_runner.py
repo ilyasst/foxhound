@@ -20,12 +20,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator, Mapping, Sequence
 
-from .agent_profiles import AgentProfileError, general_profile
+from .agent_profiles import (
+    AgentProfile,
+    AgentProfileError,
+    AgentProfileRegistry,
+    general_profile,
+    load_registry,
+)
 from .execution_worker import (
     GW_ALIAS_ENV,
     GW_ENDPOINT_ENV,
     GW_TOKEN_FILE_ENV,
     RUN_STATE_SCHEMA,
+    RUN_STATE_SCHEMA_VERSION,
     STATE_ENV,
     WORKER_SCHEMA_VERSION,
     ExecutionWorkerConfigError,
@@ -42,10 +49,6 @@ from .task_execution import (
 )
 
 
-DEFAULT_TIMEOUT_SECONDS = 240
-DEFAULT_LEASE_SECONDS = 900
-DEFAULT_HEARTBEAT_SECONDS = 60
-DEFAULT_KILL_GRACE_SECONDS = 10
 NO_PROGRESS_EXIT_CODE = 70
 STARTUP_EXIT_CODE = 71
 TIMEOUT_EXIT_CODE = 124
@@ -70,13 +73,12 @@ class ExecutionRunnerConfig:
     gw_endpoint: str = field(repr=False)
     gw_alias: str = field(repr=False)
     gw_token_file: Path = field(repr=False)
-    agent_argv: tuple[str, ...] = field(repr=False)
+    agent_command: str = field(default="hermes", repr=False)
+    profile_registry: AgentProfileRegistry = field(
+        default_factory=load_registry, repr=False
+    )
     worker_command: str = "foxhound-task-worker"
     allowed_phases: tuple[WorkflowPhase, ...] = tuple(WorkflowPhase)
-    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
-    lease_seconds: int = DEFAULT_LEASE_SECONDS
-    heartbeat_seconds: float = DEFAULT_HEARTBEAT_SECONDS
-    kill_grace_seconds: float = DEFAULT_KILL_GRACE_SECONDS
     poll_seconds: float = 0.1
 
     def __post_init__(self) -> None:
@@ -88,17 +90,9 @@ class ExecutionRunnerConfig:
             or not isinstance(self.gw_alias, str)
         ):
             raise ValueError("execution runner configuration is invalid")
-        if (
-            not isinstance(self.agent_argv, tuple)
-            or not self.agent_argv
-            or any(
-                not isinstance(value, str)
-                or not value
-                or "\0" in value
-                for value in self.agent_argv
-            )
-        ):
-            raise ValueError("execution agent command is invalid")
+        _agent_command_argv(self.agent_command)
+        if not isinstance(self.profile_registry, AgentProfileRegistry):
+            raise ValueError("agent profile registry is invalid")
         if not _COMMAND_NAME_RE.fullmatch(self.worker_command):
             raise ValueError("execution worker command is invalid")
         if (
@@ -112,32 +106,12 @@ class ExecutionRunnerConfig:
         ):
             raise ValueError("execution phase allowlist is invalid")
         if (
-            isinstance(self.lease_seconds, bool)
-            or not isinstance(self.lease_seconds, int)
-            or not 5 <= self.lease_seconds <= 3_600
+            isinstance(self.poll_seconds, bool)
+            or not isinstance(self.poll_seconds, (int, float))
+            or not math.isfinite(self.poll_seconds)
+            or self.poll_seconds <= 0
         ):
-            raise ValueError("execution lease is invalid")
-        for value, label in (
-            (self.timeout_seconds, "timeout"),
-            (self.heartbeat_seconds, "heartbeat"),
-            (self.kill_grace_seconds, "shutdown grace"),
-            (self.poll_seconds, "poll interval"),
-        ):
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(value)
-                or value <= 0
-            ):
-                raise ValueError(f"execution {label} is invalid")
-        if self.heartbeat_seconds * 3 > self.lease_seconds:
-            raise ValueError(
-                "execution lease must allow three heartbeat intervals"
-            )
-        if self.kill_grace_seconds + self.heartbeat_seconds >= self.lease_seconds:
-            raise ValueError(
-                "execution lease must exceed heartbeat plus shutdown grace"
-            )
+            raise ValueError("execution poll interval is invalid")
 
 
 @dataclass(frozen=True)
@@ -172,14 +146,7 @@ def hermes_argv(
         or max_turns < 1
     ):
         raise ValueError("execution agent turn limit is invalid")
-    if not isinstance(command, str) or not command.strip():
-        raise ValueError("execution agent command is invalid")
-    try:
-        base = shlex.split(command)
-    except ValueError:
-        raise ValueError("execution agent command is invalid") from None
-    if not base or any("\0" in value for value in base):
-        raise ValueError("execution agent command is invalid")
+    base = _agent_command_argv(command)
     argv = [
         *base,
         "chat",
@@ -196,6 +163,47 @@ def hermes_argv(
             raise ValueError("execution agent toolsets are invalid")
         argv.extend(("--toolsets", toolsets))
     return tuple(argv)
+
+
+def profile_argv(
+    command: str,
+    profile: AgentProfile,
+    *,
+    worker_command: str = "foxhound-task-worker",
+) -> tuple[str, ...]:
+    """Build the exact Hermes invocation for one validated profile."""
+    if not isinstance(profile, AgentProfile) or profile.runtime != "hermes":
+        raise ValueError("execution agent profile is invalid")
+    base = _agent_command_argv(command)
+    try:
+        prompt = profile.render_prompt(worker_command)
+    except AgentProfileError as exc:
+        raise ValueError("execution worker command is invalid") from exc
+    return (
+        *base,
+        "chat",
+        "--quiet",
+        "--query",
+        prompt,
+        "--max-turns",
+        str(profile.max_turns),
+        "--source",
+        "tool",
+        "--toolsets",
+        ",".join(profile.toolsets),
+    )
+
+
+def _agent_command_argv(command: object) -> tuple[str, ...]:
+    if not isinstance(command, str) or not command.strip():
+        raise ValueError("execution agent command is invalid")
+    try:
+        base = tuple(shlex.split(command))
+    except ValueError:
+        raise ValueError("execution agent command is invalid") from None
+    if not base or any(not value or "\0" in value for value in base):
+        raise ValueError("execution agent command is invalid")
+    return base
 
 
 def run_once(
@@ -215,21 +223,32 @@ def run_once(
     load_knowledge_config(
         config.gw_endpoint, config.gw_alias, config.gw_token_file
     )
-    service = TaskExecutionService(database)
+    service = TaskExecutionService(
+        database, profile_registry=config.profile_registry
+    )
     terminator = terminate or _terminate_process_group
     with _exclusive_lock(root / ".runner.lock") as acquired:
         if not acquired:
             return ExecutionRunResult("already_running", 0)
         claim = service.claim_next(
-            lease_seconds=config.lease_seconds,
             allowed_phases=config.allowed_phases,
         )
         if claim is None:
             return ExecutionRunResult("idle", 0)
+        try:
+            profile = config.profile_registry.resolve(
+                claim.agent_profile_id, claim.agent_profile_revision
+            )
+        except AgentProfileError:
+            _fail_claim(service, claim, "startup_failed")
+            return ExecutionRunResult(
+                "startup_failed", STARTUP_EXIT_CODE, claim.task_id
+            )
         return _run_claim(
             config,
             service,
             claim,
+            profile,
             root,
             base_environment=base_environment,
             popen=popen,
@@ -244,6 +263,7 @@ def _run_claim(
     config: ExecutionRunnerConfig,
     service: TaskExecutionService,
     claim: ExecutionClaim,
+    profile: AgentProfile,
     root: Path,
     *,
     base_environment: Mapping[str, str] | None,
@@ -257,11 +277,20 @@ def _run_claim(
     if not isinstance(run_id, str) or not _RUN_ID_RE.fullmatch(run_id):
         _fail_claim(service, claim, "startup_failed")
         return ExecutionRunResult("startup_failed", STARTUP_EXIT_CODE, claim.task_id)
+    try:
+        command = profile_argv(
+            config.agent_command,
+            profile,
+            worker_command=config.worker_command,
+        )
+    except ValueError:
+        _fail_claim(service, claim, "startup_failed")
+        return ExecutionRunResult("startup_failed", STARTUP_EXIT_CODE, claim.task_id)
     directory = root / f"run-{run_id}"
     try:
         directory.mkdir(mode=0o700)
         state_path = directory / "run-state.json"
-        _write_state(state_path, config, claim, run_id)
+        _write_state(state_path, config, claim, profile, run_id)
     except OSError:
         _fail_claim(service, claim, "startup_failed")
         return ExecutionRunResult("startup_failed", STARTUP_EXIT_CODE, claim.task_id)
@@ -290,7 +319,7 @@ def _run_claim(
             )
         try:
             process = popen(
-                list(config.agent_argv),
+                list(command),
                 env=environment,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
@@ -312,13 +341,14 @@ def _run_claim(
             prior_handlers.clear()
 
         started = clock()
-        next_heartbeat = started + config.heartbeat_seconds
+        next_heartbeat = started + profile.heartbeat_seconds
         while True:
             current = service.get(claim.task_id)
             terminal = _terminal_result(initial, current, claim.task_id)
             if terminal is not None:
                 forced = terminate(
-                    process, config.kill_grace_seconds, sleep=sleep, clock=clock
+                    process, profile.kill_grace_seconds,
+                    sleep=sleep, clock=clock
                 )
                 return ExecutionRunResult(
                     terminal, 0 if terminal == "recorded" else NO_PROGRESS_EXIT_CODE,
@@ -332,11 +362,11 @@ def _run_claim(
                         claim.task_id,
                         expected_version=claim.workflow_version,
                         claim_token=claim.token,
-                        lease_seconds=config.lease_seconds,
+                        lease_seconds=profile.claim_lease_seconds,
                     )
                 except Exception:
                     forced = terminate(
-                        process, config.kill_grace_seconds,
+                        process, profile.kill_grace_seconds,
                         sleep=sleep, clock=clock,
                     )
                     _fail_claim(service, claim, "lease_failed")
@@ -346,14 +376,14 @@ def _run_claim(
                     )
                 if renewed.disposition is WorkflowDisposition.REFUSED:
                     forced = terminate(
-                        process, config.kill_grace_seconds,
+                        process, profile.kill_grace_seconds,
                         sleep=sleep, clock=clock,
                     )
                     return ExecutionRunResult(
                         "claim_lost", NO_PROGRESS_EXIT_CODE,
                         claim.task_id, forced,
                     )
-                next_heartbeat = now + config.heartbeat_seconds
+                next_heartbeat = now + profile.heartbeat_seconds
 
             child_exit = process.poll()
             if child_exit is not None:
@@ -377,9 +407,10 @@ def _run_claim(
                     exit_code=normalized or NO_PROGRESS_EXIT_CODE,
                 )
 
-            if now - started >= config.timeout_seconds:
+            if now - started >= profile.timeout_seconds:
                 forced = terminate(
-                    process, config.kill_grace_seconds, sleep=sleep, clock=clock
+                    process, profile.kill_grace_seconds,
+                    sleep=sleep, clock=clock
                 )
                 return _failure_result(
                     service,
@@ -394,7 +425,8 @@ def _run_claim(
     except _TerminationRequested as exc:
         if process is not None:
             forced = terminate(
-                process, config.kill_grace_seconds, sleep=sleep, clock=clock
+                process, profile.kill_grace_seconds,
+                sleep=sleep, clock=clock
             )
         return _failure_result(
             service,
@@ -408,7 +440,8 @@ def _run_claim(
     except BaseException:
         if process is not None:
             terminate(
-                process, config.kill_grace_seconds, sleep=sleep, clock=clock
+                process, profile.kill_grace_seconds,
+                sleep=sleep, clock=clock
             )
         _fail_claim(service, claim, "interrupted")
         raise
@@ -556,11 +589,12 @@ def _write_state(
     path: Path,
     config: ExecutionRunnerConfig,
     claim: ExecutionClaim,
+    profile: AgentProfile,
     run_id: str,
 ) -> None:
     document = {
         "schema": RUN_STATE_SCHEMA,
-        "schema_version": WORKER_SCHEMA_VERSION,
+        "schema_version": RUN_STATE_SCHEMA_VERSION,
         "run_id": run_id,
         "database_path": str(config.database_path),
         "task_id": claim.task_id,
@@ -568,7 +602,9 @@ def _write_state(
         "workflow_version": claim.workflow_version,
         "phase": claim.phase.value,
         "claim_token": claim.token,
-        "lease_seconds": config.lease_seconds,
+        "lease_seconds": profile.claim_lease_seconds,
+        "agent_profile_id": claim.agent_profile_id,
+        "agent_profile_revision": claim.agent_profile_revision,
     }
     payload = (
         json.dumps(
@@ -679,6 +715,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--gw-alias", required=True)
     parser.add_argument("--gw-token-file", required=True, type=Path)
     parser.add_argument("--agent-command", default="hermes")
+    parser.add_argument("--agent-profile-directory", type=Path)
     parser.add_argument("--worker-command", default="foxhound-task-worker")
     parser.add_argument(
         "--allowed-phase",
@@ -690,44 +727,34 @@ def _parser() -> argparse.ArgumentParser:
             "(default: all phases)"
         ),
     )
-    parser.add_argument("--toolsets")
-    parser.add_argument("--max-turns", type=int, default=12)
-    parser.add_argument("--timeout-seconds", type=float, default=240)
-    parser.add_argument("--lease-seconds", type=int, default=900)
-    parser.add_argument("--heartbeat-seconds", type=float, default=60)
-    parser.add_argument("--kill-grace-seconds", type=float, default=10)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        command = hermes_argv(
-            args.agent_command,
-            max_turns=args.max_turns,
-            worker_command=args.worker_command,
-            toolsets=args.toolsets,
-        )
         config = ExecutionRunnerConfig(
             database_path=args.database,
             run_root=args.run_root,
             gw_endpoint=args.gw_endpoint,
             gw_alias=args.gw_alias,
             gw_token_file=args.gw_token_file,
-            agent_argv=command,
+            agent_command=args.agent_command,
+            profile_registry=load_registry(args.agent_profile_directory),
             worker_command=args.worker_command,
             allowed_phases=(
                 tuple(WorkflowPhase(value) for value in args.allowed_phases)
                 if args.allowed_phases
                 else tuple(WorkflowPhase)
             ),
-            timeout_seconds=args.timeout_seconds,
-            lease_seconds=args.lease_seconds,
-            heartbeat_seconds=args.heartbeat_seconds,
-            kill_grace_seconds=args.kill_grace_seconds,
         )
         result = run_once(config)
-    except (ValueError, ExecutionRunnerError, ExecutionWorkerConfigError):
+    except (
+        AgentProfileError,
+        ValueError,
+        ExecutionRunnerError,
+        ExecutionWorkerConfigError,
+    ):
         print("foxhound execution runner: configuration unavailable", file=sys.stderr)
         return 78
     except Exception:

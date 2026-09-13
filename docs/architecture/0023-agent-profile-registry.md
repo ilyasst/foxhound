@@ -36,9 +36,8 @@ may show bounded policy fields, but it never emits prompt text, private paths,
 or parser errors. An unavailable ID or changed revision is a refusal; there is
 no fallback to `general`.
 
-This registry is deliberately not yet a workflow selector. A later migration
-will persist the selected ID and exact revision before the runner consumes
-profiles.
+Workflow selection and runner consumption are defined separately in
+[ADR 0024](0024-workflow-agent-binding.md).
 
 ## Consequences
 

@@ -55,6 +55,12 @@ execution result does not silently close or drop its task. The execution-card
 aggregate may atomically apply an explicit reader completion or drop to both
 ledgers.
 
+Each workflow is also bound to one exact reviewed agent profile revision.
+Selection is a separate reader operation allowed only before Start; it versions
+the workflow and invalidates older cards. Claims refuse unavailable or
+phase-ineligible revisions. Results and events retain the content-free profile
+evidence. See [ADR 0024](0024-workflow-agent-binding.md).
+
 ## Failure and rollback
 
 Schema initialization is passive. Before any workflow is scheduled, rollback

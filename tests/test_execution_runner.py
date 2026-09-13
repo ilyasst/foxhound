@@ -13,6 +13,12 @@ from io import StringIO
 from pathlib import Path
 from unittest import mock
 
+from foxhound.agent_profiles import (
+    AgentProfileRegistry,
+    WORKER_COMMAND_TOKEN,
+    general_profile,
+    parse_profile,
+)
 from foxhound.candidate_inbox import CandidateInbox
 from foxhound.execution_runner import (
     ExecutionRunnerConfig,
@@ -22,6 +28,7 @@ from foxhound.execution_runner import (
     agent_prompt,
     hermes_argv,
     main,
+    profile_argv,
     run_once,
 )
 from foxhound.execution_worker import load_run_state
@@ -32,7 +39,7 @@ from foxhound.task_execution import (
     WorkflowPhase,
     WorkflowStatus,
 )
-from foxhound.task_ledger import TaskLedger
+from foxhound.task_ledger import TaskLedger, TaskLedgerError
 
 
 RESULT_ID = "c" * 32
@@ -108,11 +115,7 @@ class ExecutionRunnerTests(unittest.TestCase):
             "gw_endpoint": "http://127.0.0.1:8787",
             "gw_alias": "primary",
             "gw_token_file": self.token_file,
-            "agent_argv": ("synthetic-agent", "run"),
-            "timeout_seconds": 10,
-            "lease_seconds": 30,
-            "heartbeat_seconds": 5,
-            "kill_grace_seconds": 1,
+            "agent_command": "synthetic-agent run",
             "poll_seconds": 1,
         }
         values.update(changes)
@@ -208,9 +211,107 @@ class ExecutionRunnerTests(unittest.TestCase):
             self.service.get(1).last_failure_reason, "startup_failed"
         )
 
+    def test_selected_profile_controls_exact_prompt_tools_turns_and_timing(self):
+        specialist = parse_profile({
+            "schema": "foxhound.agent-profile",
+            "schema_version": 1,
+            "profile_id": "specialist",
+            "display_name": "Synthetic Specialist",
+            "runtime": "hermes",
+            "prompt_template": (
+                f"First call {WORKER_COMMAND_TOKEN} context. Synthetic role."
+            ),
+            "toolsets": ["terminal", "file"],
+            "max_turns": 50,
+            "timeout_seconds": 1_800,
+            "claim_lease_seconds": 2_700,
+            "heartbeat_seconds": 60,
+            "kill_grace_seconds": 30,
+            "allowed_phases": ["plan", "execute"],
+        })
+        registry = AgentProfileRegistry((general_profile(), specialist))
+        service = TaskExecutionService(
+            self.database,
+            profile_registry=registry,
+        )
+        scheduled = service.schedule(1, expected_task_version=1)
+        selected = service.select_agent(
+            1,
+            expected_version=scheduled.version,
+            profile_id=specialist.profile_id,
+            profile_revision=specialist.revision,
+        )
+        service.start_action(1, expected_version=selected.version, action="start")
+        launched = {}
+
+        def popen(argv, **kwargs):
+            launched.update(argv=argv, kwargs=kwargs)
+            state = load_run_state(
+                Path(kwargs["env"]["FOXHOUND_EXECUTION_STATE"])
+            )
+            launched["state"] = state
+
+            def release():
+                TaskExecutionService(state.database_path).release(
+                    state.task_id,
+                    expected_version=state.workflow_version,
+                    claim_token=state.claim_token,
+                )
+
+            return FakeProcess(callback=release)
+
+        result = run_once(
+            self._config(profile_registry=registry),
+            popen=popen,
+            run_id_factory=lambda: "2" * 32,
+            terminate=self._terminator,
+        )
+
+        self.assertEqual(result.outcome, "released")
+        self.assertEqual(
+            tuple(launched["argv"]),
+            profile_argv("synthetic-agent run", specialist),
+        )
+        self.assertIn(
+            "Synthetic role",
+            launched["argv"][launched["argv"].index("--query") + 1],
+        )
+        self.assertIn("50", launched["argv"])
+        self.assertIn("terminal,file", launched["argv"])
+        self.assertEqual(launched["state"].lease_seconds, 2_700)
+        self.assertEqual(
+            launched["state"].agent_profile_revision,
+            specialist.revision,
+        )
+
+    def test_runner_refuses_a_selected_revision_missing_from_its_registry(self):
+        specialist = parse_profile({
+            **general_profile().document(),
+            "profile_id": "specialist",
+            "display_name": "Synthetic Specialist",
+        })
+        registry = AgentProfileRegistry((general_profile(), specialist))
+        service = TaskExecutionService(
+            self.database, profile_registry=registry
+        )
+        scheduled = service.schedule(1, expected_task_version=1)
+        selected = service.select_agent(
+            1,
+            expected_version=scheduled.version,
+            profile_id=specialist.profile_id,
+            profile_revision=specialist.revision,
+        )
+        service.start_action(1, expected_version=selected.version, action="start")
+        before = service.get(1)
+
+        with self.assertRaises(TaskLedgerError):
+            run_once(self._config())
+
+        self.assertEqual(service.get(1), before)
+
     def test_plan_only_runner_does_not_claim_execute_work(self):
         self._ready()
-        claim = self.service.claim_next(lease_seconds=30)
+        claim = self.service.claim_next()
         self.assertIsNotNone(claim)
         recorded = self.service.record_result(ExecutionResultEnvelope(
             result_id=RESULT_ID,
@@ -249,7 +350,7 @@ class ExecutionRunnerTests(unittest.TestCase):
         monotonic = MutableMonotonic()
         process = FakeProcess()
         result = run_once(
-            self._config(timeout_seconds=2),
+            self._config(),
             popen=lambda *_args, **_kwargs: process,
             clock=monotonic,
             sleep=monotonic.sleep,
@@ -347,8 +448,7 @@ class ExecutionRunnerTests(unittest.TestCase):
             return FakeProcess(callback=close_task)
 
         result = run_once(
-            self._config(heartbeat_seconds=1, lease_seconds=5,
-                         kill_grace_seconds=0.5),
+            self._config(),
             popen=close_popen,
             clock=monotonic,
             sleep=monotonic.sleep,
@@ -370,7 +470,7 @@ class ExecutionRunnerTests(unittest.TestCase):
             run_once(self._config())
         self.run_root.chmod(0o700)
         with self.assertRaises(ValueError):
-            self._config(heartbeat_seconds=10, lease_seconds=20)
+            self._config(poll_seconds=0)
         for phases in (
             (),
             (WorkflowPhase.PLAN, WorkflowPhase.PLAN),
@@ -435,12 +535,23 @@ class ExecutionRunnerTests(unittest.TestCase):
 
     def test_cli_passes_an_explicit_phase_allowlist(self):
         output = StringIO()
+        profiles = self.root / "profiles"
+        profiles.mkdir(mode=0o700)
+        specialist = {
+            **general_profile().document(),
+            "profile_id": "specialist",
+            "display_name": "Synthetic Specialist",
+        }
+        manifest = profiles / "specialist.json"
+        manifest.write_text(json.dumps(specialist), encoding="utf-8")
+        manifest.chmod(0o600)
         arguments = [
             "--database", str(self.database),
             "--run-root", str(self.run_root),
             "--gw-endpoint", "http://127.0.0.1:8787",
             "--gw-alias", "primary",
             "--gw-token-file", str(self.token_file),
+            "--agent-profile-directory", str(profiles),
             "--allowed-phase", "plan",
         ]
         with redirect_stdout(output), mock.patch(
@@ -452,6 +563,9 @@ class ExecutionRunnerTests(unittest.TestCase):
         self.assertEqual(
             run.call_args.args[0].allowed_phases,
             (WorkflowPhase.PLAN,),
+        )
+        self.assertIsNotNone(
+            run.call_args.args[0].profile_registry.get("specialist")
         )
 
 
