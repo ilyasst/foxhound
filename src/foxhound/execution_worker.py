@@ -78,7 +78,17 @@ class ExecutionWorkerClaimError(ExecutionWorkerError):
 
 
 class ExecutionWorkerDraftError(ExecutionWorkerError):
-    pass
+    """A refusal the agent is allowed to hear the reason for.
+
+    `reason` is a bounded enum token from the ledger — `stale_version`,
+    `claim_mismatch`, `invalid_state` and so on. It names a state, never
+    task content, so it is safe to put in front of an agent and in a
+    process's standard error.
+    """
+
+    def __init__(self, message: str, *, reason: str | None = None) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -298,7 +308,14 @@ class ExecutionWorker:
             envelope
         )
         if result.disposition is WorkflowDisposition.REFUSED:
-            raise ExecutionWorkerDraftError("execution result was refused")
+            # The ledger says exactly why. Discarding it left an agent to
+            # guess: one tried to record three times, was told only
+            # "operation refused" each time, and released a complete and
+            # correct result rather than a wrong one.
+            raise ExecutionWorkerDraftError(
+                "execution result was refused",
+                reason=None if result.refusal is None else result.refusal.value,
+            )
         receipt = {
             "schema": RESULT_RECEIPT_SCHEMA,
             "schema_version": WORKER_SCHEMA_VERSION,
@@ -880,7 +897,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ExecutionWorkerClaimError:
         print("foxhound task worker: claim unavailable", file=sys.stderr)
         return 75
-    except (ExecutionWorkerDraftError, KnowledgeClientError, TaskLedgerError):
+    except ExecutionWorkerDraftError as exc:
+        reason = getattr(exc, "reason", None)
+        print(
+            "foxhound task worker: operation refused"
+            + (f" ({reason})" if reason else ""),
+            file=sys.stderr,
+        )
+        return 65
+    except (KnowledgeClientError, TaskLedgerError):
         print("foxhound task worker: operation refused", file=sys.stderr)
         return 65
     except Exception:
