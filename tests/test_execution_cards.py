@@ -356,7 +356,8 @@ class ExecutionCardTests(unittest.TestCase):
         ]
         self.assertEqual(
             [parse_execution_review_callback(value)[2] for value in callbacks],
-            ["start", "agent", "snooze", "cancel"],
+            ["start", "agent", "discuss", "snooze", "cancel",
+             "reassign", "drop"],
         )
         self.assertTrue(all(
             len(value.encode("utf-8")) <= CALLBACK_DATA_LIMIT
@@ -933,6 +934,90 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertIn("To: Someone", body)
         self.assertIn("Subject: Synthetic subject", body)
         self.assertIn("<pre>First line.\nSecond line.</pre>", body)
+
+    def test_a_gate_says_which_issue_it_is_asking_about(self):
+        """Naming the task is not naming the thing.
+
+        Two issues can share a title, and the number is what the reader
+        searches for afterwards. Without it the reader is asked to
+        authorise work they would have to go and look up first.
+        """
+        task_id = 6
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "INSERT INTO candidate_inbox(candidate_id,source_system,"
+                "source_kind,source_record_id,source_item_id,source_revision,"
+                "payload_json,created_at,first_imported_at,updated_at) "
+                "VALUES('c1','gw','issue','forge.example/acme/widget','42',"
+                "?,'{}','2030-01-01T00:00:00Z','2030-01-01T00:00:00Z',"
+                "'2030-01-01T00:00:00Z')", ("b" * 64,))
+            connection.execute(
+                "INSERT INTO task_candidate_bindings(candidate_id,"
+                "source_revision,task_id,relation,decided_at) "
+                "VALUES('c1',?,?,'accepted','2030-01-01T00:00:00Z')",
+                ("b" * 64, task_id))
+            connection.commit()
+        self._schedule_workflow(task_id)
+        self.assertEqual(self.cards.schedule().created, 1)
+        body, _keyboard = render_execution_review_card(
+            self.cards.claim_next().card)
+        self.assertIn("widget #42", body)
+
+    def test_an_unlinkable_origin_is_still_named(self):
+        # A meeting record has no address a reader can open. Naming it is
+        # still better than silence, and a wrong link is worse than none.
+        task_id = 6
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "INSERT INTO candidate_inbox(candidate_id,source_system,"
+                "source_kind,source_record_id,source_item_id,source_revision,"
+                "payload_json,created_at,first_imported_at,updated_at) "
+                "VALUES('c2','gw','meeting','record_synthetic','action-1',"
+                "?,'{}','2030-01-01T00:00:00Z','2030-01-01T00:00:00Z',"
+                "'2030-01-01T00:00:00Z')", ("b" * 64,))
+            connection.execute(
+                "INSERT INTO task_candidate_bindings(candidate_id,"
+                "source_revision,task_id,relation,decided_at) "
+                "VALUES('c2',?,?,'accepted','2030-01-01T00:00:00Z')",
+                ("b" * 64, task_id))
+            connection.commit()
+        self._schedule_workflow(task_id)
+        self.assertEqual(self.cards.schedule().created, 1)
+        body, _keyboard = render_execution_review_card(
+            self.cards.claim_next().card)
+        self.assertIn("record_synthetic", body)
+        self.assertNotIn("<a href", body)
+
+    def test_a_gate_can_be_reassigned_dropped_or_discussed(self):
+        """A task is most often noticed as someone else's when offered.
+
+        The gate used to accept only start, snooze and cancel, so "not
+        mine" was indistinguishable from "not real" and the task was lost
+        for whoever it actually belonged to.
+        """
+        def delivered_gate(task_id):
+            self._schedule_workflow(task_id)
+            self.assertEqual(self.cards.schedule().created, 1)
+            claim = self.cards.claim_next()
+            self.assertEqual(claim.card.kind, ExecutionCardKind.START)
+            delivered = self.cards.complete_delivery(
+                claim.card.id, expected_version=claim.card.version,
+                claim_token=claim.token, transport="synthetic",
+                delivery_ref="1")
+            return claim.card.id, delivered.card_version
+
+        # One input answers a card, so each is exercised on its own gate.
+        card_id, version = delivered_gate(5)
+        noted = self.cards.submit_input(
+            card_id, expected_version=version, kind="discussion",
+            value="Check the deployment story first.")
+        self.assertTrue(noted.accepted, noted.refusal)
+
+        card_id, version = delivered_gate(6)
+        moved = self.cards.submit_input(
+            card_id, expected_version=version,
+            kind="reassignment", value="Person B")
+        self.assertTrue(moved.accepted, moved.refusal)
 
     def test_a_start_card_never_claims_work_has_begun(self):
         # The phase names what WOULD run. On a gate, naming it reads as
