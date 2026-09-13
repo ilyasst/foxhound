@@ -510,7 +510,7 @@ class TaskCardServerTests(unittest.TestCase):
                 (False, "stale_version"),
             )
 
-            execution_claim = self.execution.claim_next(lease_seconds=300)
+            execution_claim = self.execution.claim_next()
             recorded = self.execution.record_result(ExecutionResultEnvelope(
                 result_id="synthetic-plan-result",
                 task_id=1,

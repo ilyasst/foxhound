@@ -135,7 +135,7 @@ class ExecutionWorkerTests(unittest.TestCase):
         service.start_action(
             1, expected_version=scheduled.version, action="start"
         )
-        self.claim = service.claim_next(lease_seconds=300)
+        self.claim = service.claim_next()
         self.assertIsNotNone(self.claim)
         self.run_directory = self.root / f"run-{RUN_ID}"
         self.run_directory.mkdir(mode=0o700)
@@ -145,7 +145,7 @@ class ExecutionWorkerTests(unittest.TestCase):
     def _write_state(self) -> None:
         self.state_path.write_text(json.dumps({
             "schema": "foxhound.execution-run-state",
-            "schema_version": 1,
+            "schema_version": 2,
             "run_id": RUN_ID,
             "database_path": str(self.database),
             "task_id": 1,
@@ -153,7 +153,9 @@ class ExecutionWorkerTests(unittest.TestCase):
             "workflow_version": self.claim.workflow_version,
             "phase": "plan",
             "claim_token": CLAIM_TOKEN,
-            "lease_seconds": 300,
+            "lease_seconds": self.claim.lease_seconds,
+            "agent_profile_id": self.claim.agent_profile_id,
+            "agent_profile_revision": self.claim.agent_profile_revision,
         }), encoding="utf-8")
         self.state_path.chmod(0o600)
 
@@ -190,7 +192,16 @@ class ExecutionWorkerTests(unittest.TestCase):
         self.assertNotIn(CLAIM_TOKEN, rendered)
         self.assertNotIn(str(self.database), rendered)
         self.assertEqual(context["task"]["text"], "Synthetic task")
+        self.assertEqual(context["schema_version"], 2)
         self.assertEqual(context["workflow"]["phase"], "plan")
+        self.assertEqual(
+            context["workflow"]["agent_profile_id"],
+            self.claim.agent_profile_id,
+        )
+        self.assertEqual(
+            context["workflow"]["agent_profile_revision"],
+            self.claim.agent_profile_revision,
+        )
         self.assertEqual(context["operator"]["display_name"], "Person A")
         self.assertEqual(result["layers"][0]["documents"][0]["excerpt"],
                          "Synthetic evidence.")
@@ -236,6 +247,12 @@ class ExecutionWorkerTests(unittest.TestCase):
         alias.symlink_to(self.state_path)
         with self.assertRaises(ExecutionWorkerConfigError):
             load_run_state(alias)
+        document = json.loads(self.state_path.read_text(encoding="utf-8"))
+        document["agent_profile_revision"] = "Z" * 64
+        self.state_path.write_text(json.dumps(document), encoding="utf-8")
+        self.state_path.chmod(0o600)
+        with self.assertRaises(ExecutionWorkerConfigError):
+            load_run_state(self.state_path)
 
     def test_release_is_fenced_and_content_free(self):
         with knowledge_server() as endpoint:

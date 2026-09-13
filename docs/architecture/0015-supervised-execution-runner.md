@@ -24,6 +24,12 @@ cause an external effect, execution cannot perform an external action, and
 the external-action phase is usable only after its separate durable reader
 approval. Execution never changes task lifecycle state.
 
+The selected workflow profile now supplies that prompt as well as the Hermes
+tool allowlist, turn limit, timeout, claim lease, heartbeat, and shutdown
+grace. The runner resolves the exact recorded revision from its reviewed
+registry before the claim and has no command-line overrides for those policy
+fields. See [ADR 0024](0024-workflow-agent-binding.md).
+
 The only supported task operations inside a run are exposed by
 `foxhound.execution_worker`:
 

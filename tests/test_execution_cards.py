@@ -12,6 +12,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import foxhound.candidate_inbox as inbox_schema
+from foxhound.agent_profiles import (
+    AgentProfileRegistry,
+    general_profile,
+    parse_profile,
+)
 from foxhound.candidate_inbox import CandidateInbox, SCHEMA_VERSION
 from foxhound.execution_cards import (
     CALLBACK_DATA_LIMIT,
@@ -53,6 +58,20 @@ def _drop_native_intake_schema(connection: sqlite3.Connection) -> None:
     connection.execute("DROP TABLE native_candidate_intake_events")
     connection.execute("DROP TABLE native_candidate_intakes")
     connection.execute("DROP TABLE candidate_feed_items")
+
+
+def _drop_agent_profile_schema(connection: sqlite3.Connection) -> None:
+    for table in (
+        "task_execution_workflows",
+        "task_execution_results",
+        "task_execution_events",
+    ):
+        connection.execute(
+            f"ALTER TABLE {table} DROP COLUMN agent_profile_revision"
+        )
+        connection.execute(
+            f"ALTER TABLE {table} DROP COLUMN agent_profile_id"
+        )
 
 
 DELIVERY_TOKEN = "delivery-token-" + "d" * 32
@@ -132,7 +151,7 @@ class ExecutionCardTests(unittest.TestCase):
         long_work: bool = False,
         work_markdown: str | None = None,
     ):
-        claim = self.execution.claim_next(lease_seconds=300)
+        claim = self.execution.claim_next()
         self.assertIsNotNone(claim)
         self.assertEqual((claim.task_id, claim.phase), (task_id, phase))
         result = self.execution.record_result(ExecutionResultEnvelope(
@@ -203,6 +222,7 @@ class ExecutionCardTests(unittest.TestCase):
     def test_schema_eight_migration_is_passive_and_preserves_execution(self):
         self._schedule_workflow(1)
         with closing(sqlite3.connect(self.database)) as connection:
+            _drop_agent_profile_schema(connection)
             _drop_native_intake_schema(connection)
             connection.execute(
                 "DROP TRIGGER execution_review_card_events_no_update"
@@ -447,6 +467,42 @@ class ExecutionCardTests(unittest.TestCase):
             )
             self.assertEqual(stale.refusal, ExecutionCardRefusal.STALE_VERSION)
             self.assertEqual(self.cards.event_count(), before + 1)
+
+    def test_agent_change_versions_workflow_and_invalidates_start_card(self):
+        workflow = self._schedule_workflow(1)
+        self.cards.schedule()
+        claim = self._claim_and_deliver()
+        specialist_document = general_profile().document()
+        specialist_document.update({
+            "profile_id": "specialist",
+            "display_name": "Synthetic Specialist",
+        })
+        specialist = parse_profile(specialist_document)
+        execution = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            profile_registry=AgentProfileRegistry((
+                general_profile(), specialist,
+            )),
+        )
+
+        selected = execution.select_agent(
+            1,
+            expected_version=workflow.version,
+            profile_id=specialist.profile_id,
+            profile_revision=specialist.revision,
+        )
+
+        self.assertEqual(selected.version, workflow.version + 1)
+        stale = self.cards.act(
+            claim.card.id,
+            expected_version=claim.card.version,
+            action="start",
+        )
+        self.assertEqual(stale.refusal, ExecutionCardRefusal.STALE_VERSION)
+        refreshed = self.cards.schedule()
+        self.assertEqual((refreshed.cancelled, refreshed.created), (1, 1))
+        self.assertEqual(self.ledger.get(1).status, TaskStatus.OPEN)
 
     def test_plan_review_rendering_approval_revision_and_cancel(self):
         for task_id, action in ((1, "approve"), (2, "revise"), (3, "cancel")):

@@ -10,6 +10,12 @@ from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from foxhound.agent_profiles import (
+    AgentProfileRegistry,
+    WORKER_COMMAND_TOKEN,
+    general_profile,
+    parse_profile,
+)
 from foxhound.candidate_inbox import CandidateInbox, SCHEMA_VERSION
 from foxhound.task_execution import (
     ExecutionOutcome,
@@ -20,11 +26,29 @@ from foxhound.task_execution import (
     WorkflowRefusal,
     WorkflowStatus,
 )
-from foxhound.task_ledger import TaskLedger
+from foxhound.task_ledger import TaskLedger, TaskLedgerError
 
 
 TOKEN = "execution-claim-token-000000000000000000000000"
 OTHER_TOKEN = "different-claim-token-000000000000000000000"
+
+
+def _profile(profile_id="specialist", *, phases=("plan", "execute")):
+    return parse_profile({
+        "schema": "foxhound.agent-profile",
+        "schema_version": 1,
+        "profile_id": profile_id,
+        "display_name": "Synthetic Specialist",
+        "runtime": "hermes",
+        "prompt_template": f"Use {WORKER_COMMAND_TOKEN} context.",
+        "toolsets": ["terminal", "file"],
+        "max_turns": 50,
+        "timeout_seconds": 1_800,
+        "claim_lease_seconds": 2_700,
+        "heartbeat_seconds": 60,
+        "kill_grace_seconds": 30,
+        "allowed_phases": list(phases),
+    })
 
 
 def _drop_native_intake_schema(connection: sqlite3.Connection) -> None:
@@ -41,6 +65,20 @@ def _drop_native_intake_schema(connection: sqlite3.Connection) -> None:
     connection.execute("DROP TABLE native_candidate_intake_events")
     connection.execute("DROP TABLE native_candidate_intakes")
     connection.execute("DROP TABLE candidate_feed_items")
+
+
+def _drop_agent_profile_schema(connection: sqlite3.Connection) -> None:
+    for table in (
+        "task_execution_workflows",
+        "task_execution_results",
+        "task_execution_events",
+    ):
+        connection.execute(
+            f"ALTER TABLE {table} DROP COLUMN agent_profile_revision"
+        )
+        connection.execute(
+            f"ALTER TABLE {table} DROP COLUMN agent_profile_id"
+        )
 
 
 class MutableClock:
@@ -98,7 +136,7 @@ class TaskExecutionTests(unittest.TestCase):
         return started
 
     def _claim(self):
-        claim = self.service.claim_next(lease_seconds=300)
+        claim = self.service.claim_next()
         self.assertIsNotNone(claim)
         return claim
 
@@ -164,6 +202,248 @@ class TaskExecutionTests(unittest.TestCase):
                 ).fetchone()[0],
                 0,
             )
+
+    def test_schema_eleven_migration_preserves_gates_and_adds_profile_evidence(self):
+        started = self._schedule_and_start()
+        claim = self._claim()
+        recorded = self.service.record_result(self._result(claim))
+        self.assertEqual(recorded.status, WorkflowStatus.AWAITING_REVIEW)
+        before = self.service.get(1)
+
+        with closing(sqlite3.connect(self.database)) as connection:
+            _drop_agent_profile_schema(connection)
+            connection.execute("PRAGMA user_version = 11")
+            connection.commit()
+
+        CandidateInbox(self.database, clock=self.clock).initialize()
+
+        after = self.service.get(1)
+        self.assertEqual(SCHEMA_VERSION, 12)
+        self.assertEqual(
+            (after.status, after.phase, after.version, after.task_version),
+            (before.status, before.phase, before.version, before.task_version),
+        )
+        self.assertEqual(after.agent_profile_id, "general")
+        self.assertEqual(
+            after.agent_profile_revision, general_profile().revision
+        )
+        with closing(sqlite3.connect(self.database)) as connection:
+            result_evidence = connection.execute(
+                "SELECT DISTINCT agent_profile_id,agent_profile_revision "
+                "FROM task_execution_results"
+            ).fetchall()
+            event_evidence = connection.execute(
+                "SELECT DISTINCT agent_profile_id,agent_profile_revision "
+                "FROM task_execution_events"
+            ).fetchall()
+        expected = [("general", general_profile().revision)]
+        self.assertEqual(result_evidence, expected)
+        self.assertEqual(event_evidence, expected)
+
+    def test_agent_selection_is_explicit_idempotent_and_version_fenced(self):
+        specialist = _profile()
+        unavailable = _profile("execute-only", phases=("execute",))
+        registry = AgentProfileRegistry((
+            general_profile(), specialist, unavailable,
+        ))
+        service = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: TOKEN,
+            profile_registry=registry,
+        )
+        scheduled = service.schedule(1, expected_task_version=1)
+        self.assertEqual(scheduled.agent_profile_id, "general")
+        self.assertEqual(
+            scheduled.agent_profile_revision, general_profile().revision
+        )
+
+        selected = service.select_agent(
+            1,
+            expected_version=scheduled.version,
+            profile_id=specialist.profile_id,
+            profile_revision=specialist.revision,
+        )
+        self.assertEqual(selected.disposition, WorkflowDisposition.APPLIED)
+        self.assertEqual(selected.version, scheduled.version + 1)
+        self.assertEqual(selected.agent_profile_id, specialist.profile_id)
+        event_count = service.event_count()
+
+        replay = service.select_agent(
+            1,
+            expected_version=selected.version,
+            profile_id=specialist.profile_id,
+            profile_revision=specialist.revision,
+        )
+        self.assertEqual(replay.disposition, WorkflowDisposition.UNCHANGED)
+        self.assertEqual(service.event_count(), event_count)
+
+        stale = service.select_agent(
+            1,
+            expected_version=scheduled.version,
+            profile_id="general",
+            profile_revision=general_profile().revision,
+        )
+        self.assertEqual(stale.refusal, WorkflowRefusal.STALE_WORKFLOW)
+        for profile_id, revision in (
+            ("missing", specialist.revision),
+            (specialist.profile_id, "0" * 64),
+            (unavailable.profile_id, unavailable.revision),
+        ):
+            with self.subTest(profile_id=profile_id, revision=revision):
+                refused = service.select_agent(
+                    1,
+                    expected_version=selected.version,
+                    profile_id=profile_id,
+                    profile_revision=revision,
+                )
+                self.assertEqual(
+                    refused.refusal,
+                    WorkflowRefusal.AGENT_PROFILE_UNAVAILABLE,
+                )
+        self.assertEqual(service.get(1).version, selected.version)
+
+        started = service.start_action(
+            1, expected_version=selected.version, action="start"
+        )
+        refused = service.select_agent(
+            1,
+            expected_version=started.version,
+            profile_id="general",
+            profile_revision=general_profile().revision,
+        )
+        self.assertEqual(refused.refusal, WorkflowRefusal.INVALID_STATE)
+        self.assertEqual(service.get(1).agent_profile_id, specialist.profile_id)
+
+    def test_default_profile_is_deterministic_and_not_selected_by_task_content(self):
+        specialist = _profile()
+        registry = AgentProfileRegistry((general_profile(), specialist))
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "UPDATE tasks SET text=? WHERE id=1", (specialist.profile_id,)
+            )
+            connection.commit()
+        service = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            profile_registry=registry,
+            default_profile_id=specialist.profile_id,
+        )
+        scheduled = service.schedule(1, expected_task_version=1)
+        self.assertEqual(scheduled.agent_profile_id, specialist.profile_id)
+        self.assertEqual(
+            scheduled.agent_profile_revision, specialist.revision
+        )
+        with self.assertRaises(ValueError):
+            TaskExecutionService(
+                self.database,
+                profile_registry=registry,
+                default_profile_id="missing",
+            )
+        with self.assertRaises(ValueError):
+            TaskExecutionService(
+                self.database,
+                profile_registry=AgentProfileRegistry((
+                    _profile("execute-only", phases=("execute",)),
+                )),
+                default_profile_id="execute-only",
+            )
+
+    def test_claim_retry_result_events_and_health_retain_exact_profile(self):
+        specialist = _profile()
+        registry = AgentProfileRegistry((general_profile(), specialist))
+        service = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: TOKEN,
+            profile_registry=registry,
+        )
+        scheduled = service.schedule(1, expected_task_version=1)
+        selected = service.select_agent(
+            1,
+            expected_version=scheduled.version,
+            profile_id=specialist.profile_id,
+            profile_revision=specialist.revision,
+        )
+        started = service.start_action(
+            1, expected_version=selected.version, action="start"
+        )
+        claim = service.claim_next()
+        self.assertEqual(claim.agent_profile_id, specialist.profile_id)
+        self.assertEqual(claim.agent_profile_revision, specialist.revision)
+        failed = service.fail(
+            1,
+            expected_version=claim.workflow_version,
+            claim_token=claim.token,
+            reason="process_exit",
+        )
+        retried = service.retry(1, expected_version=failed.version)
+        self.assertEqual(retried.agent_profile_id, specialist.profile_id)
+        self.assertEqual(retried.agent_profile_revision, specialist.revision)
+
+        claim = service.claim_next()
+        recorded = service.record_result(self._result(claim))
+        self.assertEqual(recorded.agent_profile_id, specialist.profile_id)
+        with closing(sqlite3.connect(self.database)) as connection:
+            result_evidence = connection.execute(
+                "SELECT agent_profile_id,agent_profile_revision "
+                "FROM task_execution_results WHERE result_id='result-001'"
+            ).fetchone()
+            latest_events = connection.execute(
+                "SELECT agent_profile_id,agent_profile_revision "
+                "FROM task_execution_events WHERE kind!='scheduled'"
+            ).fetchall()
+        expected = (specialist.profile_id, specialist.revision)
+        self.assertEqual(result_evidence, expected)
+        self.assertTrue(latest_events)
+        self.assertTrue(all(event == expected for event in latest_events))
+
+        health = service.profile_health()
+        self.assertEqual(len(health), 1)
+        self.assertEqual(health[0].agent_profile_id, specialist.profile_id)
+        self.assertEqual(health[0].agent_profile_revision, specialist.revision)
+        self.assertTrue(health[0].available)
+        unavailable = TaskExecutionService(
+            self.database, clock=self.clock
+        ).profile_health()
+        self.assertFalse(unavailable[0].available)
+        self.assertNotIn("Synthetic task", repr(unavailable))
+
+    def test_claim_refuses_changed_missing_or_phase_ineligible_profile(self):
+        specialist = _profile(phases=("plan",))
+        registry = AgentProfileRegistry((general_profile(), specialist))
+        service = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: TOKEN,
+            profile_registry=registry,
+        )
+        scheduled = service.schedule(1, expected_task_version=1)
+        selected = service.select_agent(
+            1,
+            expected_version=scheduled.version,
+            profile_id=specialist.profile_id,
+            profile_revision=specialist.revision,
+        )
+        service.start_action(1, expected_version=selected.version, action="start")
+
+        without_profile = TaskExecutionService(
+            self.database, clock=self.clock, token_factory=lambda: TOKEN
+        )
+        with self.assertRaises(TaskLedgerError):
+            without_profile.claim_next()
+        queued = service.get(1)
+        self.assertEqual(queued.status, WorkflowStatus.QUEUED)
+
+        claim = service.claim_next()
+        recorded = service.record_result(self._result(claim))
+        approved = service.review_action(
+            1, expected_version=recorded.version, action="approve"
+        )
+        self.assertEqual(approved.phase, WorkflowPhase.EXECUTE)
+        with self.assertRaises(TaskLedgerError):
+            service.claim_next()
+        self.assertEqual(service.get(1).status, WorkflowStatus.QUEUED)
 
     def test_schedule_is_explicit_idempotent_and_task_version_fenced(self):
         scheduled = self.service.schedule(1, expected_task_version=1)
@@ -326,7 +606,6 @@ class TaskExecutionTests(unittest.TestCase):
 
         execute_before = self.service.get(1)
         plan = self.service.claim_next(
-            lease_seconds=300,
             allowed_phases=(WorkflowPhase.PLAN,),
         )
         self.assertIsNotNone(plan)
@@ -340,7 +619,6 @@ class TaskExecutionTests(unittest.TestCase):
             claim_token=plan.token,
         )
         selected = self.service.claim_next(
-            lease_seconds=300,
             allowed_phases=(WorkflowPhase.EXECUTE,),
         )
         self.assertIsNotNone(selected)
@@ -360,7 +638,6 @@ class TaskExecutionTests(unittest.TestCase):
         external_before = self.service.get(1)
 
         plan = self.service.claim_next(
-            lease_seconds=300,
             allowed_phases=(WorkflowPhase.PLAN,),
         )
         self.assertIsNotNone(plan)
@@ -488,7 +765,7 @@ class TaskExecutionTests(unittest.TestCase):
         self.clock.advance(seconds=60)
 
         self._claim()
-        self.clock.advance(seconds=301)
+        self.clock.advance(seconds=901)
         third_claim = self.service.claim_next()
         self.assertIsNone(third_claim)
         state = self.service.get(1)
