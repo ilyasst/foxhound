@@ -229,7 +229,12 @@ def load_drafts(source: Path) -> dict[str, ProfileDraft]:
         raise ProfileStoreError("agent profile count is excessive")
     drafts: dict[str, ProfileDraft] = {}
     for path in entries:
-        info = path.lstat()
+        try:
+            info = path.lstat()
+        except OSError as exc:
+            raise ProfileStoreError(
+                "agent profile store is unavailable"
+            ) from exc
         if (
             stat.S_ISLNK(info.st_mode)
             or not stat.S_ISDIR(info.st_mode)
@@ -556,8 +561,46 @@ def migrate(
     flat = _private_directory(flat_directory, owner_only=False)
     root = _store_root(source)
     catalog = _load_catalog(root)
-    migrated: list[dict[str, Any]] = []
+    planned = _migration_plan(flat, root, catalog)
+    if dry_run:
+        return _migration_report(planned, applied=False)
     updated = dict(catalog)
+    for profile in planned:
+        draft = ProfileDraft(
+            profile_id=profile.profile_id,
+            shared=(),
+            role="role.md",
+            overlays=(),
+            policy={
+                field: profile.document()[field] for field in _POLICY_FIELDS
+            },
+        )
+        directory = root / DRAFTS_DIRECTORY / profile.profile_id
+        _ensure_directory(directory)
+        _write_file(
+            directory / draft.role,
+            profile.prompt_template.encode("utf-8") + b"\n",
+        )
+        _write_file(
+            directory / POLICY_NAME, _canonical_bytes(_draft_document(draft))
+        )
+        _write_revision(root, profile)
+        updated[profile.profile_id] = CatalogEntry(
+            profile_id=profile.profile_id,
+            state="active",
+            revision=profile.revision,
+            history=(profile.revision,),
+        )
+    if planned:
+        _write_catalog(root, updated)
+    return _migration_report(planned, applied=bool(planned))
+
+
+def _migration_plan(
+    flat: Path, root: Path, catalog: Mapping[str, CatalogEntry]
+) -> tuple[AgentProfile, ...]:
+    """Check every flat manifest before the store is touched at all."""
+    planned: list[AgentProfile] = []
     for path in _entries(flat):
         if path.suffix != ".json" or path.name == CATALOG_NAME:
             raise ProfileStoreError("private agent profile entry is invalid")
@@ -571,42 +614,25 @@ def migrate(
         ):
             raise ProfileStoreError("agent profile is already published")
         policy = {field: profile.document()[field] for field in _POLICY_FIELDS}
-        role = profile.prompt_template
-        recomposed = _effective_profile(profile.profile_id, policy, (role,))
+        recomposed = _effective_profile(
+            profile.profile_id, policy, (profile.prompt_template,)
+        )
         if recomposed.revision != profile.revision:
             raise ProfileStoreError("agent profile prompt cannot be migrated")
-        migrated.append({
-            "profile_id": profile.profile_id,
-            "revision": profile.revision,
-        })
-        if dry_run:
-            continue
-        draft = ProfileDraft(
-            profile_id=profile.profile_id,
-            shared=(),
-            role="role.md",
-            overlays=(),
-            policy=policy,
-        )
-        directory = root / DRAFTS_DIRECTORY / profile.profile_id
-        _ensure_directory(directory)
-        _write_file(directory / draft.role, role.encode("utf-8") + b"\n")
-        _write_file(
-            directory / POLICY_NAME, _canonical_bytes(_draft_document(draft))
-        )
-        _write_revision(root, profile)
-        updated[profile.profile_id] = CatalogEntry(
-            profile_id=profile.profile_id,
-            state="active",
-            revision=profile.revision,
-            history=(profile.revision,),
-        )
-    if migrated and not dry_run:
-        _write_catalog(root, updated)
+        planned.append(profile)
+    return tuple(planned)
+
+
+def _migration_report(
+    planned: Sequence[AgentProfile], *, applied: bool
+) -> dict[str, Any]:
     return {
         "ok": True,
-        "migrated": migrated,
-        "applied": bool(migrated) and not dry_run,
+        "migrated": [
+            {"profile_id": profile.profile_id, "revision": profile.revision}
+            for profile in planned
+        ],
+        "applied": applied,
         "source_retained": True,
     }
 
@@ -738,6 +764,7 @@ def _write_file(path: Path, payload: bytes) -> None:
             os.fsync(handle.fileno())
         os.chmod(temporary, FILE_MODE)
         os.replace(temporary, path)
+        _fsync_directory(path.parent)
     except OSError as exc:
         raise ProfileStoreError(
             "agent profile store cannot be written"
@@ -750,6 +777,18 @@ def _write_file(path: Path, payload: bytes) -> None:
                 os.unlink(temporary)
             except OSError:
                 pass
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        os.fsync(descriptor)
+    except OSError:
+        return
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -813,6 +852,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         document = _run(args)
     except AgentProfileError as exc:
         print(f"foxhound agent profile store: {exc}", file=sys.stderr)
+        return os.EX_CONFIG
+    except OSError:
+        print(
+            "foxhound agent profile store: store is unavailable",
+            file=sys.stderr,
+        )
         return os.EX_CONFIG
     print(json.dumps(document, sort_keys=True))
     return 0

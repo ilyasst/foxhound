@@ -444,6 +444,31 @@ class ProfileStoreTests(unittest.TestCase):
             migrate(flat, self.source)
         self.assertEqual(self.catalog()["profiles"], {})
 
+    def test_migration_writes_nothing_when_one_manifest_is_refused(self):
+        flat = self.root / "flat-mixed"
+        flat.mkdir(mode=0o700)
+        for profile_id, prompt in (
+            ("example-clerk", None),
+            ("example-courier", "  indented and unreproducible  "),
+        ):
+            document = flat_manifest(profile_id)
+            if prompt is not None:
+                document["prompt_template"] = (
+                    f"{prompt}{WORKER_COMMAND_TOKEN} context"
+                )
+            path = flat / f"{profile_id}.json"
+            path.write_text(json.dumps(document), encoding="utf-8")
+            path.chmod(0o600)
+
+        with self.assertRaises(ProfileStoreError):
+            migrate(flat, self.source)
+
+        self.assertEqual(self.catalog()["profiles"], {})
+        self.assertFalse(
+            (self.source / DRAFTS_DIRECTORY / "example-clerk").exists()
+        )
+        self.assertEqual(validate(self.source)["unpublished_files"], 0)
+
     def test_validation_reports_drafts_that_are_not_published(self):
         publish(self.source, ["example-scout"])
         self.write_draft("example-clerk", display_name="Example Clerk")
@@ -493,7 +518,10 @@ class ProfileStoreTests(unittest.TestCase):
             ("unknown-toolset", {"toolsets": ["terminal", "network"]}),
             ("schema-version", {"schema_version": 2}),
             ("unsafe-timing", {"claim_lease_seconds": 300}),
-            ("fragment-count", {"shared": [f"part-{index}.md" for index in range(9)]}),
+            (
+                "fragment-count",
+                {"shared": [f"part-{index}.md" for index in range(9)]},
+            ),
         ]
         for name, changes in variants:
             with self.subTest(case=name):
@@ -523,7 +551,10 @@ class ProfileStoreTests(unittest.TestCase):
         }
         for name, text in cases.items():
             with self.subTest(case=name):
-                path = self.source / DRAFTS_DIRECTORY / "example-scout" / "role.md"
+                path = (
+                    self.source / DRAFTS_DIRECTORY / "example-scout"
+                    / "role.md"
+                )
                 path.unlink()
                 if text is None:
                     path.symlink_to(outside)
@@ -577,6 +608,19 @@ class ProfileStoreTests(unittest.TestCase):
         self.assertNotIn("synthetic-private-prompt-value", rendered)
         self.assertNotIn(str(self.source), rendered)
         self.assertIn("prompt fragment is invalid", rendered)
+
+        for target, error in (
+            ("foxhound.profile_store._load_catalog", OSError("private path")),
+            ("foxhound.profile_store._store_root", OSError("private path")),
+        ):
+            with self.subTest(target=target):
+                with mock.patch(target, side_effect=error):
+                    rendered = self.capture(
+                        ["--source", str(self.source), "list"],
+                        expected=os.EX_CONFIG,
+                    )
+                self.assertNotIn("private path", rendered)
+                self.assertNotIn(str(self.source), rendered)
 
     def test_public_example_store_publishes_a_valid_profile(self):
         example = Path(__file__).resolve().parent.parent / "examples"
