@@ -79,6 +79,8 @@ from .task_execution import (
     WorkflowStatus,
 )
 from .execution_cards import (
+    ExecutionAgentOption,
+    ExecutionAgentSelectorResult,
     ExecutionCardDeliveryClaim,
     ExecutionCardDisposition,
     ExecutionCardKind,
@@ -89,7 +91,9 @@ from .execution_cards import (
     ExecutionCardStats,
     ExecutionCardStatus,
     ExecutionReviewCard,
+    parse_execution_agent_callback,
     parse_execution_review_callback,
+    render_execution_agent_selector,
     render_execution_review_card,
 )
 from .execution_runner import (
@@ -171,6 +175,8 @@ __all__ = (
     "WorkflowPhase",
     "WorkflowRefusal",
     "WorkflowStatus",
+    "ExecutionAgentOption",
+    "ExecutionAgentSelectorResult",
     "ExecutionCardDeliveryClaim",
     "ExecutionCardDisposition",
     "ExecutionCardKind",
@@ -181,7 +187,9 @@ __all__ = (
     "ExecutionCardStats",
     "ExecutionCardStatus",
     "ExecutionReviewCard",
+    "parse_execution_agent_callback",
     "parse_execution_review_callback",
+    "render_execution_agent_selector",
     "render_execution_review_card",
     "ExecutionRunnerConfig",
     "ExecutionRunnerError",

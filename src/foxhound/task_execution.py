@@ -435,67 +435,22 @@ class TaskExecutionService:
             return _refused(
                 task_id, WorkflowRefusal.AGENT_PROFILE_UNAVAILABLE
             )
-        now = self._now()
+        stamp = self._clock_value()
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                row = self._workflow_with_task(connection, task_id)
-                refusal = _workflow_guard(
-                    row,
-                    expected_version,
-                    {WorkflowStatus.AWAITING_START},
-                )
-                if refusal is None:
-                    refusal = _task_guard(row, int(row["task_version"]))
-                if refusal is not None:
-                    connection.rollback()
-                    return _refused_row(task_id, row, refusal)
-                if (
-                    row["agent_profile_id"] == profile.profile_id
-                    and row["agent_profile_revision"] == profile.revision
-                ):
-                    connection.rollback()
-                    return _operation(row, WorkflowDisposition.UNCHANGED)
-                version = expected_version + 1
-                updated = connection.execute(
-                    "UPDATE task_execution_workflows SET version=?,"
-                    "agent_profile_id=?,agent_profile_revision=?,updated_at=? "
-                    "WHERE task_id=? AND version=? "
-                    "AND status='awaiting_start'",
-                    (
-                        version,
-                        profile.profile_id,
-                        profile.revision,
-                        now,
-                        task_id,
-                        expected_version,
-                    ),
-                )
-                if updated.rowcount != 1:
-                    connection.rollback()
-                    return _refused_row(
-                        task_id, row, WorkflowRefusal.STALE_WORKFLOW
-                    )
-                self._event(
+                result = _apply_agent_selection(
                     connection,
                     task_id,
-                    "agent_selected",
-                    version,
-                    int(row["task_version"]),
-                    WorkflowPhase.PLAN,
-                    WorkflowStatus.AWAITING_START,
-                    now,
+                    expected_version=expected_version,
+                    profile=profile,
+                    stamp=stamp,
                 )
+                if not result.accepted:
+                    connection.rollback()
+                    return result
                 connection.commit()
-                return WorkflowOperationResult(
-                    WorkflowDisposition.APPLIED,
-                    task_id,
-                    version,
-                    WorkflowStatus.AWAITING_START,
-                    WorkflowPhase.PLAN,
-                    agent_profile_id=profile.profile_id,
-                    agent_profile_revision=profile.revision,
-                )
+                return result
             except Exception:
                 connection.rollback()
                 raise
@@ -1230,6 +1185,76 @@ class TaskExecutionService:
 
     def _now(self) -> str:
         return self._clock_value().isoformat(timespec="seconds")
+
+
+def _apply_agent_selection(
+    connection: sqlite3.Connection,
+    task_id: int,
+    *,
+    expected_version: int,
+    profile: AgentProfile,
+    stamp: datetime,
+) -> WorkflowOperationResult:
+    """Bind one exact profile inside the caller's transaction."""
+    if not _valid_identity(task_id, expected_version):
+        return _refused(task_id, WorkflowRefusal.INVALID_ARGUMENT)
+    if not isinstance(profile, AgentProfile):
+        return _refused(task_id, WorkflowRefusal.AGENT_PROFILE_UNAVAILABLE)
+    if WorkflowPhase.PLAN.value not in profile.allowed_phases:
+        return _refused(task_id, WorkflowRefusal.AGENT_PROFILE_UNAVAILABLE)
+    if stamp.tzinfo is None or stamp.utcoffset() is None:
+        raise TaskLedgerError("task execution clock must include a timezone")
+    now = stamp.astimezone(timezone.utc).isoformat(timespec="seconds")
+    row = TaskExecutionService._workflow_with_task(connection, task_id)
+    refusal = _workflow_guard(
+        row,
+        expected_version,
+        {WorkflowStatus.AWAITING_START},
+    )
+    if refusal is None:
+        refusal = _task_guard(row, int(row["task_version"]))
+    if refusal is not None:
+        return _refused_row(task_id, row, refusal)
+    if (
+        row["agent_profile_id"] == profile.profile_id
+        and row["agent_profile_revision"] == profile.revision
+    ):
+        return _operation(row, WorkflowDisposition.UNCHANGED)
+    version = expected_version + 1
+    updated = connection.execute(
+        "UPDATE task_execution_workflows SET version=?,"
+        "agent_profile_id=?,agent_profile_revision=?,updated_at=? "
+        "WHERE task_id=? AND version=? AND status='awaiting_start'",
+        (
+            version,
+            profile.profile_id,
+            profile.revision,
+            now,
+            task_id,
+            expected_version,
+        ),
+    )
+    if updated.rowcount != 1:
+        return _refused_row(task_id, row, WorkflowRefusal.STALE_WORKFLOW)
+    TaskExecutionService._event(
+        connection,
+        task_id,
+        "agent_selected",
+        version,
+        int(row["task_version"]),
+        WorkflowPhase.PLAN,
+        WorkflowStatus.AWAITING_START,
+        now,
+    )
+    return WorkflowOperationResult(
+        WorkflowDisposition.APPLIED,
+        task_id,
+        version,
+        WorkflowStatus.AWAITING_START,
+        WorkflowPhase.PLAN,
+        agent_profile_id=profile.profile_id,
+        agent_profile_revision=profile.revision,
+    )
 
 
 def _apply_start_action(

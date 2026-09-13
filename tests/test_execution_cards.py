@@ -27,7 +27,9 @@ from foxhound.execution_cards import (
     ExecutionCardRefusal,
     ExecutionCardService,
     ExecutionCardStatus,
+    parse_execution_agent_callback,
     parse_execution_review_callback,
+    render_execution_agent_selector,
     render_execution_review_card,
 )
 from foxhound.task_execution import (
@@ -354,7 +356,7 @@ class ExecutionCardTests(unittest.TestCase):
         ]
         self.assertEqual(
             [parse_execution_review_callback(value)[2] for value in callbacks],
-            ["start", "snooze", "cancel"],
+            ["start", "agent", "snooze", "cancel"],
         )
         self.assertTrue(all(
             len(value.encode("utf-8")) <= CALLBACK_DATA_LIMIT
@@ -503,6 +505,202 @@ class ExecutionCardTests(unittest.TestCase):
         refreshed = self.cards.schedule()
         self.assertEqual((refreshed.cancelled, refreshed.created), (1, 1))
         self.assertEqual(self.ledger.get(1).status, TaskStatus.OPEN)
+
+    def test_start_card_selects_agent_atomically_with_bounded_callbacks(self):
+        specialist_document = general_profile().document()
+        specialist_document.update({
+            "profile_id": "specialist",
+            "display_name": "Synthetic Specialist",
+            "max_turns": 50,
+        })
+        specialist = parse_profile(specialist_document)
+        execute_only_document = general_profile().document()
+        execute_only_document.update({
+            "profile_id": "execute-only",
+            "display_name": "Synthetic Execute Only",
+            "allowed_phases": ["execute"],
+        })
+        execute_only = parse_profile(execute_only_document)
+        registry = AgentProfileRegistry((
+            general_profile(), specialist, execute_only,
+        ))
+        cards = ExecutionCardService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: DELIVERY_TOKEN,
+            profile_registry=registry,
+        )
+        workflow = self._schedule_workflow(1)
+        cards.schedule()
+        claim = cards.claim_next()
+        cards.complete_delivery(
+            claim.card.id,
+            expected_version=claim.card.version,
+            claim_token=claim.token,
+            transport="synthetic",
+            delivery_ref="message-agent-selector",
+        )
+        body, keyboard = render_execution_review_card(claim.card)
+        self.assertIn("<b>Agent:</b> General", body)
+        agent_callback = next(
+            button["callback_data"]
+            for row in keyboard["inline_keyboard"]
+            for button in row
+            if button["text"] == "🤖 Agent"
+        )
+        self.assertEqual(
+            parse_execution_review_callback(agent_callback),
+            (claim.card.id, claim.card.version, "agent"),
+        )
+
+        choices = cards.agent_options(
+            claim.card.id, expected_version=claim.card.version
+        )
+        choice_body, choice_keyboard = render_execution_agent_selector(choices)
+        self.assertIn("Choose the agent for planning", choice_body)
+        self.assertEqual(
+            [row[0]["text"] for row in choice_keyboard["inline_keyboard"]],
+            ["✓ General", "Synthetic Specialist"],
+        )
+        callbacks = [
+            row[0]["callback_data"]
+            for row in choice_keyboard["inline_keyboard"]
+        ]
+        self.assertTrue(all(
+            len(value.encode("utf-8")) <= CALLBACK_DATA_LIMIT
+            for value in callbacks
+        ))
+        maximum_callback = (
+            "fha|9223372036854775807|9223372036854775807|" + "a" * 20
+        )
+        self.assertEqual(len(maximum_callback.encode("utf-8")), 64)
+        self.assertIsNotNone(parse_execution_agent_callback(maximum_callback))
+        specialist_callback = callbacks[1]
+        parsed = parse_execution_agent_callback(specialist_callback)
+        self.assertEqual(parsed[:2], (claim.card.id, claim.card.version))
+        before_task = self.ledger.get(1)
+        before_events = cards.event_count()
+
+        selected = cards.select_agent(
+            parsed[0],
+            expected_version=parsed[1],
+            selection_token=parsed[2],
+        )
+
+        self.assertEqual(selected.disposition, ExecutionCardDisposition.APPLIED)
+        self.assertEqual(selected.card_version, claim.card.version + 1)
+        self.assertEqual(selected.card.agent_profile_id, "specialist")
+        self.assertNotIn("Synthetic Specialist", repr(selected.card))
+        self.assertEqual(
+            (selected.card.workflow_status, selected.card.workflow_version),
+            (WorkflowStatus.AWAITING_START, workflow.version + 1),
+        )
+        refreshed_body, refreshed_keyboard = render_execution_review_card(
+            selected.card
+        )
+        self.assertIn("<b>Agent:</b> Synthetic Specialist", refreshed_body)
+        self.assertTrue(all(
+            parse_execution_review_callback(button["callback_data"])[1]
+            == selected.card_version
+            for row in refreshed_keyboard["inline_keyboard"]
+            for button in row
+        ))
+        after_task = self.ledger.get(1)
+        self.assertEqual(
+            (after_task.status, after_task.version),
+            (before_task.status, before_task.version),
+        )
+        self.assertEqual(cards.event_count(), before_events + 1)
+        with closing(sqlite3.connect(self.database)) as connection:
+            card_event = connection.execute(
+                "SELECT kind,action,card_version,workflow_version "
+                "FROM execution_review_card_events ORDER BY sequence DESC "
+                "LIMIT 1"
+            ).fetchone()
+            workflow_event = connection.execute(
+                "SELECT kind,agent_profile_id,agent_profile_revision "
+                "FROM task_execution_events ORDER BY sequence DESC LIMIT 1"
+            ).fetchone()
+        self.assertEqual(
+            card_event,
+            ("refreshed", "agent", selected.card.version,
+             selected.card.workflow_version),
+        )
+        self.assertEqual(
+            workflow_event,
+            ("agent_selected", specialist.profile_id, specialist.revision),
+        )
+
+        stale = cards.select_agent(
+            parsed[0],
+            expected_version=parsed[1],
+            selection_token=parsed[2],
+        )
+        forged = cards.select_agent(
+            selected.card.id,
+            expected_version=selected.card.version,
+            selection_token="0" * 20,
+        )
+        oversized = cards.select_agent(
+            selected.card.id,
+            expected_version=selected.card.version,
+            selection_token="a" * 21,
+        )
+        self.assertEqual(stale.refusal, ExecutionCardRefusal.STALE_VERSION)
+        self.assertEqual(forged.refusal, ExecutionCardRefusal.INVALID_ARGUMENT)
+        self.assertEqual(oversized.refusal, ExecutionCardRefusal.INVALID_ARGUMENT)
+        self.assertEqual(cards.event_count(), before_events + 1)
+
+        refreshed_choices = cards.agent_options(
+            selected.card.id, expected_version=selected.card.version
+        )
+        selected_option = next(
+            option for option in refreshed_choices.options if option.selected
+        )
+        replay = cards.select_agent(
+            selected.card.id,
+            expected_version=selected.card.version,
+            selection_token=selected_option.selection_token,
+        )
+        self.assertEqual(replay.disposition, ExecutionCardDisposition.UNCHANGED)
+        self.assertEqual(replay.card.version, selected.card.version)
+
+        started = cards.act(
+            selected.card.id,
+            expected_version=selected.card.version,
+            action="start",
+        )
+        self.assertTrue(started.accepted)
+        unavailable = cards.agent_options(
+            selected.card.id, expected_version=selected.card.version
+        )
+        self.assertEqual(unavailable.refusal, ExecutionCardRefusal.STALE_VERSION)
+
+    def test_agent_control_is_absent_from_resumed_snoozed_start_card(self):
+        self._schedule_workflow(1)
+        self.cards.schedule()
+        claim = self._claim_and_deliver()
+        snoozed = self.cards.act(
+            claim.card.id,
+            expected_version=claim.card.version,
+            action="snooze",
+        )
+        self.clock.advance(timedelta(days=1))
+        self.assertEqual(self.cards.schedule().created, 1)
+        resumed = self._claim_and_deliver()
+        _body, keyboard = render_execution_review_card(resumed.card)
+        actions = [
+            parse_execution_review_callback(button["callback_data"])[2]
+            for row in keyboard["inline_keyboard"]
+            for button in row
+        ]
+        self.assertEqual(resumed.card.workflow_status, WorkflowStatus.SNOOZED)
+        self.assertNotIn("agent", actions)
+        refused = self.cards.agent_options(
+            resumed.card.id, expected_version=resumed.card.version
+        )
+        self.assertEqual(refused.refusal, ExecutionCardRefusal.INVALID_STATE)
+        self.assertEqual(self.execution.get(1).version, snoozed.workflow_version)
 
     def test_plan_review_rendering_approval_revision_and_cancel(self):
         for task_id, action in ((1, "approve"), (2, "revise"), (3, "cancel")):
