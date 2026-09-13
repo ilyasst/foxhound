@@ -222,6 +222,45 @@ class ExecutionWorkerTests(unittest.TestCase):
                          "Synthetic evidence.")
         self.assertNotIn(CLAIM_TOKEN, repr(load_run_state(self.state_path)))
 
+    def test_the_context_names_the_thing_the_task_is_about(self):
+        """The agent is told to take repository identity from here, and told
+        to infer nothing from the task text. Omitting it did not make the
+        agent careful, it made it blind: asked to scaffold an application
+        for an issue that already had a repository, it planned a greenfield
+        project and asked the reader where to put it.
+        """
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "INSERT INTO candidate_inbox(candidate_id,source_system,"
+                "source_kind,source_record_id,source_item_id,source_revision,"
+                "payload_json,created_at,first_imported_at,updated_at) "
+                "VALUES('cand-1','gw','issue','forge.example/acme/widget',"
+                "'42',?,'{}','2030-01-01T00:00:00Z','2030-01-01T00:00:00Z',"
+                "'2030-01-01T00:00:00Z')", ("b" * 64,))
+            connection.execute(
+                "INSERT INTO task_candidate_bindings(candidate_id,"
+                "source_revision,task_id,relation,decided_at) "
+                "VALUES('cand-1',?,1,'accepted','2030-01-01T00:00:00Z')",
+                ("b" * 64,))
+            connection.commit()
+
+        with knowledge_server() as endpoint:
+            context = self._worker(endpoint).context()
+
+        self.assertEqual(
+            context["task"]["origin"],
+            {"system": "gw", "kind": "issue",
+             "record_id": "forge.example/acme/widget", "item_id": "42"},
+        )
+
+    def test_a_task_about_nothing_addressable_says_so(self):
+        # An ordinary state, not an error: a task may come from a meeting,
+        # or predate binding. The agent must be able to tell that apart from
+        # a repository it simply was not told about.
+        with knowledge_server() as endpoint:
+            context = self._worker(endpoint).context()
+        self.assertIsNone(context["task"]["origin"])
+
     def test_record_injects_identity_and_scrubs_the_private_draft(self):
         draft = self._write_draft()
         with knowledge_server() as endpoint:
