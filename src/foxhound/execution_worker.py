@@ -121,6 +121,7 @@ class ExecutionWorker:
             or task.version != state.task_version
         ):
             raise ExecutionWorkerClaimError("execution claim is unavailable")
+        origin = TaskLedger(state.database_path).origin(state.task_id)
         return {
             "schema": WORK_CONTEXT_SCHEMA,
             "schema_version": WORK_CONTEXT_SCHEMA_VERSION,
@@ -130,6 +131,17 @@ class ExecutionWorker:
                 "text": task.text,
                 "owner": task.owner,
                 "due": task.due,
+                # The agent is told to take its repository and issue identity
+                # from here and to infer nothing from the task text. Leaving
+                # it out did not make the agent careful, it made it blind: it
+                # planned a greenfield application for an issue that already
+                # had a repository, and asked the reader where to put it.
+                "origin": None if origin is None else {
+                    "system": origin.system,
+                    "kind": origin.kind,
+                    "record_id": origin.record_id,
+                    "item_id": origin.item_id,
+                },
             },
             "workflow": {
                 "version": state.workflow_version,
