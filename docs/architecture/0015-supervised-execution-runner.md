@@ -36,6 +36,9 @@ The only supported task operations inside a run are exposed by
 - `context` renews the claim and returns the current Foxhound task plus the
   strict GW execution-context snapshot;
 - `search` renews the claim around one bounded, read-only GW search;
+- `draft` reads fixed owner-only result inputs beside the run state, validates
+  them against the current phase, and atomically creates a correctly named
+  schema-valid draft without placing private result text in process arguments;
 - `record` accepts one strict owner-only draft, injects authoritative identity
   and the capability from run state, and records it in the ledger; and
 - `release` gives up the fenced claim without recording work.
@@ -44,7 +47,9 @@ The worker rejects symlinks, permissive private-state paths, duplicate JSON
 fields, unknown draft fields, mismatched result filenames and identifiers,
 and stale task, workflow, phase, or capability state. It emits content-free
 errors and never returns either credential. A successful result is durable
-before the agent-authored draft is replaced by a content-free receipt.
+before the draft is replaced by a content-free receipt and its fixed private
+input files are removed. The legacy hand-authored draft format remains valid,
+and reviewed role prompts can direct agents through the safer builder.
 
 The supervisor polls the workflow and renews its lease independently of the
 agent. A durable result or release terminates any remaining child process.
