@@ -792,7 +792,8 @@ class ExecutionCardTests(unittest.TestCase):
             claim = self._claim_and_deliver()
             self.assertEqual(claim.card.kind, ExecutionCardKind.EXTERNAL_REVIEW)
             body, keyboard = render_execution_review_card(claim.card)
-            self.assertIn("external-action approval", body)
+            self.assertIn(
+                "<b>External action awaiting your approval:</b>", body)
             self.assertIn("Publish synthetic draft &lt;alpha&gt;.", body)
             self.assertEqual(
                 keyboard["inline_keyboard"][0][0]["text"],
@@ -880,9 +881,83 @@ class ExecutionCardTests(unittest.TestCase):
 
         result_body, _keyboard = render_execution_review_card(result_claim.card)
 
-        self.assertIn("<b>Foxhound result review</b>", result_body)
+        self.assertIn("<b>Outcome:</b> completed", result_body)
         self.assertIn("<pre>", result_body)
         self.assertIn("Example Beta", result_body)
+
+    def test_a_card_names_its_task_and_shows_a_draft_in_full(self):
+        """A reader approves what the card shows them.
+
+        A deliverable rendered as its own name — "Prepared draft", a file
+        path, a one-line summary of itself — asks the reader to authorise
+        text they cannot see. The identifier matters for the same reason:
+        a card that cannot be named cannot be referred to or found again.
+        """
+        task_id = 3
+        scheduled = self._schedule_workflow(task_id)
+        started = self.execution.start_action(
+            task_id, expected_version=scheduled.version, action="start")
+        claim = self.execution.claim_next()
+        self.execution.record_result(ExecutionResultEnvelope(
+            result_id="c" * 32,
+            task_id=task_id,
+            task_version=1,
+            workflow_version=claim.workflow_version,
+            phase=WorkflowPhase.PLAN,
+            claim_token=claim.token,
+            outcome=ExecutionOutcome.AWAITING_PLAN,
+            summary="Draft prepared, awaiting contact details.",
+            work_markdown="Synthetic plan.",
+            questions=("What is their address?",),
+            external_actions=(
+                {"action": "Add them as a collaborator",
+                 "requires": "Their handle"},
+            ),
+            deliverables=(
+                {"label": "email", "recipient": "Someone",
+                 "subject": "Synthetic subject",
+                 "body": "First line.\nSecond line."},
+            ),
+        ))
+        self.assertEqual(self.cards.schedule().created, 1)
+        card = self.cards.claim_next().card
+        body, _keyboard = render_execution_review_card(card)
+
+        self.assertIn(f"<code>T{task_id}</code>", body)
+        self.assertIn("<b>Phase:</b> plan refinement", body)
+        self.assertIn("<b>Needs your input:</b>", body)
+        # The action says what is still missing, not just what it is.
+        self.assertIn("Needs: Their handle", body)
+        # The draft is readable on the card, headed and addressed.
+        self.assertIn("<b>email</b>", body)
+        self.assertIn("To: Someone", body)
+        self.assertIn("Subject: Synthetic subject", body)
+        self.assertIn("<pre>First line.\nSecond line.</pre>", body)
+
+    def test_a_start_card_never_claims_work_has_begun(self):
+        # The phase names what WOULD run. On a gate, naming it reads as
+        # though it already had.
+        task_id = 4
+        self._schedule_workflow(task_id)
+        self.assertEqual(self.cards.schedule().created, 1)
+        body, _keyboard = render_execution_review_card(
+            self.cards.claim_next().card)
+        self.assertIn("<b>Phase:</b> not started", body)
+        self.assertNotIn("plan refinement", body)
+        self.assertIn("No task work or external action has run.", body)
+
+    def test_a_plain_line_still_renders_after_records_arrived(self):
+        # Every result written before records existed is still a list of
+        # sentences, and must keep rendering as one.
+        task_id = 5
+        self._plan_review(task_id, "d" * 32)
+        self.assertEqual(self.cards.schedule().created, 1)
+        body, _keyboard = render_execution_review_card(
+            self.cards.claim_next().card)
+        self.assertIn("• Publish synthetic draft &lt;alpha&gt;.", body)
+        self.assertIn("• Proceed with Example A?", body)
+        self.assertNotIn("Needs:", body)
+        self.assertNotIn("<pre>Synthetic deliverable</pre>", body)
 
     def test_unbounded_table_like_markdown_remains_ordinary_text(self):
         header = " | ".join(f"Column {number}" for number in range(13))
@@ -1020,7 +1095,7 @@ class ExecutionCardTests(unittest.TestCase):
         claim = self.cards.claim_next()
         self.assertEqual(claim.card.kind, ExecutionCardKind.RESULT_REVIEW)
         body, keyboard = render_execution_review_card(claim.card)
-        self.assertIn("Foxhound result review", body)
+        self.assertIn("<b>Task workflow</b>", body)
         self.assertIn("<b>Outcome:</b> completed", body)
         self.assertEqual(
             [

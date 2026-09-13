@@ -599,7 +599,9 @@ def _read_result_text(path: Path, *, label: str) -> str:
     return value
 
 
-def _read_optional_string_array(path: Path, *, label: str) -> list[str]:
+def _read_optional_string_array(
+    path: Path, *, label: str
+) -> list[object]:
     try:
         path.lstat()
     except FileNotFoundError:
@@ -616,9 +618,19 @@ def _read_optional_string_array(path: Path, *, label: str) -> list[str]:
         TypeError,
     ) as exc:
         raise ExecutionWorkerDraftError(f"{label} is invalid") from exc
-    if not isinstance(value, list) or any(
-        not isinstance(item, str) for item in value
-    ):
+    if not isinstance(value, list):
+        raise ExecutionWorkerDraftError(f"{label} is invalid")
+    for item in value:
+        # A line, or a record whose fields are all lines. The ledger decides
+        # which field names it will keep; this only refuses shapes that
+        # could never be one, so an agent learns the real rule from the
+        # rejection rather than from here.
+        if isinstance(item, str):
+            continue
+        if isinstance(item, dict) and all(
+            isinstance(field_value, str) for field_value in item.values()
+        ):
+            continue
         raise ExecutionWorkerDraftError(f"{label} is invalid")
     return value
 

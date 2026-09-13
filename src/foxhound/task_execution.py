@@ -1658,13 +1658,14 @@ def _validated_result(envelope: ExecutionResultEnvelope) -> dict[str, object]:
         envelope.questions, "questions", MAX_QUESTION_CHARS,
         single_line=True,
     )
-    actions = _text_collection(
+    actions = _structured_collection(
         envelope.external_actions, "external actions", MAX_ACTION_CHARS,
-        single_line=False,
+        primary="action", aliases=_ACTION_ALIASES, optional=_ACTION_FIELDS,
     )
-    deliverables = _text_collection(
+    deliverables = _structured_collection(
         envelope.deliverables, "deliverables", MAX_DELIVERABLE_CHARS,
-        single_line=False,
+        primary="body", aliases=_DELIVERABLE_ALIASES,
+        optional=_DELIVERABLE_FIELDS,
     )
     document = {
         "result_id": envelope.result_id,
@@ -1724,6 +1725,68 @@ def _text_collection(
         _bounded_text(item, label, maximum, single_line=single_line)
         for item in items
     )
+
+
+#: A structured record is normalised on the way in, so everything that reads
+#: one later sees a single shape. The reader-facing fields an agent may fill
+#: are named here and nowhere else.
+_ACTION_FIELDS = ("requires", "channel")
+_DELIVERABLE_FIELDS = ("label", "recipient", "subject")
+_ACTION_ALIASES = ("action", "title", "text")
+_DELIVERABLE_ALIASES = ("body", "text")
+
+
+def _record_text(value: dict, aliases: tuple[str, ...]) -> object:
+    for key in aliases:
+        candidate = value.get(key)
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate
+    return None
+
+
+def _structured_collection(
+    value: object, label: str, maximum: int, *,
+    primary: str, aliases: tuple[str, ...], optional: tuple[str, ...],
+) -> tuple[object, ...]:
+    """Accept plain lines or structured records, and store one shape.
+
+    A plain string stays a plain string: every result written before this
+    existed is still valid, and an agent with nothing structured to say
+    should not have to wrap a sentence in an object. A record keeps only
+    the fields a card knows how to show, each bounded like any other text,
+    so a large object cannot arrive through a field that was never read.
+    """
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise ValueError(f"execution result {label} are invalid")
+    items = tuple(value)
+    if len(items) > MAX_COLLECTION_ITEMS:
+        raise ValueError(f"execution result {label} are invalid")
+    records: list[object] = []
+    for item in items:
+        if isinstance(item, str):
+            records.append(
+                _bounded_text(item, label, maximum, single_line=False))
+            continue
+        if not isinstance(item, dict):
+            raise ValueError(f"execution result {label} are invalid")
+        text = _record_text(item, aliases)
+        if text is None:
+            raise ValueError(f"execution result {label} are invalid")
+        record = {
+            primary: _bounded_text(
+                text, label, maximum, single_line=False),
+        }
+        for name in optional:
+            supplied = item.get(name)
+            if supplied is None:
+                continue
+            record[name] = _bounded_text(
+                supplied, label, MAX_QUESTION_CHARS, single_line=True)
+        unknown = set(item) - set(aliases) - set(optional)
+        if unknown:
+            raise ValueError(f"execution result {label} are invalid")
+        records.append(record)
+    return tuple(records)
 
 
 def _canonical_json(value: object) -> str:
