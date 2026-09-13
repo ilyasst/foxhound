@@ -1,5 +1,13 @@
 """Foxhound task lifecycle and execution service."""
 
+from .agent_profiles import (
+    AgentProfile,
+    AgentProfileError,
+    AgentProfileRegistry,
+    general_profile,
+    load_registry,
+    parse_profile,
+)
 from .candidate_inbox import (
     CandidateInbox,
     FeedImportDisposition,
@@ -95,6 +103,12 @@ from .execution_runner import (
 __version__ = "0.1.0"
 
 __all__ = (
+    "AgentProfile",
+    "AgentProfileError",
+    "AgentProfileRegistry",
+    "general_profile",
+    "load_registry",
+    "parse_profile",
     "CandidateInbox",
     "FeedImportDisposition",
     "FeedImportRefusal",
