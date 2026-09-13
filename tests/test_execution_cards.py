@@ -579,6 +579,74 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertIn("<code>sample code</code>", body)
         self.assertNotIn("**Important**", body)
 
+    def test_markdown_tables_are_safe_aligned_html_in_review_cards(self):
+        markdown = (
+            "| Option | Cost | State |\n"
+            "| :--- | ---: | :---: |\n"
+            "| **Example Alpha** | 7 | `Ready` |\n"
+            "| [Example Beta](https://example.com) | 12 | Waiting |\n"
+            "| <unsafe> | one \\| two | `x|y` |"
+        )
+        self._plan_review(1, "table-plan", work_markdown=markdown)
+        self.cards.schedule()
+        plan_claim = self._claim_and_deliver()
+
+        plan_body, _keyboard = render_execution_review_card(plan_claim.card)
+
+        self.assertIn("<pre>", plan_body)
+        self.assertIn("│", plan_body)
+        self.assertIn("─┼─", plan_body)
+        self.assertIn("Example Alpha", plan_body)
+        self.assertIn("&lt;unsafe&gt;", plan_body)
+        self.assertIn("one | two", plan_body)
+        self.assertIn("x|y", plan_body)
+        self.assertNotIn("| :--- | ---: | :---: |", plan_body)
+        self.assertNotIn("**Example Alpha**", plan_body)
+
+        dropped = self.cards.act(
+            plan_claim.card.id,
+            expected_version=plan_claim.card.version,
+            action="drop",
+        )
+        self.assertTrue(dropped.accepted)
+        scheduled = self._schedule_workflow(2)
+        self.execution.start_action(
+            2, expected_version=scheduled.version, action="start"
+        )
+        self._record(
+            2,
+            phase=WorkflowPhase.PLAN,
+            outcome=ExecutionOutcome.COMPLETED,
+            result_id="table-result",
+            work_markdown=markdown,
+        )
+        self.assertEqual(self.cards.schedule().created, 1)
+        result_claim = self.cards.claim_next()
+        self.assertEqual(result_claim.card.kind, ExecutionCardKind.RESULT_REVIEW)
+
+        result_body, _keyboard = render_execution_review_card(result_claim.card)
+
+        self.assertIn("<b>Foxhound result review</b>", result_body)
+        self.assertIn("<pre>", result_body)
+        self.assertIn("Example Beta", result_body)
+
+    def test_unbounded_table_like_markdown_remains_ordinary_text(self):
+        header = " | ".join(f"Column {number}" for number in range(13))
+        delimiter = " | ".join("---" for _ in range(13))
+        self._plan_review(
+            1,
+            "unbounded-table-plan",
+            work_markdown=f"{header}\n{delimiter}",
+        )
+        self.cards.schedule()
+        claim = self.cards.claim_next()
+
+        body, _keyboard = render_execution_review_card(claim.card)
+
+        self.assertNotIn("<pre>", body)
+        self.assertIn("Column 12", body)
+        self.assertIn("--- | ---", body)
+
     def test_complete_multi_message_review_retains_approval(self):
         markdown = "\n".join(
             f"- Synthetic review line {index} with **detail**."
