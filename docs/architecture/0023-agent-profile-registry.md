@@ -23,8 +23,25 @@ template, an allowlisted set of tool families, execution limits, safe lease
 timing, and an explicit phase allowlist. The complete execution-relevant
 document has a stable SHA-256 revision.
 
-The built-in `general` profile reproduces the existing runner prompt and
-limits. Actual role profiles are JSON manifests in one explicitly configured,
+The built-in `general` profile reproduces the existing runner prompt, toolsets,
+and phase permissions. Synthetic comparison trials exhausted its former
+12-turn budget in three representative cases; longer successful trials needed
+22 and 26 turns to record a result. Its current local-work budget is therefore
+50 turns and 1,800 seconds, with a 2,700-second claim lease, 60-second
+heartbeat, and 30-second shutdown grace. This matches the already validated
+fictional coding-profile envelope, leaves headroom above the successful trials,
+and preserves the required timing relationships.
+
+The former built-in `general` revision remains available only for exact
+resolution by workflows already pinned to it. Registry listing, ordinary ID
+lookup, and agent selection expose only the current revision. A historical
+Start card can still offer the current revision for an explicit reader
+reselection. Historical revisions must correspond to a current profile ID and
+cannot duplicate another exact ID/revision pair. This narrow compatibility
+history does not change private-manifest behavior: replacing a private
+manifest still makes its prior revision unavailable and fails closed.
+
+Actual role profiles are JSON manifests in one explicitly configured,
 absolute, owner-only directory outside every Git checkout. A deployment may
 share that directory across projects through an approved private
 synchronization system. The directory and regular manifest files must be owned
@@ -51,6 +68,8 @@ Workflow selection and runner consumption are defined separately in
 - A deployment can prepare reviewed, host-private agent prompts without adding
   private material to the repository.
 - Profile changes create new revisions and can be fenced by durable workflows.
+- Existing workflows pinned to the retained former `general` revision keep its
+  exact execution policy until explicitly reselected.
 - The first registry change does not alter which profile executes existing
   work.
 - Deployments must provision private manifests separately and keep their

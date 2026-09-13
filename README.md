@@ -206,13 +206,17 @@ launching an agent. See
 [ADR 0015](docs/architecture/0015-supervised-execution-runner.md).
 
 Agent definitions are strict, revisioned Foxhound profiles. The built-in
-`general` profile preserves the existing Hermes compatibility policy. Actual
-role profiles and prompts belong in one explicitly configured, owner-only
-directory outside every Git checkout. That private directory can be shared
-across projects through an approved synchronization system, so one coding
-agent definition can serve multiple repositories without being copied into
-them. The card service and execution runner must receive the same directory.
-The repository provides only a clearly fictional example manifest at
+`general` profile preserves the existing Hermes prompt, tools, and phase
+policy. Its current bounded local-work budget is 50 turns and 30 minutes, with
+a 45-minute renewable claim lease. A former built-in revision remains
+resolution-only so workflows already pinned to it retain their exact policy;
+it is not offered for new selection. Actual role profiles and prompts belong
+in one explicitly configured, owner-only directory outside every Git checkout.
+That private directory can be shared across projects through an approved
+synchronization system, so one coding agent definition can serve multiple
+repositories without being copied into them. The card service and execution
+runner must receive the same directory. The repository provides only a
+clearly fictional example manifest at
 `examples/agent-profiles/example-coder.json`. A deployment can inspect
 content-free identity and policy metadata for its private manifests:
 
@@ -232,9 +236,11 @@ shared private-profile deployment contract.
 Every execution workflow stores the selected profile ID and exact revision.
 The runner resolves that immutable evidence within atomic claim selection,
 then derives the Hermes prompt, tools, turn limit, timeout, lease, heartbeat,
-and shutdown grace from the profile. Missing, changed, or phase-ineligible
-profiles fail closed without claiming or launching an agent. There are no
-runner-level overrides for those profile policies. See
+and shutdown grace from the profile. Profile selection accepts only the
+current revision, while execution may resolve an explicitly retained built-in
+revision already stored by a workflow. Other missing, changed, or
+phase-ineligible profiles fail closed without claiming or launching an agent.
+There are no runner-level overrides for those profile policies. See
 [ADR 0024](docs/architecture/0024-workflow-agent-binding.md).
 
 Every Start card displays the exact selected profile's name. While the

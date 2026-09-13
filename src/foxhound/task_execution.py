@@ -424,7 +424,7 @@ class TaskExecutionService:
         if not _valid_identity(task_id, expected_version):
             return _refused(task_id, WorkflowRefusal.INVALID_ARGUMENT)
         try:
-            profile = self._profile_registry.resolve(
+            profile = self._profile_registry.resolve_current(
                 profile_id, profile_revision
             )
         except AgentProfileError:

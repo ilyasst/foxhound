@@ -31,6 +31,9 @@ from foxhound.task_ledger import TaskLedger, TaskLedgerError
 
 TOKEN = "execution-claim-token-000000000000000000000000"
 OTHER_TOKEN = "different-claim-token-000000000000000000000"
+LEGACY_GENERAL_REVISION = (
+    "f0171b0e9e09e547d9b344223d31b6de1bc0e6d13cb5b8c891fda9d0a7b0db94"
+)
 
 
 def _profile(profile_id="specialist", *, phases=("plan", "execute")):
@@ -225,7 +228,7 @@ class TaskExecutionTests(unittest.TestCase):
         )
         self.assertEqual(after.agent_profile_id, "general")
         self.assertEqual(
-            after.agent_profile_revision, general_profile().revision
+            after.agent_profile_revision, LEGACY_GENERAL_REVISION
         )
         with closing(sqlite3.connect(self.database)) as connection:
             result_evidence = connection.execute(
@@ -236,16 +239,21 @@ class TaskExecutionTests(unittest.TestCase):
                 "SELECT DISTINCT agent_profile_id,agent_profile_revision "
                 "FROM task_execution_events"
             ).fetchall()
-        expected = [("general", general_profile().revision)]
+        expected = [("general", LEGACY_GENERAL_REVISION)]
         self.assertEqual(result_evidence, expected)
         self.assertEqual(event_evidence, expected)
 
     def test_agent_selection_is_explicit_idempotent_and_version_fenced(self):
         specialist = _profile()
         unavailable = _profile("execute-only", phases=("execute",))
-        registry = AgentProfileRegistry((
-            general_profile(), specialist, unavailable,
-        ))
+        historical = parse_profile({
+            **general_profile().document(),
+            "max_turns": 49,
+        })
+        registry = AgentProfileRegistry(
+            (general_profile(), specialist, unavailable),
+            historical_profiles=(historical,),
+        )
         service = TaskExecutionService(
             self.database,
             clock=self.clock,
@@ -289,6 +297,7 @@ class TaskExecutionTests(unittest.TestCase):
             ("missing", specialist.revision),
             (specialist.profile_id, "0" * 64),
             (unavailable.profile_id, unavailable.revision),
+            (historical.profile_id, historical.revision),
         ):
             with self.subTest(profile_id=profile_id, revision=revision):
                 refused = service.select_agent(
@@ -765,7 +774,9 @@ class TaskExecutionTests(unittest.TestCase):
         self.clock.advance(seconds=60)
 
         self._claim()
-        self.clock.advance(seconds=901)
+        self.clock.advance(
+            seconds=general_profile().claim_lease_seconds + 1
+        )
         third_claim = self.service.claim_next()
         self.assertIsNone(third_claim)
         state = self.service.get(1)

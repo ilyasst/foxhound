@@ -506,6 +506,66 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertEqual((refreshed.cancelled, refreshed.created), (1, 1))
         self.assertEqual(self.ledger.get(1).status, TaskStatus.OPEN)
 
+    def test_historical_start_card_offers_current_revision_for_reselection(self):
+        current = general_profile()
+        historical_document = current.document()
+        historical_document.update({
+            "max_turns": 12,
+            "timeout_seconds": 240,
+            "claim_lease_seconds": 900,
+            "kill_grace_seconds": 10,
+        })
+        historical = parse_profile(historical_document)
+        old_execution = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: CLAIM_TOKEN,
+            profile_registry=AgentProfileRegistry((historical,)),
+        )
+        workflow = old_execution.schedule(1, expected_task_version=1)
+        registry = AgentProfileRegistry(
+            (current,), historical_profiles=(historical,)
+        )
+        cards = ExecutionCardService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: DELIVERY_TOKEN,
+            profile_registry=registry,
+        )
+        cards.schedule()
+        claim = cards.claim_next()
+        self.assertIsNotNone(claim)
+        cards.complete_delivery(
+            claim.card.id,
+            expected_version=claim.card.version,
+            claim_token=claim.token,
+            transport="synthetic",
+            delivery_ref="message-historical-selector",
+        )
+
+        choices = cards.agent_options(
+            claim.card.id, expected_version=claim.card.version
+        )
+        self.assertEqual(
+            [
+                (option.display_name, option.selected)
+                for option in choices.options
+            ],
+            [("General", False)],
+        )
+        _, keyboard = render_execution_agent_selector(choices)
+        callback = keyboard["inline_keyboard"][0][0]["callback_data"]
+        parsed = parse_execution_agent_callback(callback)
+        selected = cards.select_agent(
+            parsed[0],
+            expected_version=parsed[1],
+            selection_token=parsed[2],
+        )
+
+        self.assertEqual(selected.disposition, ExecutionCardDisposition.APPLIED)
+        self.assertEqual(selected.card.agent_profile_revision, current.revision)
+        self.assertEqual(selected.card.workflow_version, workflow.version + 1)
+
     def test_start_card_selects_agent_atomically_with_bounded_callbacks(self):
         specialist_document = general_profile().document()
         specialist_document.update({
