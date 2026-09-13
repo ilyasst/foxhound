@@ -1382,9 +1382,165 @@ def _source_line_segments(value: str) -> list[str]:
     ]
 
 
+_MAX_MARKDOWN_TABLE_COLUMNS = 12
+_MAX_MARKDOWN_TABLE_ROWS = 200
+
+
+def _markdown_table_cells(line: str) -> list[str] | None:
+    """Split a table row while preserving pipes escaped or inside code."""
+    text = line.strip()
+    if "|" not in text:
+        return None
+    cells: list[str] = []
+    cell: list[str] = []
+    code_ticks = 0
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "\\" and index + 1 < len(text):
+            following = text[index + 1]
+            if following in {"\\", "|"}:
+                cell.append(following)
+                index += 2
+                continue
+        if char == "`":
+            end = index + 1
+            while end < len(text) and text[end] == "`":
+                end += 1
+            ticks = end - index
+            if code_ticks == 0:
+                code_ticks = ticks
+            elif code_ticks == ticks:
+                code_ticks = 0
+            cell.append(text[index:end])
+            index = end
+            continue
+        if char == "|" and code_ticks == 0:
+            cells.append("".join(cell).strip())
+            cell = []
+        else:
+            cell.append(char)
+        index += 1
+    cells.append("".join(cell).strip())
+    if text.startswith("|"):
+        cells.pop(0)
+    backslashes = 0
+    for char in reversed(text[:-1]):
+        if char != "\\":
+            break
+        backslashes += 1
+    if text.endswith("|") and backslashes % 2 == 0:
+        cells.pop()
+    return cells if len(cells) >= 2 else None
+
+
+def _markdown_table_alignment(cell: str) -> str | None:
+    marker = cell.strip()
+    if not re.fullmatch(r":?-{3,}:?", marker):
+        return None
+    if marker.startswith(":") and marker.endswith(":"):
+        return "center"
+    if marker.endswith(":"):
+        return "right"
+    return "left"
+
+
+def _markdown_table_cell_text(cell: str) -> str:
+    """Flatten inline Markdown before measuring a monospace table cell."""
+    text = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)", r"\1", cell)
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+    text = re.sub(
+        r"\*\*([^*]+)\*\*|__([^_]+)__",
+        lambda match: match.group(1) or match.group(2),
+        text,
+    )
+    text = re.sub(r"(?<!\*)\*(?!\s)([^*\n]+?)\*(?!\*)", r"\1", text)
+    return text.strip()
+
+
+def _pad_markdown_table_cell(text: str, width: int, alignment: str) -> str:
+    room = width - len(text)
+    if alignment == "right":
+        return " " * room + text
+    if alignment == "center":
+        left = room // 2
+        return " " * left + text + " " * (room - left)
+    return text + " " * room
+
+
+def _markdown_table(
+    source_lines: list[str], start: int
+) -> tuple[str, int] | None:
+    """Render one bounded Markdown table and return its first unused line."""
+    if start + 1 >= len(source_lines):
+        return None
+    header = _markdown_table_cells(source_lines[start])
+    delimiter = _markdown_table_cells(source_lines[start + 1])
+    if header is None or delimiter is None or len(header) != len(delimiter):
+        return None
+    if not 2 <= len(header) <= _MAX_MARKDOWN_TABLE_COLUMNS:
+        return None
+    if any(
+        len(cell) > MAX_RENDER_SOURCE_LINE_CHARS
+        for cell in [*header, *delimiter]
+    ):
+        return None
+    alignments = [_markdown_table_alignment(cell) for cell in delimiter]
+    if any(alignment is None for alignment in alignments):
+        return None
+
+    rows: list[list[str]] = []
+    end = start + 2
+    while end < len(source_lines):
+        row = _markdown_table_cells(source_lines[end])
+        if row is None or len(row) > len(header):
+            break
+        if len(rows) >= _MAX_MARKDOWN_TABLE_ROWS or any(
+            len(cell) > MAX_RENDER_SOURCE_LINE_CHARS for cell in row
+        ):
+            return None
+        rows.append(row + [""] * (len(header) - len(row)))
+        end += 1
+
+    rendered_rows = [list(map(_markdown_table_cell_text, header))]
+    rendered_rows.extend(
+        [list(map(_markdown_table_cell_text, row)) for row in rows]
+    )
+    widths = [
+        max(3, *(len(row[column]) for row in rendered_rows))
+        for column in range(len(header))
+    ]
+    resolved_alignments = [
+        alignment for alignment in alignments if alignment is not None
+    ]
+
+    def render(row: list[str]) -> str:
+        return " │ ".join(
+            _pad_markdown_table_cell(
+                value, widths[column], resolved_alignments[column]
+            )
+            for column, value in enumerate(row)
+        ).rstrip()
+
+    separator = "─┼─".join("─" * width for width in widths)
+    display = [render(rendered_rows[0]), separator]
+    display.extend(render(row) for row in rendered_rows[1:])
+    escaped = _escape("\n".join(display))
+    return f"<pre>{escaped}</pre>", end
+
+
 def _markdown_lines(value: str) -> list[str]:
     lines: list[str] = []
-    for raw in value.split("\n"):
+    source_lines = value.split("\n")
+    cursor = 0
+    while cursor < len(source_lines):
+        table = _markdown_table(source_lines, cursor)
+        if table is not None:
+            rendered, cursor = table
+            lines.append(rendered)
+            continue
+        raw = source_lines[cursor]
+        cursor += 1
         for index, line in enumerate(_source_line_segments(raw.rstrip())):
             heading = re.match(r"^(#{1,6})\s+(.*)$", line) if not index else None
             bullet = re.match(r"^\s*[-*+]\s+(.*)$", line) if not index else None
