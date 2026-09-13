@@ -68,11 +68,18 @@ verbatim so their digests still resolve for workflows pinned to them.
 - An agent that cannot reach the worker cannot act at all, which is the
   intended failure: it has no instructions.
 - Ambient host configuration can no longer silently redefine a recorded
-  revision.
+  revision. Anything a profile actually needs, including material a deployment
+  previously got from an injected rule file or a preloaded skill, must be
+  published as one of its components.
 - Retaining a superseded built-in prompt means keeping its text in this
   repository alongside the current one.
 
 ## Failure and rollback
+
+The run state gained the worker command and a new schema version, and a run
+already in flight was started against the previous one. Its worker will refuse
+that state after an upgrade, so the run ends without progress and the workflow
+retries; upgrade when nothing is claimed, or expect one retry per active run.
 
 If the instruction bundle is missing, unreadable, permissive, or does not match
 the pinned revision, `context` refuses and the run ends without progress; the
