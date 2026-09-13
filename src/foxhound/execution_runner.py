@@ -304,6 +304,7 @@ def _run_claim(
         "HERMES_CRON_SESSION": "1",
     })
     process: subprocess.Popen | None = None
+    transcript = None
     forced = False
     prior_handlers: dict[int, object] = {}
     try:
@@ -318,12 +319,16 @@ def _run_claim(
                 "claim_lost", NO_PROGRESS_EXIT_CODE, claim.task_id
             )
         try:
+            transcript = _open_transcript(directory)
+        except OSError:
+            transcript = None
+        try:
             process = popen(
                 list(command),
                 env=environment,
                 stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=transcript or subprocess.DEVNULL,
+                stderr=subprocess.STDOUT if transcript else subprocess.DEVNULL,
                 cwd=str(directory),
                 start_new_session=True,
                 shell=False,
@@ -448,6 +453,9 @@ def _run_claim(
     finally:
         for signum, handler in prior_handlers.items():
             signal.signal(signum, handler)
+        if transcript is not None:
+            with contextlib.suppress(OSError):
+                transcript.close()
         _scrub_state_receipt(state_path, run_id, claim.task_id)
 
 
@@ -475,6 +483,31 @@ def _terminal_result(
     if current.status is WorkflowStatus.QUEUED:
         return "released"
     return "claim_lost"
+
+
+#: Owner-only, beside the result the agent writes, and never anywhere a
+#: repository or a log aggregator can reach. The contents are the agent's
+#: own working output and are as private as the task it was given.
+TRANSCRIPT_NAME = "agent-output.log"
+
+
+def _open_transcript(directory: Path):
+    """Keep what the agent said, so a failed run can be explained.
+
+    Output used to be discarded. A supervised run that ends without
+    recording anything then leaves nothing behind but the fact that it
+    failed: not the refusal it was given, not the command it tried, not
+    the budget it ran out of. Two runs of the same task each produced a
+    complete result file and neither could be explained.
+    """
+    def opener(target: str, _flags: int) -> int:
+        return os.open(
+            target,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+            0o600,
+        )
+
+    return open(directory / TRANSCRIPT_NAME, "wb", opener=opener)
 
 
 def _fail_claim(
