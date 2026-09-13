@@ -80,6 +80,46 @@ class AgentProfileTests(unittest.TestCase):
         path.chmod(0o600)
         return path
 
+    def _write_store(
+        self,
+        name: str,
+        variants: dict[str, list[dict[str, object]]],
+        *,
+        state: str = "active",
+    ) -> Path:
+        directory = self._directory(name)
+        revisions = directory / "revisions"
+        revisions.mkdir(mode=0o700)
+        profiles: dict[str, object] = {}
+        for profile_id, documents in variants.items():
+            folder = revisions / profile_id
+            folder.mkdir(mode=0o700)
+            history = []
+            for document in documents:
+                profile = parse_profile(document)
+                self._write(
+                    folder, profile.document(), f"{profile.revision}.json"
+                )
+                history.append(profile.revision)
+            profiles[profile_id] = {
+                "state": state,
+                "revision": history[-1],
+                "history": history,
+            }
+        self._write_catalog(directory, profiles)
+        return directory
+
+    def _write_catalog(self, directory: Path, profiles: object) -> None:
+        self._write(
+            directory,
+            {
+                "schema": "foxhound.agent-profile-catalog",
+                "schema_version": 1,
+                "profiles": profiles,
+            },
+            "catalog.json",
+        )
+
     def test_general_profile_is_exact_runner_compatibility_profile(self):
         profile = general_profile()
         prompt = profile.render_prompt("foxhound-task-worker")
@@ -199,18 +239,26 @@ class AgentProfileTests(unittest.TestCase):
     def test_registry_refuses_ambiguous_historical_revisions(self):
         current = general_profile()
         historical = replace(current, max_turns=49)
+        withdrawn = parse_profile(profile_document("withdrawn"))
         registry = AgentProfileRegistry(
-            (current,), historical_profiles=(historical,)
+            (current,), historical_profiles=(historical, withdrawn)
         )
         self.assertEqual(
             registry.resolve(historical.profile_id, historical.revision),
             historical,
         )
 
+        self.assertEqual(
+            registry.resolve("withdrawn", withdrawn.revision), withdrawn
+        )
+        self.assertEqual(registry.list(), (current,))
+        self.assertIsNone(registry.get("withdrawn"))
+        with self.assertRaises(AgentProfileError):
+            registry.resolve_current("withdrawn", withdrawn.revision)
+
         for invalid in (
             (current,),
             (historical, historical),
-            (replace(historical, profile_id="unlisted"),),
         ):
             with self.subTest(revisions=len(invalid)):
                 with self.assertRaises(AgentProfileError):
@@ -330,6 +378,155 @@ class AgentProfileTests(unittest.TestCase):
             [profile.profile_id for profile in registry.list()],
             ["general", "specialist"],
         )
+
+    def test_versioned_store_lists_active_and_resolves_its_history(self):
+        historical = profile_document()
+        historical["max_turns"] = 40
+        current = profile_document()
+        directory = self._write_store(
+            "store", {"specialist": [historical, current]}
+        )
+        previous = parse_profile(historical).revision
+        offered = parse_profile(current).revision
+
+        registry = load_registry(directory)
+
+        self.assertEqual(
+            [profile.profile_id for profile in registry.list()],
+            ["general", "specialist"],
+        )
+        self.assertEqual(registry.get("specialist").revision, offered)
+        self.assertEqual(
+            registry.resolve("specialist", previous).max_turns, 40
+        )
+        with self.assertRaises(AgentProfileError):
+            registry.resolve_current("specialist", previous)
+
+        catalog = json.loads(
+            (directory / "catalog.json").read_text(encoding="utf-8")
+        )
+        catalog["profiles"]["specialist"]["state"] = "disabled"
+        self._write_catalog(directory, catalog["profiles"])
+        registry = load_registry(directory)
+
+        self.assertEqual(
+            [profile.profile_id for profile in registry.list()], ["general"]
+        )
+        self.assertIsNone(registry.get("specialist"))
+        for revision in (previous, offered):
+            self.assertEqual(
+                registry.resolve("specialist", revision).revision, revision
+            )
+
+    def test_versioned_store_refuses_unsafe_catalogs_and_revisions(self):
+        def catalog_entry(directory: Path) -> dict[str, object]:
+            document = json.loads(
+                (directory / "catalog.json").read_text(encoding="utf-8")
+            )
+            return document["profiles"]
+
+        def rewrite(directory: Path, profiles: object) -> None:
+            self._write_catalog(directory, profiles)
+
+        def misplace(directory: Path) -> None:
+            """File one profile's revision under another profile's ID."""
+            entry = catalog_entry(directory)["specialist"]
+            folder = directory / "revisions" / "other-agent"
+            folder.mkdir(mode=0o700)
+            self._write(
+                folder, profile_document(), f"{entry['revision']}.json"
+            )
+            rewrite(directory, {"other-agent": entry})
+
+        cases: dict[str, object] = {
+            "schema": lambda directory: self._write(
+                directory,
+                {"schema": "other", "schema_version": 1, "profiles": {}},
+                "catalog.json",
+            ),
+            "unknown-field": lambda directory: rewrite(
+                directory,
+                {
+                    "specialist": {
+                        **catalog_entry(directory)["specialist"],
+                        "prompt": "synthetic",
+                    }
+                },
+            ),
+            "reserved-id": lambda directory: rewrite(
+                directory, {"general": catalog_entry(directory)["specialist"]}
+            ),
+            "revision-not-current": lambda directory: rewrite(
+                directory,
+                {
+                    "specialist": {
+                        **catalog_entry(directory)["specialist"],
+                        "revision": "0" * 64,
+                    }
+                },
+            ),
+            "duplicate-history": lambda directory: rewrite(
+                directory,
+                {
+                    "specialist": {
+                        **catalog_entry(directory)["specialist"],
+                        "history": [
+                            catalog_entry(directory)["specialist"]["revision"]
+                        ] * 2,
+                    }
+                },
+            ),
+            "unknown-state": lambda directory: rewrite(
+                directory,
+                {
+                    "specialist": {
+                        **catalog_entry(directory)["specialist"],
+                        "state": "retired",
+                    }
+                },
+            ),
+            "missing-revision": lambda directory: (
+                directory / "revisions" / "specialist"
+                / f"{catalog_entry(directory)['specialist']['revision']}.json"
+            ).unlink(),
+            "digest-mismatch": lambda directory: self._write(
+                directory / "revisions" / "specialist",
+                {**profile_document(), "max_turns": 40},
+                f"{catalog_entry(directory)['specialist']['revision']}.json",
+            ),
+            "misplaced-profile": lambda directory: misplace(directory),
+            "catalog-mode": lambda directory: (
+                directory / "catalog.json"
+            ).chmod(0o644),
+            "revisions-mode": lambda directory: (
+                directory / "revisions"
+            ).chmod(0o750),
+            "revision-mode": lambda directory: (
+                directory / "revisions" / "specialist"
+                / f"{catalog_entry(directory)['specialist']['revision']}.json"
+            ).chmod(0o604),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(case=name):
+                directory = self._write_store(
+                    f"store-{name}", {"specialist": [profile_document()]}
+                )
+                mutate(directory)
+                with self.assertRaises(AgentProfileError):
+                    load_registry(directory)
+
+        directory = self._write_store(
+            "store-linked", {"specialist": [profile_document()]}
+        )
+        target = directory / "revisions" / "specialist"
+        linked = directory / "revisions" / "linked"
+        linked.symlink_to(target, target_is_directory=True)
+        entry = json.loads(
+            (directory / "catalog.json").read_text(encoding="utf-8")
+        )["profiles"]["specialist"]
+        self._write_catalog(directory, {"linked": entry})
+        with self.assertRaises(AgentProfileError):
+            load_registry(directory)
 
     def test_private_directory_refuses_relative_permissive_symlink_and_git(self):
         directory = self._directory()
