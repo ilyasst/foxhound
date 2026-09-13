@@ -1,0 +1,17 @@
+{
+  "schema": "foxhound.agent-profile-draft",
+  "schema_version": 1,
+  "profile_id": "example-scout",
+  "shared": ["hermes.md"],
+  "role": "role.md",
+  "overlays": ["example-project.md"],
+  "display_name": "Example Scout",
+  "runtime": "hermes",
+  "toolsets": ["terminal", "file", "web"],
+  "max_turns": 50,
+  "timeout_seconds": 1800,
+  "claim_lease_seconds": 2700,
+  "heartbeat_seconds": 60,
+  "kill_grace_seconds": 30,
+  "allowed_phases": ["plan"]
+}

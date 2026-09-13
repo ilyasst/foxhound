@@ -233,6 +233,53 @@ content. See [ADR 0023](docs/architecture/0023-agent-profile-registry.md).
 See [ADR 0026](docs/architecture/0026-shared-private-agent-profiles.md) for the
 shared private-profile deployment contract.
 
+That directory can hold one flat manifest per profile, or the versioned store
+described below.
+
+### Versioned private profile store
+
+A profile is edited as Markdown, not as one long JSON string, and a published
+revision is never rewritten. The editable source holds shared instructions used
+by every agent, role instructions per profile, optional project overlays, and
+one policy document per profile. `examples/agent-profile-store/` contains a
+clearly fictional source store with exactly that shape:
+
+```text
+shared/hermes.md                    instructions shared by every agent
+drafts/example-scout/policy.json    one profile's limits, tools, and fragments
+drafts/example-scout/role.md        that profile's role instructions
+overlays/example-project.md         an optional narrowing overlay
+catalog.json                        what each profile currently offers
+revisions/example-scout/<sha256>.json   immutable compiled revisions
+```
+
+Publishing compiles the shared fragments, the role instructions, the selected
+overlays, and the policy into one effective manifest whose digest is the
+revision, then advances the catalog atomically. Editing shared instructions
+therefore changes every active profile, so republish them together:
+
+```sh
+foxhound-agent-profile-store --source /srv/example/private-agent-source   publish --all-active
+foxhound-agent-profile-store --source /srv/example/private-agent-source   install --target /srv/example/private-agent-profiles
+```
+
+`initialize`, `validate`, `list`, `publish`, `disable`, `enable`, `install`,
+`doctor`, `delete`, and `migrate` are the available operations. Only an active
+profile's current revision is offered for new selection; every other published
+revision still resolves exactly for a workflow already pinned to it, including
+the revisions of a profile that has been disabled. `delete` is refused unless
+the profile is already disabled and the execution databases passed with
+`--database` prove that no stored work references it. `migrate` converts a flat
+directory, only reads it, and refuses unless recompiling reproduces each
+original revision digest, so existing pins keep working.
+
+The source may be distributed by a synchronization system that does not
+preserve file modes, so `doctor` reports permissive entries as counts rather
+than enforcing them there; `install` writes the owner-only `0700`/`0600` copy
+that the card service and runner actually load. Command output carries
+identifiers, states, revisions, and counts only. See
+[ADR 0027](docs/architecture/0027-versioned-private-profile-store.md).
+
 Every execution workflow stores the selected profile ID and exact revision.
 The runner resolves that immutable evidence within atomic claim selection,
 then derives the Hermes prompt, tools, turn limit, timeout, lease, heartbeat,

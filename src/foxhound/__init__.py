@@ -4,9 +4,17 @@ from .agent_profiles import (
     AgentProfile,
     AgentProfileError,
     AgentProfileRegistry,
+    CatalogEntry,
+    catalog_document,
     general_profile,
     load_registry,
+    parse_catalog,
     parse_profile,
+)
+from .profile_store import (
+    ProfileDraft,
+    ProfileStoreError,
+    parse_draft,
 )
 from .candidate_inbox import (
     CandidateInbox,
@@ -112,8 +120,14 @@ __all__ = (
     "AgentProfile",
     "AgentProfileError",
     "AgentProfileRegistry",
+    "CatalogEntry",
+    "ProfileDraft",
+    "ProfileStoreError",
+    "catalog_document",
     "general_profile",
     "load_registry",
+    "parse_catalog",
+    "parse_draft",
     "parse_profile",
     "CandidateInbox",
     "FeedImportDisposition",
