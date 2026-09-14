@@ -644,6 +644,57 @@ class TaskLedger:
                         )
                         tasks_revised += 1
                         continue
+                    previous = self._bound_candidate(connection, binding)
+                    if previous.task == candidate.task:
+                        # A producer may enrich the evidence for an already
+                        # accepted task without changing the work itself.
+                        # Advancing the binding is necessary so cards read the
+                        # new evidence; advancing the task version would make
+                        # an active workflow stale for no task-level change.
+                        task = connection.execute(
+                            "SELECT version FROM tasks WHERE id=?",
+                            (int(binding["task_id"]),),
+                        ).fetchone()
+                        if task is None:
+                            raise _NativeIntakeConflict
+                        connection.execute(
+                            "UPDATE task_candidate_bindings SET "
+                            "source_revision=?,decided_at=? "
+                            "WHERE candidate_id=?",
+                            (
+                                candidate.source.revision,
+                                now,
+                                candidate.candidate_id,
+                            ),
+                        )
+                        connection.execute(
+                            "UPDATE task_candidate_lifecycle SET "
+                            "source_revision=?,changed_at=?,decided_at=? "
+                            "WHERE candidate_id=?",
+                            (
+                                candidate.source.revision,
+                                candidate.lifecycle.changed_at,
+                                now,
+                                candidate.candidate_id,
+                            ),
+                        )
+                        connection.execute(
+                            "INSERT INTO task_events("
+                            "task_id,kind,task_version,candidate_id,"
+                            "source_revision,from_status,to_status,occurred_at) "
+                            "VALUES(?,'candidate_revised',?,?,?,?,?,?)",
+                            (
+                                int(binding["task_id"]),
+                                int(task["version"]),
+                                candidate.candidate_id,
+                                candidate.source.revision,
+                                None,
+                                None,
+                                now,
+                            ),
+                        )
+                        tasks_revised += 1
+                        continue
                     task = connection.execute(
                         "SELECT status,version FROM tasks WHERE id=?",
                         (int(binding["task_id"]),),

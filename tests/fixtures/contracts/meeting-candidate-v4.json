@@ -1,0 +1,40 @@
+{
+  "schema": "foxhound.task-candidate",
+  "schema_version": 4,
+  "candidate_id": "tc_3e70ab1cb320f461d307475bf2d2fa50ec785d68afc616b95ba196cebe7b335a",
+  "source": {
+    "system": "gw",
+    "kind": "meeting",
+    "record_id": "record-001",
+    "item_id": "action-001",
+    "revision": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  },
+  "task": {
+    "text": "Prepare the Project Alpha summary",
+    "project": "Project Alpha",
+    "owner": "Person A",
+    "due": "2030-01-15"
+  },
+  "evidence": {
+    "document_id": "record-001",
+    "locator": "action-item-001",
+    "sources": [
+      {
+        "name": "20300102_030405_example_handoff.json",
+        "role": "handoff",
+        "extract": "Candidate action-001 declares the Project Alpha summary."
+      },
+      {
+        "name": "20300102_030405_example_protocol.md",
+        "role": "protocol",
+        "extract": "Summary:\nThe group agreed on the next report.\n\nAction item:\n- [ ] Prepare the Project Alpha summary — Person A"
+      },
+      {
+        "name": "20300102_030405_example_transcript.txt",
+        "role": "transcript",
+        "extract": "[Person A] I will prepare the Project Alpha summary by January 15."
+      }
+    ]
+  },
+  "created_at": "2030-01-02T03:04:05+00:00"
+}

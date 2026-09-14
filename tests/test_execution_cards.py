@@ -18,6 +18,7 @@ from foxhound.agent_profiles import (
     parse_profile,
 )
 from foxhound.candidate_inbox import CandidateInbox, SCHEMA_VERSION
+from foxhound.contracts import candidate_id_for
 from foxhound.execution_cards import (
     CALLBACK_DATA_LIMIT,
     MAX_CARD_BODY_BYTES,
@@ -1172,6 +1173,85 @@ class ExecutionCardTests(unittest.TestCase):
             self.cards.claim_next().card)
         self.assertIn("record_synthetic", body)
         self.assertNotIn("<a href", body)
+
+    def test_bounded_source_evidence_replaces_an_opaque_meeting_record(self):
+        task_id = 6
+        record_id = "record_" + "a" * 32
+        item_id = "action-001"
+        candidate_id = candidate_id_for(
+            system="gw", kind="meeting", record_id=record_id,
+            item_id=item_id,
+        )
+        revision = "c" * 64
+        candidate = {
+            "schema": "foxhound.task-candidate",
+            "schema_version": 4,
+            "candidate_id": candidate_id,
+            "source": {
+                "system": "gw", "kind": "meeting",
+                "record_id": record_id, "item_id": item_id,
+                "revision": revision,
+            },
+            "task": {
+                "text": "Prepare the Project Alpha summary",
+                "owner": "Person A", "due": None,
+            },
+            "evidence": {
+                "document_id": record_id,
+                "locator": "action-item-001",
+                "sources": [
+                    {
+                        "name": "20300102_example_protocol.md",
+                        "role": "protocol",
+                        "extract": "Summary:\nA report was requested.\n\nAction item:\nPrepare it.",
+                    },
+                    {
+                        "name": "20300102_example_transcript.txt",
+                        "role": "transcript",
+                        "extract": "[Person A] I will prepare the report.",
+                    },
+                ],
+            },
+            "created_at": "2030-01-01T00:00:00Z",
+        }
+        payload = json.dumps(candidate, separators=(",", ":"), sort_keys=True)
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "INSERT INTO candidate_inbox(candidate_id,source_system,"
+                "source_kind,source_record_id,source_item_id,source_revision,"
+                "payload_json,created_at,first_imported_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (candidate_id, "gw", "meeting", record_id, item_id, revision,
+                 payload, "2030-01-01T00:00:00Z",
+                 "2030-01-01T00:00:00Z", "2030-01-01T00:00:00Z"),
+            )
+            connection.execute(
+                "INSERT INTO candidate_revision_history(candidate_id,"
+                "source_revision,payload_json,created_at,imported_at) "
+                "VALUES(?,?,?,?,?)",
+                (candidate_id, revision, payload,
+                 "2030-01-01T00:00:00Z", "2030-01-01T00:00:00Z"),
+            )
+            connection.execute(
+                "INSERT INTO task_candidate_bindings(candidate_id,"
+                "source_revision,task_id,relation,decided_at) "
+                "VALUES(?,?,?,'accepted','2030-01-01T00:00:00Z')",
+                (candidate_id, revision, task_id),
+            )
+            connection.commit()
+
+        self._schedule_workflow(task_id)
+        self.assertEqual(self.cards.schedule().created, 1)
+        body, _keyboard = render_execution_review_card(
+            self.cards.claim_next().card
+        )
+
+        self.assertIn("<b>From:</b> Meeting", body)
+        self.assertIn("20300102_example_protocol.md", body)
+        self.assertIn("20300102_example_transcript.txt", body)
+        self.assertIn("A report was requested", body)
+        self.assertIn("I will prepare the report", body)
+        self.assertNotIn(record_id, body)
 
     def test_a_gate_can_be_reassigned_dropped_or_discussed(self):
         """A task is most often noticed as someone else's when offered.

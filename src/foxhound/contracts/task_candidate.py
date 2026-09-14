@@ -22,10 +22,12 @@ SCHEMA_ID = "foxhound.task-candidate"
 SCHEMA_VERSION = 1
 PROJECTLESS_SCHEMA_VERSION = 2
 LIFECYCLE_SCHEMA_VERSION = 3
+PROVENANCE_SCHEMA_VERSION = 4
 SUPPORTED_SCHEMA_VERSIONS = frozenset({
     SCHEMA_VERSION,
     PROJECTLESS_SCHEMA_VERSION,
     LIFECYCLE_SCHEMA_VERSION,
+    PROVENANCE_SCHEMA_VERSION,
 })
 LIFECYCLE_STATES = frozenset({"active", "withdrawn"})
 SOURCE_SYSTEMS = frozenset({"gw"})
@@ -54,6 +56,10 @@ SOURCE_KINDS = source_kinds_accepting("accepts_candidates")
 _OPAQUE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$")
 _REVISION_RE = re.compile(r"^[0-9a-f]{64}$")
 _CANDIDATE_ID_RE = re.compile(r"^tc_[0-9a-f]{64}$")
+_SOURCE_ROLES = frozenset({"handoff", "protocol", "transcript"})
+MAX_EVIDENCE_SOURCES = 3
+MAX_EVIDENCE_SOURCE_NAME = 255
+MAX_EVIDENCE_EXTRACT = 1_200
 
 
 class ContractError(ValueError):
@@ -78,9 +84,17 @@ class CandidateTask:
 
 
 @dataclass(frozen=True)
+class CandidateEvidenceSource:
+    name: str
+    role: str
+    extract: str
+
+
+@dataclass(frozen=True)
 class CandidateEvidence:
     document_id: str
     locator: str
+    sources: tuple[CandidateEvidenceSource, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -109,7 +123,10 @@ def task_candidate_document(candidate: TaskCandidate) -> dict[str, Any]:
         "owner": candidate.task.owner,
         "due": candidate.task.due,
     }
-    if candidate.schema_version == SCHEMA_VERSION:
+    if candidate.schema_version == SCHEMA_VERSION or (
+        candidate.schema_version == PROVENANCE_SCHEMA_VERSION
+        and candidate.task.project is not None
+    ):
         task["project"] = candidate.task.project
     document = {
         "schema": candidate.schema,
@@ -129,6 +146,15 @@ def task_candidate_document(candidate: TaskCandidate) -> dict[str, Any]:
         },
         "created_at": candidate.created_at,
     }
+    if candidate.schema_version == PROVENANCE_SCHEMA_VERSION:
+        document["evidence"]["sources"] = [
+            {
+                "name": source.name,
+                "role": source.role,
+                "extract": source.extract,
+            }
+            for source in candidate.evidence.sources
+        ]
     if candidate.schema_version == LIFECYCLE_SCHEMA_VERSION:
         document["lifecycle"] = {
             "state": candidate.lifecycle.state,
@@ -206,32 +232,54 @@ def parse_task_candidate(document: object) -> TaskCandidate:
         raise ContractError("candidate.candidate_id does not match source identity")
 
     task_doc = _object(root["task"], "candidate.task")
-    task_fields = (
-        {"text", "project", "owner", "due"}
-        if version == SCHEMA_VERSION
-        else {"text", "owner", "due"}
-    )
-    _exact_fields(task_doc, "candidate.task", task_fields)
+    base_task_fields = {"text", "owner", "due"}
+    if version == PROVENANCE_SCHEMA_VERSION:
+        _required_and_allowed_fields(
+            task_doc,
+            "candidate.task",
+            base_task_fields,
+            base_task_fields | {"project"},
+        )
+    else:
+        task_fields = (
+            base_task_fields | {"project"}
+            if version == SCHEMA_VERSION
+            else base_task_fields
+        )
+        _exact_fields(task_doc, "candidate.task", task_fields)
     task = CandidateTask(
         text=_bounded_text(task_doc["text"], "candidate.task.text", 1, 1_000),
         project=(
             _bounded_text(
                 task_doc["project"], "candidate.task.project", 1, 200
             )
-            if version == SCHEMA_VERSION else None
+            if version == SCHEMA_VERSION or (
+                version == PROVENANCE_SCHEMA_VERSION
+                and "project" in task_doc
+            ) else None
         ),
         owner=_optional_text(task_doc["owner"], "candidate.task.owner", 200),
         due=_optional_date(task_doc["due"], "candidate.task.due"),
     )
 
     evidence_doc = _object(root["evidence"], "candidate.evidence")
-    _exact_fields(evidence_doc, "candidate.evidence",
-                  {"document_id", "locator"})
+    evidence_fields = {"document_id", "locator"}
+    if version == PROVENANCE_SCHEMA_VERSION:
+        evidence_fields.add("sources")
+    _exact_fields(evidence_doc, "candidate.evidence", evidence_fields)
+    sources: tuple[CandidateEvidenceSource, ...] = ()
+    if version == PROVENANCE_SCHEMA_VERSION:
+        if source.kind != "meeting":
+            raise ContractError(
+                "candidate.source.kind is unsupported for provenance"
+            )
+        sources = _evidence_sources(evidence_doc["sources"])
     evidence = CandidateEvidence(
         document_id=_opaque_id(
             evidence_doc["document_id"], "candidate.evidence.document_id"),
         locator=_opaque_id(evidence_doc["locator"],
                            "candidate.evidence.locator"),
+        sources=sources,
     )
 
     created_at = _aware_timestamp(root["created_at"], "candidate.created_at")
@@ -286,6 +334,70 @@ def _exact_fields(value: Mapping[str, Any], field: str,
     additional = set(value) - expected
     if additional:
         raise ContractError(f"{field} contains additional fields")
+
+
+def _required_and_allowed_fields(
+    value: Mapping[str, Any],
+    field: str,
+    required: set[str],
+    allowed: set[str],
+) -> None:
+    if required - set(value):
+        raise ContractError(f"{field} is missing required fields")
+    if set(value) - allowed:
+        raise ContractError(f"{field} contains additional fields")
+
+
+def _evidence_sources(value: object) -> tuple[CandidateEvidenceSource, ...]:
+    if not isinstance(value, list) or not 1 <= len(value) <= MAX_EVIDENCE_SOURCES:
+        raise ContractError("candidate.evidence.sources has invalid length")
+    sources = []
+    seen = set()
+    for raw_source in value:
+        source = _object(raw_source, "candidate.evidence.sources entry")
+        _exact_fields(
+            source,
+            "candidate.evidence.sources entry",
+            {"name", "role", "extract"},
+        )
+        name = _source_name(
+            source["name"], "candidate.evidence.sources entry.name"
+        )
+        role = _choice(
+            source["role"],
+            "candidate.evidence.sources entry.role",
+            _SOURCE_ROLES,
+        )
+        extract = _bounded_excerpt(
+            source["extract"],
+            "candidate.evidence.sources entry.extract",
+        )
+        identity = (name, role)
+        if identity in seen:
+            raise ContractError("candidate.evidence.sources contains a duplicate")
+        seen.add(identity)
+        sources.append(CandidateEvidenceSource(name, role, extract))
+    return tuple(sources)
+
+
+def _source_name(value: object, field: str) -> str:
+    text = _bounded_text(value, field, 1, MAX_EVIDENCE_SOURCE_NAME)
+    if text in {".", ".."} or "/" in text or "\\" in text:
+        raise ContractError(f"{field} must be one safe path segment")
+    return text
+
+
+def _bounded_excerpt(value: object, field: str) -> str:
+    if not isinstance(value, str):
+        raise ContractError(f"{field} must be a string")
+    if value != value.strip():
+        raise ContractError(f"{field} must not have surrounding whitespace")
+    if not 1 <= len(value) <= MAX_EVIDENCE_EXTRACT:
+        raise ContractError(f"{field} has invalid length")
+    if any((ord(char) < 32 and char not in "\n\t") or ord(char) == 127
+           for char in value):
+        raise ContractError(f"{field} contains control characters")
+    return value
 
 
 def _bounded_text(value: object, field: str, minimum: int, maximum: int) -> str:
