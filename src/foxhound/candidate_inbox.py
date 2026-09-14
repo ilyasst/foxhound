@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -170,6 +170,14 @@ _SCHEMA_COLUMNS = {
         "tasks_revised",
         "candidates_unchanged",
         "occurred_at",
+    ),
+    "native_intake_historical_refusals": (
+        "candidate_id",
+        "source_revision",
+        "producer",
+        "stream_id",
+        "reason_code",
+        "refused_at",
     ),
     "shadow_import_cycles": (
         "sequence",
@@ -349,9 +357,15 @@ _SCHEMA_COLUMNS = {
     ),
 }
 
-_SCHEMA_V14_COLUMNS = {
+_SCHEMA_V15_COLUMNS = {
     name: columns
     for name, columns in _SCHEMA_COLUMNS.items()
+    if name != "native_intake_historical_refusals"
+}
+
+_SCHEMA_V14_COLUMNS = {
+    name: columns
+    for name, columns in _SCHEMA_V15_COLUMNS.items()
     if name not in {"candidate_lifecycle", "task_candidate_lifecycle"}
 }
 
@@ -389,6 +403,8 @@ _SCHEMA_OBJECTS = {
     "native_candidate_intakes_no_delete": "trigger",
     "native_candidate_intake_events_no_update": "trigger",
     "native_candidate_intake_events_no_delete": "trigger",
+    "native_intake_historical_refusals_no_update": "trigger",
+    "native_intake_historical_refusals_no_delete": "trigger",
     "execution_reader_inputs_no_update": "trigger",
     "execution_reader_inputs_no_delete": "trigger",
     "task_owner_events_no_update": "trigger",
@@ -1449,6 +1465,39 @@ END;
 )
 
 
+_SCHEMA_V16 = (
+    """
+CREATE TABLE IF NOT EXISTS native_intake_historical_refusals (
+    candidate_id    TEXT NOT NULL,
+    source_revision TEXT NOT NULL,
+    producer        TEXT NOT NULL,
+    stream_id       TEXT NOT NULL,
+    reason_code     TEXT NOT NULL CHECK(
+                        reason_code = 'preserved_legacy_owner'
+                    ),
+    refused_at      TEXT NOT NULL,
+    PRIMARY KEY(candidate_id, source_revision),
+    FOREIGN KEY(candidate_id, source_revision)
+        REFERENCES candidate_revision_history(candidate_id, source_revision)
+);
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS native_intake_historical_refusals_no_update
+BEFORE UPDATE ON native_intake_historical_refusals
+BEGIN
+    SELECT RAISE(ABORT, 'historical refusals are append-only');
+END;
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS native_intake_historical_refusals_no_delete
+BEFORE DELETE ON native_intake_historical_refusals
+BEGIN
+    SELECT RAISE(ABORT, 'historical refusals are append-only');
+END;
+""",
+)
+
+
 class InboxError(RuntimeError):
     """The inbox cannot safely initialize or read its state."""
 
@@ -1949,6 +1998,23 @@ class CandidateInbox:
                     for statement in _SCHEMA_V15:
                         connection.execute(statement)
                     connection.execute("PRAGMA user_version = 15")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 15
+            if version == 15:
+                self._require_tables(
+                    connection,
+                    tuple(_SCHEMA_V15_COLUMNS),
+                    columns=_SCHEMA_V15_COLUMNS,
+                )
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V16:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 16")
                     connection.commit()
                 except Exception:
                     connection.rollback()

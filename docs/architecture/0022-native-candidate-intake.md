@@ -31,6 +31,15 @@ historical prefix. It succeeds only when:
 - every current producer candidate is either bound at its current revision or
   has an explicit historical refusal.
 
+When a comparison is divergent but an operator has independently decided to
+preserve the legacy task, `refuse-divergent` can record that historical
+candidate revision as `preserved_legacy_owner`. The operation is deliberately
+narrow: it runs only before activation, selects current active and unbound
+divergent revisions from one producer stream, and requires the aggregate count
+to equal an explicit expectation before writing anything. Its rows cannot be
+updated or deleted. An exact retry is unchanged; any other historical
+divergence continues to block activation.
+
 The activation record and its append-only event are committed atomically.
 Its producer, stream, boundary cursor, and activation time cannot change, and
 the record cannot be deleted. An exact activation retry is unchanged; a
@@ -68,8 +77,9 @@ Task versioning is the invalidation boundary. A revision makes cards and
 workflows bound to an earlier version stale; their existing guards prevent an
 old approval, callback, or result from acting on revised content.
 
-The `foxhound-native-intake` one-shot command exposes separate `activate` and
-`run` operations. It requires an absolute regular database file in an
+The `foxhound-native-intake` one-shot command exposes separate
+`refuse-divergent`, `activate`, and `run` operations. It requires an absolute
+regular database file in an
 owner-only directory and emits only dispositions, cursors, and aggregate
 counts. It does not connect to the producer, inspect knowledge or persona
 state, schedule cards or workflows, run an agent, or perform lifecycle work.
