@@ -334,6 +334,19 @@ def _historical_general_profiles() -> tuple[AgentProfile, ...]:
             kill_grace_seconds=30,
             allowed_phases=_PHASES,
         ),
+        AgentProfile(
+            profile_id="general",
+            display_name="General",
+            runtime="hermes",
+            prompt_template=_GENERAL_PROMPT_TEMPLATE_V5,
+            toolsets=("terminal", "file", "web"),
+            max_turns=50,
+            timeout_seconds=1_800,
+            claim_lease_seconds=2_700,
+            heartbeat_seconds=60,
+            kill_grace_seconds=30,
+            allowed_phases=_PHASES,
+        ),
     )
 
 
@@ -869,9 +882,15 @@ _GENERAL_PROMPT_TEMPLATE_V4 = _GENERAL_PROMPT_TEMPLATE_V3.replace(
 )
 
 
-_GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V4.replace(
+_GENERAL_PROMPT_TEMPLATE_V5 = _GENERAL_PROMPT_TEMPLATE_V4.replace(
     "Use `runtime.today` as the authoritative local date. Resolve relative phrases from that date using ordinary calendar semantics: `next week` means the subsequent calendar week, never the current one. State exact dates when ambiguity matters, verify every weekday/date pair before recording, and never infer today from task age or model knowledge.",
     "Use `runtime.today` as the authoritative local date. For `next week`, use the worker-computed Monday-through-Sunday dates in `runtime.next_week` exactly; do not calculate or substitute another range. State exact dates when ambiguity matters, verify every weekday/date pair against the worker-provided values before recording, and never infer today from task age or model knowledge.",
+)
+
+
+_GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V5.replace(
+    f"If useful work cannot be completed, call `{WORKER_COMMAND_TOKEN} release`.",
+    f"When the full objective cannot be completed but a truthful plan, analysis, draft, or blocked result is still useful, draft and record that partial result. Call `{WORKER_COMMAND_TOKEN} release` only when no truthful reviewable artifact can be produced.",
 )
 
 
