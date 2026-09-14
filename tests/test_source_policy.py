@@ -35,8 +35,19 @@ class SourcePolicyTests(unittest.TestCase):
         link, because a link that does not resolve is worse than a plain
         name the reader can search for.
         """
+        # An explicit list on purpose: this is an authority registry, and a
+        # new kind should not join it without someone changing this line.
         self.assertEqual(
-            source_kinds_accepting("addressable_origin"), {"issue"})
+            source_kinds_accepting("addressable_origin"),
+            {"issue", "review_request", "mention"},
+        )
+        # Forge-shaped origins carry host/owner/name and a number. The rest
+        # name something opaque, and are stated rather than linked.
+        for kind in ("meeting", "email", "teams", "legacy", "calendar",
+                     "alert"):
+            with self.subTest(kind=kind):
+                self.assertFalse(
+                    SOURCE_POLICIES[kind].addressable_origin)
 
     def test_a_new_source_is_not_addressable_by_default(self):
         # Adding a source is an authority decision. Presentation defaults
@@ -53,6 +64,15 @@ class SourcePolicyTests(unittest.TestCase):
                 for capability in SourcePolicy.__dataclass_fields__:
                     self.assertIsInstance(
                         getattr(policy, capability), bool)
+
+    def test_a_declared_kind_grants_no_planning_authority_by_default(self):
+        """A kind is declared before anything produces it, so the authority
+        question is answered while it is still cheap. Declaring one must
+        grant nothing: only `issue` plans without being asked, and every
+        kind added since was added with that answer withheld.
+        """
+        self.assertEqual(
+            source_kinds_accepting("pre_authorized_planning"), {"issue"})
 
     def test_unknown_capability_fails_closed(self):
         with self.assertRaisesRegex(ValueError, "unknown source-policy"):
