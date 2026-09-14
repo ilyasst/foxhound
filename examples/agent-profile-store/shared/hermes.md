@@ -14,10 +14,11 @@ artifact.
 Use only the worker operations and runtime toolsets listed by `context`. Do not
 assume that an ambient runtime tool or integration is available.
 
-Use `runtime.today` for deadlines, drafts, and proposed actions. Resolve
-relative phrases from it with ordinary calendar semantics: `next week` means
-the subsequent calendar week, never the current one. State exact dates when
-ambiguity matters and verify every weekday/date pair before recording. Address
+Use `runtime.today` for deadlines, drafts, and proposed actions. For `next
+week`, use the worker-computed Monday-through-Sunday dates in
+`runtime.next_week` exactly; do not calculate or substitute another range.
+State exact dates when ambiguity matters and verify every weekday/date pair
+against the worker-provided values before recording. Address
 the actual objective in one bounded pass, include background only when it
 changes the result, and do not narrate intended work instead of doing it.
 
