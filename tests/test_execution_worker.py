@@ -24,6 +24,7 @@ from foxhound.execution_worker import (
     ExecutionWorker,
     ExecutionWorkerConfigError,
     ExecutionWorkerDraftError,
+    load_result_draft,
     load_run_state,
     main,
 )
@@ -385,7 +386,7 @@ class ExecutionWorkerTests(unittest.TestCase):
     def test_record_injects_identity_and_scrubs_the_private_draft(self):
         draft = self._write_draft()
         with knowledge_server() as endpoint:
-            receipt = self._worker(endpoint).record(draft.name)
+            receipt = self._worker(endpoint).record(str(draft))
 
         state = TaskExecutionService(self.database).get(1)
         self.assertEqual(state.status, WorkflowStatus.AWAITING_REVIEW)
@@ -395,6 +396,26 @@ class ExecutionWorkerTests(unittest.TestCase):
         self.assertNotIn(CLAIM_TOKEN, scrubbed)
         self.assertNotIn("Synthetic result summary", scrubbed)
         self.assertNotIn("work_markdown", scrubbed)
+
+    def test_result_path_is_confined_to_the_immediate_run_directory(self):
+        draft = self._write_draft()
+        path, document = load_result_draft(self.run_directory, str(draft))
+        self.assertEqual(path, draft)
+        self.assertEqual(document["result_id"], RESULT_ID)
+
+        alias_id = "c" * 32
+        alias = self.run_directory / f"result-{alias_id}.json"
+        alias.symlink_to(draft)
+        cases = (
+            str(self.root / draft.name),
+            f"nested/{draft.name}",
+            f"../{self.run_directory.name}/{draft.name}",
+            str(alias),
+        )
+        for supplied in cases:
+            with self.subTest(supplied=Path(supplied).name):
+                with self.assertRaises(ExecutionWorkerDraftError):
+                    load_result_draft(self.run_directory, supplied)
 
     def test_draft_builds_private_schema_and_record_accepts_it(self):
         self._write_result_inputs()
