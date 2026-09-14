@@ -478,8 +478,16 @@ explicit scheduling pass projects only workflows currently awaiting start,
 plan review, external-action review, or final-result review. Each card is
 bound to exact task, workflow, phase, and result state; delivery uses an
 expiring digest-fenced claim. Start cards retain the established task context
-and Done/Continue, Drop/Update, and Snooze 24h/Reassign layout. Update records
-private steering but does not start work; Continue is the explicit planning
+and Done/Continue, Drop/Update, and Snooze 24h/Reassign layout. When a task has
+a resolved, non-provisional person owner other than the reader, a deployment
+with the GW condition boundary enabled also shows **Until next meeting with
+Person B**. The first Start card is always shown; Foxhound never silently
+suppresses other-owned work. That action resolves the card without starting
+an agent, stores the exact structured owner reference, and wakes a fresh Start
+card at the first matching upcoming meeting or exactly 21 days later.
+Unresolved, group, provisional, and reader-owned tasks never receive the
+control. GW failures leave the hold in place. Update records private steering
+but does not start work; Continue is the explicit planning
 approval. Plan and result cards can request more
 investigation, collect one private discussion instruction, execute, snooze for
 a bounded interval, complete, reassign, or drop as appropriate. External
@@ -501,9 +509,16 @@ callbacks and a refreshed Start-card presentation; they are not exposed as an
 extra control in the legacy-compatible Start keyboard.
 The packaged service accepts `--agent-profile-directory`; deployments with
 private profiles must give it the same directory as the execution runner. The
-existing `/v1/task-cards/*` contracts are unchanged. Starting the service
+owner-conditioned control is disabled unless all three of `--gw-endpoint`,
+`--gw-alias`, and `--gw-token-file` are supplied. On startup the service reads
+the strict GW execution context once to identify reader aliases; scheduling
+passes later call only the content-free owner-upcoming-meeting condition.
+Deploy the GW condition route first, then a gateway version that forwards the
+`until_meeting` action, and only then restart Foxhound with those arguments.
+The existing `/v1/task-cards/*` contracts are unchanged. Starting the service
 still creates no card and advances no gate. See
-[ADR 0017](docs/architecture/0017-execution-card-service.md).
+[ADR 0017](docs/architecture/0017-execution-card-service.md) and
+[ADR 0034](docs/architecture/0034-owner-conditioned-start-holds.md).
 
 Run the contract tests with:
 
@@ -571,3 +586,5 @@ See [ADR 0029](docs/architecture/0029-legacy-workflow-card-compatibility.md) for
 the legacy-compatible card projection.
 See [ADR 0030](docs/architecture/0030-versioned-runtime-guidance.md) for
 versioned operating guidance and explicit runtime capabilities.
+See [ADR 0034](docs/architecture/0034-owner-conditioned-start-holds.md) for
+identity-bound Start-card holds and the 21-day fail-safe.

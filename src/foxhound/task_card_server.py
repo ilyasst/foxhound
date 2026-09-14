@@ -28,6 +28,11 @@ from .execution_cards import (
     render_execution_agent_selector,
     render_execution_review_card,
 )
+from .execution_worker import (
+    ExecutionWorkerConfigError,
+    load_knowledge_config,
+)
+from .knowledge_client import GwKnowledgeClient, KnowledgeClientError
 from .task_cards import (
     CardOperationResult,
     ScheduleResult,
@@ -343,7 +348,7 @@ class TaskCardApplication:
             action = request["action"]
             if not isinstance(action, str) or action not in {
                 "start", "snooze", "cancel", "approve", "revise",
-                "done", "drop", "snooze_1d", "snooze_7d",
+                "done", "drop", "until_meeting", "snooze_1d", "snooze_7d",
                 "snooze_14d", "snooze_30d",
             }:
                 raise TaskCardServerRequestError(
@@ -912,13 +917,35 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=8790)
     parser.add_argument("--request-timeout", type=float, default=5.0)
     parser.add_argument("--agent-profile-directory", type=Path)
+    parser.add_argument("--gw-endpoint")
+    parser.add_argument("--gw-alias")
+    parser.add_argument("--gw-token-file", type=Path)
     arguments = parser.parse_args(argv)
     try:
         cards = TaskCardService(arguments.database)
         cards.count()
         registry = load_registry(arguments.agent_profile_directory)
+        gw_values = (
+            arguments.gw_endpoint,
+            arguments.gw_alias,
+            arguments.gw_token_file,
+        )
+        if any(value is not None for value in gw_values) and not all(gw_values):
+            raise TaskCardServerConfigError(
+                "GW owner meeting configuration must be complete"
+            )
+        owner_condition = None
+        reader_aliases: tuple[str, ...] = ()
+        if all(gw_values):
+            knowledge = GwKnowledgeClient(load_knowledge_config(*gw_values))
+            context = knowledge.execution_context()
+            owner_condition = knowledge.owner_upcoming_meeting
+            reader_aliases = (context.display_name, *context.self_aliases)
         execution_cards = ExecutionCardService(
-            arguments.database, profile_registry=registry
+            arguments.database,
+            profile_registry=registry,
+            owner_condition=owner_condition,
+            reader_aliases=reader_aliases,
         )
         execution_cards.count()
         app = TaskCardApplication(
@@ -932,6 +959,8 @@ def main(argv: list[str] | None = None) -> int:
         serve(arguments.bind, arguments.port, app)
     except (
         AgentProfileError,
+        ExecutionWorkerConfigError,
+        KnowledgeClientError,
         OSError,
         TaskLedgerError,
         TaskCardServerConfigError,

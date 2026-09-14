@@ -19,6 +19,7 @@ from foxhound import (
     KnowledgeRequestError,
     KnowledgeResponseError,
     KnowledgeTransportError,
+    OwnerUpcomingMeeting,
 )
 
 
@@ -97,6 +98,17 @@ def execution_context_response(request: dict) -> dict:
     }
 
 
+def owner_meeting_response(_request: dict) -> dict:
+    return {
+        "schema": "gw.owner-upcoming-meeting",
+        "schema_version": 1,
+        "ok": True,
+        "match": True,
+        "checked_at": "2030-04-05T12:00:00+00:00",
+        "evidence_revision": "a" * 64,
+    }
+
+
 @contextmanager
 def server(
     *,
@@ -130,6 +142,8 @@ def server(
                 response = owner_response(request)
             elif self.path == "/v1/execution-context":
                 response = execution_context_response(request)
+            elif self.path == "/v1/owner-upcoming-meeting":
+                response = owner_meeting_response(request)
             else:
                 response = search_response(request)
             if transform is not None:
@@ -171,6 +185,72 @@ def client(endpoint: str, **changes) -> GwKnowledgeClient:
 
 
 class KnowledgeClientTests(unittest.TestCase):
+    def test_owner_meeting_condition_is_exact_and_content_free(self):
+        reference = {
+            "kind": "person",
+            "speaker_id": "SPK_002",
+            "canonical_speaker_id": "SPK_002",
+            "speaker_registry_id": "registry-1",
+            "pinned": False,
+            "provisional": False,
+        }
+        with server() as (endpoint, requests):
+            result = client(endpoint).owner_upcoming_meeting(
+                owner="Person B", owner_ref=reference
+            )
+        self.assertEqual(
+            result,
+            OwnerUpcomingMeeting(
+                True,
+                "2030-04-05T12:00:00+00:00",
+                "a" * 64,
+            ),
+        )
+        self.assertEqual(requests[0], {
+            "path": "/v1/owner-upcoming-meeting",
+            "authorization": f"Bearer {TOKEN}",
+            "document": {
+                "schema": "gw.owner-upcoming-meeting-request",
+                "schema_version": 1,
+                "alias": "primary",
+                "owner": "Person B",
+                "owner_ref": reference,
+            },
+        })
+
+    def test_owner_meeting_condition_rejects_ambiguous_identity_and_response(self):
+        with server() as (endpoint, _requests):
+            with self.assertRaises(KnowledgeRequestError):
+                client(endpoint).owner_upcoming_meeting(
+                    owner="Person B",
+                    owner_ref={
+                        "kind": "person",
+                        "speaker_id": "SPK_002",
+                        "canonical_speaker_id": None,
+                        "speaker_registry_id": "registry-1",
+                        "pinned": False,
+                        "provisional": False,
+                    },
+                )
+
+        def add_content(document):
+            document["event_title"] = "Synthetic private meeting"
+            return document
+
+        reference = {
+            "kind": "external",
+            "speaker_id": None,
+            "canonical_speaker_id": None,
+            "speaker_registry_id": None,
+            "pinned": True,
+            "provisional": False,
+        }
+        with server(transform=add_content) as (endpoint, _requests):
+            with self.assertRaises(KnowledgeResponseError):
+                client(endpoint).owner_upcoming_meeting(
+                    owner="Person B", owner_ref=reference
+                )
+
     def test_execution_context_is_allowlisted_and_digest_bound(self):
         with server() as (endpoint, requests):
             result = client(endpoint).execution_context()
@@ -431,10 +511,24 @@ class KnowledgeClientTests(unittest.TestCase):
                         if not name.startswith("_")
                         and callable(getattr(instance, name))
                     },
-                    {"execution_context", "resolve_task_owner", "search"},
+                    {
+                        "execution_context", "owner_upcoming_meeting",
+                        "resolve_task_owner", "search",
+                    },
                 )
                 instance.search("synthetic query")
                 instance.execution_context()
+                instance.owner_upcoming_meeting(
+                    owner="Person B",
+                    owner_ref={
+                        "kind": "external",
+                        "speaker_id": None,
+                        "canonical_speaker_id": None,
+                        "speaker_registry_id": None,
+                        "pinned": True,
+                        "provisional": False,
+                    },
+                )
             after = tuple(os.scandir(temporary))
             self.assertEqual(
                 [entry.name for entry in before],
