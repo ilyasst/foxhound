@@ -413,7 +413,7 @@ class ExecutionCardTests(unittest.TestCase):
             [
                 ["✅ Done", "▶️ Continue"],
                 ["🗑 Drop", "✏️ Update"],
-                ["🕓 Snooze 24h", "👥 Reassign"],
+                ["🕓 Snooze", "👥 Reassign"],
             ],
         )
         self.assertTrue(all(
@@ -1484,6 +1484,51 @@ class ExecutionCardTests(unittest.TestCase):
             with closing(sqlite3.connect(self.database)) as connection:
                 connection.execute("DELETE FROM execution_review_card_events")
         self.assertEqual(self.cards.event_count(), before)
+
+    def test_a_gate_can_be_snoozed_for_a_chosen_interval(self):
+        """A gate is asked before any work has been done, which makes it the
+        card most likely to be deferred — and "tomorrow" is rarely the right
+        answer for something waiting on another person, a release, or a
+        month end. The review cards already accept these intervals; only
+        the gate did not, so the reader could defer it one day at a time.
+        """
+        for task_id, action, days in (
+            (2, "snooze_7d", 7), (3, "snooze_30d", 30),
+        ):
+            with self.subTest(action=action):
+                self._schedule_workflow(task_id)
+                self.cards.schedule()
+                claim = self._claim_and_deliver()
+                self.assertEqual(claim.card.kind, ExecutionCardKind.START)
+
+                snoozed = self.cards.act(
+                    claim.card.id,
+                    expected_version=claim.card.version,
+                    action=action,
+                )
+
+                self.assertTrue(snoozed.accepted, snoozed.refusal)
+                self.assertEqual(
+                    snoozed.workflow_status, WorkflowStatus.SNOOZED)
+                self.assertEqual(
+                    snoozed.wake_at,
+                    (NOW + timedelta(days=days)).isoformat(
+                        timespec="seconds"),
+                )
+
+    def test_a_gate_still_takes_the_plain_snooze(self):
+        # The control the reader taps sends `snooze`; the interval arrives
+        # from the picker that opens. Both have to keep working.
+        self._schedule_workflow(4)
+        self.cards.schedule()
+        claim = self._claim_and_deliver()
+        snoozed = self.cards.act(
+            claim.card.id,
+            expected_version=claim.card.version,
+            action="snooze",
+        )
+        self.assertTrue(snoozed.accepted, snoozed.refusal)
+        self.assertEqual(snoozed.workflow_status, WorkflowStatus.SNOOZED)
 
     def test_review_snooze_is_durable_and_resumes_the_same_gate(self):
         self._plan_review(1, "snooze-plan")

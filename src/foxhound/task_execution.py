@@ -1300,7 +1300,7 @@ def _apply_start_action(
     """Apply one start gate inside the caller transaction."""
     if not _valid_identity(task_id, expected_version):
         return _refused(task_id, WorkflowRefusal.INVALID_ARGUMENT)
-    if action not in {"start", "snooze", "cancel"}:
+    if action not in {"start", "snooze", "cancel", *REVIEW_SNOOZE_INTERVALS}:
         return _refused(task_id, WorkflowRefusal.INVALID_ACTION)
     if stamp.tzinfo is None or stamp.utcoffset() is None:
         raise TaskLedgerError("task execution clock must include a timezone")
@@ -1329,9 +1329,13 @@ def _apply_start_action(
         wake = None
         completed = None
         kind = "start_approved"
-    elif action == "snooze":
+    elif action == "snooze" or action in REVIEW_SNOOZE_INTERVALS:
+        # A bare `snooze` keeps the gate's own default, because that is what
+        # the control sends before the reader has chosen. An interval comes
+        # from the picker, and means they did choose.
         status = WorkflowStatus.SNOOZED
-        wake = (stamp + START_SNOOZE_INTERVAL).isoformat(timespec="seconds")
+        interval = REVIEW_SNOOZE_INTERVALS.get(action, START_SNOOZE_INTERVAL)
+        wake = (stamp + interval).isoformat(timespec="seconds")
         completed = None
         kind = "snoozed"
     else:

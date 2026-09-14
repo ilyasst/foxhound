@@ -2233,7 +2233,7 @@ def _button_rows(
         rows: tuple[tuple[tuple[str, str], ...], ...] = (
             (("✅ Done", "done"), ("▶️ Continue", "start")),
             (("🗑 Drop", "drop"), ("✏️ Update", "discuss")),
-            (("🕓 Snooze 24h", "snooze"), ("👥 Reassign", "reassign")),
+            (("🕓 Snooze", "snooze"), ("👥 Reassign", "reassign")),
         )
         return rows if approvable else rows[1:]
     stop_row = (("👥 Reassign", "reassign"), ("🗑 Drop task", "drop"))
@@ -2268,7 +2268,14 @@ def _button_rows(
 
 def _direct_actions_for_kind(kind: ExecutionCardKind) -> set[str]:
     if kind is ExecutionCardKind.START:
-        return {"start", "snooze", "cancel", "done", "drop"}
+        # The intervals the review cards already accept. A gate is the card
+        # most likely to be deferred, because it is asked before any work
+        # has been done, and "tomorrow" is rarely the right answer for a
+        # task waiting on someone else, a release, or a month end.
+        return {
+            "start", "snooze", "cancel", "done", "drop",
+            *REVIEW_SNOOZE_INTERVALS,
+        }
     if kind is ExecutionCardKind.RESULT_REVIEW:
         return {"done", "drop", *REVIEW_SNOOZE_INTERVALS}
     return {
