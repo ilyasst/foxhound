@@ -1057,7 +1057,7 @@ class ExecutionCardTests(unittest.TestCase):
         body, _keyboard = render_execution_review_card(
             self.cards.claim_next().card)
         self.assertIn("widget #42", body)
-        self.assertIn("<i>(Project Alpha)</i>", body)
+        self.assertNotIn("Project Alpha", body)
         self.assertIn("<b>First raised:</b> 2030-01-01", body)
 
     def test_an_unlinkable_origin_is_still_named(self):
@@ -1147,6 +1147,57 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertNotIn("plan refinement", body)
         self.assertIn("No agent has looked at this yet.", body)
         self.assertIn("<b>Continue</b> starts the investigation.", body)
+
+    def test_project_metadata_is_absent_from_start_and_review_headers(self):
+        payload = json.dumps({"task": {"project": "Project Alpha"}})
+        revision = "e" * 64
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "INSERT INTO candidate_inbox(candidate_id,source_system,"
+                "source_kind,source_record_id,source_item_id,source_revision,"
+                "payload_json,created_at,first_imported_at,updated_at) "
+                "VALUES('project-card','gw','meeting','record-alpha',"
+                "'action-alpha',?,?, '2030-01-01T00:00:00Z',"
+                "'2030-01-01T00:00:00Z','2030-01-01T00:00:00Z')",
+                (revision, payload),
+            )
+            connection.execute(
+                "INSERT INTO candidate_revision_history(candidate_id,"
+                "source_revision,payload_json,created_at,imported_at) "
+                "VALUES('project-card',?,?,?,?)",
+                (revision, payload, "2030-01-01T00:00:00Z",
+                 "2030-01-01T00:00:00Z"),
+            )
+            connection.execute(
+                "INSERT INTO task_candidate_bindings(candidate_id,"
+                "source_revision,task_id,relation,decided_at) "
+                "VALUES('project-card',?,1,'accepted',"
+                "'2030-01-01T00:00:00Z')",
+                (revision,),
+            )
+            connection.commit()
+
+        self._schedule_workflow(1)
+        self.assertEqual(self.cards.schedule().created, 1)
+        start = self._claim_and_deliver()
+        start_body, _keyboard = render_execution_review_card(start.card)
+        self.assertNotIn("Project Alpha", start_body)
+        started = self.cards.act(
+            start.card.id,
+            expected_version=start.card.version,
+            action="start",
+        )
+        self._record(
+            1,
+            phase=WorkflowPhase.PLAN,
+            outcome=ExecutionOutcome.AWAITING_PLAN,
+            result_id="projectless-header-plan",
+        )
+        self.assertEqual(self.cards.schedule().created, 1)
+        review = self.cards.claim_next()
+        review_body, _keyboard = render_execution_review_card(review.card)
+        self.assertNotIn("Project Alpha", review_body)
+        self.assertEqual(started.workflow_status, WorkflowStatus.QUEUED)
 
     def test_a_plain_line_still_renders_after_records_arrived(self):
         # Every result written before records existed is still a list of
