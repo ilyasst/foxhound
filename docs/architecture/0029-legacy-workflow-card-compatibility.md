@@ -42,11 +42,22 @@ retain the pre-run statement that no agent has looked at the task yet.
 Oversized presentations still omit affirmative controls, and forged or stale
 callbacks remain refused.
 
-Execution workflows continue to store an exact agent profile revision. The
-legacy-compatible Start keyboard does not expose a seventh Agent control.
-Authenticated agent-options and agent-selection operations remain available
-to trusted integrations, and deployment scheduling remains responsible for
-choosing the profile before card creation.
+Execution workflows continue to store an exact agent profile revision.
+
+**Amended.** This decision withheld the Agent control from the Start
+keyboard and left the choice to deployment scheduling before card creation.
+In practice a Start card then showed neither which agent would run the task
+nor any way to change it, and scheduling had nothing to choose from: every
+task started on the default. A pull request was handed to the compatibility
+profile, failed to record anything three times, and parked with its review
+already written.
+
+A Start card therefore names its agent, and offers the Agent control while
+the workflow is still awaiting its start — not after, because rebinding work
+already in flight is a different act. Which agent a kind of work starts on is
+now a declared preference rather than one default for everything, so
+scheduling has something to be right about. Authenticated agent-options and
+agent-selection operations remain available to trusted integrations.
 
 ## Consequences
 
