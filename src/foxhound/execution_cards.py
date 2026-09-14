@@ -46,6 +46,7 @@ from .task_ledger import (
     _apply_task_transition,
 )
 from .task_archive import review_links
+from .task_owner import canonical_owner_display
 
 
 CALLBACK_PREFIX = "fhe"
@@ -975,7 +976,12 @@ class ExecutionCardService:
                     event_kind = "reassigned"
                     resolution = "reassign"
                     task_update = connection.execute(
-                        "UPDATE tasks SET owner=?,version=?,updated_at=? "
+                        "UPDATE tasks SET owner=?,version=?,updated_at=?,"
+                        "owner_ref_version=1,owner_kind='external',"
+                        "owner_speaker_id=NULL,"
+                        "owner_canonical_speaker_id=NULL,"
+                        "owner_speaker_registry_id=NULL,owner_pinned=1,"
+                        "owner_provisional=0 "
                         "WHERE id=? AND version=? AND status='open'",
                         (
                             value,
@@ -1154,7 +1160,7 @@ class ExecutionCardService:
     @staticmethod
     def _card_select() -> str:
         return (
-            "SELECT c.*,t.text AS task_text,t.owner,t.due,"
+            "SELECT c.*,t.text AS task_text,t.owner,t.owner_kind,t.due,"
             "t.status AS task_status_current,t.version AS task_version_current,"
             "w.status AS workflow_status_current,"
             "w.phase AS workflow_phase_current,"
@@ -1526,7 +1532,7 @@ def _card(
             agent_profile_revision=profile_revision,
             agent_display_name=profile_name,
             task_text=str(row["task_text"]),
-            owner=row["owner"],
+            owner=canonical_owner_display(row["owner"], row["owner_kind"]),
             due=row["due"],
             first_raised=row["first_raised"],
             last_mentioned=row["last_mentioned"],

@@ -101,6 +101,72 @@ class TaskCandidateContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ContractError, "provenance"):
             parse_task_candidate(wrong_kind)
 
+    def test_version_5_round_trips_a_scoped_owner_identity(self):
+        document = fixture("meeting-candidate-v2.json")
+        document["schema_version"] = 5
+        document["task"]["owner_ref"] = {
+            "kind": "person",
+            "speaker_id": "SPK_101",
+            "canonical_speaker_id": "SPK_001",
+            "speaker_registry_id": "registry-alpha",
+            "pinned": False,
+            "provisional": False,
+        }
+
+        candidate = parse_task_candidate(document)
+
+        self.assertEqual(candidate.task.owner_ref.kind, "person")
+        self.assertEqual(
+            candidate.task.owner_ref.canonical_speaker_id, "SPK_001"
+        )
+        self.assertEqual(task_candidate_document(candidate), document)
+
+    def test_version_5_requires_complete_nonleaking_owner_identity(self):
+        valid = fixture("meeting-candidate-v2.json")
+        valid["schema_version"] = 5
+        valid["task"]["owner_ref"] = {
+            "kind": "person",
+            "speaker_id": "SPK_101",
+            "canonical_speaker_id": "SPK_001",
+            "speaker_registry_id": "registry-alpha",
+            "pinned": False,
+            "provisional": False,
+        }
+        changes = (
+            lambda value: value["task"]["owner_ref"].__setitem__(
+                "speaker_registry_id", None
+            ),
+            lambda value: value["task"].__setitem__(
+                "owner", "Person A (SPK_101)"
+            ),
+            lambda value: value["task"]["owner_ref"].__setitem__(
+                "pinned", 1
+            ),
+            lambda value: value["task"]["owner_ref"].__setitem__(
+                "token", "synthetic-secret"
+            ),
+        )
+        for change in changes:
+            broken = copy.deepcopy(valid)
+            change(broken)
+            with self.assertRaises(ContractError):
+                parse_task_candidate(broken)
+
+        producer_pin = copy.deepcopy(valid)
+        producer_pin["task"]["owner_ref"]["pinned"] = True
+        with self.assertRaisesRegex(ContractError, "producer pin"):
+            parse_task_candidate(producer_pin)
+
+        unresolved = copy.deepcopy(valid)
+        unresolved["task"]["owner"] = "Unknown speaker"
+        unresolved["task"]["owner_ref"].update({
+            "kind": "unresolved",
+            "canonical_speaker_id": None,
+            "provisional": True,
+        })
+        with self.assertRaisesRegex(ContractError, "unresolved display"):
+            parse_task_candidate(unresolved)
+
     def test_version_3_distinguishes_active_from_withdrawn(self):
         for state in ("active", "withdrawn"):
             document = fixture("meeting-candidate-v2.json")
@@ -289,6 +355,16 @@ class TaskCandidateContractTests(unittest.TestCase):
             3,
         )
         self.assertFalse(version_4["additionalProperties"])
+        version_5 = json.loads(
+            schema_path.with_name("task-candidate-v5.schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(version_5["properties"]["schema_version"]["const"], 5)
+        self.assertFalse(version_5["additionalProperties"])
+        self.assertFalse(
+            version_5["$defs"]["ownerRef"]["additionalProperties"]
+        )
         expected_kinds = {"meeting", "email", "teams", "issue", "legacy"}
         self.assertEqual(
             set(schema["properties"]["source"]["properties"]["kind"]["enum"]),

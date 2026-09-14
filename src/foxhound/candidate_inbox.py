@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -126,6 +126,13 @@ _SCHEMA_COLUMNS = {
         "created_at",
         "updated_at",
         "closed_at",
+        "owner_ref_version",
+        "owner_kind",
+        "owner_speaker_id",
+        "owner_canonical_speaker_id",
+        "owner_speaker_registry_id",
+        "owner_pinned",
+        "owner_provisional",
     ),
     "task_candidate_bindings": (
         "candidate_id",
@@ -359,13 +366,28 @@ _SCHEMA_COLUMNS = {
     ),
 }
 
+_OWNER_COLUMNS = {
+    "owner_ref_version",
+    "owner_kind",
+    "owner_speaker_id",
+    "owner_canonical_speaker_id",
+    "owner_speaker_registry_id",
+    "owner_pinned",
+    "owner_provisional",
+}
+
+_SCHEMA_V17_COLUMNS = {
+    name: tuple(column for column in columns if column not in _OWNER_COLUMNS)
+    for name, columns in _SCHEMA_COLUMNS.items()
+}
+
 _SCHEMA_V16_COLUMNS = {
     name: tuple(
         column
         for column in columns
         if column not in {"task_work_directory", "task_kb_file"}
     )
-    for name, columns in _SCHEMA_COLUMNS.items()
+    for name, columns in _SCHEMA_V17_COLUMNS.items()
 }
 
 _SCHEMA_V15_COLUMNS = {
@@ -1519,6 +1541,21 @@ _SCHEMA_V17 = (
     "AND substr(task_kb_file,1,1)='/'));",
 )
 
+_SCHEMA_V18 = (
+    "ALTER TABLE tasks ADD COLUMN owner_ref_version INTEGER NOT NULL "
+    "DEFAULT 0 CHECK(owner_ref_version IN (0,1));",
+    "ALTER TABLE tasks ADD COLUMN owner_kind TEXT "
+    "CHECK(owner_kind IS NULL OR owner_kind IN "
+    "('person','unresolved','external','group'));",
+    "ALTER TABLE tasks ADD COLUMN owner_speaker_id TEXT;",
+    "ALTER TABLE tasks ADD COLUMN owner_canonical_speaker_id TEXT;",
+    "ALTER TABLE tasks ADD COLUMN owner_speaker_registry_id TEXT;",
+    "ALTER TABLE tasks ADD COLUMN owner_pinned INTEGER NOT NULL "
+    "DEFAULT 0 CHECK(owner_pinned IN (0,1));",
+    "ALTER TABLE tasks ADD COLUMN owner_provisional INTEGER NOT NULL "
+    "DEFAULT 1 CHECK(owner_provisional IN (0,1));",
+)
+
 
 class InboxError(RuntimeError):
     """The inbox cannot safely initialize or read its state."""
@@ -2054,6 +2091,23 @@ class CandidateInbox:
                     for statement in _SCHEMA_V17:
                         connection.execute(statement)
                     connection.execute("PRAGMA user_version = 17")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 17
+            if version == 17:
+                self._require_tables(
+                    connection,
+                    tuple(_SCHEMA_V17_COLUMNS),
+                    columns=_SCHEMA_V17_COLUMNS,
+                )
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V18:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 18")
                     connection.commit()
                 except Exception:
                     connection.rollback()

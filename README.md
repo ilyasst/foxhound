@@ -141,6 +141,14 @@ with bounded supporting extracts. Cards render those readable sources instead
 of an opaque record identifier. Versions 1 through 3 remain accepted. See
 [ADR 0032](docs/architecture/0032-readable-task-source-provenance.md).
 
+Candidate version 5 separates the owner label shown on cards from a scoped
+owner reference. Foxhound persists the observed and canonical speaker IDs with
+their registry, resolution kind, confidence state, and human pin. Existing
+candidate versions remain accepted as explicitly provisional legacy owner
+labels. A reader reassignment is pinned and cannot be replaced by a later
+producer revision. See
+[ADR 0033](docs/architecture/0033-structured-task-owner-identity.md).
+
 Meeting, email, Teams, and forge-issue candidates retain their actual source
 kind. A
 bounded authority cutover may additionally use the explicit `legacy` kind for
