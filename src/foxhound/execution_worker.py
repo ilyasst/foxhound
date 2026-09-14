@@ -339,6 +339,57 @@ class ExecutionWorker:
             "base": base,
         }
 
+    def act_review(self, *, body_file: str,
+                   repository: str | None = None) -> dict[str, Any]:
+        """Post one review on the pull request this task is about.
+
+        Refused outside `external_action`, like every other forge write:
+        the phase IS the approval. A reader approved posting this, and
+        commenting while planning would bypass the gate that makes the
+        approval mean anything.
+
+        The pull request comes from the task's binding. A review task's
+        identity names a state — `7/<when>` — so the number is the part
+        before the state: a review of Thursday's state is still a review of
+        pull request 7.
+        """
+        state, service = self._active()
+        if state.phase is not WorkflowPhase.EXTERNAL_ACTION:
+            raise ExecutionWorkerClaimError(
+                "an external action is only available in the external_action "
+                "phase"
+            )
+        origin = TaskLedger(state.database_path).origin(state.task_id)
+        if origin is None:
+            raise ExecutionWorkerClaimError(
+                "this task has no origin, so it names nothing to review"
+            )
+        if origin.kind != "review_request":
+            raise ExecutionWorkerClaimError(
+                "this task is not about a pull request awaiting review"
+            )
+        body = _read_private_text(
+            self._state_path.parent / body_file,
+            maximum=60_000, label="review body")
+        try:
+            receipt = forge_action.post_review(
+                repository=repository or origin.record_id,
+                number=origin.item_id.split("/", 1)[0],
+                task_id=state.task_id,
+                body=body,
+            )
+        except forge_action.ForgeActionError as exc:
+            raise ExecutionWorkerClaimError(str(exc)) from exc
+        # Renewed only after the write succeeded, so a lease that lapses
+        # mid-post is not extended by the attempt itself.
+        self._renew(service, state)
+        return {
+            "kind": "review",
+            "repository": receipt.repository,
+            "number": receipt.number,
+            "url": receipt.url,
+        }
+
     def act_pull_request(self, *, head: str, title: str,
                          body_file: str | None,
                          repository: str | None = None) -> dict[str, Any]:
@@ -1081,6 +1132,13 @@ def _parser() -> argparse.ArgumentParser:
     pull_request.add_argument(
         "--body-file",
         help="file beside the run state holding the pull request body")
+    review = act_kinds.add_parser(
+        "review", help="post a review on the pull request this task is about")
+    review.add_argument(
+        "--body-file", required=True,
+        help="file beside the run state holding the review")
+    review.add_argument(
+        "--repository", help="canonical locator; defaults to the task origin")
     record = subcommands.add_parser("record")
     record.add_argument("draft")
     draft = subcommands.add_parser(
@@ -1109,6 +1167,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         elif args.operation == "act" and args.action_kind == "worktree":
             result = worker.act_worktree(repository=args.repository)
+        elif args.operation == "act" and args.action_kind == "review":
+            result = worker.act_review(
+                body_file=args.body_file, repository=args.repository)
         elif args.operation == "act":
             result = worker.act_pull_request(
                 head=args.head, title=args.title, body_file=args.body_file,
