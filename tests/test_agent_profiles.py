@@ -27,12 +27,15 @@ from foxhound.agent_profiles import (
 
 
 EXPECTED_GENERAL_PROMPT_SHA256 = (
-    "e6508e28cdb500163815c366c7bdbb1b1d8310cf443bfc5ee5dcbecc8066398c"
+    "e883978027d024bc09d4936c80c7398dbef1ac63a50807c9de69ccb8c1c1184f"
 )
 EXPECTED_GENERAL_REVISION = (
-    "0e20873704f124560bca5b8d925c223c066a477278573a29cd8d18fb71e2b70b"
+    "a1ad27c9d410bd9dd67129ee0165d77a81fa2e785643379635ed93f4ebc0a59b"
 )
 IMMEDIATE_PREVIOUS_GENERAL_REVISION = (
+    "0e20873704f124560bca5b8d925c223c066a477278573a29cd8d18fb71e2b70b"
+)
+DATE_SEMANTICS_GENERAL_REVISION = (
     "9b80c488634e614127dd1da15facbfbf78fe3f38ac000c0f2dde30c394aeb23a"
 )
 EARLIER_GENERAL_REVISION = (
@@ -162,10 +165,13 @@ class AgentProfileTests(unittest.TestCase):
             "search before concluding that evidence is missing",
             "draft --outcome OUTCOME",
             "Do not hand-author or experimentally probe the envelope schema",
+            "draft and record that partial result",
+            "release` only when no truthful reviewable artifact can be produced",
             "only the exact reviewed action",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, prompt)
+        self.assertNotIn("If useful work cannot be completed", prompt)
         with self.assertRaises(AgentProfileError):
             profile.render_prompt("worker; command")
 
@@ -184,10 +190,14 @@ class AgentProfileTests(unittest.TestCase):
         immediate_previous = registry.resolve(
             "general", IMMEDIATE_PREVIOUS_GENERAL_REVISION
         )
+        date_semantics = registry.resolve(
+            "general", DATE_SEMANTICS_GENERAL_REVISION
+        )
         earlier = registry.resolve("general", EARLIER_GENERAL_REVISION)
 
         for retained in (
-            legacy, superseded, previous, earlier, immediate_previous
+            legacy, superseded, previous, earlier, date_semantics,
+            immediate_previous,
         ):
             with self.subTest(revision=retained.revision):
                 with self.assertRaises(AgentProfileError):

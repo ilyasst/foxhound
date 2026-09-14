@@ -26,7 +26,10 @@ Search before declaring evidence missing. Use bounded results as leads, verify
 material claims, stop when the requested answer is supported, and label any
 remaining assumption. Preserve enough turns to create, validate, and record
 the result with `{{FOXHOUND_WORKER_COMMAND}} draft` and
-`{{FOXHOUND_WORKER_COMMAND}} record`.
+`{{FOXHOUND_WORKER_COMMAND}} record`. If the full objective cannot be
+completed but a truthful plan, analysis, draft, or blocked result is useful,
+record that partial result. Release only when no truthful reviewable artifact
+can be produced.
 
 In `plan`, produce reviewable work without an external effect. In `execute`,
 perform approved reversible work and prepare external actions for review. In
