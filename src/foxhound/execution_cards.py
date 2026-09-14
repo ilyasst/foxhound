@@ -311,13 +311,15 @@ class ExecutionCardService:
                     # and it already bounds that; a gate is how work gets
                     # queued in the first place, so suppressing it while
                     # work runs is how a queue empties and never refills.
-                    # A parked workflow is offered as a gate, and the
-                    # schema requires a gate to be in `plan`. One parked
-                    # later than that is deliberately left out rather than
-                    # written as a card the constraint would refuse — it
-                    # needs a card of its own, which does not exist yet.
+                    # A parked workflow is offered as a gate in whatever
+                    # phase it stopped in. The gate used to be pinned to
+                    # `plan` because the schema pinned the card there, so a
+                    # workflow that gave up during `execute` produced no
+                    # card at all and the task simply went quiet. The pin
+                    # was a proxy for "a gate carries no result", which the
+                    # constraint still says on its own.
                     " (w.status='awaiting_start' OR "
-                    "  (w.status='parked' AND w.phase='plan') OR "
+                    "  w.status='parked' OR "
                     "  (w.status='snoozed' AND w.due_at<=? "
                     "   AND w.last_result_id IS NULL)) OR "
                     " (w.status='snoozed' AND w.due_at<=? "
@@ -2286,8 +2288,13 @@ def _heading_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
     if card.kind is ExecutionCardKind.START:
         # The phase names what WOULD run. Naming it here would read as
         # though it already had, which is the one thing a start gate must
-        # not imply.
-        phase = "not started"
+        # not imply — unless it has. A workflow parked after `plan` was
+        # planned, approved and attempted, so calling it "not started"
+        # hides the very history the reader needs to judge the retry.
+        if card.workflow_status is WorkflowStatus.PARKED:
+            phase = f"{phase} — stopped here"
+        else:
+            phase = "not started"
     elif card.outcome is ExecutionOutcome.COMPLETED:
         # Marked rather than renamed: the same card carrying its last
         # update, recognisable at a glance as finished.

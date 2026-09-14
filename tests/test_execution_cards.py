@@ -1487,6 +1487,96 @@ class ExecutionCardTests(unittest.TestCase):
             self.cards.claim_next().card)
         self.assertIn("Stopped after 3 failed attempt", body)
 
+    def _park_in_execute(self, task_id: int):
+        """Plan, get approved, then fail the execute phase until it parks."""
+        self._plan_review(task_id, f"plan-{task_id}")
+        approved = self.execution.review_action(
+            task_id,
+            expected_version=self.execution.get(task_id).version,
+            action="approve",
+        )
+        self.assertEqual(approved.phase, WorkflowPhase.EXECUTE)
+        for _ in range(3):
+            self.clock.advance(timedelta(hours=1))
+            claim = self.execution.claim_next()
+            self.assertIsNotNone(claim)
+            self.execution.fail(
+                task_id,
+                expected_version=claim.workflow_version,
+                claim_token=claim.token,
+                reason="process_exit",
+            )
+        return self.execution.get(task_id)
+
+    def test_a_workflow_that_parks_after_planning_still_says_so(self):
+        """Parking during `execute` used to produce no card at all.
+
+        Eligibility only matched a park in `plan`, because the schema
+        pinned a start card there, so a workflow that planned, was
+        approved, and then gave up went completely quiet. The reader saw a
+        task that simply stopped, with nothing to answer.
+        """
+        task_id = 1
+        parked = self._park_in_execute(task_id)
+        self.assertEqual(parked.status, WorkflowStatus.PARKED)
+        self.assertEqual(parked.phase, WorkflowPhase.EXECUTE)
+
+        self.assertEqual(self.cards.schedule().created, 1)
+        card = self.cards.claim_next().card
+        body, keyboard = render_execution_review_card(card)
+
+        self.assertIn("Stopped after 3 failed attempt", body)
+        self.assertIn("process_exit", body)
+        # It planned, was approved and was attempted, so it is not "not
+        # started" — saying so would hide the history the reader needs to
+        # judge whether another attempt is worth it.
+        self.assertNotIn("not started", body)
+        actions = [
+            parse_execution_review_callback(button["callback_data"])[2]
+            for row in keyboard["inline_keyboard"] for button in row
+        ]
+        self.assertIn("start", actions)
+
+    def test_continuing_a_late_park_does_not_discard_the_approved_plan(self):
+        """`start` used to reset the phase to `plan` unconditionally.
+
+        For a workflow parked in `execute` that throws away a plan the
+        reader already read and approved, and silently asks the agent to
+        redo accepted work.
+        """
+        task_id = 1
+        self._park_in_execute(task_id)
+        self.assertEqual(self.cards.schedule().created, 1)
+        card = self.cards.claim_next().card
+
+        resumed = self.execution.start_action(
+            task_id,
+            expected_version=self.execution.get(task_id).version,
+            action="start",
+        )
+        self.assertEqual(resumed.status, WorkflowStatus.QUEUED)
+        self.assertEqual(resumed.phase, WorkflowPhase.EXECUTE)
+        # And the retry starts with a full set of attempts.
+        workflow = self.execution.get(task_id)
+        self.assertEqual(workflow.phase, WorkflowPhase.EXECUTE)
+        self.assertIsNone(card.result_id)
+
+    def test_a_park_during_planning_still_resumes_planning(self):
+        """The phase is preserved, not advanced: a park in `plan` must
+        still come back as `plan`."""
+        task_id = 1
+        parked = self._park(task_id)
+        self.assertEqual(parked.phase, WorkflowPhase.PLAN)
+        resumed = self.execution.start_action(
+            task_id,
+            expected_version=self.execution.get(task_id).version,
+            action="start",
+        )
+        self.assertEqual(
+            (resumed.status, resumed.phase),
+            (WorkflowStatus.QUEUED, WorkflowPhase.PLAN),
+        )
+
     def test_one_unrenderable_workflow_cannot_silence_the_others(self):
         # The sweep classifies every eligible row, so anything that raises
         # mid-sweep costs every card behind it, not just its own.
