@@ -1474,8 +1474,15 @@ def _apply_start_action(
         wake = None
         completed = now
         kind = "cancelled"
+    # The phase is kept, not reset. A gate reached from `awaiting_start` or
+    # `snoozed` is already in `plan`, so this is the same statement for them.
+    # One reached from `parked` may be in `execute` or `external_action`,
+    # behind a plan the reader already read and approved: sending it back to
+    # `plan` would throw that approval away and silently ask the agent to
+    # redo work that was accepted.
+    phase = WorkflowPhase(row["phase"])
     connection.execute(
-        "UPDATE task_execution_workflows SET status=?,phase='plan',version=?,"
+        "UPDATE task_execution_workflows SET status=?,phase=?,version=?,"
         "due_at=?,claim_token_digest=NULL,claimed_at=NULL,"
         "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
         # Restarting clears what parked it, so a retry gets a full set of
@@ -1485,6 +1492,7 @@ def _apply_start_action(
         "WHERE task_id=? AND version=?",
         (
             status,
+            phase,
             version,
             wake,
             now,
@@ -1499,7 +1507,7 @@ def _apply_start_action(
         kind,
         version,
         int(row["task_version"]),
-        WorkflowPhase.PLAN,
+        phase,
         status,
         now,
     )
@@ -1508,7 +1516,7 @@ def _apply_start_action(
         task_id,
         version,
         status,
-        WorkflowPhase.PLAN,
+        phase,
         wake_at=wake,
         agent_profile_id=row["agent_profile_id"],
         agent_profile_revision=row["agent_profile_revision"],

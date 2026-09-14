@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -1688,6 +1688,44 @@ END;
 )
 
 
+# A start gate is the "run this?" question, and until now the schema pinned
+# it to `plan`. That pin was really a proxy for "carries no result", which
+# the same branch already states. A workflow that parks during `execute` or
+# `external_action` needs exactly this card — the agent gave up and the
+# reader must be told — so the phase pin is dropped and the result pin kept.
+_SCHEMA_V20_CARD_TABLE = _SCHEMA_V11_CARD_TABLE.replace(
+    "(kind = 'start' AND phase = 'plan' AND result_id IS NULL)",
+    "(kind = 'start' AND result_id IS NULL)",
+)
+
+_SCHEMA_V20 = (
+    # SQLite cannot alter a CHECK in place, and three tables carry a foreign
+    # key to this one. Renaming the card table would rewrite all three to
+    # follow the rename, leaving them pointed at the table this migration
+    # drops. So the replacement is built under its own name and renamed into
+    # place last: nothing ever references `_v20`, so that final rename
+    # rewrites nothing, and the children keep naming `execution_review_cards`
+    # throughout. Foreign keys are disabled around the whole step, because
+    # dropping the old table is otherwise read as orphaning every child row.
+    _SCHEMA_V20_CARD_TABLE.replace(
+        "CREATE TABLE execution_review_cards (",
+        "CREATE TABLE execution_review_cards_v20 (",
+    ),
+    "INSERT INTO execution_review_cards_v20("
+    "id,task_id,task_version,workflow_version,kind,phase,result_id,status,"
+    "version,claim_token_digest,claim_expires_at,transport,delivery_ref,"
+    "delivered_at,resolution,created_at,updated_at,resolved_at) "
+    "SELECT id,task_id,task_version,workflow_version,kind,phase,result_id,"
+    "status,version,claim_token_digest,claim_expires_at,transport,"
+    "delivery_ref,delivered_at,resolution,created_at,updated_at,resolved_at "
+    "FROM execution_review_cards;",
+    "DROP TABLE execution_review_cards;",
+    "ALTER TABLE execution_review_cards_v20 "
+    "RENAME TO execution_review_cards;",
+    _SCHEMA_V9[1],
+)
+
+
 class InboxError(RuntimeError):
     """The inbox cannot safely initialize or read its state."""
 
@@ -2260,6 +2298,34 @@ class CandidateInbox:
                 except Exception:
                     connection.rollback()
                     raise
+                version = 19
+            if version == 19:
+                self._require_tables(
+                    connection,
+                    ("execution_review_cards",),
+                )
+                # Off before the transaction, not inside it: the pragma is a
+                # no-op once one is open, and the rebuild below drops a table
+                # three others reference.
+                connection.execute("PRAGMA foreign_keys = OFF")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V20:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 20")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                finally:
+                    connection.execute("PRAGMA foreign_keys = ON")
+                orphans = connection.execute(
+                    "PRAGMA foreign_key_check"
+                ).fetchall()
+                if orphans:
+                    raise InboxError(
+                        "candidate inbox schema is incomplete"
+                    )
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:
