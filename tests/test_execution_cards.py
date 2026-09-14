@@ -64,6 +64,12 @@ def _drop_native_intake_schema(connection: sqlite3.Connection) -> None:
 
 
 def _drop_agent_profile_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        "ALTER TABLE task_execution_results DROP COLUMN task_kb_file"
+    )
+    connection.execute(
+        "ALTER TABLE task_execution_results DROP COLUMN task_work_directory"
+    )
     for table in (
         "task_execution_workflows",
         "task_execution_results",
@@ -1015,7 +1021,10 @@ class ExecutionCardTests(unittest.TestCase):
             claim_token=claim.token,
             outcome=ExecutionOutcome.AWAITING_PLAN,
             summary="Draft prepared, awaiting contact details.",
-            work_markdown="Synthetic plan.",
+            work_markdown=(
+                "Synthetic plan. Review [PR 12]"
+                "(https://github.com/example/project-alpha/pull/12)."
+            ),
             questions=("What is their address?",),
             external_actions=(
                 {"action": "Add them as a collaborator",
@@ -1026,6 +1035,8 @@ class ExecutionCardTests(unittest.TestCase):
                  "subject": "Synthetic subject",
                  "body": "First line.\nSecond line."},
             ),
+            task_work_directory="/srv/example/Tasks/T3-synthetic-task",
+            task_kb_file="/srv/example/KB/Tasks/T3-synthetic-task.md",
         ))
         self.assertEqual(self.cards.schedule().created, 1)
         card = self.cards.claim_next().card
@@ -1034,6 +1045,12 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertIn(f"<code>T{task_id}</code>", body)
         self.assertIn("<b>Phase:</b> plan refinement", body)
         self.assertIn("<b>Agent:</b> General", body)
+        self.assertIn("<b>Review files:</b>", body)
+        self.assertIn("/srv/example/Tasks/T3-synthetic-task", body)
+        self.assertIn("/srv/example/KB/Tasks/T3-synthetic-task.md", body)
+        self.assertIn(
+            'href="https://github.com/example/project-alpha/pull/12"', body
+        )
         self.assertIn("<b>Needs your input:</b>", body)
         # The action says what is still missing, not just what it is.
         self.assertIn("Needs: Their handle", body)

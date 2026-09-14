@@ -39,10 +39,17 @@ from .agent_profiles import (
     parse_profile,
 )
 from .task_ledger import TaskLedger, TaskLedgerError, TaskStatus
+from .task_archive import (
+    ARTIFACT_MANIFEST_NAME,
+    TaskArchiveError,
+    TaskArchivePaths,
+    append_result,
+    preserve_run_files,
+)
 
 
 RUN_STATE_SCHEMA = "foxhound.execution-run-state"
-RUN_STATE_SCHEMA_VERSION = 3
+RUN_STATE_SCHEMA_VERSION = 4
 INSTRUCTIONS_NAME = "agent-instructions.json"
 WORK_CONTEXT_SCHEMA = "foxhound.execution-work-context"
 WORK_CONTEXT_SCHEMA_VERSION = 4
@@ -71,6 +78,7 @@ _RESULT_INPUTS = (
     "result-questions.json",
     "result-external-actions.json",
     "result-deliverables.json",
+    ARTIFACT_MANIFEST_NAME,
 )
 
 
@@ -148,6 +156,9 @@ class ExecutionRunState:
     agent_profile_revision: str
     worker_command: str
     knowledge_root: str | None = None
+    task_work_directory: str | None = None
+    task_kb_file: str | None = None
+    task_run_directory: str | None = None
 
 
 class ExecutionWorker:
@@ -405,7 +416,37 @@ class ExecutionWorker:
             questions=draft["questions"],
             external_actions=draft["external_actions"],
             deliverables=draft["deliverables"],
+            task_work_directory=state.task_work_directory,
+            task_kb_file=state.task_kb_file,
         )
+        if state.task_run_directory is not None:
+            ledger = TaskLedger(state.database_path)
+            task = ledger.get(state.task_id)
+            origin = ledger.origin(state.task_id)
+            if task is None:
+                raise ExecutionWorkerClaimError("execution claim is unavailable")
+            paths = TaskArchivePaths(
+                Path(state.task_work_directory or ""),
+                Path(state.task_kb_file or ""),
+                Path(state.task_run_directory),
+            )
+            try:
+                preserve_run_files(
+                    self._state_path.parent,
+                    paths.run_directory,
+                    include_transcript=False,
+                )
+                append_result(
+                    paths,
+                    result=draft,
+                    origin_kind=None if origin is None else origin.kind,
+                    origin_record=None if origin is None else origin.record_id,
+                    origin_item=None if origin is None else origin.item_id,
+                )
+            except TaskArchiveError:
+                raise ExecutionWorkerDraftError(
+                    "execution result review files could not be preserved"
+                ) from None
         result = TaskExecutionService(state.database_path).record_result(
             envelope
         )
@@ -468,6 +509,8 @@ class ExecutionWorker:
                 run_directory / "result-deliverables.json",
                 label="execution result deliverables",
             ),
+            task_work_directory=state.task_work_directory,
+            task_kb_file=state.task_kb_file,
         )
         try:
             validated = _validated_result(envelope)
@@ -549,19 +592,24 @@ def load_run_state(path: str | os.PathLike[str]) -> ExecutionRunState:
     document = _read_private_json(
         state_path, maximum=MAX_STATE_BYTES, label="execution run state"
     )
+    base_fields = {
+        "schema", "schema_version", "run_id", "database_path",
+        "task_id", "task_version", "workflow_version", "phase",
+        "claim_token", "lease_seconds", "agent_profile_id",
+        "agent_profile_revision", "knowledge_root", "worker_command",
+    }
+    version = document.get("schema_version")
     _exact_fields(
         document,
-        {
-            "schema", "schema_version", "run_id", "database_path",
-            "task_id", "task_version", "workflow_version", "phase",
-            "claim_token", "lease_seconds", "agent_profile_id",
-            "agent_profile_revision", "knowledge_root", "worker_command",
-        },
+        base_fields | (
+            {"task_work_directory", "task_kb_file", "task_run_directory"}
+            if version == RUN_STATE_SCHEMA_VERSION else set()
+        ),
         "execution run state",
     )
     if (
         document["schema"] != RUN_STATE_SCHEMA
-        or document["schema_version"] != RUN_STATE_SCHEMA_VERSION
+        or document["schema_version"] not in {3, RUN_STATE_SCHEMA_VERSION}
         or isinstance(document["schema_version"], bool)
         or not isinstance(document["run_id"], str)
         or not _RUN_ID_RE.fullmatch(document["run_id"])
@@ -606,6 +654,17 @@ def load_run_state(path: str | os.PathLike[str]) -> ExecutionRunState:
         raise ExecutionWorkerConfigError(
             "execution run state is invalid"
         ) from None
+    task_work_directory = _archive_path(
+        document.get("task_work_directory"), kind="directory"
+    )
+    task_kb_file = _archive_path(document.get("task_kb_file"), kind="file")
+    task_run_directory = _archive_path(
+        document.get("task_run_directory"), kind="directory"
+    )
+    if len({value is None for value in (
+        task_work_directory, task_kb_file, task_run_directory
+    )}) != 1:
+        raise ExecutionWorkerConfigError("execution run state is invalid")
     return ExecutionRunState(
         run_id=document["run_id"],
         database_path=database,
@@ -619,7 +678,22 @@ def load_run_state(path: str | os.PathLike[str]) -> ExecutionRunState:
         agent_profile_revision=profile_revision,
         worker_command=worker_command,
         knowledge_root=_knowledge_root(document["knowledge_root"]),
+        task_work_directory=task_work_directory,
+        task_kb_file=task_kb_file,
+        task_run_directory=task_run_directory,
     )
+
+
+def _archive_path(value: object, *, kind: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value or "\0" in value:
+        raise ExecutionWorkerConfigError("execution run state is invalid")
+    path = Path(value)
+    valid = path.is_dir() if kind == "directory" else path.is_file()
+    if not path.is_absolute() or path.is_symlink() or not valid:
+        raise ExecutionWorkerConfigError("execution run state is invalid")
+    return str(path)
 
 
 def _knowledge_root(value: object) -> str | None:

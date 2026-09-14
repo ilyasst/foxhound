@@ -159,8 +159,10 @@ class ExecutionResultEnvelope:
     summary: str = field(default="", repr=False)
     work_markdown: str = field(default="", repr=False)
     questions: Sequence[str] = field(default=(), repr=False)
-    external_actions: Sequence[str] = field(default=(), repr=False)
-    deliverables: Sequence[str] = field(default=(), repr=False)
+    external_actions: Sequence[object] = field(default=(), repr=False)
+    deliverables: Sequence[object] = field(default=(), repr=False)
+    task_work_directory: str | None = field(default=None, repr=False)
+    task_kb_file: str | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -804,8 +806,9 @@ class TaskExecutionService:
                     "result_id,task_id,workflow_version,task_version,phase,"
                     "outcome,content_digest,summary,work_markdown,"
                     "questions_json,external_actions_json,deliverables_json,"
-                    "created_at,agent_profile_id,agent_profile_revision) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "created_at,agent_profile_id,agent_profile_revision,"
+                    "task_work_directory,task_kb_file) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         result["result_id"], result["task_id"],
                         result["workflow_version"], result["task_version"],
@@ -816,6 +819,8 @@ class TaskExecutionService:
                         result["deliverables_json"], now,
                         row["agent_profile_id"],
                         row["agent_profile_revision"],
+                        result["task_work_directory"],
+                        result["task_kb_file"],
                     ),
                 )
                 version = result["workflow_version"] + 1
@@ -1703,6 +1708,12 @@ def _validated_result(envelope: ExecutionResultEnvelope) -> dict[str, object]:
         primary="body", aliases=_DELIVERABLE_ALIASES,
         optional=_DELIVERABLE_FIELDS,
     )
+    task_work_directory = _result_path(
+        envelope.task_work_directory, "task work directory"
+    )
+    task_kb_file = _result_path(envelope.task_kb_file, "task KB file")
+    if (task_work_directory is None) != (task_kb_file is None):
+        raise ValueError("execution result review paths are invalid")
     document = {
         "result_id": envelope.result_id,
         "task_id": envelope.task_id,
@@ -1715,6 +1726,8 @@ def _validated_result(envelope: ExecutionResultEnvelope) -> dict[str, object]:
         "questions": questions,
         "external_actions": actions,
         "deliverables": deliverables,
+        "task_work_directory": task_work_directory,
+        "task_kb_file": task_kb_file,
     }
     raw = _canonical_json(document).encode("utf-8")
     if len(raw) > MAX_RESULT_BYTES:
@@ -1730,6 +1743,20 @@ def _validated_result(envelope: ExecutionResultEnvelope) -> dict[str, object]:
         "deliverables_json": _canonical_json(deliverables),
         "claim_token": envelope.claim_token,
     }
+
+
+def _result_path(value: object, label: str) -> str | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value.startswith("/")
+        or len(value) > 4_096
+        or "\0" in value
+        or any(ord(character) < 32 for character in value)
+    ):
+        raise ValueError(f"execution result {label} is invalid")
+    return value
 
 
 #: An origin that already carries the reader's permission to spend a

@@ -44,6 +44,7 @@ from .task_ledger import (
     TransitionDisposition,
     _apply_task_transition,
 )
+from .task_archive import review_links
 
 
 CALLBACK_PREFIX = "fhe"
@@ -141,6 +142,8 @@ class ExecutionReviewCard:
     origin_kind: str = field(default="", repr=False)
     origin_record: str = field(default="", repr=False)
     origin_item: str = field(default="", repr=False)
+    task_work_directory: str = field(default="", repr=False)
+    task_kb_file: str = field(default="", repr=False)
     outcome: ExecutionOutcome | None = None
 
 
@@ -1159,6 +1162,7 @@ class ExecutionCardService:
             "r.task_version AS result_task_version,r.phase AS result_phase,"
             "r.outcome AS result_outcome,r.summary,r.work_markdown,"
             "r.questions_json,r.external_actions_json,r.deliverables_json,"
+            "r.task_work_directory,r.task_kb_file,"
             "(SELECT min(h.created_at) "
             " FROM task_candidate_bindings AS b "
             " JOIN candidate_revision_history AS h "
@@ -1516,6 +1520,8 @@ def _card(
             origin_kind=str(row["origin_kind"] or ""),
             origin_record=str(row["origin_record"] or ""),
             origin_item=str(row["origin_item"] or ""),
+            task_work_directory=str(row["task_work_directory"] or ""),
+            task_kb_file=str(row["task_kb_file"] or ""),
         )
     except (AgentProfileError, KeyError, TypeError, ValueError) as exc:
         raise TaskLedgerError("execution review card state is invalid") from exc
@@ -1716,6 +1722,44 @@ def _asked_for_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
     return ["", "You asked for:", shown]
 
 
+def _review_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
+    """Put the durable evidence and forge references before the long work."""
+    lines: list[str] = []
+    if card.task_work_directory or card.task_kb_file:
+        lines.extend(("", "<b>Review files:</b>" if html else "Review files:"))
+        if card.task_work_directory:
+            shown = _escape(card.task_work_directory)
+            lines.append(
+                f"• Working folder: <code>{shown}</code>"
+                if html else f"- Working folder: {card.task_work_directory}"
+            )
+        if card.task_kb_file:
+            shown = _escape(card.task_kb_file)
+            lines.append(
+                f"• KB task file: <code>{shown}</code>"
+                if html else f"- KB task file: {card.task_kb_file}"
+            )
+    links = review_links(
+        "\n".join((
+            card.summary,
+            card.work_markdown,
+            *(question for question in card.questions),
+            *(record.text for record in card.external_actions),
+            *(record.text for record in card.deliverables),
+        )),
+        origin_kind=card.origin_kind,
+        origin_record=card.origin_record,
+        origin_item=card.origin_item,
+    )
+    if links:
+        lines.extend(("", "<b>Review links:</b>" if html else "Review links:"))
+        lines.extend(
+            f"• {_markdown_inline(link)}" if html else f"- {link}"
+            for link in links
+        )
+    return lines
+
+
 def _card_lines(card: ExecutionReviewCard) -> list[str]:
     if card.kind is ExecutionCardKind.START:
         return _start_card_lines(card, html=False)
@@ -1735,6 +1779,7 @@ def _card_lines(card: ExecutionReviewCard) -> list[str]:
             "Approve only if these exact external effects are intended.",
             "",
             f"Summary: {card.summary}",
+            *_review_lines(card, html=False),
             *_asked_for_lines(card, html=False),
         ]
         if card.questions:
@@ -1748,6 +1793,7 @@ def _card_lines(card: ExecutionReviewCard) -> list[str]:
             "",
             f"Outcome: {card.outcome}",
             f"Summary: {card.summary}",
+            *_review_lines(card, html=False),
             *_asked_for_lines(card, html=False),
         ]
         if card.questions:
@@ -1763,6 +1809,7 @@ def _card_lines(card: ExecutionReviewCard) -> list[str]:
         *details,
         "",
         f"Summary: {card.summary}",
+        *_review_lines(card, html=False),
         *_asked_for_lines(card, html=False),
     ]
     if card.questions:
@@ -1855,6 +1902,7 @@ def _html_card_lines(card: ExecutionReviewCard) -> list[str]:
             "Approve only if these exact external effects are intended.",
             "",
             *_labelled_html_lines("Summary", card.summary),
+            *_review_lines(card, html=True),
             *_asked_for_lines(card, html=True),
         ]
         if card.questions:
@@ -1871,6 +1919,7 @@ def _html_card_lines(card: ExecutionReviewCard) -> list[str]:
             "",
             *_labelled_html_lines("Outcome", str(card.outcome)),
             *_labelled_html_lines("Summary", card.summary),
+            *_review_lines(card, html=True),
             *_asked_for_lines(card, html=True),
         ]
         if card.questions:
@@ -1887,6 +1936,7 @@ def _html_card_lines(card: ExecutionReviewCard) -> list[str]:
         *details,
         "",
         *_labelled_html_lines("Summary", card.summary),
+        *_review_lines(card, html=True),
         *_asked_for_lines(card, html=True),
     ]
     if card.questions:

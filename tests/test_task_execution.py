@@ -71,6 +71,12 @@ def _drop_native_intake_schema(connection: sqlite3.Connection) -> None:
 
 
 def _drop_agent_profile_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        "ALTER TABLE task_execution_results DROP COLUMN task_kb_file"
+    )
+    connection.execute(
+        "ALTER TABLE task_execution_results DROP COLUMN task_work_directory"
+    )
     for table in (
         "task_execution_workflows",
         "task_execution_results",
@@ -221,7 +227,7 @@ class TaskExecutionTests(unittest.TestCase):
         CandidateInbox(self.database, clock=self.clock).initialize()
 
         after = self.service.get(1)
-        self.assertEqual(SCHEMA_VERSION, 16)
+        self.assertEqual(SCHEMA_VERSION, 17)
         self.assertEqual(
             (after.status, after.phase, after.version, after.task_version),
             (before.status, before.phase, before.version, before.task_version),
