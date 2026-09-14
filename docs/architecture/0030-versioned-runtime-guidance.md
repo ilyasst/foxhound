@@ -65,6 +65,9 @@ Guidance for an unavailable ambient integration is not copied into a profile.
   mutable ambient policy rather than duplicating it at runtime.
 - Changing shared private guidance creates and deploys new immutable profile
   revisions; workflows already pinned to older revisions continue unchanged.
+- In the plan phase, a mistaken release request with valid result inputs is
+  finalized as `awaiting_plan`; phases with ambiguous outcomes still refuse
+  release while inputs exist.
 
 ## Failure and rollback
 
