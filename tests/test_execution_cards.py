@@ -356,8 +356,16 @@ class ExecutionCardTests(unittest.TestCase):
         ]
         self.assertEqual(
             [parse_execution_review_callback(value)[2] for value in callbacks],
-            ["start", "agent", "discuss", "snooze", "cancel",
-             "drop"],
+            ["done", "start", "drop", "discuss", "snooze", "reassign"],
+        )
+        self.assertEqual(
+            [[button["text"] for button in row]
+             for row in keyboard["inline_keyboard"]],
+            [
+                ["✅ Done", "▶️ Continue"],
+                ["🗑 Drop", "✏️ Update"],
+                ["🕓 Snooze 24h", "👥 Reassign"],
+            ],
         )
         self.assertTrue(all(
             len(value.encode("utf-8")) <= CALLBACK_DATA_LIMIT
@@ -438,16 +446,18 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertEqual(replacement.card.id, claim.card.id)
         self.assertGreater(replacement.card.version, retried.card_version)
 
-    def test_start_actions_are_atomic_and_do_not_change_task_lifecycle(self):
+    def test_start_actions_atomically_apply_the_expected_task_lifecycle(self):
         expected = {
-            1: ("start", WorkflowStatus.QUEUED),
-            2: ("snooze", WorkflowStatus.SNOOZED),
-            3: ("cancel", WorkflowStatus.CANCELLED),
+            1: ("start", WorkflowStatus.QUEUED, TaskStatus.OPEN),
+            2: ("snooze", WorkflowStatus.SNOOZED, TaskStatus.OPEN),
+            3: ("cancel", WorkflowStatus.CANCELLED, TaskStatus.OPEN),
+            4: ("done", WorkflowStatus.COMPLETED, TaskStatus.DONE),
+            5: ("drop", WorkflowStatus.CANCELLED, TaskStatus.DROPPED),
         }
         for task_id in expected:
             self._schedule_workflow(task_id)
         self.cards.schedule()
-        for task_id, (action, status) in expected.items():
+        for task_id, (action, status, task_status) in expected.items():
             claim = self._claim_and_deliver()
             self.assertEqual(claim.card.task_id, task_id)
             before = self.cards.event_count()
@@ -461,7 +471,7 @@ class ExecutionCardTests(unittest.TestCase):
                 (ExecutionCardStatus.RESOLVED, status),
             )
             self.assertEqual(
-                self.ledger.get(task_id).status, TaskStatus.OPEN
+                self.ledger.get(task_id).status, task_status
             )
             stale = self.cards.act(
                 claim.card.id,
@@ -601,19 +611,6 @@ class ExecutionCardTests(unittest.TestCase):
             transport="synthetic",
             delivery_ref="message-agent-selector",
         )
-        body, keyboard = render_execution_review_card(claim.card)
-        self.assertIn("<b>Agent:</b> General", body)
-        agent_callback = next(
-            button["callback_data"]
-            for row in keyboard["inline_keyboard"]
-            for button in row
-            if button["text"] == "🤖 Agent"
-        )
-        self.assertEqual(
-            parse_execution_review_callback(agent_callback),
-            (claim.card.id, claim.card.version, "agent"),
-        )
-
         choices = cards.agent_options(
             claim.card.id, expected_version=claim.card.version
         )
@@ -659,7 +656,8 @@ class ExecutionCardTests(unittest.TestCase):
         refreshed_body, refreshed_keyboard = render_execution_review_card(
             selected.card
         )
-        self.assertIn("<b>Agent:</b> Synthetic Specialist", refreshed_body)
+        self.assertIn("<b>Start this task?</b>", refreshed_body)
+        self.assertNotIn("Synthetic Specialist", refreshed_body)
         self.assertTrue(all(
             parse_execution_review_callback(button["callback_data"])[1]
             == selected.card_version
@@ -789,7 +787,7 @@ class ExecutionCardTests(unittest.TestCase):
                  for value in callbacks],
                 [
                     "revise", "discuss", "approve", "snooze", "done",
-                    "drop",
+                    "reassign", "drop",
                 ],
             )
             self.assertEqual(
@@ -799,7 +797,7 @@ class ExecutionCardTests(unittest.TestCase):
                     ["🔎 Investigate further", "💬 Discuss"],
                     ["▶️ Execute plan", "🕒 Snooze"],
                     ["✅ Mark as done"],
-                    ["🗑 Drop task"],
+                    ["👥 Reassign", "🗑 Drop task"],
                 ],
             )
             result = self.cards.act(
@@ -828,7 +826,7 @@ class ExecutionCardTests(unittest.TestCase):
             for button in row
         ]
         self.assertEqual(
-            actions, ["revise", "discuss", "snooze", "drop"]
+            actions, ["revise", "discuss", "snooze", "reassign", "drop"]
         )
         before = self.execution.get(1)
         refused = self.cards.act(
@@ -1032,14 +1030,22 @@ class ExecutionCardTests(unittest.TestCase):
         authorise work they would have to go and look up first.
         """
         task_id = 6
+        payload = json.dumps({"task": {"project": "Project Alpha"}})
         with closing(sqlite3.connect(self.database)) as connection:
             connection.execute(
                 "INSERT INTO candidate_inbox(candidate_id,source_system,"
                 "source_kind,source_record_id,source_item_id,source_revision,"
                 "payload_json,created_at,first_imported_at,updated_at) "
                 "VALUES('c1','gw','issue','forge.example/acme/widget','42',"
-                "?,'{}','2030-01-01T00:00:00Z','2030-01-01T00:00:00Z',"
-                "'2030-01-01T00:00:00Z')", ("b" * 64,))
+                "?,?,'2030-01-01T00:00:00Z','2030-01-01T00:00:00Z',"
+                "'2030-01-01T00:00:00Z')", ("b" * 64, payload))
+            connection.execute(
+                "INSERT INTO candidate_revision_history(candidate_id,"
+                "source_revision,payload_json,created_at,imported_at) "
+                "VALUES('c1',?,?,?,?)",
+                ("b" * 64, payload, "2030-01-01T00:00:00Z",
+                 "2030-01-01T00:00:00Z"),
+            )
             connection.execute(
                 "INSERT INTO task_candidate_bindings(candidate_id,"
                 "source_revision,task_id,relation,decided_at) "
@@ -1051,6 +1057,8 @@ class ExecutionCardTests(unittest.TestCase):
         body, _keyboard = render_execution_review_card(
             self.cards.claim_next().card)
         self.assertIn("widget #42", body)
+        self.assertIn("<i>(Project Alpha)</i>", body)
+        self.assertIn("<b>First raised:</b> 2030-01-01", body)
 
     def test_an_unlinkable_origin_is_still_named(self):
         # A meeting record has no address a reader can open. Naming it is
@@ -1101,6 +1109,24 @@ class ExecutionCardTests(unittest.TestCase):
             card_id, expected_version=version, kind="discussion",
             value="Check the deployment story first.")
         self.assertTrue(noted.accepted, noted.refusal)
+        self.assertEqual(noted.workflow_status, WorkflowStatus.AWAITING_START)
+        self.assertEqual(self.cards.schedule().created, 1)
+        replacement = self._claim_and_deliver()
+        started = self.cards.act(
+            replacement.card.id,
+            expected_version=replacement.card.version,
+            action="start",
+        )
+        self.assertEqual(started.workflow_status, WorkflowStatus.QUEUED)
+        run = self.execution.claim_next()
+        self.assertEqual(
+            self.execution.reader_instruction(
+                5,
+                expected_version=run.workflow_version,
+                claim_token=run.token,
+            ),
+            "Check the deployment story first.",
+        )
 
         card_id, version = delivered_gate(6)
         moved = self.cards.submit_input(
@@ -1116,9 +1142,11 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertEqual(self.cards.schedule().created, 1)
         body, _keyboard = render_execution_review_card(
             self.cards.claim_next().card)
-        self.assertIn("<b>Phase:</b> not started", body)
+        self.assertIn("<b>Start this task?</b>", body)
+        self.assertNotIn("<b>Phase:</b>", body)
         self.assertNotIn("plan refinement", body)
-        self.assertIn("No task work or external action has run.", body)
+        self.assertIn("No agent has looked at this yet.", body)
+        self.assertIn("<b>Continue</b> starts the investigation.", body)
 
     def test_a_plain_line_still_renders_after_records_arrived(self):
         # Every result written before records existed is still a list of
@@ -1277,7 +1305,7 @@ class ExecutionCardTests(unittest.TestCase):
                 for row in keyboard["inline_keyboard"]
                 for button in row
             ],
-            ["done", "discuss", "snooze", "drop"],
+            ["done", "discuss", "snooze", "reassign", "drop"],
         )
         self.cards.complete_delivery(
             claim.card.id,
