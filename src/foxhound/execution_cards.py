@@ -126,8 +126,11 @@ class ExecutionReviewCard:
     agent_profile_revision: str = field(repr=False)
     agent_display_name: str = field(repr=False)
     task_text: str = field(repr=False)
+    project: str | None = field(repr=False)
     owner: str | None = field(repr=False)
     due: str | None = field(repr=False)
+    first_raised: str | None = field(repr=False)
+    last_mentioned: str | None = field(repr=False)
     summary: str = field(default="", repr=False)
     work_markdown: str = field(default="", repr=False)
     questions: tuple[str, ...] = field(default=(), repr=False)
@@ -640,7 +643,17 @@ class ExecutionCardService:
                     return _refused_row(card_id, row, refusal)
 
                 card_kind = ExecutionCardKind(row["kind"])
-                if card_kind is ExecutionCardKind.START:
+                if (
+                    card_kind is ExecutionCardKind.START
+                    and action in {"done", "drop"}
+                ):
+                    workflow = _apply_review_lifecycle_action(
+                        connection,
+                        row,
+                        action=action,
+                        now=now,
+                    )
+                elif card_kind is ExecutionCardKind.START:
                     workflow = _apply_start_action(
                         connection,
                         int(row["task_id"]),
@@ -911,13 +924,18 @@ class ExecutionCardService:
                 )
                 if kind == "discussion":
                     task_version = int(row["task_version"])
-                    status = WorkflowStatus.QUEUED
+                    status = (
+                        WorkflowStatus.AWAITING_START
+                        if ExecutionCardKind(row["kind"])
+                        is ExecutionCardKind.START
+                        else WorkflowStatus.QUEUED
+                    )
                     phase = WorkflowPhase.PLAN
                     event_kind = "discussion_requested"
                     resolution = "discuss"
                     workflow_update = connection.execute(
                         "UPDATE task_execution_workflows SET "
-                        "status='queued',phase='plan',version=?,due_at=NULL,"
+                        "status=?,phase='plan',version=?,due_at=NULL,"
                         "claim_token_digest=NULL,claimed_at=NULL,"
                         "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
                         "failure_count=0,last_failure_reason=NULL,"
@@ -925,6 +943,7 @@ class ExecutionCardService:
                         "parked_at=NULL,updated_at=?,completed_at=NULL "
                         "WHERE task_id=? AND version=?",
                         (
+                            status,
                             target_workflow_version,
                             now,
                             int(row["task_id"]),
@@ -1130,6 +1149,21 @@ class ExecutionCardService:
             "r.task_version AS result_task_version,r.phase AS result_phase,"
             "r.outcome AS result_outcome,r.summary,r.work_markdown,"
             "r.questions_json,r.external_actions_json,r.deliverables_json,"
+            "(SELECT json_extract(o.payload_json,'$.task.project') "
+            " FROM task_candidate_bindings AS b "
+            " JOIN candidate_inbox AS o ON o.candidate_id=b.candidate_id "
+            " WHERE b.task_id=c.task_id AND b.relation='accepted') "
+            " AS project,"
+            "(SELECT min(h.created_at) "
+            " FROM task_candidate_bindings AS b "
+            " JOIN candidate_revision_history AS h "
+            " ON h.candidate_id=b.candidate_id "
+            " WHERE b.task_id=c.task_id) AS first_raised,"
+            "(SELECT max(h.created_at) "
+            " FROM task_candidate_bindings AS b "
+            " JOIN candidate_revision_history AS h "
+            " ON h.candidate_id=b.candidate_id "
+            " WHERE b.task_id=c.task_id) AS last_mentioned,"
             # How many plans this task has already produced, and the last
             # thing the reader said. Counted rather than stored: a pass is a
             # result, so the ledger already knows, and a second column would
@@ -1454,8 +1488,11 @@ def _card(
             agent_profile_revision=profile_revision,
             agent_display_name=profile_name,
             task_text=str(row["task_text"]),
+            project=row["project"],
             owner=row["owner"],
             due=row["due"],
+            first_raised=row["first_raised"],
+            last_mentioned=row["last_mentioned"],
             summary="" if row["summary"] is None else str(row["summary"]),
             work_markdown=(
                 ""
@@ -1569,6 +1606,52 @@ def _origin_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
     return [f'<b>From:</b> <a href="{_escape(url)}">{_escape(shown)}</a>']
 
 
+def _card_date(value: str | None) -> str:
+    return "" if not value else str(value)[:10]
+
+
+def _start_card_lines(
+    card: ExecutionReviewCard, *, html: bool
+) -> list[str]:
+    """Render the established pre-work decision card."""
+    handle = f"T{card.task_id}"
+    if html:
+        head = f"🚦 <b>Start this task?</b>  <code>{handle}</code>"
+        if card.project:
+            head += f"  <i>({_escape(card.project)})</i>"
+        task = f"<b>{_escape(card.task_text)}</b>"
+    else:
+        head = f"🚦 Start this task?  {handle}"
+        if card.project:
+            head += f"  ({card.project})"
+        task = card.task_text
+    lines = [head, "", task]
+    if card.owner:
+        lines.append(
+            f"👤 <b>Owner:</b> {_escape(card.owner)}"
+            if html else f"👤 Owner: {card.owner}"
+        )
+    first = _card_date(card.first_raised)
+    if first:
+        lines.append(
+            f"📌 <b>First raised:</b> {_escape(first)}"
+            if html else f"📌 First raised: {first}"
+        )
+    last = _card_date(card.last_mentioned)
+    if last and last != first:
+        lines.append(
+            f"🕑 <b>Last mentioned:</b> {_escape(last)}"
+            if html else f"🕑 Last mentioned: {last}"
+        )
+    lines.extend(_origin_lines(card, html=html))
+    explanation = "No agent has looked at this yet. "
+    explanation += (
+        "<b>Continue</b> starts the investigation."
+        if html else "Continue starts the investigation."
+    )
+    return [*lines, "", explanation]
+
+
 def _heading_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
     """Identify the task before describing it.
 
@@ -1580,9 +1663,13 @@ def _heading_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
     title = "Task workflow"
     if html:
         head = f"🤖 <b>{title}</b>  <code>{handle}</code>"
+        if card.project:
+            head += f"  <i>({_escape(card.project)})</i>"
         body = f"<b>{_escape(card.task_text)}</b>"
     else:
         head = f"🤖 {title}  {handle}"
+        if card.project:
+            head += f"  ({card.project})"
         body = card.task_text
     lines = [head, body, ""]
     phase = _phase_name(card.phase)
@@ -1622,19 +1709,13 @@ def _asked_for_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
 
 
 def _card_lines(card: ExecutionReviewCard) -> list[str]:
+    if card.kind is ExecutionCardKind.START:
+        return _start_card_lines(card, html=False)
     details = []
     if card.owner:
         details.append(f"Owner: {card.owner}")
     if card.due:
         details.append(f"Due: {card.due}")
-    if card.kind is ExecutionCardKind.START:
-        details.append(f"Agent: {card.agent_display_name}")
-        return [
-            *_heading_lines(card, html=False),
-            *details,
-            "",
-            "Start the planning phase? No task work or external action has run.",
-        ]
     if card.kind is ExecutionCardKind.EXTERNAL_REVIEW:
         lines = [
             *_heading_lines(card, html=False),
@@ -1748,19 +1829,13 @@ def _drafted(values: Sequence[CardRecord]) -> list[str]:
 
 
 def _html_card_lines(card: ExecutionReviewCard) -> list[str]:
+    if card.kind is ExecutionCardKind.START:
+        return _start_card_lines(card, html=True)
     details = []
     if card.owner:
         details.extend(_labelled_html_lines("Owner", card.owner))
     if card.due:
         details.extend(_labelled_html_lines("Due", card.due))
-    if card.kind is ExecutionCardKind.START:
-        details.extend(_labelled_html_lines("Agent", card.agent_display_name))
-        return [
-            *_heading_lines(card, html=True),
-            *details,
-            "",
-            "Start the planning phase? No task work or external action has run.",
-        ]
     if card.kind is ExecutionCardKind.EXTERNAL_REVIEW:
         lines = [
             *_heading_lines(card, html=True),
@@ -2154,38 +2229,31 @@ def _button_rows(
     kind = card.kind
     if kind is ExecutionCardKind.START:
         rows: tuple[tuple[tuple[str, str], ...], ...] = (
-            (("▶️ Start planning", "start"),),
-        )
-        if card.workflow_status is WorkflowStatus.AWAITING_START:
-            rows += ((("🤖 Agent", "agent"),),)
-        rows += (
-            (("💬 Discuss", "discuss"), ("🕒 Snooze 24h", "snooze")),
-            (("⛔ Cancel workflow", "cancel"),),
-            # Present at every phase. Cancel stops the agent and leaves the
-            # task open; Drop says the task should not happen at all. A gate
-            # offering only Cancel could not express the second.
-            (("🗑 Drop task", "drop"),),
+            (("✅ Done", "done"), ("▶️ Continue", "start")),
+            (("🗑 Drop", "drop"), ("✏️ Update", "discuss")),
+            (("🕓 Snooze 24h", "snooze"), ("👥 Reassign", "reassign")),
         )
         return rows if approvable else rows[1:]
+    stop_row = (("👥 Reassign", "reassign"), ("🗑 Drop task", "drop"))
     if kind is ExecutionCardKind.EXTERNAL_REVIEW:
         rows = (
             (("✅ Authorize action", "approve"), ("⛔ Not now", "revise")),
             (("🕒 Snooze", "snooze"),),
             (("💬 Discuss", "discuss"), ("✅ Mark as done", "done")),
-            (("🗑 Drop task", "drop"),),
+            stop_row,
         )
     elif kind is ExecutionCardKind.RESULT_REVIEW:
         rows = (
             (("✅ Mark as done", "done"),),
             (("💬 Discuss", "discuss"), ("🕒 Snooze", "snooze")),
-            (("🗑 Drop task", "drop"),),
+            stop_row,
         )
     else:
         rows = (
             (("🔎 Investigate further", "revise"), ("💬 Discuss", "discuss")),
             (("▶️ Execute plan", "approve"), ("🕒 Snooze", "snooze")),
             (("✅ Mark as done", "done"),),
-            (("🗑 Drop task", "drop"),),
+            stop_row,
         )
     if approvable:
         return rows
@@ -2198,7 +2266,7 @@ def _button_rows(
 
 def _direct_actions_for_kind(kind: ExecutionCardKind) -> set[str]:
     if kind is ExecutionCardKind.START:
-        return {"start", "snooze", "cancel", "drop"}
+        return {"start", "snooze", "cancel", "done", "drop"}
     if kind is ExecutionCardKind.RESULT_REVIEW:
         return {"done", "drop", *REVIEW_SNOOZE_INTERVALS}
     return {

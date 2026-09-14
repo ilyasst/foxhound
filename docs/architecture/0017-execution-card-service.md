@@ -37,8 +37,9 @@ Free-text input is accepted only at `/v1/execution-cards/input`; prompt-only
 callbacks make no durable change, and stale or malformed responses fail
 without partial task, workflow, card, or event writes.
 
-The Agent button uses the ordinary execution callback namespace only to open
-the selector. Each choice uses a separate namespace and an opaque 20-character
+Trusted integrations open the agent selector through the dedicated service
+operation; the legacy-compatible Start keyboard does not add an Agent button.
+Each choice uses a separate namespace and an opaque 20-character
 digest of the exact profile ID and revision. Even with maximum SQLite integer
 identities, the complete callback is at most Telegram's 64-byte limit. The
 service maps the token only against installed profiles eligible for planning;
