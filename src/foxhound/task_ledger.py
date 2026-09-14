@@ -24,6 +24,7 @@ from .candidate_inbox import CandidateInbox, InboxError, SCHEMA_VERSION
 from .contracts import (
     ContractError,
     EQUIVALENCE_BASIS,
+    EQUIVALENCE_BASES,
     OwnerEquivalenceContractError,
     OwnerEquivalenceResolutionError,
     TaskCandidate,
@@ -642,7 +643,7 @@ class TaskLedger:
                         if resolution is None:
                             divergent += 1
                             continue
-                        effective_owner, is_new = resolution
+                        effective_owner, is_new, equivalence_basis = resolution
                         owner_equivalent += 1
                         if is_new:
                             connection.execute(
@@ -656,7 +657,7 @@ class TaskLedger:
                                     int(row["legacy_task_id"]),
                                     row["comparable_digest"],
                                     effective_owner,
-                                    EQUIVALENCE_BASIS,
+                                    equivalence_basis,
                                     now,
                                 ),
                             )
@@ -905,7 +906,7 @@ class TaskLedger:
         row: sqlite3.Row,
         candidate: TaskCandidate,
         pending: TaskOwnerEquivalence | None,
-    ) -> tuple[str, bool] | None:
+    ) -> tuple[str, bool, str] | None:
         if row["equivalence_candidate_id"] is not None:
             if (
                 row["equivalence_candidate_id"] != candidate.candidate_id
@@ -915,7 +916,7 @@ class TaskLedger:
                 != row["legacy_task_id"]
                 or row["equivalence_legacy_digest"]
                 != row["comparable_digest"]
-                or row["equivalence_basis"] != EQUIVALENCE_BASIS
+                or row["equivalence_basis"] not in EQUIVALENCE_BASES
                 or not _valid_effective_owner(
                     row["equivalence_effective_owner"]
                 )
@@ -929,7 +930,7 @@ class TaskLedger:
                 owner=effective_owner,
             ) != row["comparable_digest"]:
                 raise _BootstrapConflict
-            return effective_owner, False
+            return effective_owner, False, row["equivalence_basis"]
 
         if not isinstance(pending, TaskOwnerEquivalence) or not pending.equivalent:
             return None
@@ -948,7 +949,7 @@ class TaskLedger:
             or request.source_revision != candidate.source.revision
             or request.legacy_task_id != row["legacy_task_id"]
             or request.legacy_digest != row["comparable_digest"]
-            or pending.basis != EQUIVALENCE_BASIS
+            or pending.basis not in EQUIVALENCE_BASES
             or not _valid_effective_owner(pending.effective_owner)
             or comparable_task_digest(
                 text=candidate.task.text,
@@ -957,7 +958,7 @@ class TaskLedger:
             ) != row["comparable_digest"]
         ):
             return None
-        return pending.effective_owner, True
+        return pending.effective_owner, True, pending.basis
 
     def transition(
         self, task_id: int, *, expected_version: int, action: str
