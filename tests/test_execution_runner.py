@@ -605,6 +605,7 @@ class ExecutionRunnerTests(unittest.TestCase):
 
     def test_public_agent_prompt_and_argv_have_no_task_or_capability(self):
         bootstrap = agent_prompt()
+        self.assertIn("absolute path in the same starting directory", bootstrap)
         argv = hermes_argv("hermes", max_turns=12, toolsets="terminal")
         rendered = json.dumps(argv)
         instructions = general_profile().render_prompt("foxhound-task-worker")
