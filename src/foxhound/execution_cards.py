@@ -9,6 +9,7 @@ import os
 import re
 import secrets
 import sqlite3
+import unicodedata
 import urllib.parse
 from contextlib import closing
 from dataclasses import dataclass, field
@@ -24,6 +25,7 @@ from .agent_profiles import (
     load_registry,
 )
 from .candidate_inbox import CandidateInbox, InboxError, SCHEMA_VERSION
+from .knowledge_client import KnowledgeClientError, OwnerUpcomingMeeting
 from .contracts.task_candidate import ContractError, parse_task_candidate
 from .source_policy import source_kinds_accepting
 from .task_execution import (
@@ -65,6 +67,27 @@ REVIEW_DIRECT_ACTIONS = {
 READER_INPUT_KINDS = {"discussion", "reassignment"}
 MAX_DISCUSSION_CHARS = 16_000
 MAX_OWNER_CHARS = 200
+OWNER_HOLD_INTERVAL = timedelta(days=21)
+MAX_OWNER_HOLD_CHECKS = 100
+OWNER_HOLD_ACTION = "until_meeting"
+_OWNER_HOLD_SELECT = (
+    "SELECT h.*,t.status AS task_status_current,"
+    "t.version AS task_version_current,t.owner AS owner_current,"
+    "t.owner_ref_version AS owner_ref_version_current,"
+    "t.owner_kind AS owner_kind_current,"
+    "t.owner_speaker_id AS owner_speaker_id_current,"
+    "t.owner_canonical_speaker_id AS owner_canonical_speaker_id_current,"
+    "t.owner_speaker_registry_id AS owner_speaker_registry_id_current,"
+    "t.owner_pinned AS owner_pinned_current,"
+    "t.owner_provisional AS owner_provisional_current,"
+    "w.status AS workflow_status_current,"
+    "w.version AS workflow_version_current,"
+    "w.task_version AS workflow_task_version_current,"
+    "w.due_at AS workflow_due_at "
+    "FROM task_execution_owner_holds AS h "
+    "JOIN tasks AS t ON t.id=h.task_id "
+    "JOIN task_execution_workflows AS w ON w.task_id=h.task_id"
+)
 
 
 class ExecutionCardKind(StrEnum):
@@ -134,6 +157,7 @@ class ExecutionReviewCard:
     due: str | None = field(repr=False)
     first_raised: str | None = field(repr=False)
     last_mentioned: str | None = field(repr=False)
+    owner_hold_eligible: bool = field(default=False, repr=False)
     summary: str = field(default="", repr=False)
     work_markdown: str = field(default="", repr=False)
     questions: tuple[str, ...] = field(default=(), repr=False)
@@ -213,6 +237,10 @@ class ExecutionCardService:
         clock: Callable[[], datetime] | None = None,
         token_factory: Callable[[], str] | None = None,
         profile_registry: AgentProfileRegistry | None = None,
+        owner_condition: Callable[
+            [str, Mapping[str, object]], OwnerUpcomingMeeting
+        ] | None = None,
+        reader_aliases: Sequence[str] = (),
     ) -> None:
         self.database_path = Path(database_path)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
@@ -223,6 +251,21 @@ class ExecutionCardService:
         if not isinstance(registry, AgentProfileRegistry):
             raise ValueError("agent profile registry is invalid")
         self._profile_registry = registry
+        if owner_condition is not None and not callable(owner_condition):
+            raise ValueError("owner meeting condition is invalid")
+        aliases = tuple(reader_aliases)
+        if any(
+            not isinstance(alias, str)
+            or not alias
+            or alias != alias.strip()
+            or len(alias) > MAX_OWNER_CHARS
+            for alias in aliases
+        ):
+            raise ValueError("reader aliases are invalid")
+        self._owner_condition = owner_condition
+        self._reader_aliases = frozenset(
+            _normalized_owner(alias) for alias in aliases
+        )
 
     def initialize(self) -> None:
         CandidateInbox(self.database_path, clock=self._clock).initialize()
@@ -233,7 +276,9 @@ class ExecutionCardService:
                 ExecutionCardDisposition.REFUSED,
                 refusal=ExecutionCardRefusal.INVALID_ARGUMENT,
             )
-        now = self._now()
+        stamp = self._clock_value()
+        self._poll_owner_holds(stamp, limit=min(limit, MAX_OWNER_HOLD_CHECKS))
+        now = stamp.isoformat(timespec="seconds")
         with closing(self._connect()) as connection:
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("BEGIN IMMEDIATE")
@@ -380,7 +425,7 @@ class ExecutionCardService:
                     return None
                 if not _current_card(row):
                     raise TaskLedgerError("execution card state is invalid")
-                _card(row, self._profile_registry)
+                self._render_card(row)
                 version = int(row["version"]) + 1
                 updated = connection.execute(
                     "UPDATE execution_review_cards SET status='delivering',"
@@ -413,7 +458,7 @@ class ExecutionCardService:
                 values = dict(row)
                 values.update(status=ExecutionCardStatus.DELIVERING, version=version)
                 return ExecutionCardDeliveryClaim(
-                    _card(values, self._profile_registry), token, expires
+                    self._render_card(values), token, expires
                 )
             except Exception:
                 connection.rollback()
@@ -641,7 +686,9 @@ class ExecutionCardService:
     ) -> ExecutionCardOperationResult:
         if not _valid_identity(card_id, expected_version):
             return _refused(card_id, ExecutionCardRefusal.INVALID_ARGUMENT)
-        if action not in {"start", "snooze", *REVIEW_DIRECT_ACTIONS}:
+        if action not in {
+            "start", "snooze", OWNER_HOLD_ACTION, *REVIEW_DIRECT_ACTIONS
+        }:
             return _refused(card_id, ExecutionCardRefusal.INVALID_ACTION)
         stamp = self._clock_value()
         now = stamp.isoformat(timespec="seconds")
@@ -664,7 +711,7 @@ class ExecutionCardService:
                 if (
                     refusal is None
                     and action in {"start", "approve", "done"}
-                    and not _card_fits(_card(row, self._profile_registry))
+                    and not _card_fits(self._render_card(row))
                 ):
                     refusal = ExecutionCardRefusal.INVALID_STATE
                 if refusal is not None:
@@ -681,6 +728,19 @@ class ExecutionCardService:
                         row,
                         action=action,
                         now=now,
+                    )
+                elif (
+                    card_kind is ExecutionCardKind.START
+                    and action == OWNER_HOLD_ACTION
+                ):
+                    card = self._render_card(row)
+                    if not card.owner_hold_eligible:
+                        connection.rollback()
+                        return _refused_row(
+                            card_id, row, ExecutionCardRefusal.INVALID_ACTION
+                        )
+                    workflow = _apply_owner_hold(
+                        connection, row, stamp=stamp
                     )
                 elif card_kind is ExecutionCardKind.START:
                     workflow = _apply_start_action(
@@ -769,7 +829,7 @@ class ExecutionCardService:
             refusal = _agent_card_refusal(row, expected_version)
             if refusal is not None:
                 return _agent_refused_row(card_id, row, refusal)
-            card = _card(row, self._profile_registry)
+            card = self._render_card(row)
             options = _agent_options(self._profile_registry, card)
             return ExecutionAgentSelectorResult(
                 ExecutionCardDisposition.UNCHANGED,
@@ -817,7 +877,7 @@ class ExecutionCardService:
                 if refusal is not None:
                     connection.rollback()
                     return _agent_refused_row(card_id, row, refusal)
-                current = _card(row, self._profile_registry)
+                current = self._render_card(row)
                 workflow = _apply_agent_selection(
                     connection,
                     int(row["task_id"]),
@@ -873,7 +933,7 @@ class ExecutionCardService:
                     workflow_agent_profile_id=profile.profile_id,
                     workflow_agent_profile_revision=profile.revision,
                 )
-                card = _card(values, self._profile_registry)
+                card = self._render_card(values)
                 connection.commit()
                 return ExecutionAgentSelectorResult(
                     ExecutionCardDisposition.APPLIED,
@@ -1135,6 +1195,168 @@ class ExecutionCardService:
                 ).fetchone()[0]
             )
 
+    def _poll_owner_holds(self, stamp: datetime, *, limit: int) -> None:
+        """Refresh bounded durable holds without keeping a write lock."""
+        now = stamp.isoformat(timespec="seconds")
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                _OWNER_HOLD_SELECT + " "
+                "WHERE h.status='active' ORDER BY h.id LIMIT ?",
+                (limit,),
+            ).fetchall()
+        for row in rows:
+            if not _current_owner_hold(row):
+                self._finish_owner_hold(row, now=now, reason="stale")
+                continue
+            if row["backstop_at"] <= now:
+                self._finish_owner_hold(row, now=now, reason="backstop")
+                continue
+            if self._owner_condition is None:
+                continue
+            try:
+                result = self._owner_condition(
+                    str(row["owner_display"]), _owner_ref(row)
+                )
+            except KnowledgeClientError:
+                continue
+            if not isinstance(result, OwnerUpcomingMeeting):
+                continue
+            self._record_owner_condition(row, result=result, now=now)
+
+    def _record_owner_condition(
+        self,
+        row: Mapping[str, object],
+        *,
+        result: OwnerUpcomingMeeting,
+        now: str,
+    ) -> None:
+        with closing(self._connect()) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                current = connection.execute(
+                    _OWNER_HOLD_SELECT + " WHERE h.id=?",
+                    (int(row["id"]),),
+                ).fetchone()
+                if (
+                    current is None
+                    or current["status"] != "active"
+                    or not _current_owner_hold(current)
+                ):
+                    connection.rollback()
+                    return
+                row = current
+                connection.execute(
+                    "UPDATE task_execution_owner_holds SET "
+                    "last_checked_at=?,last_evidence_revision=?,"
+                    "last_match=? WHERE id=? AND status='active'",
+                    (
+                        result.checked_at,
+                        result.evidence_revision,
+                        int(result.match),
+                        int(row["id"]),
+                    ),
+                )
+                _owner_hold_event(
+                    connection,
+                    row,
+                    kind="condition_checked",
+                    matched=result.match,
+                    evidence_revision=result.evidence_revision,
+                    now=now,
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        if result.match:
+            self._finish_owner_hold(row, now=now, reason="meeting")
+
+    def _finish_owner_hold(
+        self, row: Mapping[str, object], *, now: str, reason: str
+    ) -> None:
+        with closing(self._connect()) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                current = connection.execute(
+                    _OWNER_HOLD_SELECT + " WHERE h.id=?",
+                    (int(row["id"]),),
+                ).fetchone()
+                if current is None or current["status"] != "active":
+                    connection.rollback()
+                    return
+                if not _current_owner_hold(current):
+                    reason = "stale"
+                row = current
+                if reason == "stale":
+                    connection.execute(
+                        "UPDATE task_execution_owner_holds SET "
+                        "status='cancelled',release_reason='stale',"
+                        "released_at=? WHERE id=? AND status='active'",
+                        (now, int(row["id"])),
+                    )
+                    _owner_hold_event(
+                        connection, row, kind="cancelled", now=now
+                    )
+                    connection.commit()
+                    return
+                workflow_version = int(row["workflow_version"]) + 1
+                updated = connection.execute(
+                    "UPDATE task_execution_workflows SET "
+                    "status='awaiting_start',phase='plan',version=?,"
+                    "due_at=NULL,claim_token_digest=NULL,claimed_at=NULL,"
+                    "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
+                    "failure_count=0,last_failure_reason=NULL,"
+                    "last_failure_at=NULL,next_attempt_at=NULL,"
+                    "parked_at=NULL,updated_at=?,completed_at=NULL "
+                    "WHERE task_id=? AND task_version=? AND version=? "
+                    "AND status='snoozed' AND due_at=?",
+                    (
+                        workflow_version,
+                        now,
+                        int(row["task_id"]),
+                        int(row["task_version"]),
+                        int(row["workflow_version"]),
+                        row["backstop_at"],
+                    ),
+                )
+                if updated.rowcount != 1:
+                    connection.execute(
+                        "UPDATE task_execution_owner_holds SET "
+                        "status='cancelled',release_reason='stale',"
+                        "released_at=? WHERE id=? AND status='active'",
+                        (now, int(row["id"])),
+                    )
+                    _owner_hold_event(
+                        connection, row, kind="cancelled", now=now
+                    )
+                    connection.commit()
+                    return
+                connection.execute(
+                    "UPDATE task_execution_owner_holds SET status='released',"
+                    "release_reason=?,released_at=? "
+                    "WHERE id=? AND status='active'",
+                    (reason, now, int(row["id"])),
+                )
+                _owner_hold_event(
+                    connection, row, kind="released", now=now
+                )
+                TaskExecutionService._event(
+                    connection,
+                    int(row["task_id"]),
+                    "scheduled",
+                    workflow_version,
+                    int(row["task_version"]),
+                    WorkflowPhase.PLAN,
+                    WorkflowStatus.AWAITING_START,
+                    now,
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+
     def _cancel_stale(
         self, connection: sqlite3.Connection, now: str
     ) -> int:
@@ -1170,7 +1392,10 @@ class ExecutionCardService:
     @staticmethod
     def _card_select() -> str:
         return (
-            "SELECT c.*,t.text AS task_text,t.owner,t.owner_kind,t.due,"
+            "SELECT c.*,t.text AS task_text,t.owner,t.owner_ref_version,"
+            "t.owner_kind,t.owner_speaker_id,t.owner_canonical_speaker_id,"
+            "t.owner_speaker_registry_id,t.owner_pinned,t.owner_provisional,"
+            "t.due,"
             "t.status AS task_status_current,t.version AS task_version_current,"
             "w.status AS workflow_status_current,"
             "w.failure_count AS workflow_failure_count,"
@@ -1298,6 +1523,16 @@ class ExecutionCardService:
             ) from exc
         return connection
 
+    def _render_card(
+        self, row: Mapping[str, object]
+    ) -> ExecutionReviewCard:
+        return _card(
+            row,
+            self._profile_registry,
+            reader_aliases=self._reader_aliases,
+            condition_available=self._owner_condition is not None,
+        )
+
     def _clock_value(self) -> datetime:
         value = self._clock()
         if value.tzinfo is None or value.utcoffset() is None:
@@ -1403,7 +1638,8 @@ def parse_execution_review_callback(
         return None
     if parts[3] not in {
         "start", "snooze", "cancel", "approve", "revise", "discuss",
-        "done", "reassign", "drop", "agent", *REVIEW_SNOOZE_INTERVALS,
+        "done", "reassign", "drop", "agent", OWNER_HOLD_ACTION,
+        *REVIEW_SNOOZE_INTERVALS,
     }:
         return None
     return card_id, version, parts[3]
@@ -1526,7 +1762,11 @@ def _current_card(row: Mapping[str, object]) -> bool:
 
 
 def _card(
-    row: Mapping[str, object], registry: AgentProfileRegistry
+    row: Mapping[str, object],
+    registry: AgentProfileRegistry,
+    *,
+    reader_aliases: frozenset[str] = frozenset(),
+    condition_available: bool = False,
 ) -> ExecutionReviewCard:
     try:
         kind = ExecutionCardKind(row["kind"])
@@ -1539,6 +1779,7 @@ def _card(
             if kind is ExecutionCardKind.START:
                 raise
             profile_name = profile_id
+        owner_display = canonical_owner_display(row["owner"], row["owner_kind"])
         return ExecutionReviewCard(
             id=int(row["id"]),
             task_id=int(row["task_id"]),
@@ -1557,10 +1798,16 @@ def _card(
             agent_profile_revision=profile_revision,
             agent_display_name=profile_name,
             task_text=str(row["task_text"]),
-            owner=canonical_owner_display(row["owner"], row["owner_kind"]),
+            owner=owner_display,
             due=row["due"],
             first_raised=row["first_raised"],
             last_mentioned=row["last_mentioned"],
+            owner_hold_eligible=_owner_hold_eligible(
+                row,
+                owner_display,
+                reader_aliases=reader_aliases,
+                condition_available=condition_available,
+            ),
             summary="" if row["summary"] is None else str(row["summary"]),
             work_markdown=(
                 ""
@@ -1590,6 +1837,182 @@ def _card(
         )
     except (AgentProfileError, KeyError, TypeError, ValueError) as exc:
         raise TaskLedgerError("execution review card state is invalid") from exc
+
+
+def _normalized_owner(value: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", value).casefold()
+    return " ".join(
+        "".join(
+            character if character.isalnum() else " "
+            for character in decomposed
+            if not unicodedata.combining(character)
+        ).split()
+    )
+
+
+def _owner_hold_eligible(
+    row: Mapping[str, object],
+    owner_display: str | None,
+    *,
+    reader_aliases: frozenset[str],
+    condition_available: bool,
+) -> bool:
+    if (
+        not condition_available
+        or not reader_aliases
+        or owner_display in {None, "(unassigned)"}
+        or row["owner_ref_version"] != 1
+        or row["owner_kind"] not in {"person", "external"}
+        or row["owner_provisional"] != 0
+        or _normalized_owner(owner_display) in reader_aliases
+    ):
+        return False
+    scoped = (
+        row["owner_speaker_id"],
+        row["owner_canonical_speaker_id"],
+        row["owner_speaker_registry_id"],
+    )
+    return all(value is None for value in scoped) or all(
+        isinstance(value, str) and bool(value) for value in scoped
+    )
+
+
+def _owner_ref(row: Mapping[str, object]) -> dict[str, object]:
+    return {
+        "kind": row["owner_kind"],
+        "speaker_id": row["owner_speaker_id"],
+        "canonical_speaker_id": row["owner_canonical_speaker_id"],
+        "speaker_registry_id": row["owner_speaker_registry_id"],
+        "pinned": bool(row["owner_pinned"]),
+        "provisional": bool(row["owner_provisional"]),
+    }
+
+
+def _current_owner_hold(row: Mapping[str, object]) -> bool:
+    return (
+        row["task_status_current"] == TaskStatus.OPEN
+        and row["task_version_current"] == row["task_version"]
+        and row["workflow_task_version_current"] == row["task_version"]
+        and row["workflow_version_current"] == row["workflow_version"]
+        and row["workflow_status_current"] == WorkflowStatus.SNOOZED
+        and row["workflow_due_at"] == row["backstop_at"]
+        and canonical_owner_display(
+            row["owner_current"], row["owner_kind_current"]
+        ) == row["owner_display"]
+        and row["owner_ref_version_current"] == row["owner_ref_version"]
+        and row["owner_kind_current"] == row["owner_kind"]
+        and row["owner_speaker_id_current"] == row["owner_speaker_id"]
+        and row["owner_canonical_speaker_id_current"]
+        == row["owner_canonical_speaker_id"]
+        and row["owner_speaker_registry_id_current"]
+        == row["owner_speaker_registry_id"]
+        and row["owner_pinned_current"] == row["owner_pinned"]
+        and row["owner_provisional_current"] == row["owner_provisional"]
+    )
+
+
+def _apply_owner_hold(
+    connection: sqlite3.Connection,
+    row: Mapping[str, object],
+    *,
+    stamp: datetime,
+) -> WorkflowOperationResult:
+    now = stamp.isoformat(timespec="seconds")
+    wake = (stamp + OWNER_HOLD_INTERVAL).isoformat(timespec="seconds")
+    task_id = int(row["task_id"])
+    workflow_version = int(row["workflow_version"]) + 1
+    updated = connection.execute(
+        "UPDATE task_execution_workflows SET status='snoozed',phase='plan',"
+        "version=?,due_at=?,claim_token_digest=NULL,claimed_at=NULL,"
+        "claim_heartbeat_at=NULL,claim_expires_at=NULL,failure_count=0,"
+        "last_failure_reason=NULL,last_failure_at=NULL,next_attempt_at=NULL,"
+        "parked_at=NULL,updated_at=?,completed_at=NULL "
+        "WHERE task_id=? AND version=? AND task_version=? "
+        "AND status IN ('awaiting_start','snoozed','parked')",
+        (
+            workflow_version,
+            wake,
+            now,
+            task_id,
+            int(row["workflow_version"]),
+            int(row["task_version"]),
+        ),
+    )
+    if updated.rowcount != 1:
+        return WorkflowOperationResult(
+            WorkflowDisposition.REFUSED,
+            task_id,
+            refusal=WorkflowRefusal.STALE_WORKFLOW,
+        )
+    cursor = connection.execute(
+        "INSERT INTO task_execution_owner_holds("
+        "task_id,task_version,workflow_version,status,owner_display,"
+        "owner_ref_version,owner_kind,owner_speaker_id,"
+        "owner_canonical_speaker_id,owner_speaker_registry_id,owner_pinned,"
+        "owner_provisional,backstop_at,created_at) "
+        "VALUES(?,?,?,'active',?,?,?,?,?,?,?,?,?,?)",
+        (
+            task_id,
+            int(row["task_version"]),
+            workflow_version,
+            canonical_owner_display(row["owner"], row["owner_kind"]),
+            int(row["owner_ref_version"]),
+            row["owner_kind"],
+            row["owner_speaker_id"],
+            row["owner_canonical_speaker_id"],
+            row["owner_speaker_registry_id"],
+            int(row["owner_pinned"]),
+            int(row["owner_provisional"]),
+            wake,
+            now,
+        ),
+    )
+    hold_row = {"id": int(cursor.lastrowid), "task_id": task_id}
+    _owner_hold_event(connection, hold_row, kind="created", now=now)
+    TaskExecutionService._event(
+        connection,
+        task_id,
+        "snoozed",
+        workflow_version,
+        int(row["task_version"]),
+        WorkflowPhase.PLAN,
+        WorkflowStatus.SNOOZED,
+        now,
+    )
+    return WorkflowOperationResult(
+        WorkflowDisposition.APPLIED,
+        task_id,
+        workflow_version,
+        WorkflowStatus.SNOOZED,
+        WorkflowPhase.PLAN,
+        wake_at=wake,
+        agent_profile_id=row["workflow_agent_profile_id"],
+        agent_profile_revision=row["workflow_agent_profile_revision"],
+    )
+
+
+def _owner_hold_event(
+    connection: sqlite3.Connection,
+    row: Mapping[str, object],
+    *,
+    kind: str,
+    now: str,
+    matched: bool | None = None,
+    evidence_revision: str | None = None,
+) -> None:
+    connection.execute(
+        "INSERT INTO task_execution_owner_hold_events("
+        "hold_id,task_id,kind,matched,evidence_revision,occurred_at) "
+        "VALUES(?,?,?,?,?,?)",
+        (
+            int(row["id"]),
+            int(row["task_id"]),
+            kind,
+            None if matched is None else int(matched),
+            evidence_revision,
+            now,
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -2460,6 +2883,10 @@ def _button_rows(
             (("🗑 Drop", "drop"), ("✏️ Update", "discuss")),
             (("🕓 Snooze", "snooze"), ("👥 Reassign", "reassign")),
         )
+        if card.owner_hold_eligible and card.owner:
+            rows += ((
+                (_owner_hold_button_label(card.owner), OWNER_HOLD_ACTION),
+            ),)
         return rows if approvable else rows[1:]
     stop_row = (("👥 Reassign", "reassign"), ("🗑 Drop task", "drop"))
     if kind is ExecutionCardKind.EXTERNAL_REVIEW:
@@ -2491,6 +2918,25 @@ def _button_rows(
     )
 
 
+def _owner_hold_button_label(owner: str) -> str:
+    prefix = "🗓 Until next meeting with "
+    maximum = 64
+    if len((prefix + owner).encode("utf-8")) <= maximum:
+        return prefix + owner
+    suffix = "…"
+    budget = maximum - len((prefix + suffix).encode("utf-8"))
+    encoded = owner.encode("utf-8")[:budget]
+    while encoded:
+        try:
+            shortened = encoded.decode("utf-8")
+            break
+        except UnicodeDecodeError:
+            encoded = encoded[:-1]
+    else:
+        shortened = ""
+    return prefix + shortened.rstrip() + suffix
+
+
 def _direct_actions_for_kind(kind: ExecutionCardKind) -> set[str]:
     if kind is ExecutionCardKind.START:
         # The intervals the review cards already accept. A gate is the card
@@ -2499,6 +2945,7 @@ def _direct_actions_for_kind(kind: ExecutionCardKind) -> set[str]:
         # task waiting on someone else, a release, or a month end.
         return {
             "start", "snooze", "cancel", "done", "drop",
+            OWNER_HOLD_ACTION,
             *REVIEW_SNOOZE_INTERVALS,
         }
     if kind is ExecutionCardKind.RESULT_REVIEW:
@@ -2510,7 +2957,11 @@ def _direct_actions_for_kind(kind: ExecutionCardKind) -> set[str]:
 
 
 def _stored_action(action: str) -> str:
-    return "snooze" if action in REVIEW_SNOOZE_INTERVALS else action
+    return (
+        "snooze"
+        if action in {*REVIEW_SNOOZE_INTERVALS, OWNER_HOLD_ACTION}
+        else action
+    )
 
 
 def _valid_reader_input(kind: str, value: object) -> bool:
