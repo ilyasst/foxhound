@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/foxhound/contracts/task-candidate-v4.schema.json",
+  "title": "Foxhound task candidate with bounded source provenance",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "candidate_id",
+    "source",
+    "task",
+    "evidence",
+    "created_at"
+  ],
+  "properties": {
+    "schema": {"const": "foxhound.task-candidate"},
+    "schema_version": {"const": 4},
+    "candidate_id": {
+      "type": "string",
+      "pattern": "^tc_[0-9a-f]{64}$"
+    },
+    "source": {
+      "type": "object",
+      "required": ["system", "kind", "record_id", "item_id", "revision"],
+      "properties": {
+        "system": {"const": "gw"},
+        "kind": {"const": "meeting"},
+        "record_id": {"$ref": "#/$defs/opaqueId"},
+        "item_id": {"$ref": "#/$defs/opaqueId"},
+        "revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "task": {
+      "type": "object",
+      "required": ["text", "owner", "due"],
+      "properties": {
+        "text": {"$ref": "#/$defs/taskText"},
+        "project": {"$ref": "#/$defs/shortText"},
+        "owner": {
+          "oneOf": [{"$ref": "#/$defs/shortText"}, {"type": "null"}]
+        },
+        "due": {
+          "oneOf": [{"type": "string", "format": "date"}, {"type": "null"}]
+        }
+      },
+      "additionalProperties": false
+    },
+    "evidence": {
+      "type": "object",
+      "required": ["document_id", "locator", "sources"],
+      "properties": {
+        "document_id": {"$ref": "#/$defs/opaqueId"},
+        "locator": {"$ref": "#/$defs/opaqueId"},
+        "sources": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 3,
+          "items": {
+            "type": "object",
+            "required": ["name", "role", "extract"],
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 255,
+                "pattern": "^[^/\\\\]+$",
+                "not": {"enum": [".", ".."]}
+              },
+              "role": {"enum": ["handoff", "protocol", "transcript"]},
+              "extract": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1200
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "created_at": {"type": "string", "format": "date-time"}
+  },
+  "$defs": {
+    "opaqueId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$"
+    },
+    "shortText": {"type": "string", "minLength": 1, "maxLength": 200},
+    "taskText": {"type": "string", "minLength": 1, "maxLength": 1000}
+  },
+  "additionalProperties": false
+}

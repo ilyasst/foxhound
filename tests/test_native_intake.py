@@ -94,6 +94,33 @@ def lifecycle_candidate(
     return item
 
 
+def provenance_candidate(index: int) -> dict:
+    """The same fictional task with a richer source-only revision."""
+    item = candidate(index)
+    item["schema_version"] = 4
+    item["evidence"]["sources"] = [
+        {
+            "name": "20300102_example_handoff.json",
+            "role": "handoff",
+            "extract": "The handoff declares this synthetic action.",
+        },
+        {
+            "name": "20300102_example_protocol.md",
+            "role": "protocol",
+            "extract": "Action item:\nPrepare the synthetic summary.",
+        },
+        {
+            "name": "20300102_example_transcript.txt",
+            "role": "transcript",
+            "extract": "[Person A] I will prepare the synthetic summary.",
+        },
+    ]
+    item["source"]["revision"] = hashlib.sha256(
+        json.dumps(item["evidence"], sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return item
+
+
 def legacy_candidate(index: int) -> dict:
     """A fictional open task offered only for a bounded cutover."""
     item = candidate(
@@ -504,6 +531,42 @@ class NativeCandidateIntakeTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(binding, revised["source"]["revision"])
         self.assertEqual(event, ("candidate_revised", 2, binding))
+
+    def test_provenance_only_revision_preserves_an_active_workflow(self):
+        self.activate()
+        initial = candidate(1)
+        self.inbox.import_feed(feed(0, initial))
+        self.intake()
+        execution = TaskExecutionService(self.database, clock=lambda: NOW)
+        scheduled = execution.schedule(1, expected_task_version=1)
+        started = execution.start_action(
+            1, expected_version=scheduled.version, action="start"
+        )
+        enriched = provenance_candidate(1)
+        self.assertEqual(enriched["task"], initial["task"])
+        self.inbox.import_feed(feed(1, enriched))
+
+        result = self.intake()
+
+        task = self.ledger.get(1)
+        workflow = execution.get(1)
+        self.assertEqual((result.tasks_revised, self.ledger.count()), (1, 1))
+        self.assertEqual(task.version, 1)
+        self.assertEqual(workflow.version, started.version)
+        self.assertEqual(workflow.status, WorkflowStatus.QUEUED)
+        self.assertEqual(
+            self.inbox.get(enriched["candidate_id"]).evidence.sources[1].role,
+            "protocol",
+        )
+        with closing(sqlite3.connect(self.database)) as connection:
+            binding, event = connection.execute(
+                "SELECT source_revision FROM task_candidate_bindings"
+            ).fetchone()[0], connection.execute(
+                "SELECT kind,task_version FROM task_events "
+                "ORDER BY sequence DESC LIMIT 1"
+            ).fetchone()
+        self.assertEqual(binding, enriched["source"]["revision"])
+        self.assertEqual(event, ("candidate_revised", 1))
 
     def test_withdrawal_before_binding_advances_without_creating_a_task(self):
         self.activate()

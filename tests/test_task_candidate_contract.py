@@ -49,6 +49,58 @@ class TaskCandidateContractTests(unittest.TestCase):
         self.assertIsNone(candidate.task.project)
         self.assertEqual(task_candidate_document(candidate), document)
 
+    def test_accepts_and_round_trips_bounded_source_provenance(self):
+        document = fixture("meeting-candidate-v4.json")
+
+        candidate = parse_task_candidate(document)
+
+        self.assertEqual(candidate.schema_version, 4)
+        self.assertEqual(
+            [source.role for source in candidate.evidence.sources],
+            ["handoff", "protocol", "transcript"],
+        )
+        self.assertEqual(task_candidate_document(candidate), document)
+
+    def test_version_4_allows_a_projectless_meeting(self):
+        document = fixture("meeting-candidate-v4.json")
+        del document["task"]["project"]
+
+        candidate = parse_task_candidate(document)
+
+        self.assertIsNone(candidate.task.project)
+        self.assertEqual(task_candidate_document(candidate), document)
+
+    def test_version_4_provenance_is_strict_and_bounded(self):
+        document = fixture("meeting-candidate-v4.json")
+        changes = (
+            lambda value: value["evidence"]["sources"].__setitem__(slice(None), []),
+            lambda value: value["evidence"]["sources"][0].__setitem__(
+                "name", "../private.txt"
+            ),
+            lambda value: value["evidence"]["sources"][0].__setitem__(
+                "extract", "x" * 1_201
+            ),
+            lambda value: value["evidence"]["sources"][0].__setitem__(
+                "token", "synthetic-secret"
+            ),
+        )
+        for change in changes:
+            broken = copy.deepcopy(document)
+            change(broken)
+            with self.assertRaises(ContractError):
+                parse_task_candidate(broken)
+
+        wrong_kind = copy.deepcopy(document)
+        wrong_kind["source"]["kind"] = "email"
+        wrong_kind["candidate_id"] = candidate_id_for(
+            system="gw",
+            kind="email",
+            record_id=wrong_kind["source"]["record_id"],
+            item_id=wrong_kind["source"]["item_id"],
+        )
+        with self.assertRaisesRegex(ContractError, "provenance"):
+            parse_task_candidate(wrong_kind)
+
     def test_version_3_distinguishes_active_from_withdrawn(self):
         for state in ("active", "withdrawn"):
             document = fixture("meeting-candidate-v2.json")
@@ -224,6 +276,19 @@ class TaskCandidateContractTests(unittest.TestCase):
             {"active", "withdrawn"},
         )
         self.assertFalse(version_3["additionalProperties"])
+        version_4 = json.loads(
+            schema_path.with_name("task-candidate-v4.schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(version_4["properties"]["schema_version"]["const"], 4)
+        self.assertEqual(
+            version_4["properties"]["evidence"]["properties"]["sources"][
+                "maxItems"
+            ],
+            3,
+        )
+        self.assertFalse(version_4["additionalProperties"])
         expected_kinds = {"meeting", "email", "teams", "issue", "legacy"}
         self.assertEqual(
             set(schema["properties"]["source"]["properties"]["kind"]["enum"]),

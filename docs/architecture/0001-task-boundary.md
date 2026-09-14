@@ -105,6 +105,10 @@ project-bearing candidate revisions therefore remain stable across producer
 contract upgrades; removing a project is an explicit new revision of the same
 stable candidate identity.
 
+Meeting producers may subsequently enrich either shape as version 4 with
+bounded source basenames and extracts. Its revision includes that evidence;
+the stable candidate identity does not. See ADR 0032.
+
 Foxhound advances a stream cursor only in the same transaction that stores all
 candidate changes and the page receipt. An exact page replay is accepted
 without rewriting state. A gap, unreceipted overlap, altered reuse of a cursor

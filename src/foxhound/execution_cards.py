@@ -24,6 +24,7 @@ from .agent_profiles import (
     load_registry,
 )
 from .candidate_inbox import CandidateInbox, InboxError, SCHEMA_VERSION
+from .contracts.task_candidate import ContractError, parse_task_candidate
 from .source_policy import source_kinds_accepting
 from .task_execution import (
     ExecutionOutcome,
@@ -144,6 +145,9 @@ class ExecutionReviewCard:
     origin_item: str = field(default="", repr=False)
     task_work_directory: str = field(default="", repr=False)
     task_kb_file: str = field(default="", repr=False)
+    origin_sources: tuple["CardSourceEvidence", ...] = field(
+        default=(), repr=False
+    )
     outcome: ExecutionOutcome | None = None
 
 
@@ -1196,7 +1200,13 @@ class ExecutionCardService:
             "(SELECT o.source_item_id FROM task_candidate_bindings AS b "
             " JOIN candidate_inbox AS o ON o.candidate_id=b.candidate_id "
             " WHERE b.task_id=c.task_id AND b.relation='accepted') "
-            " AS origin_item "
+            " AS origin_item,"
+            "(SELECT h.payload_json FROM task_candidate_bindings AS b "
+            " JOIN candidate_revision_history AS h "
+            " ON h.candidate_id=b.candidate_id "
+            " AND h.source_revision=b.source_revision "
+            " WHERE b.task_id=c.task_id AND b.relation='accepted') "
+            " AS origin_payload "
             "FROM execution_review_cards AS c "
             "JOIN tasks AS t ON t.id=c.task_id "
             "JOIN task_execution_workflows AS w ON w.task_id=c.task_id "
@@ -1522,6 +1532,7 @@ def _card(
             origin_item=str(row["origin_item"] or ""),
             task_work_directory=str(row["task_work_directory"] or ""),
             task_kb_file=str(row["task_kb_file"] or ""),
+            origin_sources=_stored_origin_sources(row["origin_payload"]),
         )
     except (AgentProfileError, KeyError, TypeError, ValueError) as exc:
         raise TaskLedgerError("execution review card state is invalid") from exc
@@ -1549,6 +1560,28 @@ class CardRecord:
     def structured(self) -> bool:
         return bool(self.requires or self.channel or self.label
                     or self.recipient or self.subject)
+
+
+@dataclass(frozen=True)
+class CardSourceEvidence:
+    """A validated source basename and bounded extract safe to render."""
+
+    name: str
+    role: str
+    extract: str
+
+
+def _stored_origin_sources(value: object) -> tuple[CardSourceEvidence, ...]:
+    if not isinstance(value, str) or not value:
+        return ()
+    try:
+        candidate = parse_task_candidate(json.loads(value))
+    except (json.JSONDecodeError, TypeError, ContractError):
+        return ()
+    return tuple(
+        CardSourceEvidence(source.name, source.role, source.extract)
+        for source in candidate.evidence.sources
+    )
 
 
 def _stored_lines(value: object) -> tuple[str, ...]:
@@ -1606,6 +1639,26 @@ def _origin_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
     is not the same as naming the thing: two issues can share a title, and
     an issue number is what the reader will search for afterwards.
     """
+    if card.origin_sources:
+        kind = card.origin_kind.replace("_", " ").title() or "Source"
+        lines = [
+            f"<b>From:</b> {_escape(kind)}" if html else f"From: {kind}",
+            "<b>Source files and evidence:</b>"
+            if html else "Source files and evidence:",
+        ]
+        for source in card.origin_sources:
+            role = source.role.title()
+            if html:
+                lines.extend((
+                    f"• <code>{_escape(source.name)}</code> — {_escape(role)}",
+                    f"<blockquote>{_escape(source.extract)}</blockquote>",
+                ))
+            else:
+                lines.extend((
+                    f"- {source.name} — {role}",
+                    *("> " + line for line in source.extract.splitlines()),
+                ))
+        return lines
     if not (card.origin_record and card.origin_item):
         return []
     record, item = card.origin_record, card.origin_item

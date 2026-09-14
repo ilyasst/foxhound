@@ -119,8 +119,11 @@ foxhound-native-intake run \
 Activation refuses an unreconciled historical prefix and permanently disables
 the legacy shadow bootstrap for that producer. A run advances one bounded,
 contiguous page in a transaction. New candidate identities create at most one
-task; later revisions update only the accepted open task and increment its
-version, making older cards and workflows stale. Producer task decisions,
+task; later task-content revisions update only the accepted open task and
+increment its version, making older cards and workflows stale. A version-4
+revision that changes only bounded meeting-source provenance advances the
+binding without advancing the task version, so active work is preserved.
+Producer task decisions,
 folded bindings, terminal tasks, gaps, and contradictory state fail closed
 without advancing the intake cursor. Both commands report aggregate metadata
 only. See [ADR 0022](docs/architecture/0022-native-candidate-intake.md).
@@ -132,6 +135,11 @@ open tasks are withheld from cards and execution, while reader-modified or
 already-active tasks are preserved as explicit conflicts. Existing version 1
 and 2 producers retain active generation-zero behavior. See
 [ADR 0023](docs/architecture/0023-candidate-lifecycle.md).
+
+Meeting candidate version 4 carries one to three validated source basenames
+with bounded supporting extracts. Cards render those readable sources instead
+of an opaque record identifier. Versions 1 through 3 remain accepted. See
+[ADR 0032](docs/architecture/0032-readable-task-source-provenance.md).
 
 Meeting, email, Teams, and forge-issue candidates retain their actual source
 kind. A
