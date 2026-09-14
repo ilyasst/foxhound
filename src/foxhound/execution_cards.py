@@ -237,16 +237,26 @@ class ExecutionCardService:
                     " WHERE active.task_id=w.task_id AND active.status IN "
                     " ('pending','delivering','delivered')"
                     ") AND ("
-                    " w.status='awaiting_start' OR "
-                    " (w.status='snoozed' AND w.due_at<=?) OR "
+                    " ((w.status='awaiting_start' OR "
+                    "   (w.status='snoozed' AND w.due_at<=? "
+                    "    AND w.last_result_id IS NULL)) "
+                    "  AND NOT EXISTS("
+                    "   SELECT 1 FROM task_execution_workflows AS busy "
+                    "   WHERE busy.status IN "
+                    "   ('queued','running','awaiting_review')"
+                    "  )) OR "
+                    " (w.status='snoozed' AND w.due_at<=? "
+                    "  AND w.last_result_id IS NOT NULL) OR "
                     " (w.status='awaiting_review' AND w.phase='plan' "
                     "  AND r.outcome='awaiting_plan') OR "
                     " (w.status='awaiting_review' AND w.phase='execute' "
                     "  AND r.outcome='awaiting_external') OR "
                     " (w.status IN ('awaiting_review','completed') "
                     "  AND r.outcome IN ('completed','declined','ineligible'))"
-                    ") ORDER BY w.updated_at,w.task_id LIMIT ?",
-                    (now, limit),
+                    ") ORDER BY CASE WHEN w.status='awaiting_start' OR "
+                    "(w.status='snoozed' AND w.last_result_id IS NULL) "
+                    "THEN 1 ELSE 0 END,w.updated_at,w.task_id LIMIT ?",
+                    (now, now, limit),
                 ).fetchall()
                 for row in rows:
                     kind = _kind_for_workflow(row)
