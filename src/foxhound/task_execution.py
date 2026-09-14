@@ -67,6 +67,17 @@ MAX_SUMMARY_CHARS = 1_200
 MAX_WORK_MARKDOWN_CHARS = 131_072
 MAX_COLLECTION_ITEMS = 20
 MAX_QUESTION_CHARS = 1_000
+
+# Match the retired GW scheduler's two independent bounds.  Work consumes
+# fleet capacity; a workflow waiting for a reader consumes attention instead.
+# Conflating the two lets one unanswered card stop agents, while leaving work
+# unbounded lets a scheduling pass queue an arbitrary backlog.
+WORK_IN_PROGRESS_CAP = 5
+AWAITING_READER_CAP = 20
+WORKING_STATUSES = frozenset({"queued", "running"})
+READER_WAITING_STATUSES = frozenset({
+    "awaiting_start", "awaiting_review", "completed",
+})
 MAX_ACTION_CHARS = 4_000
 MAX_DELIVERABLE_CHARS = 16_000
 
@@ -300,7 +311,13 @@ class TaskExecutionService:
         CandidateInbox(self.database_path, clock=self._clock).initialize()
 
     def schedule_new(self, *, limit: int = 100) -> ExecutionScheduleResult:
-        """Create Start-gated workflows only for never-scheduled open tasks."""
+        """Create bounded workflows only for never-scheduled open tasks.
+
+        Agent work and reader-waiting decisions have separate capacities.  A
+        deployment may therefore keep planning while a card waits, without a
+        single pass filling either queue without bound.  Existing over-cap
+        rows are counted but never rewritten; capacity returns as they drain.
+        """
         if (
             isinstance(limit, bool)
             or not isinstance(limit, int)
@@ -324,6 +341,27 @@ class TaskExecutionService:
                     " AND l.state='withdrawn' AND l.resolution='preserved_open'"
                     ")"
                 ).fetchone()[0])
+                waiting_statuses = tuple(sorted(READER_WAITING_STATUSES))
+                waiting_marks = ",".join("?" for _ in waiting_statuses)
+                capacity = connection.execute(
+                    "SELECT "
+                    "SUM(CASE WHEN w.status='running' OR "
+                    "(w.status='queued' AND (w.next_attempt_at IS NULL OR "
+                    "w.next_attempt_at<=?)) "
+                    "THEN 1 ELSE 0 END) AS working,"
+                    "SUM(CASE WHEN t.status='open' AND "
+                    f"w.status IN ({waiting_marks}) "
+                    "THEN 1 ELSE 0 END) AS waiting "
+                    "FROM task_execution_workflows AS w JOIN tasks AS t "
+                    "ON t.id=w.task_id",
+                    (now, *waiting_statuses),
+                ).fetchone()
+                working_room = max(
+                    0, WORK_IN_PROGRESS_CAP - int(capacity["working"] or 0)
+                )
+                waiting_room = max(
+                    0, AWAITING_READER_CAP - int(capacity["waiting"] or 0)
+                )
                 rows = connection.execute(
                     "SELECT t.id,t.version,("
                     " SELECT o.source_kind FROM task_candidate_bindings AS b "
@@ -339,14 +377,24 @@ class TaskExecutionService:
                     " ON l.candidate_id=blocked.candidate_id "
                     " WHERE blocked.task_id=t.id AND blocked.relation='accepted' "
                     " AND l.state='withdrawn' AND l.resolution='preserved_open'"
-                    ") ORDER BY t.id LIMIT ?",
-                    (limit,),
-                ).fetchall()
+                    ") ORDER BY t.id"
+                )
+                scheduled = 0
                 for row in rows:
+                    if scheduled >= limit:
+                        break
                     task_id = int(row["id"])
                     task_version = int(row["version"])
                     status = _initial_status(
                         row["origin_kind"], self._planning_grants)
+                    if status.value in WORKING_STATUSES:
+                        if working_room == 0:
+                            continue
+                        working_room -= 1
+                    else:
+                        if waiting_room == 0:
+                            continue
+                        waiting_room -= 1
                     profile = self._profile_for(row["origin_kind"])
                     connection.execute(
                         "INSERT INTO task_execution_workflows("
@@ -370,10 +418,11 @@ class TaskExecutionService:
                         status,
                         now,
                     )
+                    scheduled += 1
                 connection.commit()
                 return ExecutionScheduleResult(
-                    scheduled=len(rows),
-                    remaining=eligible - len(rows),
+                    scheduled=scheduled,
+                    remaining=eligible - scheduled,
                 )
             except Exception:
                 connection.rollback()

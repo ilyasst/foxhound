@@ -452,6 +452,34 @@ class ExecutionCardTests(unittest.TestCase):
         )
         self.assertEqual(finished.workflow_status, WorkflowStatus.COMPLETED)
 
+    def test_existing_over_capacity_work_does_not_hide_a_start_card(self):
+        for task_id in range(1, 7):
+            workflow = self._schedule_workflow(task_id)
+            queued = self.execution.start_action(
+                task_id,
+                expected_version=workflow.version,
+                action="start",
+            )
+            self.assertEqual(queued.status, WorkflowStatus.QUEUED)
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "INSERT INTO tasks(id,status,text,owner,due,version,"
+                "created_at,updated_at,closed_at) "
+                "VALUES(7,'open','Synthetic task 7','Person A',NULL,1,?,?,NULL)",
+                (self.clock().isoformat(), self.clock().isoformat()),
+            )
+            connection.commit()
+        self._schedule_workflow(7)
+
+        self.assertEqual(self.cards.schedule(limit=1).created, 1)
+        with closing(sqlite3.connect(self.database)) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT task_id,kind FROM execution_review_cards"
+                ).fetchone(),
+                (7, "start"),
+            )
+
     def test_delivery_retry_expiry_acknowledgement_and_callbacks(self):
         self._schedule_workflow(1)
         self.cards.schedule()
