@@ -29,7 +29,8 @@ The built-in profile and the fictional shared-profile example establish these
 invariants:
 
 - use the worker-reported local date instead of inferring the date from task
-  age or model knowledge;
+  age or model knowledge, resolve `next week` as the subsequent calendar
+  week, and verify weekday/date pairs;
 - stay bounded to the requested objective and include background only when it
   affects a decision, action, or deliverable;
 - inspect evidence before declaring it missing, stop when the result is
