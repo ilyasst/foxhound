@@ -143,6 +143,7 @@ class ExecutionReviewCard:
     origin_kind: str = field(default="", repr=False)
     origin_record: str = field(default="", repr=False)
     origin_item: str = field(default="", repr=False)
+    prior_task_id: int | None = None
     task_work_directory: str = field(default="", repr=False)
     task_kb_file: str = field(default="", repr=False)
     origin_sources: tuple["CardSourceEvidence", ...] = field(
@@ -1201,6 +1202,24 @@ class ExecutionCardService:
             " JOIN candidate_inbox AS o ON o.candidate_id=b.candidate_id "
             " WHERE b.task_id=c.task_id AND b.relation='accepted') "
             " AS origin_item,"
+            # The task that reviewed an earlier state of the same thing.
+            # An identity like `7/<state>` makes each state its own task, so
+            # without this an agent starts from nothing every time a pull
+            # request moves, and a reader cannot tell a second pass from a
+            # duplicate.
+            "(SELECT b2.task_id FROM task_candidate_bindings AS b2 "
+            " JOIN candidate_inbox AS o2 "
+            " ON o2.candidate_id=b2.candidate_id "
+            " JOIN task_candidate_bindings AS b1 "
+            " ON b1.task_id=c.task_id AND b1.relation='accepted' "
+            " JOIN candidate_inbox AS o1 "
+            " ON o1.candidate_id=b1.candidate_id "
+            " WHERE b2.relation='accepted' AND b2.task_id<>c.task_id "
+            " AND o2.source_kind=o1.source_kind "
+            " AND o2.source_record_id=o1.source_record_id "
+            " AND " + _ITEM_STEM.format(column="o2.source_item_id") + "="
+            + _ITEM_STEM.format(column="o1.source_item_id") +
+            " ORDER BY b2.task_id DESC LIMIT 1) AS prior_task_id,"
             "(SELECT h.payload_json FROM task_candidate_bindings AS b "
             " JOIN candidate_revision_history AS h "
             " ON h.candidate_id=b.candidate_id "
@@ -1530,6 +1549,10 @@ def _card(
             origin_kind=str(row["origin_kind"] or ""),
             origin_record=str(row["origin_record"] or ""),
             origin_item=str(row["origin_item"] or ""),
+            prior_task_id=(
+                None if row["prior_task_id"] is None
+                else int(row["prior_task_id"])
+            ),
             task_work_directory=str(row["task_work_directory"] or ""),
             task_kb_file=str(row["task_kb_file"] or ""),
             origin_sources=_stored_origin_sources(row["origin_payload"]),
@@ -1622,14 +1645,46 @@ def _stored_collection(value: object) -> tuple[CardRecord, ...]:
     return tuple(records)
 
 
+#: The part of an identifier before its state, if it has one. A review
+#: task is `7/<state>`; an issue is just `42`. Written once because it has
+#: to mean the same thing on both sides of a comparison.
+_ITEM_STEM = (
+    "(CASE WHEN instr({column},'/')>0 "
+    "THEN substr({column},1,instr({column},'/')-1) ELSE {column} END)"
+)
+
 #: Only a forge we know how to address. An origin we cannot build a link
 #: for is still named, just not linked — a wrong link is worse than none.
 _LINKABLE_HOSTS = ("github.com",)
+
+#: Where a forge keeps each kind. A review request is a pull request, and
+#: linking one to /issues/ would open the wrong page.
+_ORIGIN_PATHS = {"issue": "issues", "review_request": "pull"}
 
 #: Which sources name something a reader can open. Declared once, beside
 #: the authority each source is granted, rather than compared by name at
 #: each place a card is built.
 ADDRESSABLE_ORIGINS = source_kinds_accepting("addressable_origin")
+
+
+def _continues_lines(
+    card: ExecutionReviewCard, *, html: bool
+) -> list[str]:
+    """Name the task that looked at an earlier state of the same thing.
+
+    Some sources are identified by state as well as by thing, because
+    looking at a pull request as it stood on Monday and as it stands on
+    Thursday are two jobs. Without naming the first, an agent starts from
+    nothing each time, and a reader cannot tell a second pass from a
+    duplicate card.
+
+    There are two heading builders, so this lives in one place rather than
+    being written twice and drifting.
+    """
+    if card.prior_task_id is None:
+        return []
+    shown = f"Continues T{card.prior_task_id}"
+    return [f"↩ <b>{shown}</b>" if html else f"↩ {shown}"]
 
 
 def _origin_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
@@ -1666,11 +1721,14 @@ def _origin_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
         return [f"<b>From:</b> {_escape(record)}" if html
                 else f"From: {record}"]
     name = record.rsplit("/", 1)[-1]
-    shown = f"{name} #{item}"
+    # An identity may name a state — `7/<when>` — but a reader wants the
+    # thing. The state belongs in the continuation line, not here.
+    number = item.split("/", 1)[0]
+    shown = f"{name} #{number}"
     if not html or not record.startswith(_LINKABLE_HOSTS):
         return [f"<b>From:</b> {_escape(shown)}" if html
                 else f"From: {shown}"]
-    url = f"https://{record}/issues/{item}"
+    url = f"https://{record}/{_ORIGIN_PATHS.get(card.origin_kind, 'issues')}/{number}"
     return [f'<b>From:</b> <a href="{_escape(url)}">{_escape(shown)}</a>']
 
 
@@ -1708,6 +1766,7 @@ def _start_card_lines(
             if html else f"🕑 Last mentioned: {last}"
         )
     lines.extend(_origin_lines(card, html=html))
+    lines.extend(_continues_lines(card, html=html))
     explanation = "No agent has looked at this yet. "
     explanation += (
         "<b>Continue</b> starts the investigation."
@@ -1755,6 +1814,7 @@ def _heading_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
         revised = f"Revision {card.revisions}"
         lines.append(f"<b>{revised}</b>" if html else revised)
     lines.extend(_origin_lines(card, html=html))
+    lines.extend(_continues_lines(card, html=html))
     return lines
 
 

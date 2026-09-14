@@ -1149,6 +1149,55 @@ class ExecutionCardTests(unittest.TestCase):
             with self.subTest(kind=kind):
                 self.assertNotIn(kind, ADDRESSABLE_ORIGINS)
 
+    def test_a_second_look_names_what_it_continues(self):
+        """A pull request reviewed twice is two tasks, because reviewing it
+        at one state and at a later one are two jobs. Without naming the
+        first, an agent starts from nothing every time it moves, and a
+        reader cannot tell a second pass from a duplicate card.
+        """
+        def bind(task_id, candidate_id, item_id):
+            with closing(sqlite3.connect(self.database)) as connection:
+                connection.execute(
+                    "INSERT INTO candidate_inbox(candidate_id,source_system,"
+                    "source_kind,source_record_id,source_item_id,"
+                    "source_revision,payload_json,created_at,"
+                    "first_imported_at,updated_at) "
+                    "VALUES(?,'gw','review_request',"
+                    "'forge.example/acme/widget',?,?,'{}',"
+                    "'2030-01-01T00:00:00Z','2030-01-01T00:00:00Z',"
+                    "'2030-01-01T00:00:00Z')",
+                    (candidate_id, item_id, "b" * 64))
+                connection.execute(
+                    "INSERT INTO task_candidate_bindings(candidate_id,"
+                    "source_revision,task_id,relation,decided_at) "
+                    "VALUES(?,?,?,'accepted','2030-01-01T00:00:00Z')",
+                    (candidate_id, "b" * 64, task_id))
+                connection.commit()
+
+        # Two states of pull request 7, and one of a different pull request
+        # in the same repository, which must not be mistaken for a prior.
+        bind(4, "cand-first", "7/2030-01-02T10:00:00Z")
+        bind(6, "cand-other", "9/2030-01-02T10:00:00Z")
+        bind(5, "cand-second", "7/2030-01-03T09:00:00Z")
+
+        self._schedule_workflow(5)
+        self.assertEqual(self.cards.schedule().created, 1)
+        card = self.cards.claim_next().card
+
+        self.assertEqual(card.prior_task_id, 4)
+        body, _keyboard = render_execution_review_card(card)
+        self.assertIn("Continues T4", body)
+
+    def test_a_first_look_continues_nothing(self):
+        # An ordinary state, and it must not be reported as a second pass.
+        task_id = 6
+        self._schedule_workflow(task_id)
+        self.assertEqual(self.cards.schedule().created, 1)
+        card = self.cards.claim_next().card
+        self.assertIsNone(card.prior_task_id)
+        body, _keyboard = render_execution_review_card(card)
+        self.assertNotIn("Continues", body)
+
     def test_an_unlinkable_origin_is_still_named(self):
         # A meeting record has no address a reader can open. Naming it is
         # still better than silence, and a wrong link is worse than none.
