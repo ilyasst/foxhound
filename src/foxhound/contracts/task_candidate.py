@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Mapping
 
-from foxhound.source_policy import source_kinds_accepting
+from foxhound.source_policy import provenance_roles_for, source_kinds_accepting
 
 
 SCHEMA_ID = "foxhound.task-candidate"
@@ -25,6 +25,7 @@ LIFECYCLE_SCHEMA_VERSION = 3
 PROVENANCE_SCHEMA_VERSION = 4
 OWNER_SCHEMA_VERSION = 5
 OWNER_PROVENANCE_SCHEMA_VERSION = 6
+CUMULATIVE_SCHEMA_VERSION = 7
 SUPPORTED_SCHEMA_VERSIONS = frozenset({
     SCHEMA_VERSION,
     PROJECTLESS_SCHEMA_VERSION,
@@ -32,6 +33,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset({
     PROVENANCE_SCHEMA_VERSION,
     OWNER_SCHEMA_VERSION,
     OWNER_PROVENANCE_SCHEMA_VERSION,
+    CUMULATIVE_SCHEMA_VERSION,
 })
 LIFECYCLE_STATES = frozenset({"active", "withdrawn"})
 SOURCE_SYSTEMS = frozenset({"gw"})
@@ -60,7 +62,6 @@ SOURCE_KINDS = source_kinds_accepting("accepts_candidates")
 _OPAQUE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$")
 _REVISION_RE = re.compile(r"^[0-9a-f]{64}$")
 _CANDIDATE_ID_RE = re.compile(r"^tc_[0-9a-f]{64}$")
-_SOURCE_ROLES = frozenset({"handoff", "protocol", "transcript"})
 OWNER_KINDS = frozenset({"person", "unresolved", "external", "group"})
 UNRESOLVED_OWNER_DISPLAY = "(unassigned)"
 _SPEAKER_ID_RE = re.compile(r"^SPK_\d+$")
@@ -147,6 +148,7 @@ def task_candidate_document(candidate: TaskCandidate) -> dict[str, Any]:
     if candidate.schema_version == SCHEMA_VERSION or (
         candidate.schema_version in {
             PROVENANCE_SCHEMA_VERSION, OWNER_PROVENANCE_SCHEMA_VERSION,
+            CUMULATIVE_SCHEMA_VERSION,
         }
         and candidate.task.project is not None
     ) or (
@@ -156,6 +158,7 @@ def task_candidate_document(candidate: TaskCandidate) -> dict[str, Any]:
         task["project"] = candidate.task.project
     if candidate.schema_version in {
         OWNER_SCHEMA_VERSION, OWNER_PROVENANCE_SCHEMA_VERSION,
+        CUMULATIVE_SCHEMA_VERSION,
     }:
         owner_ref = candidate.task.owner_ref
         task["owner_ref"] = None if owner_ref is None else {
@@ -186,7 +189,10 @@ def task_candidate_document(candidate: TaskCandidate) -> dict[str, Any]:
     }
     if candidate.schema_version in {
         PROVENANCE_SCHEMA_VERSION, OWNER_PROVENANCE_SCHEMA_VERSION,
-    }:
+    } or (
+        candidate.schema_version == CUMULATIVE_SCHEMA_VERSION
+        and candidate.evidence.sources
+    ):
         document["evidence"]["sources"] = [
             {
                 "name": source.name,
@@ -195,7 +201,9 @@ def task_candidate_document(candidate: TaskCandidate) -> dict[str, Any]:
             }
             for source in candidate.evidence.sources
         ]
-    if candidate.schema_version == LIFECYCLE_SCHEMA_VERSION:
+    if candidate.schema_version in {
+        LIFECYCLE_SCHEMA_VERSION, CUMULATIVE_SCHEMA_VERSION,
+    }:
         document["lifecycle"] = {
             "state": candidate.lifecycle.state,
             "generation": candidate.lifecycle.generation,
@@ -240,7 +248,9 @@ def parse_task_candidate(document: object) -> TaskCandidate:
     _exact_fields(
         root,
         "candidate",
-        base_fields | ({"lifecycle"} if version == LIFECYCLE_SCHEMA_VERSION else set()),
+        base_fields | ({"lifecycle"} if version in {
+            LIFECYCLE_SCHEMA_VERSION, CUMULATIVE_SCHEMA_VERSION,
+        } else set()),
     )
 
     source_doc = _object(root["source"], "candidate.source")
@@ -277,9 +287,13 @@ def parse_task_candidate(document: object) -> TaskCandidate:
         PROVENANCE_SCHEMA_VERSION,
         OWNER_SCHEMA_VERSION,
         OWNER_PROVENANCE_SCHEMA_VERSION,
+        CUMULATIVE_SCHEMA_VERSION,
     }:
         allowed = base_task_fields | {"project"}
-        if version in {OWNER_SCHEMA_VERSION, OWNER_PROVENANCE_SCHEMA_VERSION}:
+        if version in {
+            OWNER_SCHEMA_VERSION, OWNER_PROVENANCE_SCHEMA_VERSION,
+            CUMULATIVE_SCHEMA_VERSION,
+        }:
             allowed.add("owner_ref")
         _required_and_allowed_fields(
             task_doc,
@@ -288,6 +302,7 @@ def parse_task_candidate(document: object) -> TaskCandidate:
                 {"owner_ref"}
                 if version in {
                     OWNER_SCHEMA_VERSION, OWNER_PROVENANCE_SCHEMA_VERSION,
+                    CUMULATIVE_SCHEMA_VERSION,
                 }
                 else set()
             ),
@@ -303,7 +318,10 @@ def parse_task_candidate(document: object) -> TaskCandidate:
     owner = _optional_text(task_doc["owner"], "candidate.task.owner", 200)
     owner_ref = (
         _owner_ref(task_doc["owner_ref"], owner, source_kind=source.kind)
-        if version in {OWNER_SCHEMA_VERSION, OWNER_PROVENANCE_SCHEMA_VERSION}
+        if version in {
+            OWNER_SCHEMA_VERSION, OWNER_PROVENANCE_SCHEMA_VERSION,
+            CUMULATIVE_SCHEMA_VERSION,
+        }
         else None
     )
     task = CandidateTask(
@@ -317,6 +335,7 @@ def parse_task_candidate(document: object) -> TaskCandidate:
                     PROVENANCE_SCHEMA_VERSION,
                     OWNER_SCHEMA_VERSION,
                     OWNER_PROVENANCE_SCHEMA_VERSION,
+                    CUMULATIVE_SCHEMA_VERSION,
                 }
                 and "project" in task_doc
             ) else None
@@ -330,9 +349,17 @@ def parse_task_candidate(document: object) -> TaskCandidate:
     evidence_fields = {"document_id", "locator"}
     if version in {
         PROVENANCE_SCHEMA_VERSION, OWNER_PROVENANCE_SCHEMA_VERSION,
-    }:
+    } or (version == CUMULATIVE_SCHEMA_VERSION and "sources" in evidence_doc):
         evidence_fields.add("sources")
-    _exact_fields(evidence_doc, "candidate.evidence", evidence_fields)
+    if version == CUMULATIVE_SCHEMA_VERSION:
+        _required_and_allowed_fields(
+            evidence_doc,
+            "candidate.evidence",
+            {"document_id", "locator"},
+            {"document_id", "locator", "sources"},
+        )
+    else:
+        _exact_fields(evidence_doc, "candidate.evidence", evidence_fields)
     sources: tuple[CandidateEvidenceSource, ...] = ()
     if version in {
         PROVENANCE_SCHEMA_VERSION, OWNER_PROVENANCE_SCHEMA_VERSION,
@@ -341,7 +368,13 @@ def parse_task_candidate(document: object) -> TaskCandidate:
             raise ContractError(
                 "candidate.source.kind is unsupported for provenance"
             )
-        sources = _evidence_sources(evidence_doc["sources"])
+        sources = _evidence_sources(
+            evidence_doc["sources"], provenance_roles_for("meeting")
+        )
+    elif version == CUMULATIVE_SCHEMA_VERSION and "sources" in evidence_doc:
+        sources = _evidence_sources(
+            evidence_doc["sources"], provenance_roles_for(source.kind)
+        )
     evidence = CandidateEvidence(
         document_id=_opaque_id(
             evidence_doc["document_id"], "candidate.evidence.document_id"),
@@ -352,7 +385,7 @@ def parse_task_candidate(document: object) -> TaskCandidate:
 
     created_at = _aware_timestamp(root["created_at"], "candidate.created_at")
     lifecycle = CandidateLifecycle("active", 0, None)
-    if version == LIFECYCLE_SCHEMA_VERSION:
+    if version in {LIFECYCLE_SCHEMA_VERSION, CUMULATIVE_SCHEMA_VERSION}:
         lifecycle_doc = _object(root["lifecycle"], "candidate.lifecycle")
         _exact_fields(
             lifecycle_doc,
@@ -416,7 +449,9 @@ def _required_and_allowed_fields(
         raise ContractError(f"{field} contains additional fields")
 
 
-def _evidence_sources(value: object) -> tuple[CandidateEvidenceSource, ...]:
+def _evidence_sources(
+    value: object, allowed_roles: frozenset[str]
+) -> tuple[CandidateEvidenceSource, ...]:
     if not isinstance(value, list) or not 1 <= len(value) <= MAX_EVIDENCE_SOURCES:
         raise ContractError("candidate.evidence.sources has invalid length")
     sources = []
@@ -434,7 +469,7 @@ def _evidence_sources(value: object) -> tuple[CandidateEvidenceSource, ...]:
         role = _choice(
             source["role"],
             "candidate.evidence.sources entry.role",
-            _SOURCE_ROLES,
+            allowed_roles,
         )
         extract = _bounded_excerpt(
             source["extract"],

@@ -25,9 +25,13 @@ from .agent_profiles import (
     load_registry,
 )
 from .candidate_inbox import CandidateInbox, InboxError, SCHEMA_VERSION
+from .card_provenance import (
+    ADDRESSABLE_ORIGINS,
+    CardSourceEvidence,
+    origin_lines as shared_origin_lines,
+    stored_origin_sources,
+)
 from .knowledge_client import KnowledgeClientError, OwnerUpcomingMeeting
-from .contracts.task_candidate import ContractError, parse_task_candidate
-from .source_policy import source_kinds_accepting
 from .task_execution import (
     ExecutionOutcome,
     REVIEW_SNOOZE_INTERVALS,
@@ -1853,7 +1857,7 @@ def _card(
             ),
             task_work_directory=str(row["task_work_directory"] or ""),
             task_kb_file=str(row["task_kb_file"] or ""),
-            origin_sources=_stored_origin_sources(row["origin_payload"]),
+            origin_sources=stored_origin_sources(row["origin_payload"]),
         )
     except (AgentProfileError, KeyError, TypeError, ValueError) as exc:
         raise TaskLedgerError("execution review card state is invalid") from exc
@@ -2059,28 +2063,6 @@ class CardRecord:
                     or self.recipient or self.subject)
 
 
-@dataclass(frozen=True)
-class CardSourceEvidence:
-    """A validated source basename and bounded extract safe to render."""
-
-    name: str
-    role: str
-    extract: str
-
-
-def _stored_origin_sources(value: object) -> tuple[CardSourceEvidence, ...]:
-    if not isinstance(value, str) or not value:
-        return ()
-    try:
-        candidate = parse_task_candidate(json.loads(value))
-    except (json.JSONDecodeError, TypeError, ContractError):
-        return ()
-    return tuple(
-        CardSourceEvidence(source.name, source.role, source.extract)
-        for source in candidate.evidence.sources
-    )
-
-
 def _stored_lines(value: object) -> tuple[str, ...]:
     """Questions are prose, so a record is flattened back to its sentence."""
     return tuple(record.text for record in _stored_collection(value))
@@ -2127,20 +2109,6 @@ _ITEM_STEM = (
     "THEN substr({column},1,instr({column},'/')-1) ELSE {column} END)"
 )
 
-#: Only a forge we know how to address. An origin we cannot build a link
-#: for is still named, just not linked — a wrong link is worse than none.
-_LINKABLE_HOSTS = ("github.com",)
-
-#: Where a forge keeps each kind. A review request is a pull request, and
-#: linking one to /issues/ would open the wrong page.
-_ORIGIN_PATHS = {"issue": "issues", "review_request": "pull"}
-
-#: Which sources name something a reader can open. Declared once, beside
-#: the authority each source is granted, rather than compared by name at
-#: each place a card is built.
-ADDRESSABLE_ORIGINS = source_kinds_accepting("addressable_origin")
-
-
 def _continues_lines(
     card: ExecutionReviewCard, *, html: bool
 ) -> list[str]:
@@ -2168,42 +2136,13 @@ def _origin_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
     is not the same as naming the thing: two issues can share a title, and
     an issue number is what the reader will search for afterwards.
     """
-    if card.origin_sources:
-        kind = card.origin_kind.replace("_", " ").title() or "Source"
-        lines = [
-            f"<b>From:</b> {_escape(kind)}" if html else f"From: {kind}",
-            "<b>Source files and evidence:</b>"
-            if html else "Source files and evidence:",
-        ]
-        for source in card.origin_sources:
-            role = source.role.title()
-            if html:
-                lines.extend((
-                    f"• <code>{_escape(source.name)}</code> — {_escape(role)}",
-                    f"<blockquote>{_escape(source.extract)}</blockquote>",
-                ))
-            else:
-                lines.extend((
-                    f"- {source.name} — {role}",
-                    *("> " + line for line in source.extract.splitlines()),
-                ))
-        return lines
-    if not (card.origin_record and card.origin_item):
-        return []
-    record, item = card.origin_record, card.origin_item
-    if card.origin_kind not in ADDRESSABLE_ORIGINS or "/" not in record:
-        return [f"<b>From:</b> {_escape(record)}" if html
-                else f"From: {record}"]
-    name = record.rsplit("/", 1)[-1]
-    # An identity may name a state — `7/<when>` — but a reader wants the
-    # thing. The state belongs in the continuation line, not here.
-    number = item.split("/", 1)[0]
-    shown = f"{name} #{number}"
-    if not html or not record.startswith(_LINKABLE_HOSTS):
-        return [f"<b>From:</b> {_escape(shown)}" if html
-                else f"From: {shown}"]
-    url = f"https://{record}/{_ORIGIN_PATHS.get(card.origin_kind, 'issues')}/{number}"
-    return [f'<b>From:</b> <a href="{_escape(url)}">{_escape(shown)}</a>']
+    return shared_origin_lines(
+        kind=card.origin_kind,
+        record=card.origin_record,
+        item=card.origin_item,
+        sources=card.origin_sources,
+        html_output=html,
+    )
 
 
 def _card_date(value: str | None) -> str:
