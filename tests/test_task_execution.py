@@ -221,7 +221,7 @@ class TaskExecutionTests(unittest.TestCase):
         CandidateInbox(self.database, clock=self.clock).initialize()
 
         after = self.service.get(1)
-        self.assertEqual(SCHEMA_VERSION, 14)
+        self.assertEqual(SCHEMA_VERSION, 15)
         self.assertEqual(
             (after.status, after.phase, after.version, after.task_version),
             (before.status, before.phase, before.version, before.task_version),

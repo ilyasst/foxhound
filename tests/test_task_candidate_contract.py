@@ -49,6 +49,46 @@ class TaskCandidateContractTests(unittest.TestCase):
         self.assertIsNone(candidate.task.project)
         self.assertEqual(task_candidate_document(candidate), document)
 
+    def test_version_3_distinguishes_active_from_withdrawn(self):
+        for state in ("active", "withdrawn"):
+            document = fixture("meeting-candidate-v2.json")
+            document["schema_version"] = 3
+            document["lifecycle"] = {
+                "state": state,
+                "generation": 7,
+                "changed_at": "2030-02-01T12:00:00Z",
+            }
+
+            candidate = parse_task_candidate(document)
+
+            self.assertEqual(candidate.lifecycle.state, state)
+            self.assertEqual(candidate.lifecycle.generation, 7)
+            self.assertEqual(task_candidate_document(candidate), document)
+
+    def test_version_3_lifecycle_is_strict(self):
+        document = fixture("meeting-candidate-v2.json")
+        document["schema_version"] = 3
+        document["lifecycle"] = {
+            "state": "withdrawn",
+            "generation": 1,
+            "changed_at": "2030-02-01T12:00:00Z",
+        }
+        for field, value in (
+            ("state", "unknown"),
+            ("generation", 0),
+            ("generation", True),
+            ("changed_at", "2030-02-01T12:00:00"),
+        ):
+            changed = copy.deepcopy(document)
+            changed["lifecycle"][field] = value
+            with self.assertRaises(ContractError):
+                parse_task_candidate(changed)
+
+        older = fixture("meeting-candidate-v2.json")
+        older["lifecycle"] = copy.deepcopy(document["lifecycle"])
+        with self.assertRaisesRegex(ContractError, "additional fields"):
+            parse_task_candidate(older)
+
     def test_accepts_and_round_trips_a_synthetic_legacy_candidate(self):
         document = fixture("meeting-candidate-v1.json")
         document["source"].update({
@@ -173,6 +213,17 @@ class TaskCandidateContractTests(unittest.TestCase):
             version_2["properties"]["task"]["additionalProperties"]
         )
         self.assertNotIn("project", version_2["properties"]["task"]["properties"])
+        version_3 = json.loads(
+            schema_path.with_name("task-candidate-v3.schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(version_3["properties"]["schema_version"]["const"], 3)
+        self.assertEqual(
+            set(version_3["properties"]["lifecycle"]["properties"]["state"]["enum"]),
+            {"active", "withdrawn"},
+        )
+        self.assertFalse(version_3["additionalProperties"])
         expected_kinds = {"meeting", "email", "teams", "issue", "legacy"}
         self.assertEqual(
             set(schema["properties"]["source"]["properties"]["kind"]["enum"]),
@@ -180,6 +231,10 @@ class TaskCandidateContractTests(unittest.TestCase):
         )
         self.assertEqual(
             set(version_2["properties"]["source"]["properties"]["kind"]["enum"]),
+            expected_kinds,
+        )
+        self.assertEqual(
+            set(version_3["properties"]["source"]["properties"]["kind"]["enum"]),
             expected_kinds,
         )
 

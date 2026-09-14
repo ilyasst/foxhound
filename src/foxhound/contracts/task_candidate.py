@@ -21,10 +21,13 @@ from foxhound.source_policy import source_kinds_accepting
 SCHEMA_ID = "foxhound.task-candidate"
 SCHEMA_VERSION = 1
 PROJECTLESS_SCHEMA_VERSION = 2
+LIFECYCLE_SCHEMA_VERSION = 3
 SUPPORTED_SCHEMA_VERSIONS = frozenset({
     SCHEMA_VERSION,
     PROJECTLESS_SCHEMA_VERSION,
+    LIFECYCLE_SCHEMA_VERSION,
 })
+LIFECYCLE_STATES = frozenset({"active", "withdrawn"})
 SOURCE_SYSTEMS = frozenset({"gw"})
 #: ``issue`` is a forge issue nominated for work. Its ``record_id`` is the
 #: repository's canonical locator and its ``item_id`` the issue number, so the
@@ -81,12 +84,20 @@ class CandidateEvidence:
 
 
 @dataclass(frozen=True)
+class CandidateLifecycle:
+    state: str
+    generation: int
+    changed_at: str | None
+
+
+@dataclass(frozen=True)
 class TaskCandidate:
     candidate_id: str
     source: CandidateSource
     task: CandidateTask
     evidence: CandidateEvidence
     created_at: str
+    lifecycle: CandidateLifecycle = CandidateLifecycle("active", 0, None)
     schema: str = SCHEMA_ID
     schema_version: int = SCHEMA_VERSION
 
@@ -100,7 +111,7 @@ def task_candidate_document(candidate: TaskCandidate) -> dict[str, Any]:
     }
     if candidate.schema_version == SCHEMA_VERSION:
         task["project"] = candidate.task.project
-    return {
+    document = {
         "schema": candidate.schema,
         "schema_version": candidate.schema_version,
         "candidate_id": candidate.candidate_id,
@@ -118,6 +129,13 @@ def task_candidate_document(candidate: TaskCandidate) -> dict[str, Any]:
         },
         "created_at": candidate.created_at,
     }
+    if candidate.schema_version == LIFECYCLE_SCHEMA_VERSION:
+        document["lifecycle"] = {
+            "state": candidate.lifecycle.state,
+            "generation": candidate.lifecycle.generation,
+            "changed_at": candidate.lifecycle.changed_at,
+        }
+    return document
 
 
 def candidate_id_for(*, system: str, kind: str, record_id: str,
@@ -141,18 +159,23 @@ def parse_task_candidate(document: object) -> TaskCandidate:
     Unknown versions, missing fields, and additional fields fail closed.
     """
     root = _object(document, "candidate")
-    _exact_fields(
-        root,
-        "candidate",
-        {"schema", "schema_version", "candidate_id", "source", "task",
-         "evidence", "created_at"},
-    )
+    base_fields = {
+        "schema", "schema_version", "candidate_id", "source", "task",
+        "evidence", "created_at",
+    }
+    if {"schema", "schema_version"} - set(root):
+        raise ContractError("candidate is missing required fields")
     if root["schema"] != SCHEMA_ID:
         raise ContractError("candidate.schema is unsupported")
     version = root["schema_version"]
     if (isinstance(version, bool)
             or version not in SUPPORTED_SCHEMA_VERSIONS):
         raise ContractError("candidate.schema_version is unsupported")
+    _exact_fields(
+        root,
+        "candidate",
+        base_fields | ({"lifecycle"} if version == LIFECYCLE_SCHEMA_VERSION else set()),
+    )
 
     source_doc = _object(root["source"], "candidate.source")
     _exact_fields(
@@ -212,12 +235,39 @@ def parse_task_candidate(document: object) -> TaskCandidate:
     )
 
     created_at = _aware_timestamp(root["created_at"], "candidate.created_at")
+    lifecycle = CandidateLifecycle("active", 0, None)
+    if version == LIFECYCLE_SCHEMA_VERSION:
+        lifecycle_doc = _object(root["lifecycle"], "candidate.lifecycle")
+        _exact_fields(
+            lifecycle_doc,
+            "candidate.lifecycle",
+            {"state", "generation", "changed_at"},
+        )
+        state = _choice(
+            lifecycle_doc["state"],
+            "candidate.lifecycle.state",
+            LIFECYCLE_STATES,
+        )
+        generation = lifecycle_doc["generation"]
+        if (
+            isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or not 1 <= generation <= 9_223_372_036_854_775_807
+        ):
+            raise ContractError(
+                "candidate.lifecycle.generation must be a positive integer"
+            )
+        changed_at = _aware_timestamp(
+            lifecycle_doc["changed_at"], "candidate.lifecycle.changed_at"
+        )
+        lifecycle = CandidateLifecycle(state, generation, changed_at)
     return TaskCandidate(
         candidate_id=candidate_id,
         source=source,
         task=task,
         evidence=evidence,
         created_at=created_at,
+        lifecycle=lifecycle,
         schema_version=version,
     )
 

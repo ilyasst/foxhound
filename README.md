@@ -125,6 +125,14 @@ folded bindings, terminal tasks, gaps, and contradictory state fail closed
 without advancing the intake cursor. Both commands report aggregate metadata
 only. See [ADR 0022](docs/architecture/0022-native-candidate-intake.md).
 
+Lifecycle-aware candidate version 3 distinguishes an action revision from an
+explicit evidence withdrawal and orders each identity with a monotonic
+generation. Withdrawal never completes or deletes a Foxhound task: untouched
+open tasks are withheld from cards and execution, while reader-modified or
+already-active tasks are preserved as explicit conflicts. Existing version 1
+and 2 producers retain active generation-zero behavior. See
+[ADR 0023](docs/architecture/0023-candidate-lifecycle.md).
+
 Meeting, email, Teams, and forge-issue candidates retain their actual source
 kind. A
 bounded authority cutover may additionally use the explicit `legacy` kind for

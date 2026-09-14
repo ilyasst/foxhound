@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -330,6 +330,29 @@ _SCHEMA_COLUMNS = {
         "to_owner",
         "occurred_at",
     ),
+    "candidate_lifecycle": (
+        "candidate_id",
+        "source_revision",
+        "state",
+        "generation",
+        "changed_at",
+        "updated_at",
+    ),
+    "task_candidate_lifecycle": (
+        "candidate_id",
+        "source_revision",
+        "task_version",
+        "state",
+        "resolution",
+        "changed_at",
+        "decided_at",
+    ),
+}
+
+_SCHEMA_V14_COLUMNS = {
+    name: columns
+    for name, columns in _SCHEMA_COLUMNS.items()
+    if name not in {"candidate_lifecycle", "task_candidate_lifecycle"}
 }
 
 _SCHEMA_V11_COLUMNS = {
@@ -338,7 +361,7 @@ _SCHEMA_V11_COLUMNS = {
         for column in columns
         if column not in {"agent_profile_id", "agent_profile_revision"}
     )
-    for name, columns in _SCHEMA_COLUMNS.items()
+    for name, columns in _SCHEMA_V14_COLUMNS.items()
 }
 
 _SCHEMA_OBJECTS = {
@@ -1329,6 +1352,102 @@ FROM task_owner_equivalences_v13;
     _SCHEMA_V6[2],
 )
 
+_SCHEMA_V15 = (
+    """
+CREATE TABLE IF NOT EXISTS candidate_lifecycle (
+    candidate_id    TEXT PRIMARY KEY,
+    source_revision TEXT NOT NULL,
+    state           TEXT NOT NULL CHECK(state IN ('active','withdrawn')),
+    generation      INTEGER NOT NULL CHECK(generation >= 0),
+    changed_at      TEXT,
+    updated_at      TEXT NOT NULL,
+    FOREIGN KEY(candidate_id, source_revision)
+        REFERENCES candidate_revision_history(candidate_id, source_revision)
+);
+""",
+    """
+INSERT OR IGNORE INTO candidate_lifecycle(
+    candidate_id,source_revision,state,generation,changed_at,updated_at
+)
+SELECT candidate_id,source_revision,'active',0,NULL,updated_at
+FROM candidate_inbox;
+""",
+    """
+CREATE TABLE IF NOT EXISTS task_candidate_lifecycle (
+    candidate_id    TEXT PRIMARY KEY,
+    source_revision TEXT NOT NULL,
+    task_version    INTEGER NOT NULL CHECK(task_version >= 1),
+    state           TEXT NOT NULL CHECK(state IN ('active','withdrawn')),
+    resolution      TEXT NOT NULL CHECK(
+                        resolution IN (
+                            'current','preserved_open','reader_conflict'
+                        )
+                    ),
+    changed_at      TEXT,
+    decided_at      TEXT NOT NULL,
+    FOREIGN KEY(candidate_id) REFERENCES task_candidate_bindings(candidate_id),
+    FOREIGN KEY(candidate_id, source_revision)
+        REFERENCES candidate_revision_history(candidate_id, source_revision)
+);
+""",
+    """
+INSERT OR IGNORE INTO task_candidate_lifecycle(
+    candidate_id,source_revision,task_version,state,resolution,
+    changed_at,decided_at
+)
+SELECT b.candidate_id,b.source_revision,t.version,'active','current',
+       NULL,b.decided_at
+FROM task_candidate_bindings AS b
+JOIN tasks AS t ON t.id=b.task_id;
+""",
+    "DROP TRIGGER task_events_no_update;",
+    "DROP TRIGGER task_events_no_delete;",
+    "ALTER TABLE task_events RENAME TO task_events_v13;",
+    """
+CREATE TABLE task_events (
+    sequence        INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id         INTEGER NOT NULL,
+    kind            TEXT NOT NULL CHECK(kind IN (
+                        'created','candidate_folded','candidate_revised',
+                        'candidate_withdrawn','candidate_withdrawal_conflict',
+                        'candidate_reactivated','candidate_reactivation_conflict',
+                        'status_changed'
+                    )),
+    task_version    INTEGER NOT NULL CHECK(task_version >= 1),
+    candidate_id    TEXT,
+    source_revision TEXT,
+    from_status     TEXT,
+    to_status       TEXT,
+    occurred_at     TEXT NOT NULL,
+    FOREIGN KEY(task_id) REFERENCES tasks(id)
+);
+""",
+    """
+INSERT INTO task_events(
+    sequence,task_id,kind,task_version,candidate_id,source_revision,
+    from_status,to_status,occurred_at
+)
+SELECT sequence,task_id,kind,task_version,candidate_id,source_revision,
+       from_status,to_status,occurred_at
+FROM task_events_v13;
+""",
+    "DROP TABLE task_events_v13;",
+    """
+CREATE TRIGGER task_events_no_update
+BEFORE UPDATE ON task_events
+BEGIN
+    SELECT RAISE(ABORT, 'task events are append-only');
+END;
+""",
+    """
+CREATE TRIGGER task_events_no_delete
+BEFORE DELETE ON task_events
+BEGIN
+    SELECT RAISE(ABORT, 'task events are append-only');
+END;
+""",
+)
+
 
 class InboxError(RuntimeError):
     """The inbox cannot safely initialize or read its state."""
@@ -1345,6 +1464,9 @@ class ImportRefusal(StrEnum):
     INVALID_CONTRACT = "invalid_contract"
     REVISION_CONFLICT = "revision_conflict"
     CREATED_AT_CONFLICT = "created_at_conflict"
+    STALE_GENERATION = "stale_generation"
+    GENERATION_CONFLICT = "generation_conflict"
+    GENERATION_GAP = "generation_gap"
 
 
 class FeedImportDisposition(StrEnum):
@@ -1785,7 +1907,7 @@ class CandidateInbox:
                         "execution_review_cards",
                         "execution_review_card_events",
                     ),
-                    columns=_SCHEMA_COLUMNS,
+                    columns=_SCHEMA_V14_COLUMNS,
                 )
                 connection.execute("PRAGMA foreign_keys = ON")
                 connection.execute("BEGIN IMMEDIATE")
@@ -1802,7 +1924,7 @@ class CandidateInbox:
                 self._require_tables(
                     connection,
                     ("task_owner_equivalences",),
-                    columns=_SCHEMA_COLUMNS,
+                    columns=_SCHEMA_V14_COLUMNS,
                 )
                 connection.execute("PRAGMA foreign_keys = ON")
                 connection.execute("BEGIN IMMEDIATE")
@@ -1810,6 +1932,23 @@ class CandidateInbox:
                     for statement in _SCHEMA_V14:
                         connection.execute(statement)
                     connection.execute("PRAGMA user_version = 14")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 14
+            if version == 14:
+                self._require_tables(
+                    connection,
+                    tuple(_SCHEMA_V14_COLUMNS),
+                    columns=_SCHEMA_V14_COLUMNS,
+                )
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V15:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 15")
                     connection.commit()
                 except Exception:
                     connection.rollback()
@@ -2233,8 +2372,11 @@ class CandidateInbox:
                          candidate: TaskCandidate, payload: str,
                          imported_at: str) -> ImportResult:
         row = connection.execute(
-            "SELECT source_revision,payload_json,created_at "
-            "FROM candidate_inbox WHERE candidate_id=?",
+            "SELECT c.source_revision,c.payload_json,c.created_at,"
+            "l.state AS lifecycle_state,l.generation AS lifecycle_generation,"
+            "l.changed_at AS lifecycle_changed_at "
+            "FROM candidate_inbox AS c LEFT JOIN candidate_lifecycle AS l "
+            "ON l.candidate_id=c.candidate_id WHERE c.candidate_id=?",
             (candidate.candidate_id,),
         ).fetchone()
         history = connection.execute(
@@ -2275,12 +2417,54 @@ class CandidateInbox:
                     imported_at,
                 ),
             )
+            connection.execute(
+                "INSERT INTO candidate_lifecycle(candidate_id,source_revision,"
+                "state,generation,changed_at,updated_at) VALUES(?,?,?,?,?,?)",
+                (
+                    candidate.candidate_id,
+                    candidate.source.revision,
+                    candidate.lifecycle.state,
+                    candidate.lifecycle.generation,
+                    candidate.lifecycle.changed_at,
+                    imported_at,
+                ),
+            )
             return ImportResult(ImportDisposition.INSERTED)
 
         if row["created_at"] != candidate.created_at:
             return ImportResult(
                 ImportDisposition.REFUSED,
                 ImportRefusal.CREATED_AT_CONFLICT,
+            )
+        if row["lifecycle_generation"] is None:
+            raise InboxError("candidate lifecycle state is incomplete")
+        current_generation = int(row["lifecycle_generation"])
+        incoming_generation = candidate.lifecycle.generation
+        if incoming_generation < current_generation:
+            return ImportResult(
+                ImportDisposition.REFUSED,
+                ImportRefusal.STALE_GENERATION,
+            )
+        if (
+            incoming_generation == current_generation
+            and incoming_generation > 0
+            and (
+                row["source_revision"] != candidate.source.revision
+                or row["payload_json"] != payload
+            )
+        ):
+            return ImportResult(
+                ImportDisposition.REFUSED,
+                ImportRefusal.GENERATION_CONFLICT,
+            )
+        if (
+            incoming_generation > current_generation
+            and current_generation > 0
+            and incoming_generation != current_generation + 1
+        ):
+            return ImportResult(
+                ImportDisposition.REFUSED,
+                ImportRefusal.GENERATION_GAP,
             )
         if history is not None:
             if history["created_at"] != candidate.created_at:
@@ -2316,8 +2500,24 @@ class CandidateInbox:
         connection.execute(
             "UPDATE candidate_inbox SET source_revision=?,payload_json=?,"
             "updated_at=? WHERE candidate_id=?",
-            (candidate.source.revision, payload, imported_at,
-             candidate.candidate_id),
+            (
+                candidate.source.revision,
+                payload,
+                imported_at,
+                candidate.candidate_id,
+            ),
+        )
+        connection.execute(
+            "UPDATE candidate_lifecycle SET source_revision=?,state=?,"
+            "generation=?,changed_at=?,updated_at=? WHERE candidate_id=?",
+            (
+                candidate.source.revision,
+                candidate.lifecycle.state,
+                candidate.lifecycle.generation,
+                candidate.lifecycle.changed_at,
+                imported_at,
+                candidate.candidate_id,
+            ),
         )
         return ImportResult(ImportDisposition.UPDATED)
 
@@ -2366,7 +2566,9 @@ class CandidateInbox:
 
     @staticmethod
     def _require_schema(connection: sqlite3.Connection) -> None:
-        CandidateInbox._require_tables(connection, tuple(_SCHEMA_COLUMNS))
+        CandidateInbox._require_tables(
+            connection, tuple(_SCHEMA_COLUMNS), columns=_SCHEMA_COLUMNS
+        )
         for name, expected_type in _SCHEMA_OBJECTS.items():
             row = connection.execute(
                 "SELECT type FROM sqlite_master WHERE name=?", (name,)
@@ -2381,7 +2583,7 @@ class CandidateInbox:
         *,
         columns: dict[str, tuple[str, ...]] | None = None,
     ) -> None:
-        expected_schema = _SCHEMA_COLUMNS if columns is None else columns
+        expected_schema = _SCHEMA_V14_COLUMNS if columns is None else columns
         for table in tables:
             expected_columns = expected_schema[table]
             row = connection.execute(

@@ -18,7 +18,8 @@
     "candidate": {
       "oneOf": [
         {"$ref": "task-candidate-v1.schema.json"},
-        {"$ref": "task-candidate-v2.schema.json"}
+        {"$ref": "task-candidate-v2.schema.json"},
+        {"$ref": "task-candidate-v3.schema.json"}
       ]
     },
     "disposition": {

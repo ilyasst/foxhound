@@ -229,7 +229,11 @@ class TaskShadowObservationContractTests(unittest.TestCase):
         candidate_versions = schema["properties"]["candidate"]["oneOf"]
         self.assertEqual(
             [item["$ref"] for item in candidate_versions],
-            ["task-candidate-v1.schema.json", "task-candidate-v2.schema.json"],
+            [
+                "task-candidate-v1.schema.json",
+                "task-candidate-v2.schema.json",
+                "task-candidate-v3.schema.json",
+            ],
         )
 
 

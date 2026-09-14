@@ -2,6 +2,7 @@
 
 from .task_candidate import (
     CandidateEvidence,
+    CandidateLifecycle,
     CandidateSource,
     CandidateTask,
     ContractError,
@@ -63,6 +64,7 @@ from .task_lifecycle_outcome_feed import (
 
 __all__ = (
     "CandidateEvidence",
+    "CandidateLifecycle",
     "CandidateFeed",
     "CandidateFeedItem",
     "CandidateSource",
