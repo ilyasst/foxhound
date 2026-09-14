@@ -1,6 +1,6 @@
 # ADR 0036: Consumer-scoped task-card claims for a second gateway
 
-Status: accepted.
+Status: proposed.
 
 ## Context
 
@@ -14,11 +14,18 @@ card gateway," singular. Every pacing and delivery mechanism in
   the schema or the claim path records who is claiming; a caller's identity
   first appears only in `complete_delivery`, which records a `transport`
   value, and only after the card has already left the pacing pool.
-- Nothing server-side limits how many cards one caller can hold at once. The
-  "one card at a time" behavior described in ADR 0011 is a convention the
-  existing chat gateway happens to follow by pacing its own requests; it is
-  not enforced by `claim_next()`, which will hand out a fresh card on every
-  call regardless of how many the same caller already holds.
+- Nothing server-side limits how many cards one caller can hold at once.
+  ADR 0011 describes claiming "one card under a bounded delivery lease" —
+  one card per request, not one card held in total — and its very next
+  sentence assumes a caller may hold more than one: "A gateway computes its
+  on-screen load as `delivering + delivered`," arithmetic that would be
+  pointless if the answer could only ever be zero or one. The existing chat
+  gateway in fact paces itself to a configurable on-screen count, not to a
+  single card, and reaches it by calling `claim_next()` repeatedly in one
+  pass until its own count of `delivering + delivered` closes the gap.
+  Nothing server-side enforces even that self-imposed count: `claim_next()`
+  hands out a fresh card on every call regardless of how many the same
+  caller already holds.
 - `act()` is, by contrast, already consumer-agnostic: it authorizes a reader
   action purely from the card's id, its exact version, and its `delivered`
   status. It does not check `claim_token_digest` or `transport`. Whoever
@@ -55,9 +62,11 @@ visible at once.
 
 Each bearer token the server is configured to accept is paired, in server
 configuration, with exactly one fixed **role** drawn from a closed set:
-`drip` (the existing chat gateway's pattern — cards are claimed and shown one
-at a time) or `queue_view` (the console's pattern — cards are claimed to
-populate a page). A request's consumer identity is the digest of whichever
+`drip` (the existing chat gateway's pattern — cards are claimed up to the
+gateway's own configured on-screen count and dripped into chat) or
+`queue_view` (the console's pattern — a card is read without claiming, and
+claimed only at the moment a reader acts on it; see decision 4). A request's
+consumer identity is the digest of whichever
 configured token authenticated it (the same digest function already used for
 claim-token capabilities), not a client-supplied field. No route gains a
 `consumer` request parameter.
@@ -104,14 +113,24 @@ require only the card id, version, and claim token, exactly as today; they
 need no consumer parameter because identity is already bound at claim time.
 
 While a card is `delivering` or `delivered`, its content, id, and version are
-visible only to the consumer whose claim produced that state. A different
-consumer never receives that card's content, id, or version through `stats`,
-`claim`, or any other route while it is held. The existing invariants are
+disclosed only to the consumer whose claim produced that state: no route
+(`stats`, `claim`, or any other) hands that card's content, id, or version to
+a different consumer while it is held. This is enforced by non-disclosure,
+not by an access check on the card itself — `act()` stays consumer-agnostic
+(summary invariant 12 below), so anyone who does come to hold a delivered card's
+exact id and version can resolve it regardless of who claimed it. The
+guarantee therefore depends entirely on this decision never handing that
+identifier to a second consumer through any route, and it is only as strong
+as that. Decision 3 already concedes that a legacy, unattributable row can
+exist; such a row's identity is not "held" by anyone in the sense this
+invariant describes, and it is deliberately excluded from every consumer's
+"mine" accounting rather than treated as evidence the guarantee has an
+authorization backstop it does not have. The existing invariants are
 unchanged: at most one active card per task, and `claim_next` claims
 atomically.
 
 Once a card is resolved (`done`, `keep_open`, `drop`) or returns to `pending`
-(via `snooze`, lease expiry, or the operator repair in decision 5), it has no
+(via `snooze`, lease expiry, or the operator repair in decision 6), it has no
 consumer affinity. The next `claim_next` call to win the atomic race — from
 either consumer — claims it next. Nothing stipulates that the same task's
 future cards return to the consumer that handled it before.
@@ -149,9 +168,9 @@ authenticated identity used for claiming. A row whose `consumer` value cannot
 be attributed (only possible for cards claimed by a pre-migration binary,
 before this decision's column existed) is counted in `active` and in its raw
 status bucket but excluded from every specific consumer's "mine" count and
-from `elsewhere`. It cannot grow after activation, because decision 4 makes
-claiming without a resolved consumer identity impossible, and it drains to
-zero as those specific rows resolve.
+from `elsewhere`. It cannot grow after activation, because decision 1's
+fail-closed rule makes claiming without a resolved consumer identity
+impossible, and it drains to zero as those specific rows resolve.
 
 **Rejected alternative: keep one global `stats()` response and let each
 gateway subtract its own previously-observed claims client-side.** Rejected
@@ -160,38 +179,118 @@ previously claimed, so client-side subtraction drifts from the true count
 after any restart. The server already has ground truth per row; it should be
 the one computing the count, not every client separately.
 
-### 4. A per-role concurrency ceiling bounds how many cards one consumer may hold
+### 4. The console reads the queue read-only and claims only at the moment of action
 
-`claim_next()` refuses to hand out a new card to a consumer already holding
-its role's ceiling of cards (`delivering` + `delivered`, i.e. the same two
-terms `stats()` now reports as "mine"). "Refuses" means the same thing an
-empty queue means today: `claim_next` returns no card, not an error. A
-consumer at its ceiling simply stops receiving new cards until it resolves or
-releases one it already holds.
+Rendering a queue page must not require holding a stack of leases just to
+have their content ready. `TaskCardService.due()` already exists as a
+non-mutating, content-bearing projection of `pending` and `snoozed` cards
+(noted in Context); this decision authorizes exposing it over HTTP, gated to
+the `queue_view` role, as the console's sole means of populating its page.
+Reading it claims nothing, mutates nothing, and issues no lease. This
+amends ADR 0011's statement that "only a successful claim contains private
+card text": for the `queue_view` role specifically, a read of the queue also
+does, because that role's entire purpose is to display many cards without
+committing to deliver any of them.
 
-| Role | Ceiling (delivering + delivered) | Existing precedent |
+The console never displays a card that is `delivering` or `delivered` under
+any consumer, including one it is itself in the middle of acting on —
+`due()`'s existing query already excludes both statuses, and decision 2
+requires that exclusion regardless: content held by one consumer must not
+reach a second one. A card currently on the chat gateway's screen is
+represented on the console only as one unit of the content-free `elsewhere`
+count from decision 3, never by its own text, id, or version — the console
+can know "N cards are elsewhere," never "which N." This is a consequence of
+decision 2, not a defect introduced here.
+
+When the reader acts on a specific card shown in the console, the console
+must first claim that exact card — not merely "the next due card," which is
+all `claim_next()` can do. This decision therefore also authorizes a second
+claim path, claim-by-identifier: given a card id and the exact version the
+console just read, it claims that specific row under the `queue_view`
+identity if it is still `pending` or `snoozed` at that version, and refuses
+if it has moved (the same stale-version refusal `act()` already gives for
+the same reason). A successful claim proceeds through the existing
+delivering → delivered → act lifecycle exactly as the drip gateway's claims
+do. The console is expected to carry it straight through to delivery and
+action rather than leaving it delivering, so in ordinary operation a
+`queue_view` consumer holds at most one claim at a time, for as long as one
+reader decision is in flight — not because a ceiling forbids more (decision 5
+still sets one), but because claim-on-demand gives it no reason to want more.
+
+**Rejected alternative: claim-to-display, where `queue_view` claims up to a
+fixed ceiling of cards purely to have their content ready to render.** This
+was this record's original decision, and it is rejected here in favor of
+claim-on-demand for three reasons. First, it manufactures a much larger
+stranding surface: a vanished console under claim-to-display could strand as
+many cards as its display ceiling, where claim-on-demand strands at most the
+one card a reader happened to be acting on when it vanished — the same order
+of magnitude as any other consumer's worst case. Second, its ceiling had to
+be picked from something; the only candidate in this codebase was `due()`'s
+own default page size, which sizes a read, not a lease, and using it to size
+a lease ceiling was exactly the kind of unverified number this decision
+should not be making twice. Third, it treats "look at the queue" and "commit
+to acting on one card" as one operation when the service already has two —
+`due()` and `claim_next()` — built for exactly that distinction; collapsing
+them back together to avoid building a claim-by-identifier path traded a
+smaller, well-understood new mechanism for a larger, less-examined one.
+Claim-on-demand is not free — it needs both a new HTTP-reachable read and a
+new claim-by-identifier capability, neither of which exists today — but that
+cost is smaller and more targeted than a role-ceiling system paired with the
+extended manual repair decision 6 would otherwise have had to lean on as its
+primary mitigation.
+
+### 5. A per-role concurrency ceiling still bounds how many cards one consumer may hold
+
+`claim_next()` (including the claim-by-identifier path) refuses to hand out
+a card to a consumer already holding its role's ceiling of cards
+(`delivering` + `delivered` — the same two terms `stats()` reports as
+"mine"). "Refuses" means the same thing an empty or already-claimed queue
+means today: no card, not an error.
+
+With claim-on-demand in place, this ceiling is no longer the mechanism that
+keeps either role's footprint small — decision 4 already does that for
+`queue_view`, and the drip gateway's own client-side pacing already does it
+for `drip`. It survives as a fixed backstop against a misbehaving or buggy
+caller of either role, in the same spirit as the fixed capacities in ADR
+0035.
+
+| Role | Ceiling (delivering + delivered) | Basis |
 |---|---|---|
-| `drip` | one | ADR 0011's description of the existing chat gateway |
-| `queue_view` | twenty | `TaskCardService.due()`'s existing default page size — the closest existing precedent in this codebase for "one screenful of queue" |
+| `queue_view` | one | Matches decision 4's claim-on-demand model: a correctly behaved console never legitimately needs a second concurrent claim. |
+| `drip` | twenty | The existing chat gateway's own on-screen pacing setting — a value the operator configures on the gateway side — defaults to five and is permitted up to twenty; the gateway sizes each pacing pass as that configured cap minus its own current on-screen count. |
 
-Setting the `drip` ceiling to one turns today's caller convention (the chat
-gateway happens to pace itself to one card) into a server-enforced invariant.
-This is a behavior hardening, not a behavior change, for any correctly
-behaved existing gateway.
+The `drip` figure corrects this record's earlier draft, which set the
+ceiling to one on the mistaken premise that the chat gateway only ever holds
+a single card. It does not: it already holds up to its own configured cap,
+by default five and as high as twenty, and each of its pacing passes claims
+however many cards close that gap. A server-side ceiling of one would have
+throttled that gateway to a fifth of its already-configured rate, and done
+so silently — `claim_next` returning nothing looks identical to an empty
+queue, which is precisely the quiet-failure class this record exists to
+close. Twenty is the gateway's own documented maximum, not a number invented
+in this record, and this decision commits to keeping the `drip` ceiling at
+least that high for as long as that maximum stays where it is; lowering it
+below the gateway's own configured range would reintroduce the same silent
+throttle by a different route.
 
 **Invariants:**
 
-4. `claim_next` never lets a consumer's held count (`delivering` +
-   `delivered` under its own identity) exceed its role's fixed ceiling.
-5. Ceilings are fixed per role, not per request and not operator-configurable
-   at runtime; changing them is a decision for a future ADR.
+4. `claim_next` (both the due-order and claim-by-identifier paths) never
+   lets a consumer's held count exceed its role's fixed ceiling: one for
+   `queue_view`, twenty for `drip`.
+5. Ceilings are fixed per role, not accepted from a request and not
+   runtime-configurable. Changing either number is a decision for a future
+   ADR, and any future reduction of the `drip` ceiling must first confirm
+   what the chat gateway's own pacing setting actually permits at that time,
+   exactly the check this draft skipped the first time.
 
-**Rejected alternative: unbounded concurrent claims for `queue_view`.**
-Rejected because nothing else stops a `queue_view` consumer from claiming the
-entire backlog in one burst — the per-task uniqueness index only prevents
-claiming the same task's card twice, not claiming every task's card. An
-unbounded console would starve the `drip` consumer of everything, turning
-"show the queue" into "own the queue."
+**Rejected alternative: no ceiling at all, relying entirely on decision 4's
+claim-on-demand model and the drip gateway's client-side pacing.** Rejected
+because neither is a server-side guarantee: a bug in either consumer (a
+retry loop, a mis-sized pacing pass) would otherwise have nothing stopping
+it from claiming without bound. A small fixed ceiling costs nothing for a
+correctly behaved caller of either role and catches exactly that failure
+mode.
 
 **Rejected alternative: a caller-supplied `max_claims` per request.**
 Rejected for the same reason request-supplied consumer identity was rejected
@@ -200,37 +299,47 @@ server-side constant is safer, and it departs from this repository's existing
 preference (ADR 0035) for small fixed capacities over runtime-configurable
 ones.
 
-### 5. A gateway that goes away
+### 6. A consumer that goes away
 
 The existing lease expiry already recovers a card stuck in `delivering`: an
 unacknowledged claim expires and the card returns to `pending` under a new
 version, exactly as today, unchanged by this decision.
 
-A card that has reached `delivered` has no expiry today, and this decision
-does not add one. An automatic timeout for `delivered` would require the
-service to infer whether a browser tab or chat process is still alive, and
-the current design has no heartbeat or liveness protocol to infer that from
-— inventing one is out of scope here.
+A card that has reached `delivered` has no expiry today, for either role,
+and this decision does not add one. An automatic timeout for `delivered`
+would require the service to infer whether a browser tab or chat process is
+still alive, and the current design has no heartbeat or liveness protocol to
+infer that from — inventing one is out of scope here. Note that this gap
+already exists for the single gateway running today: nothing in
+`task_cards.py` can recover a task review card that reached `delivered` and
+was then never acted on, regardless of how many gateways exist. This
+decision does not introduce that exposure; it inherits it, and closes it the
+same way for both roles rather than leaving it unaddressed.
 
-Instead, this decision extends the existing local-operator recovery already
-established for execution cards in ADR 0016 — an explicit, transport-absent
-administrative requeue of a still-current delivered card — to task review
-cards, as the sanctioned way to release a card whose owning consumer has gone
-away. The repair clears delivery metadata and increments the card version,
-exactly as ADR 0016 describes for execution cards, so the stale presentation
-becomes unusable without rerunning any lifecycle transition. It remains
-absent from the remote/authenticated API, available only to a trusted local
-operator tool.
+The remedy is the local-operator recovery already established for execution
+cards in ADR 0016 — an explicit, transport-absent administrative requeue of
+a still-current delivered card — extended here to task review cards. The
+repair clears delivery metadata and increments the card version, exactly as
+ADR 0016 describes, so the stale presentation becomes unusable without
+rerunning any lifecycle transition. It remains absent from the remote,
+authenticated API, available only to a trusted local operator tool.
 
-This interacts with decision 4: previously, a vanished gateway could strand
-at most one card (the `drip` ceiling). A vanished `queue_view` consumer can
-now strand up to twenty. This decision accepts that trade-off in exchange for
-the console being able to show a real queue at all, and names the operator
-repair as the intended mitigation — but this specific trade-off has not been
-exercised against a real vanished-console scenario, and is the weakest point
-of this decision (see the closing note).
+Because decision 4 keeps a `queue_view` consumer's ordinary footprint to at
+most one claim, a vanished console now strands at most one card. A vanished
+`drip` consumer can still strand up to its own ceiling of twenty, but that
+exposure is not created by this decision — it is the chat gateway's existing
+design, holding as many cards on screen as its own configured setting
+permits, unrelated to how many other consumers exist. This decision does not
+make the `drip` exposure worse and does not need to fix it to answer the
+question this record is about; it is noted here because it is now, after
+this revision, the larger of the two stranding risks, and any future work on
+the delivered-card recovery path should size itself against that one, not
+against the `queue_view` figure this record's earlier draft focused on. The
+trade-off that earlier draft accepted — a vanished console stranding up to
+twenty cards — no longer applies; it was a consequence of claim-to-display,
+not of consumer identity itself.
 
-### 6. Migration and rollback
+### 7. Migration and rollback
 
 **Schema.** One nullable column, recording the claiming consumer's identity,
 is added to `task_review_cards` alongside the existing `transport` column;
@@ -240,6 +349,14 @@ structure, never mutates the meaning of existing rows). The exact column
 name, migration number, and schema-version bump are implementation details
 left to the follow-up change; this decision fixes only the column's shape
 (nullable, populated at claim, one value per configured token) and semantics.
+
+**New routes.** Decision 4 requires two HTTP-reachable operations that do not
+exist today: a `queue_view`-gated read equivalent to `due()`, and a
+claim-by-identifier path alongside the existing due-order `claim`. Both are
+additive to the route table; no existing route's request or response shape
+changes because of them. Their exact paths, request/response schemas, and
+contract-version numbers are implementation details left to the follow-up
+change.
 
 **Configuration.** Each accepted bearer token is paired with a role at
 startup. The existing single-token invocation shape from ADR 0011 is
@@ -260,7 +377,7 @@ identical to ADR 0011's.
 claimed cards): revoke its token first, so no further request can authenticate
 as it. Cards it already holds are not reassigned or deleted automatically.
 Ones still `delivering` drain through the existing lease expiry, unchanged.
-Ones already `delivered` require the decision-5 operator repair, because the
+Ones already `delivered` require the decision-6 operator repair, because the
 surviving `drip` consumer was never given their card ids or versions — only
 the content-free `elsewhere` count in its own `stats()` response — and cannot
 reach them through the ordinary `action` route without first learning them
@@ -288,30 +405,41 @@ decision relies on that existing gate rather than adding a second one.
    claim; `complete_delivery` and `fail_delivery` require no consumer
    parameter because identity is already bound.
 5. While `delivering` or `delivered`, a card's content, id, and version are
-   visible only to the consumer that holds its claim.
+   disclosed only to the consumer whose claim produced that state; this is a
+   non-disclosure guarantee, not an access check, since `act()` (invariant
+   12) remains consumer-agnostic once a card's id and version are known.
 6. A resolved or re-pooled card carries no consumer affinity into its next
    claim.
 7. `stats()` reports `pending` and `snoozed` identically to every caller,
    `delivering`/`delivered` scoped to the caller's own held cards, a
    content-free `elsewhere` count of cards held by other consumers, and an
    unchanged system-wide `active` total.
-8. `claim_next` never lets a consumer exceed its role's fixed ceiling
-   (`drip`: one; `queue_view`: twenty) of held cards.
-9. Ceilings are fixed per role by this decision, not accepted from a request
-   and not runtime-configurable.
-10. A `delivering` card recovers only through the existing lease expiry; a
+8. The `queue_view` role reads pending and snoozed cards without claiming or
+   mutating anything, and claims a specific card by identifier and exact
+   version only when a reader acts on it; it does not claim in due order to
+   pre-populate a display.
+9. `claim_next` (due-order or by-identifier) never lets a consumer exceed
+   its role's fixed ceiling (`queue_view`: one; `drip`: twenty, matching the
+   existing chat gateway's own configurable maximum) of held cards.
+10. Ceilings are fixed per role by this decision, not accepted from a
+    request and not runtime-configurable; lowering `drip`'s below the chat
+    gateway's own configured range is not permitted without first checking
+    that range.
+11. A `delivering` card recovers only through the existing lease expiry; a
     `delivered` card recovers only through an explicit, transport-absent
-    local operator repair, never automatically.
-11. `act()`'s existing authorization — card id, exact version, `delivered`
+    local operator repair, never automatically, for either role.
+12. `act()`'s existing authorization — card id, exact version, `delivered`
     status, nothing else — is unchanged by this decision.
 
 ## Out of scope
 
 This decision does not specify the exact schema migration or its version
 number, the exact response-schema-version bump needed to carry the new
-`elsewhere` field, the exact configuration file or flag syntax for pairing a
-token with a role, or any console implementation or rendering. Those are
-left to a follow-up implementation change to be reviewed against this record.
+`elsewhere` field, the exact routes or request/response schemas for the new
+`queue_view` read and claim-by-identifier operations, the exact
+configuration file or flag syntax for pairing a token with a role, or any
+console implementation or rendering. Those are left to a follow-up
+implementation change to be reviewed against this record.
 
 It also does not design more than two concurrently configured consumers or
 any role beyond `drip` and `queue_view`; the two-role set is deliberately
@@ -320,17 +448,39 @@ existing consumer-agnostic authorization. It does not design an automatic
 liveness or heartbeat mechanism for a `delivered` card, and it does not
 design a way to explicitly hand a specific card's content from one named
 consumer to another — the only handoff this decision provides is the
-decision-5 repair, which returns a card to the shared, unowned pool rather
-than moving it directly to a chosen consumer.
+decision-6 repair, which returns a card to the shared, unowned pool rather
+than moving it directly to a chosen consumer. It does not decide anything
+about the exact source or mechanism of the chat gateway's own on-screen
+pacing setting; decision 5 treats that setting's current default and range
+as a given fact to size against, not something this record controls.
 
 ## Closing note on confidence
 
-The `queue_view` ceiling of twenty, and the choice to size it after
-`due()`'s existing default rather than after any measurement of how large a
-console's queue actually gets, is a judgment call, not a validated one. The
-decision-5 trade-off it implies — a vanished console can now strand up to
-twenty cards instead of one — has not been exercised against a real
-vanished-console scenario. If that number turns out to be badly sized in
-either direction, or if operators need to release a stranded batch faster
-than the repair tool in decision 5 allows one card at a time, that would be
-grounds to revisit this record rather than to patch around it.
+This record's first draft set the `drip` ceiling to one on an unverified
+assumption about how the existing chat gateway behaves, rather than checking
+it against that gateway's own code. That was the real defect in this
+decision, not the `queue_view` number originally flagged here as the weak
+point — a reminder that an ADR's invariants are only as good as the facts
+they were checked against, not how carefully the surrounding reasoning reads.
+
+The residual uncertainty this draft is aware of now is the coupling itself:
+decision 5 fixes the `drip` ceiling at twenty because that is the chat
+gateway's own current maximum, but that maximum lives in the gateway's own
+configuration, outside this record's control. If it changes upward in the
+future, this ceiling becomes exactly the kind of silent throttle this
+revision exists to remove, and nothing here re-checks that automatically —
+only invariant 10's stated obligation to re-verify before lowering the
+ceiling exists to catch it, and that obligation depends on whoever makes the
+next change actually reading it. The claim-by-identifier path in decision 4
+is also new and has not been exercised: its behavior when a reader's click
+races a card's own resolution elsewhere relies entirely on the same
+stale-version refusal `act()` already uses, which is a reasonable bet but an
+unverified one.
+
+Decision 6 also surfaces, without resolving, that a vanished `drip` consumer
+can strand up to twenty cards — larger than the `queue_view` figure this
+record spent the most attention on. That exposure predates this decision and
+is not made worse by it, but this record does not fix it either, and a
+reader who takes decision 6's repair as an adequate answer to "what happens
+when a gateway disappears" should notice that its worst case is now sized by
+`drip`, not by `queue_view`.
