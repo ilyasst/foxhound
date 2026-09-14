@@ -136,6 +136,76 @@ class SchedulerCutoverTests(unittest.TestCase):
                 self.assertFalse(self.candidate.exists())
                 self.assertFalse(self.rollback.exists())
 
+    def test_residual_mode_removes_only_four_remaining_writers(self) -> None:
+        residual = (
+            RETAINED_PREFIX.replace(
+                b"23 * * * * python -m gw.task_registry "
+                b"--persona demo --apply\r\n",
+                b"",
+            )
+            + b"".join(REMOVED[2:])
+            + RETAINED_SUFFIX
+        )
+        self._write_snapshot(residual)
+        report = prepare_cutover(
+            self.snapshot,
+            candidate_path=self.candidate,
+            rollback_path=self.rollback,
+            stage=CutoverStage.RESIDUAL,
+        )
+        expected = RETAINED_PREFIX.replace(
+            b"23 * * * * python -m gw.task_registry "
+            b"--persona demo --apply\r\n",
+            b"",
+        ) + RETAINED_SUFFIX
+        self.assertEqual(self.candidate.read_bytes(), expected)
+        self.assertEqual(self.rollback.read_bytes(), residual)
+        self.assertEqual(report.removed_jobs, 4)
+        self.assertEqual(report.retained_creation_registry, 0)
+        self.assertEqual(report.candidate_sha256, report.retained_sha256)
+        self.assertEqual(
+            verify_cutover(
+                self.snapshot,
+                candidate_path=self.candidate,
+                rollback_path=self.rollback,
+                stage="residual",
+            ),
+            report,
+        )
+
+    def test_residual_mode_refuses_every_other_boundary(self) -> None:
+        registry = (
+            b"23 * * * * python -m gw.task_registry "
+            b"--persona demo --apply\r\n"
+        )
+        residual = (
+            RETAINED_PREFIX.replace(registry, b"")
+            + b"".join(REMOVED[2:])
+            + RETAINED_SUFFIX
+        )
+        cases = (
+            self.payload,
+            residual + b"\n" + REMOVED[0],
+            residual + b"\n" + registry,
+            residual.replace(REMOVED[2], b""),
+            residual + b"\n" + REMOVED[2],
+            RETAINED_PREFIX.replace(registry, b"") + RETAINED_SUFFIX,
+        )
+        for payload in cases:
+            with self.subTest(payload_size=len(payload)):
+                self.candidate.unlink(missing_ok=True)
+                self.rollback.unlink(missing_ok=True)
+                self._write_snapshot(payload)
+                with self.assertRaises(SchedulerCutoverError):
+                    prepare_cutover(
+                        self.snapshot,
+                        candidate_path=self.candidate,
+                        rollback_path=self.rollback,
+                        stage=CutoverStage.RESIDUAL,
+                    )
+                self.assertFalse(self.candidate.exists())
+                self.assertFalse(self.rollback.exists())
+
     def test_missing_duplicate_and_ambiguous_jobs_fail_closed(self) -> None:
         cases = (
             self.payload.replace(REMOVED[0], b""),

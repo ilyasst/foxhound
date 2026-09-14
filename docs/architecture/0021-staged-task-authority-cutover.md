@@ -24,6 +24,15 @@ The migration uses three explicit stages. A deployment advances only after all
 exit conditions for the current stage are proven from private, aggregate
 evidence.
 
+An interrupted older deployment may already have removed lifecycle closure,
+stale archival, and the temporary creation registry while retaining exactly
+one inventory, workflow scheduler, workflow agent, and task-review job. This
+is not another authority stage. The offline scheduler transformer exposes an
+explicit `residual` recovery mode that accepts only that exact boundary and
+removes only those four remaining lines. Any mixed, missing, or duplicate
+signature is refused, and the candidate still requires independent operator
+installation from a current owner-private snapshot.
+
 ### Stage 0: plan-only comparison
 
 The producer remains authoritative for lifecycle, ordinary task cards,

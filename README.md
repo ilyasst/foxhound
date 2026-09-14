@@ -363,6 +363,26 @@ foxhound-scheduler-cutover verify \
 
 The command does not inspect or install the active scheduler. Installing the
 candidate and restoring the rollback artifact remain explicit operator steps.
+If an older deployment was interrupted after lifecycle writers and the
+creation registry were removed but before the four inventory/workflow/review
+jobs were removed, neither normal stage matches. The explicit `residual` mode
+is bounded recovery tooling for only that exact boundary. It refuses if either
+lifecycle writer or the registry is present, or unless every residual writer
+appears exactly once:
+
+```sh
+foxhound-scheduler-cutover prepare --stage residual \
+  --snapshot /srv/example/private-cutover/scheduler.residual-current \
+  --candidate /srv/example/private-cutover/scheduler.residual \
+  --rollback /srv/example/private-cutover/scheduler.residual-rollback
+foxhound-scheduler-cutover verify --stage residual \
+  --snapshot /srv/example/private-cutover/scheduler.residual-current \
+  --candidate /srv/example/private-cutover/scheduler.residual \
+  --rollback /srv/example/private-cutover/scheduler.residual-rollback
+```
+
+Residual recovery is not a normal third authority stage and must not be used
+to infer live state; its input is still an explicit owner-private snapshot.
 After native candidate intake has been activated, capture the then-current
 Stage 1 scheduler and explicitly prepare Stage 2. This mode refuses any
 remaining Stage 1 writer and removes the temporary creation registry exactly
