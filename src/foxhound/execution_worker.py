@@ -500,6 +500,9 @@ class ExecutionWorker:
     def release(self) -> dict[str, Any]:
         state, service = self._active()
         if _result_inputs_present(self._state_path.parent):
+            if state.phase is WorkflowPhase.PLAN:
+                ready = self.draft(outcome="awaiting_plan")
+                return self.record(ready["draft"])
             raise ExecutionWorkerDraftError(
                 "execution result inputs must be drafted or removed before "
                 "release"
