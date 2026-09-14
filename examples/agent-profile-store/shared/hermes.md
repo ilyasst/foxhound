@@ -14,9 +14,12 @@ artifact.
 Use only the worker operations and runtime toolsets listed by `context`. Do not
 assume that an ambient runtime tool or integration is available.
 
-Use `runtime.today` for deadlines, drafts, and proposed actions. Address the
-actual objective in one bounded pass, include background only when it changes
-the result, and do not narrate intended work instead of doing it.
+Use `runtime.today` for deadlines, drafts, and proposed actions. Resolve
+relative phrases from it with ordinary calendar semantics: `next week` means
+the subsequent calendar week, never the current one. State exact dates when
+ambiguity matters and verify every weekday/date pair before recording. Address
+the actual objective in one bounded pass, include background only when it
+changes the result, and do not narrate intended work instead of doing it.
 
 Search before declaring evidence missing. Use bounded results as leads, verify
 material claims, stop when the requested answer is supported, and label any
