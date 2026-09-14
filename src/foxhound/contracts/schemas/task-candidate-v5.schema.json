@@ -1,0 +1,180 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/foxhound/contracts/task-candidate-v5.schema.json",
+  "title": "Foxhound task candidate with structured owner identity",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "candidate_id",
+    "source",
+    "task",
+    "evidence",
+    "created_at"
+  ],
+  "properties": {
+    "schema": {"const": "foxhound.task-candidate"},
+    "schema_version": {"const": 5},
+    "candidate_id": {
+      "type": "string",
+      "pattern": "^tc_[0-9a-f]{64}$"
+    },
+    "source": {
+      "type": "object",
+      "required": ["system", "kind", "record_id", "item_id", "revision"],
+      "properties": {
+        "system": {"const": "gw"},
+        "kind": {"enum": ["meeting", "email", "teams", "issue", "legacy"]},
+        "record_id": {"$ref": "#/$defs/opaqueId"},
+        "item_id": {"$ref": "#/$defs/opaqueId"},
+        "revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "task": {
+      "type": "object",
+      "required": ["text", "owner", "owner_ref", "due"],
+      "properties": {
+        "text": {"$ref": "#/$defs/taskText"},
+        "project": {"$ref": "#/$defs/shortText"},
+        "owner": {
+          "oneOf": [{"$ref": "#/$defs/shortText"}, {"type": "null"}]
+        },
+        "owner_ref": {
+          "oneOf": [{"$ref": "#/$defs/ownerRef"}, {"type": "null"}]
+        },
+        "due": {
+          "oneOf": [{"type": "string", "format": "date"}, {"type": "null"}]
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"owner": {"type": "null"}}},
+          "then": {"properties": {"owner_ref": {"type": "null"}}},
+          "else": {"properties": {"owner_ref": {"$ref": "#/$defs/ownerRef"}}}
+        },
+        {
+          "if": {
+            "properties": {
+              "owner_ref": {
+                "type": "object",
+                "required": ["kind"],
+                "properties": {"kind": {"const": "unresolved"}}
+              }
+            }
+          },
+          "then": {"properties": {"owner": {"const": "(unassigned)"}}}
+        }
+      ],
+      "additionalProperties": false
+    },
+    "evidence": {
+      "type": "object",
+      "required": ["document_id", "locator"],
+      "properties": {
+        "document_id": {"$ref": "#/$defs/opaqueId"},
+        "locator": {"$ref": "#/$defs/opaqueId"}
+      },
+      "additionalProperties": false
+    },
+    "created_at": {"type": "string", "format": "date-time"}
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "source": {
+            "properties": {"kind": {"not": {"const": "legacy"}}}
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "task": {
+            "properties": {
+              "owner_ref": {
+                "oneOf": [
+                  {"type": "null"},
+                  {
+                    "type": "object",
+                    "properties": {"pinned": {"const": false}}
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "opaqueId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$"
+    },
+    "shortText": {"type": "string", "minLength": 1, "maxLength": 200},
+    "taskText": {"type": "string", "minLength": 1, "maxLength": 1000},
+    "speakerId": {"type": "string", "pattern": "^SPK_[0-9]+$"},
+    "ownerRef": {
+      "type": "object",
+      "required": [
+        "kind",
+        "speaker_id",
+        "canonical_speaker_id",
+        "speaker_registry_id",
+        "pinned",
+        "provisional"
+      ],
+      "properties": {
+        "kind": {"enum": ["person", "unresolved", "external", "group"]},
+        "speaker_id": {
+          "oneOf": [{"$ref": "#/$defs/speakerId"}, {"type": "null"}]
+        },
+        "canonical_speaker_id": {
+          "oneOf": [{"$ref": "#/$defs/speakerId"}, {"type": "null"}]
+        },
+        "speaker_registry_id": {
+          "oneOf": [{"$ref": "#/$defs/opaqueId"}, {"type": "null"}]
+        },
+        "pinned": {"type": "boolean"},
+        "provisional": {"type": "boolean"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"speaker_id": {"type": "null"}}},
+          "then": {
+            "properties": {
+              "canonical_speaker_id": {"type": "null"},
+              "speaker_registry_id": {"type": "null"}
+            }
+          },
+          "else": {
+            "properties": {
+              "speaker_registry_id": {"$ref": "#/$defs/opaqueId"}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"kind": {"enum": ["external", "group"]}}},
+          "then": {
+            "properties": {
+              "speaker_id": {"type": "null"},
+              "canonical_speaker_id": {"type": "null"},
+              "speaker_registry_id": {"type": "null"}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"kind": {"const": "unresolved"}}},
+          "then": {
+            "properties": {"canonical_speaker_id": {"type": "null"}}
+          }
+        }
+      ],
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

@@ -23,11 +23,13 @@ SCHEMA_VERSION = 1
 PROJECTLESS_SCHEMA_VERSION = 2
 LIFECYCLE_SCHEMA_VERSION = 3
 PROVENANCE_SCHEMA_VERSION = 4
+OWNER_SCHEMA_VERSION = 5
 SUPPORTED_SCHEMA_VERSIONS = frozenset({
     SCHEMA_VERSION,
     PROJECTLESS_SCHEMA_VERSION,
     LIFECYCLE_SCHEMA_VERSION,
     PROVENANCE_SCHEMA_VERSION,
+    OWNER_SCHEMA_VERSION,
 })
 LIFECYCLE_STATES = frozenset({"active", "withdrawn"})
 SOURCE_SYSTEMS = frozenset({"gw"})
@@ -57,6 +59,10 @@ _OPAQUE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$")
 _REVISION_RE = re.compile(r"^[0-9a-f]{64}$")
 _CANDIDATE_ID_RE = re.compile(r"^tc_[0-9a-f]{64}$")
 _SOURCE_ROLES = frozenset({"handoff", "protocol", "transcript"})
+OWNER_KINDS = frozenset({"person", "unresolved", "external", "group"})
+UNRESOLVED_OWNER_DISPLAY = "(unassigned)"
+_SPEAKER_ID_RE = re.compile(r"^SPK_\d+$")
+_SPEAKER_ID_IN_DISPLAY_RE = re.compile(r"(?<![A-Za-z0-9_])SPK_\d+(?!\d)")
 MAX_EVIDENCE_SOURCES = 3
 MAX_EVIDENCE_SOURCE_NAME = 255
 MAX_EVIDENCE_EXTRACT = 1_200
@@ -81,6 +87,19 @@ class CandidateTask:
     project: str | None
     owner: str | None
     due: str | None
+    owner_ref: CandidateOwnerRef | None = None
+
+
+@dataclass(frozen=True)
+class CandidateOwnerRef:
+    """A scoped owner identity kept separately from its card display text."""
+
+    kind: str
+    speaker_id: str | None
+    canonical_speaker_id: str | None
+    speaker_registry_id: str | None
+    pinned: bool
+    provisional: bool
 
 
 @dataclass(frozen=True)
@@ -126,8 +145,21 @@ def task_candidate_document(candidate: TaskCandidate) -> dict[str, Any]:
     if candidate.schema_version == SCHEMA_VERSION or (
         candidate.schema_version == PROVENANCE_SCHEMA_VERSION
         and candidate.task.project is not None
+    ) or (
+        candidate.schema_version == OWNER_SCHEMA_VERSION
+        and candidate.task.project is not None
     ):
         task["project"] = candidate.task.project
+    if candidate.schema_version == OWNER_SCHEMA_VERSION:
+        owner_ref = candidate.task.owner_ref
+        task["owner_ref"] = None if owner_ref is None else {
+            "kind": owner_ref.kind,
+            "speaker_id": owner_ref.speaker_id,
+            "canonical_speaker_id": owner_ref.canonical_speaker_id,
+            "speaker_registry_id": owner_ref.speaker_registry_id,
+            "pinned": owner_ref.pinned,
+            "provisional": owner_ref.provisional,
+        }
     document = {
         "schema": candidate.schema,
         "schema_version": candidate.schema_version,
@@ -233,12 +265,17 @@ def parse_task_candidate(document: object) -> TaskCandidate:
 
     task_doc = _object(root["task"], "candidate.task")
     base_task_fields = {"text", "owner", "due"}
-    if version == PROVENANCE_SCHEMA_VERSION:
+    if version in {PROVENANCE_SCHEMA_VERSION, OWNER_SCHEMA_VERSION}:
+        allowed = base_task_fields | {"project"}
+        if version == OWNER_SCHEMA_VERSION:
+            allowed.add("owner_ref")
         _required_and_allowed_fields(
             task_doc,
             "candidate.task",
-            base_task_fields,
-            base_task_fields | {"project"},
+            base_task_fields | (
+                {"owner_ref"} if version == OWNER_SCHEMA_VERSION else set()
+            ),
+            allowed,
         )
     else:
         task_fields = (
@@ -247,6 +284,11 @@ def parse_task_candidate(document: object) -> TaskCandidate:
             else base_task_fields
         )
         _exact_fields(task_doc, "candidate.task", task_fields)
+    owner = _optional_text(task_doc["owner"], "candidate.task.owner", 200)
+    owner_ref = (
+        _owner_ref(task_doc["owner_ref"], owner, source_kind=source.kind)
+        if version == OWNER_SCHEMA_VERSION else None
+    )
     task = CandidateTask(
         text=_bounded_text(task_doc["text"], "candidate.task.text", 1, 1_000),
         project=(
@@ -254,12 +296,13 @@ def parse_task_candidate(document: object) -> TaskCandidate:
                 task_doc["project"], "candidate.task.project", 1, 200
             )
             if version == SCHEMA_VERSION or (
-                version == PROVENANCE_SCHEMA_VERSION
+                version in {PROVENANCE_SCHEMA_VERSION, OWNER_SCHEMA_VERSION}
                 and "project" in task_doc
             ) else None
         ),
-        owner=_optional_text(task_doc["owner"], "candidate.task.owner", 200),
+        owner=owner,
         due=_optional_date(task_doc["due"], "candidate.task.due"),
+        owner_ref=owner_ref,
     )
 
     evidence_doc = _object(root["evidence"], "candidate.evidence")
@@ -380,6 +423,98 @@ def _evidence_sources(value: object) -> tuple[CandidateEvidenceSource, ...]:
     return tuple(sources)
 
 
+def _owner_ref(
+    value: object, owner: str | None, *, source_kind: str
+) -> CandidateOwnerRef | None:
+    if value is None:
+        if owner is not None:
+            raise ContractError(
+                "candidate.task.owner_ref is required when owner is present"
+            )
+        return None
+    if owner is None:
+        raise ContractError(
+            "candidate.task.owner must be present when owner_ref is present"
+        )
+    reference = _object(value, "candidate.task.owner_ref")
+    _exact_fields(
+        reference,
+        "candidate.task.owner_ref",
+        {
+            "kind",
+            "speaker_id",
+            "canonical_speaker_id",
+            "speaker_registry_id",
+            "pinned",
+            "provisional",
+        },
+    )
+    kind = _choice(
+        reference["kind"], "candidate.task.owner_ref.kind", OWNER_KINDS
+    )
+    speaker_id = _optional_pattern_text(
+        reference["speaker_id"],
+        "candidate.task.owner_ref.speaker_id",
+        _SPEAKER_ID_RE,
+    )
+    canonical_speaker_id = _optional_pattern_text(
+        reference["canonical_speaker_id"],
+        "candidate.task.owner_ref.canonical_speaker_id",
+        _SPEAKER_ID_RE,
+    )
+    registry_id = (
+        _opaque_id(
+            reference["speaker_registry_id"],
+            "candidate.task.owner_ref.speaker_registry_id",
+        )
+        if reference["speaker_registry_id"] is not None else None
+    )
+    pinned = _boolean(reference["pinned"], "candidate.task.owner_ref.pinned")
+    provisional = _boolean(
+        reference["provisional"], "candidate.task.owner_ref.provisional"
+    )
+    if pinned and source_kind != "legacy":
+        raise ContractError(
+            "candidate.task.owner_ref producer pin is unsupported"
+        )
+
+    has_observed_identity = speaker_id is not None or registry_id is not None
+    if has_observed_identity and not (speaker_id and registry_id):
+        raise ContractError(
+            "candidate.task.owner_ref speaker identity must be scoped"
+        )
+    if canonical_speaker_id is not None and not (speaker_id and registry_id):
+        raise ContractError(
+            "candidate.task.owner_ref canonical identity must be scoped"
+        )
+    if kind in {"external", "group"} and (
+        speaker_id or canonical_speaker_id or registry_id
+    ):
+        raise ContractError(
+            "candidate.task.owner_ref kind cannot carry speaker identity"
+        )
+    if kind == "unresolved" and canonical_speaker_id is not None:
+        raise ContractError(
+            "candidate.task.owner_ref unresolved identity cannot be canonical"
+        )
+    if kind == "unresolved" and owner != UNRESOLVED_OWNER_DISPLAY:
+        raise ContractError(
+            "candidate.task.owner must use the unresolved display"
+        )
+    if _SPEAKER_ID_IN_DISPLAY_RE.search(owner):
+        raise ContractError(
+            "candidate.task.owner must not expose a speaker identifier"
+        )
+    return CandidateOwnerRef(
+        kind=kind,
+        speaker_id=speaker_id,
+        canonical_speaker_id=canonical_speaker_id,
+        speaker_registry_id=registry_id,
+        pinned=pinned,
+        provisional=provisional,
+    )
+
+
 def _source_name(value: object, field: str) -> str:
     text = _bounded_text(value, field, 1, MAX_EVIDENCE_SOURCE_NAME)
     if text in {".", ".."} or "/" in text or "\\" in text:
@@ -423,6 +558,20 @@ def _pattern_text(value: object, field: str, pattern: re.Pattern[str]) -> str:
     if not pattern.fullmatch(text):
         raise ContractError(f"{field} has invalid format")
     return text
+
+
+def _optional_pattern_text(
+    value: object, field: str, pattern: re.Pattern[str]
+) -> str | None:
+    if value is None:
+        return None
+    return _pattern_text(value, field, pattern)
+
+
+def _boolean(value: object, field: str) -> bool:
+    if not isinstance(value, bool):
+        raise ContractError(f"{field} must be a boolean")
+    return value
 
 
 def _opaque_id(value: object, field: str) -> str:

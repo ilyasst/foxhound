@@ -21,6 +21,7 @@ from .task_ledger import (
     TransitionRefusal,
     _apply_task_transition,
 )
+from .task_owner import canonical_owner_display
 
 
 SNOOZE_INTERVAL = timedelta(days=3)
@@ -605,7 +606,7 @@ class TaskCardService:
     def _card_select() -> str:
         return (
             "SELECT c.id,c.task_id,c.task_version,c.status,c.version,c.due_at,"
-            "t.text,t.owner,t.due FROM task_review_cards AS c "
+            "t.text,t.owner,t.owner_kind,t.due FROM task_review_cards AS c "
             "JOIN tasks AS t ON t.id=c.task_id"
         )
 
@@ -691,7 +692,7 @@ def _card(row) -> TaskReviewCard:
         version=int(row["version"]),
         due_at=row["due_at"],
         text=row["text"],
-        owner=row["owner"],
+        owner=canonical_owner_display(row["owner"], row["owner_kind"]),
         due=row["due"],
     )
 
