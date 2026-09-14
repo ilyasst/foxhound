@@ -1110,6 +1110,27 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertNotIn("Project Alpha", body)
         self.assertIn("<b>First raised:</b> 2030-01-01", body)
 
+    def test_the_card_asks_the_policy_which_origins_are_addressable(self):
+        """Presentation is declared beside the authority each source has,
+        not compared by name where a card happens to be built. A source
+        whose origin is not addressable is still named — a reader can
+        search for a name, and a link that does not resolve is worse than
+        none — but it is never offered as a link.
+        """
+        from foxhound.execution_cards import ADDRESSABLE_ORIGINS
+        from foxhound.source_policy import SOURCE_POLICIES
+
+        self.assertEqual(
+            ADDRESSABLE_ORIGINS,
+            {kind for kind, policy in SOURCE_POLICIES.items()
+             if policy.addressable_origin},
+        )
+        # The kinds a reader actually sees today, decided deliberately.
+        self.assertIn("issue", ADDRESSABLE_ORIGINS)
+        for kind in ("meeting", "legacy", "email", "teams"):
+            with self.subTest(kind=kind):
+                self.assertNotIn(kind, ADDRESSABLE_ORIGINS)
+
     def test_an_unlinkable_origin_is_still_named(self):
         # A meeting record has no address a reader can open. Naming it is
         # still better than silence, and a wrong link is worse than none.
