@@ -32,6 +32,7 @@ from foxhound.execution_worker import (
 )
 from foxhound.knowledge_client import KnowledgeClientConfig
 from foxhound.task_execution import (
+    ExecutionResultEnvelope,
     TaskExecutionService,
     WorkflowPhase,
     WorkflowStatus,
@@ -164,7 +165,7 @@ class ExecutionWorkerTests(unittest.TestCase):
             "task_id": 1,
             "task_version": 1,
             "workflow_version": self.claim.workflow_version,
-            "phase": "plan",
+            "phase": self.claim.phase.value,
             "claim_token": CLAIM_TOKEN,
             "lease_seconds": self.claim.lease_seconds,
             "agent_profile_id": self.claim.agent_profile_id,
@@ -623,10 +624,61 @@ class ExecutionWorkerTests(unittest.TestCase):
         self.assertEqual(receipt["status"], "queued")
         self.assertNotIn(CLAIM_TOKEN, json.dumps(receipt))
 
-    def test_release_refuses_to_discard_result_inputs(self):
+    def test_plan_release_records_valid_result_inputs(self):
         self._write_result_inputs()
         service = TaskExecutionService(self.database)
+
+        with knowledge_server() as endpoint:
+            receipt = self._worker(endpoint).release()
+
+        after = service.get(1)
+        self.assertEqual(
+            receipt["schema"], "foxhound.execution-result-receipt"
+        )
+        self.assertEqual(receipt["status"], "awaiting_review")
+        self.assertEqual(after.status, WorkflowStatus.AWAITING_REVIEW)
+        self.assertEqual(after.last_result_id, RUN_ID)
+
+    def test_plan_release_leaves_invalid_result_inputs_for_correction(self):
+        self._write_result_inputs()
+        self._write_result_input("result-questions.json", [{"invalid": True}])
+        service = TaskExecutionService(self.database)
         before = service.get(1)
+
+        with knowledge_server() as endpoint:
+            with self.assertRaisesRegex(
+                ExecutionWorkerDraftError,
+                "execution result questions is invalid",
+            ):
+                self._worker(endpoint).release()
+
+        after = service.get(1)
+        self.assertEqual(after.status, WorkflowStatus.RUNNING)
+        self.assertEqual(after.version, before.version)
+
+    def test_execute_release_refuses_to_discard_result_inputs(self):
+        service = TaskExecutionService(
+            self.database, token_factory=lambda: CLAIM_TOKEN
+        )
+        recorded = service.record_result(ExecutionResultEnvelope(
+            result_id=RESULT_ID,
+            task_id=1,
+            task_version=1,
+            workflow_version=self.claim.workflow_version,
+            phase="plan",
+            claim_token=CLAIM_TOKEN,
+            outcome="awaiting_plan",
+            summary="Synthetic result",
+            work_markdown="Synthetic plan",
+        ))
+        service.review_action(
+            1, expected_version=recorded.version, action="approve"
+        )
+        self.claim = service.claim_next()
+        self.assertEqual(self.claim.phase, WorkflowPhase.EXECUTE)
+        self.state_path.unlink()
+        self._write_state()
+        self._write_result_inputs()
 
         with knowledge_server() as endpoint:
             with self.assertRaisesRegex(
@@ -637,7 +689,7 @@ class ExecutionWorkerTests(unittest.TestCase):
 
         after = service.get(1)
         self.assertEqual(after.status, WorkflowStatus.RUNNING)
-        self.assertEqual(after.version, before.version)
+        self.assertEqual(after.version, self.claim.workflow_version)
 
     def test_cli_failure_does_not_echo_private_configuration(self):
         private_value = "synthetic-private-config-value"

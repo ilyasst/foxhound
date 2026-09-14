@@ -206,7 +206,10 @@ are injected from owner-only run state rather than trusted from agent output.
 Before recording, the worker can construct a correctly named draft from fixed
 owner-only summary, work, and optional string-array files beside that run
 state. Private result content is never passed in command-line arguments, and
-the existing strict hand-authored draft path remains compatible. Work-context
+the existing strict hand-authored draft path remains compatible. A plan-phase
+release with result inputs validates and records them as `awaiting_plan`;
+later phases refuse to discard inputs because their outcome cannot be inferred
+safely. Work-context
 version 4 also reports authoritative local calendar anchors, exact profile
 toolsets, and phase-derived worker capabilities so versioned guidance does not
 depend on ambient Hermes configuration or model date arithmetic. See
