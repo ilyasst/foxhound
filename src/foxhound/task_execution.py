@@ -41,11 +41,25 @@ REVIEW_SNOOZE_INTERVALS = {
     "snooze_14d": timedelta(days=14),
     "snooze_30d": timedelta(days=30),
 }
+#: The agent a kind of work starts on, when that machine has it installed.
+#: A preference, not a rule: the reader may change it at the gate, and a
+#: machine without the profile falls back to its default rather than
+#: refusing the task.
+SOURCE_KIND_PROFILES = {
+    "issue": "sigint",
+    "review_request": "sigint",
+}
+
 DEFAULT_LEASE_SECONDS = 300
 MIN_LEASE_SECONDS = 5
 MAX_LEASE_SECONDS = 3_600
 DEFAULT_MAX_ATTEMPTS = 3
 MAX_ATTEMPTS = 20
+#: How long a parked workflow waits before trying again on its own. Long
+#: enough that a passing outage has ended, short enough that a reader who
+#: does nothing still gets the work attempted the same day.
+PARK_RETRY_INTERVAL = timedelta(hours=6)
+
 RETRY_BASE_SECONDS = 60
 RETRY_MAX_SECONDS = 3_600
 MAX_RESULT_BYTES = 256 * 1024
@@ -272,6 +286,27 @@ class TaskExecutionService:
         self._planning_grants = _planning_grants(planning_grants)
         self._default_profile = profile
 
+    def _profile_for(self, origin_kind: object) -> AgentProfile:
+        """Which agent a task of this kind starts on.
+
+        A default that ignores what the task is sends repository work to a
+        compatibility profile. One review of a pull request went to
+        `general`, produced nothing recordable three times, and parked —
+        with the review already written.
+
+        Falls back to the default when a preferred profile is not installed
+        on this machine, because a machine that lacks it should still work
+        rather than refuse every task of that kind.
+        """
+        preferred = SOURCE_KIND_PROFILES.get(origin_kind)
+        if preferred:
+            profile = self._profile_registry.get(preferred)
+            if profile is not None and (
+                WorkflowPhase.PLAN.value in profile.allowed_phases
+            ):
+                return profile
+        return self._default_profile
+
     def initialize(self) -> None:
         CandidateInbox(self.database_path, clock=self._clock).initialize()
 
@@ -360,6 +395,7 @@ class TaskExecutionService:
                         if waiting_room == 0:
                             continue
                         waiting_room -= 1
+                    profile = self._profile_for(row["origin_kind"])
                     connection.execute(
                         "INSERT INTO task_execution_workflows("
                         "task_id,task_version,status,phase,version,due_at,"
@@ -368,8 +404,8 @@ class TaskExecutionService:
                         "VALUES(?,?,?,'plan',1,NULL,0,?,?,?,?)",
                         (
                             task_id, task_version, status.value, now, now,
-                            self._default_profile.profile_id,
-                            self._default_profile.revision,
+                            profile.profile_id,
+                            profile.revision,
                         ),
                     )
                     self._event(
@@ -594,7 +630,12 @@ class TaskExecutionService:
                     "SELECT w.*,t.text,t.owner,t.due,t.status AS task_status,"
                     "t.version AS current_task_version "
                     "FROM task_execution_workflows AS w JOIN tasks AS t "
-                    "ON t.id=w.task_id WHERE w.status='queued' "
+                    # `parked` is claimable once its retry time arrives.
+                    # Parking stops the immediate retries; it is not a
+                    # decision to abandon the work, and a reader who never
+                    # answers the card should still have it attempted.
+                    "ON t.id=w.task_id "
+                    "WHERE w.status IN ('queued','parked') "
                     "AND (w.next_attempt_at IS NULL OR w.next_attempt_at<=?) "
                     f"AND w.phase IN ({placeholders}) "
                     "AND t.status='open' AND t.version=w.task_version "
@@ -617,8 +658,20 @@ class TaskExecutionService:
                 updated = connection.execute(
                     "UPDATE task_execution_workflows SET status='running',"
                     "version=?,claim_token_digest=?,claimed_at=?,"
-                    "claim_heartbeat_at=?,claim_expires_at=?,updated_at=? "
-                    "WHERE task_id=? AND version=? AND status='queued'",
+                    "claim_heartbeat_at=?,claim_expires_at=?,updated_at=?,"
+                    # Claiming a parked workflow starts a fresh round of
+                    # attempts. One attempt from the limit would park it
+                    # again on the first slip, which is a retry in name
+                    # only. Set here so the reset and the claim are the
+                    # same statement.
+                    "failure_count=CASE WHEN status='parked' THEN 0 "
+                    "ELSE failure_count END,"
+                    # The schema requires parked_at to exist exactly while
+                    # the status is parked, so leaving it set here is a
+                    # constraint failure rather than a stale field.
+                    "parked_at=NULL,next_attempt_at=NULL "
+                    "WHERE task_id=? AND version=? "
+                    "AND status IN ('queued','parked')",
                     (
                         version, digest, now, now, expires, now,
                         int(row["task_id"]), int(row["version"]),
@@ -1165,8 +1218,16 @@ class TaskExecutionService:
         failures = int(row["failure_count"]) + 1
         version = int(row["version"]) + 1
         if failures >= self._max_attempts:
+            # Parked, and due to try again later. A run of failures is often
+            # something passing — a forge that was unreachable, a machine
+            # under load — and giving up permanently on the third one turns
+            # a bad hour into abandoned work. The reader is told either way:
+            # parking raises a card, and if the later round fails it raises
+            # another.
             status = WorkflowStatus.PARKED
-            next_attempt = None
+            next_attempt = (stamp + PARK_RETRY_INTERVAL).isoformat(
+                timespec="seconds"
+            )
             parked = now
             kind = "parked"
         else:

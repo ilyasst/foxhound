@@ -35,6 +35,7 @@ from foxhound.execution_cards import (
     render_execution_review_card,
 )
 from foxhound.task_execution import (
+    PARK_RETRY_INTERVAL,
     ExecutionOutcome,
     ExecutionResultEnvelope,
     TaskExecutionService,
@@ -392,30 +393,42 @@ class ExecutionCardTests(unittest.TestCase):
             ExecutionCardRefusal.INVALID_ARGUMENT,
         )
 
-    def test_work_and_reader_waiting_are_independent_card_conditions(self):
+    def test_work_in_flight_does_not_hide_the_work_behind_it(self):
+        """A gate is how work gets queued. Suppressing gates while a
+        workflow runs means the queue empties and never refills: one
+        machine had 143 tasks invisible behind seven in flight, with a free
+        card surface and nothing to put on it.
+
+        How many cards a reader sees at once is the drip's business, and it
+        already bounds that. It is not this query's job to decide the
+        machine is too busy to be asked.
+        """
         first = self._schedule_workflow(1)
         self._schedule_workflow(2)
 
         queued = self.execution.start_action(
-            1, expected_version=first.version, action="start"
-        )
+            1, expected_version=first.version, action="start")
         self.assertEqual(queued.status, WorkflowStatus.QUEUED)
-        self.assertEqual(self.cards.schedule(limit=6).created, 1)
-        with closing(sqlite3.connect(self.database)) as connection:
-            self.assertEqual(
-                connection.execute(
-                    "SELECT task_id,kind FROM execution_review_cards "
-                    "ORDER BY id"
-                ).fetchall(),
-                [(2, "start")],
-            )
 
+        # Task 2 has not been asked about, and task 1 being queued is not a
+        # reason to keep asking about nothing.
+        self.assertEqual(self.cards.schedule(limit=6).created, 1)
+        card = self.cards.claim_next().card
+        self.assertEqual(
+            (card.task_id, card.kind), (2, ExecutionCardKind.START))
+
+        # Still true once the first is actually running.
         claim = self.execution.claim_next()
-        self.assertIsNotNone(claim)
         self.assertEqual(claim.task_id, 1)
-        self._schedule_workflow(3)
-        self.assertEqual(self.cards.schedule(limit=6).created, 1)
+        self.assertEqual(self.cards.schedule(limit=6).created, 0)
 
+    def test_a_review_still_arrives_while_other_work_runs(self):
+        # The point is not "more cards"; it is that finishing one piece of
+        # work still produces its own card whatever else is in flight.
+        first = self._schedule_workflow(1)
+        self.execution.start_action(
+            1, expected_version=first.version, action="start")
+        claim = self.execution.claim_next()
         recorded = self.execution.record_result(ExecutionResultEnvelope(
             result_id="priority-plan",
             task_id=1,
@@ -429,22 +442,15 @@ class ExecutionCardTests(unittest.TestCase):
         ))
         self.assertTrue(recorded.accepted)
 
-        self._schedule_workflow(4)
-        self.assertEqual(self.cards.schedule(limit=6).created, 2)
-        with closing(sqlite3.connect(self.database)) as connection:
-            rows = connection.execute(
-                "SELECT task_id,kind FROM execution_review_cards "
-                "ORDER BY id"
-            ).fetchall()
-        self.assertEqual(
-            rows,
-            [
-                (2, "start"),
-                (3, "start"),
-                (1, "plan_review"),
-                (4, "start"),
-            ],
+        self.assertEqual(self.cards.schedule(limit=6).created, 1)
+        review = self._claim_and_deliver()
+        self.assertEqual(review.card.kind, ExecutionCardKind.PLAN_REVIEW)
+        finished = self.cards.act(
+            review.card.id,
+            expected_version=review.card.version,
+            action="done",
         )
+        self.assertEqual(finished.workflow_status, WorkflowStatus.COMPLETED)
 
     def test_existing_over_capacity_work_does_not_hide_a_start_card(self):
         for task_id in range(1, 7):
@@ -489,7 +495,8 @@ class ExecutionCardTests(unittest.TestCase):
         ]
         self.assertEqual(
             [parse_execution_review_callback(value)[2] for value in callbacks],
-            ["done", "start", "drop", "discuss", "snooze", "reassign"],
+            ["done", "start", "drop", "discuss", "snooze", "reassign",
+             "agent"],
         )
         self.assertEqual(
             [[button["text"] for button in row]
@@ -498,6 +505,7 @@ class ExecutionCardTests(unittest.TestCase):
                 ["✅ Done", "▶️ Continue"],
                 ["🗑 Drop", "✏️ Update"],
                 ["🕓 Snooze", "👥 Reassign"],
+                ["🤖 Agent"],
             ],
         )
         self.assertTrue(all(
@@ -973,7 +981,9 @@ class ExecutionCardTests(unittest.TestCase):
             selected.card
         )
         self.assertIn("<b>Start this task?</b>", refreshed_body)
-        self.assertNotIn("Synthetic Specialist", refreshed_body)
+        # Choosing an agent shows on the card. Selecting one and seeing no
+        # sign of it is indistinguishable from the tap not working.
+        self.assertIn("Synthetic Specialist", refreshed_body)
         self.assertTrue(all(
             parse_execution_review_callback(button["callback_data"])[1]
             == selected.card_version
@@ -1442,6 +1452,41 @@ class ExecutionCardTests(unittest.TestCase):
         ]
         self.assertIn("start", actions)
 
+    def test_a_parked_workflow_tries_again_on_its_own(self):
+        """Parking stops the immediate retries; it is not a decision to
+        abandon the work. A run of failures is often something passing — an
+        unreachable forge, a machine under load — and a reader who never
+        answers the card should still have the work attempted.
+
+        The reader is told either way: parking raises a card, and a failed
+        second round raises another.
+        """
+        task_id = 1
+        parked = self._park(task_id)
+        self.assertEqual(parked.status, WorkflowStatus.PARKED)
+
+        # Not immediately: that would be the retry loop parking prevented.
+        self.assertIsNone(self.execution.claim_next())
+
+        self.clock.advance(PARK_RETRY_INTERVAL + timedelta(minutes=1))
+        claim = self.execution.claim_next()
+
+        self.assertIsNotNone(claim)
+        self.assertEqual(claim.task_id, task_id)
+        # A fresh round, or the first slip would park it again at once.
+        self.assertEqual(self.execution.get(task_id).failure_count, 0)
+
+    def test_parking_still_raises_a_card_before_it_retries(self):
+        # The automatic round must not replace telling the reader. They
+        # decide whether the work is still wanted; the retry only means
+        # nobody has to notice for it to be attempted again.
+        task_id = 1
+        self._park(task_id)
+        self.assertEqual(self.cards.schedule().created, 1)
+        body, _keyboard = render_execution_review_card(
+            self.cards.claim_next().card)
+        self.assertIn("Stopped after 3 failed attempt", body)
+
     def test_trying_again_gives_a_full_set_of_attempts(self):
         # Restarting with the count still at its limit would park again on
         # the first slip, which is a retry in name only.
@@ -1738,7 +1783,10 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertNotIn("plan refinement", body)
         self.assertIn("No agent has looked at this yet.", body)
         self.assertIn("<b>Continue</b> starts the investigation.", body)
-        self.assertNotIn("<b>Agent:</b>", body)
+        # The gate names its agent. A reader who cannot see it cannot tell
+        # that a pull request is about to be reviewed by a compatibility
+        # profile, which is how one review was lost.
+        self.assertIn("<b>Agent:</b>", body)
 
     def test_every_post_run_card_identifies_its_bound_agent(self):
         self._plan_review(1, "agent-plan")

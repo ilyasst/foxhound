@@ -506,6 +506,31 @@ class TaskExecutionTests(unittest.TestCase):
         refused = self.service.schedule(1, expected_task_version=2)
         self.assertEqual(refused.refusal, WorkflowRefusal.INVALID_STATE)
 
+    def test_repository_work_starts_on_an_agent_that_can_do_it(self):
+        """A single default sends every kind of work to the same agent. One
+        pull-request review went to the compatibility profile, produced
+        nothing recordable three times, and parked with the review written.
+
+        A preference, not a rule: the reader may still change it at the
+        gate, and a machine without the profile falls back rather than
+        refusing the task.
+        """
+        from foxhound.agent_profiles import AgentProfile, AgentProfileRegistry
+        from foxhound.task_execution import SOURCE_KIND_PROFILES
+
+        self.assertEqual(SOURCE_KIND_PROFILES.get("review_request"), "sigint")
+        self.assertEqual(SOURCE_KIND_PROFILES.get("issue"), "sigint")
+        # A meeting action has no preference and keeps the default.
+        self.assertIsNone(SOURCE_KIND_PROFILES.get("meeting"))
+
+        general = self.service._profile_registry.get("general")
+        service = TaskExecutionService(
+            self.database, clock=self.clock,
+            profile_registry=AgentProfileRegistry([general]))
+        # `sigint` is not installed here, so the task still gets an agent.
+        self.assertEqual(
+            service._profile_for("review_request").profile_id, "general")
+
     def test_an_enrolled_repository_issue_is_planned_without_being_asked(self):
         """The gate asks a question already answered by enrolling the repo.
 
