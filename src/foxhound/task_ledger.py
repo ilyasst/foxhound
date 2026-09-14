@@ -134,6 +134,7 @@ class NativeIntakeResult:
     tasks_created: int = 0
     tasks_revised: int = 0
     candidates_unchanged: int = 0
+    candidates_withdrawn: int = 0
     remaining: int = 0
     refusal: NativeIntakeRefusal | None = None
 
@@ -272,7 +273,9 @@ class TaskLedger:
 
                 unreconciled = connection.execute(
                     "SELECT COUNT(*) AS total FROM candidate_inbox AS c "
-                    "WHERE c.source_system=? AND NOT EXISTS("
+                    "JOIN candidate_lifecycle AS l ON l.candidate_id=c.candidate_id "
+                    "WHERE c.source_system=? AND l.state!='withdrawn' "
+                    "AND NOT EXISTS("
                     " SELECT 1 FROM task_candidate_bindings AS b "
                     " WHERE b.candidate_id=c.candidate_id "
                     " AND b.source_revision=c.source_revision"
@@ -397,6 +400,7 @@ class TaskLedger:
 
                 expected_sequence = previous_cursor + 1
                 tasks_created = tasks_revised = candidates_unchanged = 0
+                candidates_withdrawn = 0
                 for row in rows:
                     if int(row["sequence"]) != expected_sequence:
                         raise _NativeIntakeConflict
@@ -418,8 +422,12 @@ class TaskLedger:
                         raise _NativeIntakeConflict
 
                     binding = connection.execute(
-                        "SELECT source_revision,task_id,relation "
-                        "FROM task_candidate_bindings WHERE candidate_id=?",
+                        "SELECT b.candidate_id,b.source_revision,b.task_id,"
+                        "b.relation,l.state AS lifecycle_state,"
+                        "l.resolution AS lifecycle_resolution,"
+                        "l.task_version FROM task_candidate_bindings AS b "
+                        "JOIN task_candidate_lifecycle AS l "
+                        "ON l.candidate_id=b.candidate_id WHERE b.candidate_id=?",
                         (candidate.candidate_id,),
                     ).fetchone()
                     producer_decision = connection.execute(
@@ -441,6 +449,24 @@ class TaskLedger:
                             continue
                         raise _NativeIntakeConflict
 
+                    if candidate.lifecycle.state == "withdrawn":
+                        if binding is None:
+                            candidates_withdrawn += 1
+                            continue
+                        if binding["source_revision"] == candidate.source.revision:
+                            candidates_unchanged += 1
+                            continue
+                        if binding["relation"] != "accepted":
+                            raise _NativeIntakeConflict
+                        self._apply_candidate_withdrawal(
+                            connection,
+                            candidate=candidate,
+                            binding=binding,
+                            now=now,
+                        )
+                        candidates_withdrawn += 1
+                        continue
+
                     if binding is None:
                         task_id = self._insert_task(
                             connection, candidate, candidate.task.owner, now
@@ -456,6 +482,12 @@ class TaskLedger:
                                 now,
                             ),
                         )
+                        self._insert_task_candidate_lifecycle(
+                            connection,
+                            candidate=candidate,
+                            task_version=1,
+                            now=now,
+                        )
                         tasks_created += 1
                         continue
 
@@ -464,6 +496,15 @@ class TaskLedger:
                         continue
                     if binding["relation"] != "accepted":
                         raise _NativeIntakeConflict
+                    if binding["lifecycle_state"] == "withdrawn":
+                        self._apply_candidate_reactivation(
+                            connection,
+                            candidate=candidate,
+                            binding=binding,
+                            now=now,
+                        )
+                        tasks_revised += 1
+                        continue
                     task = connection.execute(
                         "SELECT status,version FROM tasks WHERE id=?",
                         (int(binding["task_id"]),),
@@ -488,6 +529,18 @@ class TaskLedger:
                         "decided_at=? WHERE candidate_id=?",
                         (
                             candidate.source.revision,
+                            now,
+                            candidate.candidate_id,
+                        ),
+                    )
+                    connection.execute(
+                        "UPDATE task_candidate_lifecycle SET source_revision=?,"
+                        "task_version=?,state='active',resolution='current',"
+                        "changed_at=?,decided_at=? WHERE candidate_id=?",
+                        (
+                            candidate.source.revision,
+                            version,
+                            candidate.lifecycle.changed_at,
                             now,
                             candidate.candidate_id,
                         ),
@@ -544,6 +597,7 @@ class TaskLedger:
                     tasks_created=tasks_created,
                     tasks_revised=tasks_revised,
                     candidates_unchanged=candidates_unchanged,
+                    candidates_withdrawn=candidates_withdrawn,
                     remaining=remaining,
                 )
             except _NativeIntakeConflict:
@@ -772,6 +826,12 @@ class TaskLedger:
                                 relation,
                                 now,
                             ),
+                        )
+                        self._insert_task_candidate_lifecycle(
+                            connection,
+                            candidate=item.candidate,
+                            task_version=task_version,
+                            now=now,
                         )
                         bindings_created += 1
                         if relation == "folded":
@@ -1052,6 +1112,203 @@ class TaskLedger:
                 "SELECT COUNT(*) AS total FROM task_candidate_bindings"
             ).fetchone()
             return int(row["total"])
+
+    @staticmethod
+    def _insert_task_candidate_lifecycle(
+        connection: sqlite3.Connection,
+        *,
+        candidate: TaskCandidate,
+        task_version: int,
+        now: str,
+    ) -> None:
+        connection.execute(
+            "INSERT INTO task_candidate_lifecycle(candidate_id,source_revision,"
+            "task_version,state,resolution,changed_at,decided_at) "
+            "VALUES(?,?,?,?,'current',?,?)",
+            (
+                candidate.candidate_id,
+                candidate.source.revision,
+                task_version,
+                candidate.lifecycle.state,
+                candidate.lifecycle.changed_at,
+                now,
+            ),
+        )
+
+    @staticmethod
+    def _apply_candidate_withdrawal(
+        connection: sqlite3.Connection,
+        *,
+        candidate: TaskCandidate,
+        binding: sqlite3.Row,
+        now: str,
+    ) -> None:
+        task = connection.execute(
+            "SELECT status,text,owner,due,version FROM tasks WHERE id=?",
+            (int(binding["task_id"]),),
+        ).fetchone()
+        if task is None:
+            raise _NativeIntakeConflict
+        previous = TaskLedger._bound_candidate(connection, binding)
+        active_workflow = connection.execute(
+            "SELECT 1 FROM task_execution_workflows WHERE task_id=? "
+            "AND status NOT IN ('awaiting_start','completed','cancelled')",
+            (int(binding["task_id"]),),
+        ).fetchone()
+        reader_conflict = (
+            task["status"] != TaskStatus.OPEN
+            or int(task["version"]) != int(binding["task_version"])
+            or task["text"] != previous.task.text
+            or task["owner"] != previous.task.owner
+            or task["due"] != previous.task.due
+            or active_workflow is not None
+        )
+        version = int(task["version"])
+        event_kind = "candidate_withdrawal_conflict"
+        resolution = "reader_conflict"
+        if not reader_conflict:
+            version += 1
+            connection.execute(
+                "UPDATE tasks SET version=?,updated_at=? WHERE id=?",
+                (version, now, int(binding["task_id"])),
+            )
+            event_kind = "candidate_withdrawn"
+            resolution = "preserved_open"
+        connection.execute(
+            "UPDATE task_candidate_bindings SET source_revision=?,decided_at=? "
+            "WHERE candidate_id=?",
+            (
+                candidate.source.revision,
+                now,
+                candidate.candidate_id,
+            ),
+        )
+        connection.execute(
+            "UPDATE task_candidate_lifecycle SET source_revision=?,"
+            "task_version=?,state='withdrawn',resolution=?,changed_at=?,"
+            "decided_at=? WHERE candidate_id=?",
+            (
+                candidate.source.revision,
+                version,
+                resolution,
+                candidate.lifecycle.changed_at,
+                now,
+                candidate.candidate_id,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO task_events(task_id,kind,task_version,candidate_id,"
+            "source_revision,from_status,to_status,occurred_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (
+                int(binding["task_id"]),
+                event_kind,
+                version,
+                candidate.candidate_id,
+                candidate.source.revision,
+                None,
+                None,
+                now,
+            ),
+        )
+
+    @staticmethod
+    def _apply_candidate_reactivation(
+        connection: sqlite3.Connection,
+        *,
+        candidate: TaskCandidate,
+        binding: sqlite3.Row,
+        now: str,
+    ) -> None:
+        task = connection.execute(
+            "SELECT status,version FROM tasks WHERE id=?",
+            (int(binding["task_id"]),),
+        ).fetchone()
+        if task is None:
+            raise _NativeIntakeConflict
+        active_workflow = connection.execute(
+            "SELECT 1 FROM task_execution_workflows WHERE task_id=? "
+            "AND status NOT IN ('awaiting_start','completed','cancelled')",
+            (int(binding["task_id"]),),
+        ).fetchone()
+        reader_conflict = (
+            binding["lifecycle_resolution"] == "reader_conflict"
+            or task["status"] != TaskStatus.OPEN
+            or int(task["version"]) != int(binding["task_version"])
+            or active_workflow is not None
+        )
+        version = int(task["version"])
+        event_kind = "candidate_reactivation_conflict"
+        resolution = "reader_conflict"
+        if not reader_conflict:
+            version += 1
+            connection.execute(
+                "UPDATE tasks SET text=?,owner=?,due=?,version=?,updated_at=? "
+                "WHERE id=?",
+                (
+                    candidate.task.text,
+                    candidate.task.owner,
+                    candidate.task.due,
+                    version,
+                    now,
+                    int(binding["task_id"]),
+                ),
+            )
+            event_kind = "candidate_reactivated"
+            resolution = "current"
+        connection.execute(
+            "UPDATE task_candidate_bindings SET source_revision=?,decided_at=? "
+            "WHERE candidate_id=?",
+            (
+                candidate.source.revision,
+                now,
+                candidate.candidate_id,
+            ),
+        )
+        connection.execute(
+            "UPDATE task_candidate_lifecycle SET source_revision=?,"
+            "task_version=?,state='active',resolution=?,changed_at=?,"
+            "decided_at=? WHERE candidate_id=?",
+            (
+                candidate.source.revision,
+                version,
+                resolution,
+                candidate.lifecycle.changed_at,
+                now,
+                candidate.candidate_id,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO task_events(task_id,kind,task_version,candidate_id,"
+            "source_revision,from_status,to_status,occurred_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (
+                int(binding["task_id"]),
+                event_kind,
+                version,
+                candidate.candidate_id,
+                candidate.source.revision,
+                None,
+                None,
+                now,
+            ),
+        )
+
+    @staticmethod
+    def _bound_candidate(
+        connection: sqlite3.Connection, binding: sqlite3.Row
+    ) -> TaskCandidate:
+        row = connection.execute(
+            "SELECT payload_json FROM candidate_revision_history "
+            "WHERE candidate_id=? AND source_revision=?",
+            (binding["candidate_id"], binding["source_revision"]),
+        ).fetchone()
+        if row is None:
+            raise _NativeIntakeConflict
+        try:
+            return parse_task_candidate(json.loads(row["payload_json"]))
+        except (json.JSONDecodeError, TypeError, ContractError) as exc:
+            raise _NativeIntakeConflict from exc
 
     @staticmethod
     def _native_intake_event(

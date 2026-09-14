@@ -147,6 +147,13 @@ class TaskCardService:
                     "SELECT t.id,t.version FROM tasks AS t "
                     "WHERE t.status='open' "
                     "AND NOT EXISTS("
+                    " SELECT 1 FROM task_candidate_bindings AS b JOIN "
+                    " task_candidate_lifecycle AS l ON l.candidate_id=b.candidate_id "
+                    " WHERE b.task_id=t.id AND b.relation='accepted' "
+                    " AND l.state='withdrawn' "
+                    " AND l.resolution='preserved_open'"
+                    ") "
+                    "AND NOT EXISTS("
                     " SELECT 1 FROM task_review_cards AS active "
                     " WHERE active.task_id=t.id AND active.status IN "
                     " ('pending','delivering','delivered','snoozed')"
@@ -549,7 +556,12 @@ class TaskCardService:
             "SELECT c.id,c.task_id,c.task_version,c.version "
             "FROM task_review_cards AS c JOIN tasks AS t ON t.id=c.task_id "
             "WHERE c.status IN ('pending','delivering','delivered','snoozed') "
-            "AND (t.status!='open' OR t.version!=c.task_version) ORDER BY c.id"
+            "AND (t.status!='open' OR t.version!=c.task_version OR EXISTS("
+            " SELECT 1 FROM task_candidate_bindings AS b JOIN "
+            " task_candidate_lifecycle AS l ON l.candidate_id=b.candidate_id "
+            " WHERE b.task_id=t.id AND b.relation='accepted' "
+            " AND l.state='withdrawn' AND l.resolution='preserved_open'"
+            ")) ORDER BY c.id"
         ).fetchall()
         for row in rows:
             next_version = int(row["version"]) + 1
