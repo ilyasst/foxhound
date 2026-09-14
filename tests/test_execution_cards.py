@@ -893,6 +893,52 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertEqual(refused.refusal, ExecutionCardRefusal.INVALID_STATE)
         self.assertEqual(self.execution.get(1), before)
 
+    def test_an_approval_card_shows_what_it_asks_to_send(self):
+        """The card says "approve only if these exact external effects are
+        intended", and the effect is usually "send this". Showing a summary
+        of a draft instead of the draft asks a reader to authorise text they
+        have not read — which is the one thing the gate exists to prevent.
+
+        The plan and result cards already show drafts in full; this one did
+        not, so the card asking for authority was the least informative of
+        the three.
+        """
+        task_id = 1
+        self._plan_review(task_id, "approve-draft")
+        approved = self.execution.review_action(
+            task_id,
+            expected_version=self.execution.get(task_id).version,
+            action="approve",
+        )
+        self.assertEqual(approved.phase, WorkflowPhase.EXECUTE)
+        claim = self.execution.claim_next()
+        self.execution.record_result(ExecutionResultEnvelope(
+            result_id="e" * 32,
+            task_id=task_id,
+            task_version=1,
+            workflow_version=claim.workflow_version,
+            phase=WorkflowPhase.EXECUTE,
+            claim_token=claim.token,
+            outcome=ExecutionOutcome.AWAITING_EXTERNAL,
+            summary="Reviewed it; two things to fix.",
+            work_markdown="Synthetic work.",
+            questions=(),
+            external_actions=(
+                {"action": "Post this review on the pull request",
+                 "channel": "forge.example/acme/widget"},
+            ),
+            deliverables=(
+                {"label": "review", "body": "Line one.\nSynthetic finding."},
+            ),
+        ))
+        self.assertEqual(self.cards.schedule().created, 1)
+        card = self.cards.claim_next().card
+        self.assertEqual(card.kind, ExecutionCardKind.EXTERNAL_REVIEW)
+
+        body, _keyboard = render_execution_review_card(card)
+        self.assertIn("<b>review</b>", body)
+        self.assertIn("Synthetic finding.", body)
+
     def test_external_review_requires_its_exact_separate_approval(self):
         self._external_review(1, "external-one")
         self._external_review(2, "external-two")
