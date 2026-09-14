@@ -144,6 +144,26 @@ def owner_candidate(
     return item
 
 
+def owner_provenance_candidate(index: int) -> dict:
+    item = provenance_candidate(index)
+    item["schema_version"] = 6
+    item["task"]["owner_ref"] = {
+        "kind": "person",
+        "speaker_id": "SPK_101",
+        "canonical_speaker_id": "SPK_001",
+        "speaker_registry_id": "registry-alpha",
+        "pinned": False,
+        "provisional": False,
+    }
+    item["source"]["revision"] = hashlib.sha256(
+        json.dumps(
+            {"task": item["task"], "evidence": item["evidence"]},
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    return item
+
+
 def legacy_candidate(index: int) -> dict:
     """A fictional open task offered only for a bounded cutover."""
     item = candidate(
@@ -888,6 +908,30 @@ class NativeCandidateIntakeTests(unittest.TestCase):
             action="done",
         )
         self.assertEqual(stale.refusal, CardRefusal.STALE_VERSION)
+
+    def test_owner_provenance_revision_retains_sources_and_updates_owner(self):
+        self.activate()
+        initial = provenance_candidate(1)
+        self.inbox.import_feed(feed(0, initial))
+        self.intake()
+        revised = owner_provenance_candidate(1)
+        self.inbox.import_feed(feed(1, revised))
+
+        result = self.intake()
+
+        self.assertEqual(result.tasks_revised, 1)
+        task = self.ledger.get(1)
+        self.assertEqual(task.owner_ref_version, 1)
+        self.assertEqual(task.owner_kind, "person")
+        with closing(sqlite3.connect(self.database)) as connection:
+            payload = json.loads(
+                connection.execute(
+                    "SELECT payload_json FROM candidate_inbox WHERE candidate_id=?",
+                    (revised["candidate_id"],),
+                ).fetchone()[0]
+            )
+        self.assertEqual(payload["schema_version"], 6)
+        self.assertEqual(len(payload["evidence"]["sources"]), 3)
 
     def test_conflict_rolls_back_complete_pass_and_keeps_cursor(self):
         self.activate()

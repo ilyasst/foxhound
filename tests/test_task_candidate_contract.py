@@ -167,6 +167,60 @@ class TaskCandidateContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ContractError, "unresolved display"):
             parse_task_candidate(unresolved)
 
+    def test_version_6_round_trips_provenance_and_owner_identity(self):
+        document = fixture("meeting-candidate-v4.json")
+        document["schema_version"] = 6
+        document["task"]["owner"] = "Person A"
+        document["task"]["owner_ref"] = {
+            "kind": "person",
+            "speaker_id": "SPK_101",
+            "canonical_speaker_id": "SPK_001",
+            "speaker_registry_id": "registry-alpha",
+            "pinned": False,
+            "provisional": False,
+        }
+
+        candidate = parse_task_candidate(document)
+
+        self.assertEqual(candidate.schema_version, 6)
+        self.assertEqual(candidate.task.owner_ref.kind, "person")
+        self.assertEqual(len(candidate.evidence.sources), 3)
+        self.assertEqual(task_candidate_document(candidate), document)
+
+    def test_version_6_requires_meeting_provenance_and_unpinned_owner(self):
+        valid = fixture("meeting-candidate-v4.json")
+        valid["schema_version"] = 6
+        valid["task"]["owner_ref"] = {
+            "kind": "person",
+            "speaker_id": None,
+            "canonical_speaker_id": None,
+            "speaker_registry_id": None,
+            "pinned": False,
+            "provisional": False,
+        }
+        parse_task_candidate(valid)
+
+        no_sources = copy.deepcopy(valid)
+        del no_sources["evidence"]["sources"]
+        with self.assertRaisesRegex(ContractError, "missing required fields"):
+            parse_task_candidate(no_sources)
+
+        wrong_kind = copy.deepcopy(valid)
+        wrong_kind["source"]["kind"] = "email"
+        wrong_kind["candidate_id"] = candidate_id_for(
+            system="gw",
+            kind="email",
+            record_id=wrong_kind["source"]["record_id"],
+            item_id=wrong_kind["source"]["item_id"],
+        )
+        with self.assertRaisesRegex(ContractError, "provenance"):
+            parse_task_candidate(wrong_kind)
+
+        pinned = copy.deepcopy(valid)
+        pinned["task"]["owner_ref"]["pinned"] = True
+        with self.assertRaisesRegex(ContractError, "producer pin"):
+            parse_task_candidate(pinned)
+
     def test_version_3_distinguishes_active_from_withdrawn(self):
         for state in ("active", "withdrawn"):
             document = fixture("meeting-candidate-v2.json")
@@ -364,6 +418,22 @@ class TaskCandidateContractTests(unittest.TestCase):
         self.assertFalse(version_5["additionalProperties"])
         self.assertFalse(
             version_5["$defs"]["ownerRef"]["additionalProperties"]
+        )
+        version_6 = json.loads(
+            schema_path.with_name("task-candidate-v6.schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(version_6["properties"]["schema_version"]["const"], 6)
+        self.assertEqual(
+            version_6["properties"]["evidence"]["properties"]["sources"][
+                "maxItems"
+            ],
+            3,
+        )
+        self.assertFalse(version_6["additionalProperties"])
+        self.assertFalse(
+            version_6["$defs"]["ownerRef"]["additionalProperties"]
         )
         expected_kinds = {"meeting", "email", "teams", "issue", "legacy"}
         self.assertEqual(

@@ -24,12 +24,14 @@ PROJECTLESS_SCHEMA_VERSION = 2
 LIFECYCLE_SCHEMA_VERSION = 3
 PROVENANCE_SCHEMA_VERSION = 4
 OWNER_SCHEMA_VERSION = 5
+OWNER_PROVENANCE_SCHEMA_VERSION = 6
 SUPPORTED_SCHEMA_VERSIONS = frozenset({
     SCHEMA_VERSION,
     PROJECTLESS_SCHEMA_VERSION,
     LIFECYCLE_SCHEMA_VERSION,
     PROVENANCE_SCHEMA_VERSION,
     OWNER_SCHEMA_VERSION,
+    OWNER_PROVENANCE_SCHEMA_VERSION,
 })
 LIFECYCLE_STATES = frozenset({"active", "withdrawn"})
 SOURCE_SYSTEMS = frozenset({"gw"})
@@ -143,14 +145,18 @@ def task_candidate_document(candidate: TaskCandidate) -> dict[str, Any]:
         "due": candidate.task.due,
     }
     if candidate.schema_version == SCHEMA_VERSION or (
-        candidate.schema_version == PROVENANCE_SCHEMA_VERSION
+        candidate.schema_version in {
+            PROVENANCE_SCHEMA_VERSION, OWNER_PROVENANCE_SCHEMA_VERSION,
+        }
         and candidate.task.project is not None
     ) or (
         candidate.schema_version == OWNER_SCHEMA_VERSION
         and candidate.task.project is not None
     ):
         task["project"] = candidate.task.project
-    if candidate.schema_version == OWNER_SCHEMA_VERSION:
+    if candidate.schema_version in {
+        OWNER_SCHEMA_VERSION, OWNER_PROVENANCE_SCHEMA_VERSION,
+    }:
         owner_ref = candidate.task.owner_ref
         task["owner_ref"] = None if owner_ref is None else {
             "kind": owner_ref.kind,
@@ -178,7 +184,9 @@ def task_candidate_document(candidate: TaskCandidate) -> dict[str, Any]:
         },
         "created_at": candidate.created_at,
     }
-    if candidate.schema_version == PROVENANCE_SCHEMA_VERSION:
+    if candidate.schema_version in {
+        PROVENANCE_SCHEMA_VERSION, OWNER_PROVENANCE_SCHEMA_VERSION,
+    }:
         document["evidence"]["sources"] = [
             {
                 "name": source.name,
@@ -265,15 +273,23 @@ def parse_task_candidate(document: object) -> TaskCandidate:
 
     task_doc = _object(root["task"], "candidate.task")
     base_task_fields = {"text", "owner", "due"}
-    if version in {PROVENANCE_SCHEMA_VERSION, OWNER_SCHEMA_VERSION}:
+    if version in {
+        PROVENANCE_SCHEMA_VERSION,
+        OWNER_SCHEMA_VERSION,
+        OWNER_PROVENANCE_SCHEMA_VERSION,
+    }:
         allowed = base_task_fields | {"project"}
-        if version == OWNER_SCHEMA_VERSION:
+        if version in {OWNER_SCHEMA_VERSION, OWNER_PROVENANCE_SCHEMA_VERSION}:
             allowed.add("owner_ref")
         _required_and_allowed_fields(
             task_doc,
             "candidate.task",
             base_task_fields | (
-                {"owner_ref"} if version == OWNER_SCHEMA_VERSION else set()
+                {"owner_ref"}
+                if version in {
+                    OWNER_SCHEMA_VERSION, OWNER_PROVENANCE_SCHEMA_VERSION,
+                }
+                else set()
             ),
             allowed,
         )
@@ -287,7 +303,8 @@ def parse_task_candidate(document: object) -> TaskCandidate:
     owner = _optional_text(task_doc["owner"], "candidate.task.owner", 200)
     owner_ref = (
         _owner_ref(task_doc["owner_ref"], owner, source_kind=source.kind)
-        if version == OWNER_SCHEMA_VERSION else None
+        if version in {OWNER_SCHEMA_VERSION, OWNER_PROVENANCE_SCHEMA_VERSION}
+        else None
     )
     task = CandidateTask(
         text=_bounded_text(task_doc["text"], "candidate.task.text", 1, 1_000),
@@ -296,7 +313,11 @@ def parse_task_candidate(document: object) -> TaskCandidate:
                 task_doc["project"], "candidate.task.project", 1, 200
             )
             if version == SCHEMA_VERSION or (
-                version in {PROVENANCE_SCHEMA_VERSION, OWNER_SCHEMA_VERSION}
+                version in {
+                    PROVENANCE_SCHEMA_VERSION,
+                    OWNER_SCHEMA_VERSION,
+                    OWNER_PROVENANCE_SCHEMA_VERSION,
+                }
                 and "project" in task_doc
             ) else None
         ),
@@ -307,11 +328,15 @@ def parse_task_candidate(document: object) -> TaskCandidate:
 
     evidence_doc = _object(root["evidence"], "candidate.evidence")
     evidence_fields = {"document_id", "locator"}
-    if version == PROVENANCE_SCHEMA_VERSION:
+    if version in {
+        PROVENANCE_SCHEMA_VERSION, OWNER_PROVENANCE_SCHEMA_VERSION,
+    }:
         evidence_fields.add("sources")
     _exact_fields(evidence_doc, "candidate.evidence", evidence_fields)
     sources: tuple[CandidateEvidenceSource, ...] = ()
-    if version == PROVENANCE_SCHEMA_VERSION:
+    if version in {
+        PROVENANCE_SCHEMA_VERSION, OWNER_PROVENANCE_SCHEMA_VERSION,
+    }:
         if source.kind != "meeting":
             raise ContractError(
                 "candidate.source.kind is unsupported for provenance"
