@@ -36,8 +36,11 @@ that queues planning.
 
 Plan, external-action, and result cards retain their existing content and
 approval boundaries while restoring Reassign beside Drop task in their final
-row. Oversized presentations still omit affirmative controls, and forged or
-stale callbacks remain refused.
+row. Every post-run review card identifies the bound agent by its resolved
+display name, so the reader knows whose work is being reviewed. Start cards
+retain the pre-run statement that no agent has looked at the task yet.
+Oversized presentations still omit affirmative controls, and forged or stale
+callbacks remain refused.
 
 Execution workflows continue to store an exact agent profile revision. The
 legacy-compatible Start keyboard does not expose a seventh Agent control.

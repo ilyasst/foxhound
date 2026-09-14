@@ -27,6 +27,7 @@ from foxhound.execution_cards import (
     ExecutionCardRefusal,
     ExecutionCardService,
     ExecutionCardStatus,
+    ExecutionReviewCard,
     parse_execution_agent_callback,
     parse_execution_review_callback,
     render_execution_agent_selector,
@@ -1032,6 +1033,7 @@ class ExecutionCardTests(unittest.TestCase):
 
         self.assertIn(f"<code>T{task_id}</code>", body)
         self.assertIn("<b>Phase:</b> plan refinement", body)
+        self.assertIn("<b>Agent:</b> General", body)
         self.assertIn("<b>Needs your input:</b>", body)
         # The action says what is still missing, not just what it is.
         self.assertIn("Needs: Their handle", body)
@@ -1201,6 +1203,49 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertNotIn("plan refinement", body)
         self.assertIn("No agent has looked at this yet.", body)
         self.assertIn("<b>Continue</b> starts the investigation.", body)
+        self.assertNotIn("<b>Agent:</b>", body)
+
+    def test_every_post_run_card_identifies_its_bound_agent(self):
+        self._plan_review(1, "agent-plan")
+        self.assertEqual(self.cards.schedule().created, 1)
+        plan = self.cards.claim_next().card
+        plan_body, _ = render_execution_review_card(plan)
+        self.assertIn("<b>Agent:</b> General", plan_body)
+
+        self._external_review(2, "agent-external")
+        self.assertEqual(self.cards.schedule().created, 1)
+        external = self.cards.claim_next().card
+        external_body, _ = render_execution_review_card(external)
+        self.assertIn("<b>Agent:</b> General", external_body)
+
+        self._plan_review(3, "agent-result-plan")
+        approved = self.execution.review_action(
+            3,
+            expected_version=self.execution.get(3).version,
+            action="approve",
+        )
+        result = self._record(
+            3,
+            phase=WorkflowPhase.EXECUTE,
+            outcome=ExecutionOutcome.COMPLETED,
+            result_id="agent-result",
+        )
+        self.assertTrue(result.accepted)
+        self.assertGreater(result.version, approved.version)
+        self.assertEqual(self.cards.schedule().created, 1)
+        completed = self.cards.claim_next().card
+        completed_body, _ = render_execution_review_card(completed)
+        self.assertIn("<b>Agent:</b> General", completed_body)
+
+        oversized = ExecutionReviewCard(
+            **{
+                **plan.__dict__,
+                "work_markdown": "Synthetic plan. " * 4_000,
+            }
+        )
+        oversized_body, _ = render_execution_review_card(oversized)
+        self.assertIn("Agent: General", oversized_body)
+        self.assertNotIn("<b>Agent:</b>", oversized_body)
 
     def test_project_metadata_is_absent_from_start_and_review_headers(self):
         payload = json.dumps({"task": {"project": "Project Alpha"}})
