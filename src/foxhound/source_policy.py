@@ -17,13 +17,19 @@ class SourcePolicy:
     accepts_shadow_observations: bool
     accepts_native_intake: bool
     pre_authorized_planning: bool
+    #: Whether this kind's origin names something a reader can open. An
+    #: issue has a number and an address; a meeting action has an opaque
+    #: record id that no link can be built from. A card states the origin
+    #: either way — a wrong link is worse than none — but only an
+    #: addressable one is offered as a link.
+    addressable_origin: bool = False
 
 
 SOURCE_POLICIES = {
     "meeting": SourcePolicy(True, True, True, False),
     "email": SourcePolicy(True, True, True, False),
     "teams": SourcePolicy(True, True, True, False),
-    "issue": SourcePolicy(True, True, True, True),
+    "issue": SourcePolicy(True, True, True, True, addressable_origin=True),
     "legacy": SourcePolicy(True, True, True, False),
 }
 

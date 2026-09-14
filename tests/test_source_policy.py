@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import unittest
 
-from foxhound.source_policy import SOURCE_POLICIES, source_kinds_accepting
+from foxhound.source_policy import (
+    SOURCE_POLICIES,
+    SourcePolicy,
+    source_kinds_accepting,
+)
 from foxhound.task_execution import WorkflowStatus, _initial_status
 
 
@@ -24,6 +28,31 @@ class SourcePolicyTests(unittest.TestCase):
         self.assertEqual(
             _initial_status("teams"), WorkflowStatus.AWAITING_START
         )
+
+    def test_only_an_addressable_source_is_offered_as_a_link(self):
+        """A card states where work came from whichever source it is. Only
+        a source whose origin names something openable is offered as a
+        link, because a link that does not resolve is worse than a plain
+        name the reader can search for.
+        """
+        self.assertEqual(
+            source_kinds_accepting("addressable_origin"), {"issue"})
+
+    def test_a_new_source_is_not_addressable_by_default(self):
+        # Adding a source is an authority decision. Presentation defaults
+        # to the cautious answer so a new kind cannot inherit a link shape
+        # that does not fit it simply by being added.
+        policy = SourcePolicy(True, True, True, False)
+        self.assertFalse(policy.addressable_origin)
+
+    def test_every_declared_source_answers_every_capability(self):
+        # The registry is the one place these are decided; a kind missing
+        # from it is a kind whose authority nobody reviewed.
+        for kind, policy in SOURCE_POLICIES.items():
+            with self.subTest(kind=kind):
+                for capability in SourcePolicy.__dataclass_fields__:
+                    self.assertIsInstance(
+                        getattr(policy, capability), bool)
 
     def test_unknown_capability_fails_closed(self):
         with self.assertRaisesRegex(ValueError, "unknown source-policy"):

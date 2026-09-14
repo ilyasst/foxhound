@@ -24,6 +24,7 @@ from .agent_profiles import (
     load_registry,
 )
 from .candidate_inbox import CandidateInbox, InboxError, SCHEMA_VERSION
+from .source_policy import source_kinds_accepting
 from .task_execution import (
     ExecutionOutcome,
     REVIEW_SNOOZE_INTERVALS,
@@ -1586,6 +1587,11 @@ def _stored_collection(value: object) -> tuple[CardRecord, ...]:
 #: for is still named, just not linked — a wrong link is worse than none.
 _LINKABLE_HOSTS = ("github.com",)
 
+#: Which sources name something a reader can open. Declared once, beside
+#: the authority each source is granted, rather than compared by name at
+#: each place a card is built.
+ADDRESSABLE_ORIGINS = source_kinds_accepting("addressable_origin")
+
 
 def _origin_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
     """Say where the work came from, and make it reachable.
@@ -1597,7 +1603,7 @@ def _origin_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
     if not (card.origin_record and card.origin_item):
         return []
     record, item = card.origin_record, card.origin_item
-    if card.origin_kind != "issue" or "/" not in record:
+    if card.origin_kind not in ADDRESSABLE_ORIGINS or "/" not in record:
         return [f"<b>From:</b> {_escape(record)}" if html
                 else f"From: {record}"]
     name = record.rsplit("/", 1)[-1]
