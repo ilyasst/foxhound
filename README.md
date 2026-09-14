@@ -125,7 +125,8 @@ folded bindings, terminal tasks, gaps, and contradictory state fail closed
 without advancing the intake cursor. Both commands report aggregate metadata
 only. See [ADR 0022](docs/architecture/0022-native-candidate-intake.md).
 
-Meeting, email, and forge-issue candidates retain their actual source kind. A
+Meeting, email, Teams, and forge-issue candidates retain their actual source
+kind. A
 bounded authority cutover may additionally use the explicit `legacy` kind for
 still-open backlog records that predate those handoffs; it receives no special
 authority and must not become a permanent producer task registry.

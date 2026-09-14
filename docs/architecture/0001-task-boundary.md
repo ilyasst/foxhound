@@ -24,9 +24,9 @@ task candidates. Foxhound owns acceptance of a candidate as a durable task and
 all subsequent task behavior.
 
 The initial producer is identified as `gw`. Its meeting candidates may
-originate in an upstream meeting protocol, while its email candidates may be
-derived during email ingestion. That provenance does not transfer durable task
-ownership back to the producer.
+originate in an upstream meeting protocol, while its email and Teams
+candidates may be derived during source ingestion. That provenance does not
+transfer durable task ownership back to the producer.
 
 Foxhound owns:
 
@@ -66,6 +66,12 @@ produces the test-vector identifier ending in `4bbd8df4200fb56d...`.
 
 `source.revision` is intentionally excluded. A changed revision updates the
 same candidate; it does not create a duplicate durable task.
+
+Supported source kinds and their authority at candidate, shadow, native-intake,
+and planning gates are declared together in `foxhound.source_policy`. Teams is
+accepted at the first three gates but, like meeting and email evidence, does
+not pre-authorize an agent planning pass. Adding a source therefore cannot
+silently grant execution authority by widening only a parser enum.
 
 `created_at` is the time the producer first emitted the candidate, not the time
 of the source material. It is preserved across retries.

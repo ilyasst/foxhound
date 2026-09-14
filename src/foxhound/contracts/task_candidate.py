@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Mapping
 
+from foxhound.source_policy import source_kinds_accepting
+
 
 SCHEMA_ID = "foxhound.task-candidate"
 SCHEMA_VERSION = 1
@@ -33,7 +35,7 @@ SOURCE_SYSTEMS = frozenset({"gw"})
 #: a bounded authority cutover. Calling that record a meeting, email, or issue
 #: would give an execution agent a false origin. It receives no special
 #: lifecycle or execution authority and is not a permanent producer registry.
-SOURCE_KINDS = frozenset({"meeting", "email", "issue", "legacy"})
+SOURCE_KINDS = source_kinds_accepting("accepts_candidates")
 
 #: Identifiers are opaque to this parser: it checks their shape, never their
 #: meaning. ``/`` is accepted because forge identifiers are path-shaped — a

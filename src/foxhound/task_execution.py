@@ -27,6 +27,7 @@ from .agent_profiles import (
     load_registry,
 )
 from .candidate_inbox import CandidateInbox, InboxError, SCHEMA_VERSION
+from .source_policy import source_kinds_accepting
 from .task_ledger import TaskLedgerError, TaskStatus
 
 
@@ -1704,7 +1705,7 @@ def _validated_result(envelope: ExecutionResultEnvelope) -> dict[str, object]:
 
 #: An origin that already carries the reader's permission to spend a
 #: planning pass on it.
-PRE_AUTHORIZED_ORIGINS = frozenset({"issue"})
+PRE_AUTHORIZED_ORIGINS = source_kinds_accepting("pre_authorized_planning")
 
 
 def _initial_status(origin_kind: object) -> WorkflowStatus:

@@ -25,7 +25,7 @@
       "required": ["system", "kind", "record_id", "item_id", "revision"],
       "properties": {
         "system": {"enum": ["gw"]},
-        "kind": {"enum": ["meeting", "email", "issue", "legacy"]},
+        "kind": {"enum": ["meeting", "email", "teams", "issue", "legacy"]},
         "record_id": {"$ref": "#/$defs/opaqueId"},
         "item_id": {"$ref": "#/$defs/opaqueId"},
         "revision": {
