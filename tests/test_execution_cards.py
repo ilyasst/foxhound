@@ -1452,6 +1452,49 @@ class ExecutionCardTests(unittest.TestCase):
         ]
         self.assertIn("start", actions)
 
+    def test_a_workflow_parked_after_a_result_still_produces_a_card(self):
+        """A planning pass can succeed and a later attempt still park, so a
+        parked workflow may carry a result from earlier.
+
+        Matching the eligibility query while matching no card kind raised,
+        and the raise happened inside the scheduling sweep — which took
+        down every other card with it. One machine produced no cards at
+        all because a single workflow was in this state.
+        """
+        task_id = 1
+        self._plan_review(task_id, "parked-with-result")
+        # Send it back for another pass, then fail that pass until it parks.
+        self.execution.review_action(
+            task_id,
+            expected_version=self.execution.get(task_id).version,
+            action="revise")
+        for _ in range(3):
+            self.clock.advance(timedelta(hours=1))
+            claim = self.execution.claim_next()
+            self.assertIsNotNone(claim)
+            self.execution.fail(
+                task_id,
+                expected_version=claim.workflow_version,
+                claim_token=claim.token,
+                reason="process_exit")
+        workflow = self.execution.get(task_id)
+        self.assertEqual(workflow.status, WorkflowStatus.PARKED)
+        self.assertIsNotNone(workflow.last_result_id)
+
+        # The sweep must not raise, and must produce the card.
+        self.assertEqual(self.cards.schedule().created, 1)
+        body, _keyboard = render_execution_review_card(
+            self.cards.claim_next().card)
+        self.assertIn("Stopped after 3 failed attempt", body)
+
+    def test_one_unrenderable_workflow_cannot_silence_the_others(self):
+        # The sweep classifies every eligible row, so anything that raises
+        # mid-sweep costs every card behind it, not just its own.
+        self._schedule_workflow(2)
+        self._schedule_workflow(3)
+        created = self.cards.schedule(limit=6).created
+        self.assertGreaterEqual(created, 2)
+
     def test_a_parked_workflow_tries_again_on_its_own(self):
         """Parking stops the immediate retries; it is not a decision to
         abandon the work. A run of failures is often something passing — an
