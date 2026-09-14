@@ -164,6 +164,41 @@ def owner_provenance_candidate(index: int) -> dict:
     return item
 
 
+def cumulative_candidate(index: int, kind: str) -> dict:
+    """A fictional current-shape candidate for any accepted source kind."""
+    item = owner_candidate(index)
+    item["schema_version"] = 7
+    item["source"]["kind"] = kind
+    item["candidate_id"] = candidate_id_for(
+        system="gw",
+        kind=kind,
+        record_id=item["source"]["record_id"],
+        item_id=item["source"]["item_id"],
+    )
+    item["lifecycle"] = {
+        "state": "active",
+        "generation": 1,
+        "changed_at": "2030-02-01T12:00:00Z",
+    }
+    item["source"]["revision"] = hashlib.sha256(
+        json.dumps(item, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return item
+
+
+SOURCE_ROLE = {
+    "meeting": "transcript",
+    "email": "message",
+    "teams": "message",
+    "issue": "body",
+    "legacy": "record",
+    "review_request": "diff",
+    "mention": "comment",
+    "calendar": "description",
+    "alert": "detail",
+}
+
+
 def legacy_candidate(index: int) -> dict:
     """A fictional open task offered only for a bounded cutover."""
     item = candidate(
@@ -668,6 +703,38 @@ class NativeCandidateIntakeTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(binding, enriched["source"]["revision"])
         self.assertEqual(event, ("candidate_revised", 1))
+
+    def test_cumulative_provenance_revision_never_versions_the_task(self):
+        self.activate()
+        cursor = 0
+        for offset, (kind, role) in enumerate(SOURCE_ROLE.items(), start=10):
+            with self.subTest(kind=kind):
+                initial = cumulative_candidate(offset, kind)
+                self.inbox.import_feed(feed(cursor, initial))
+                cursor = self.intake().current_cursor
+                enriched = copy.deepcopy(initial)
+                enriched["evidence"]["sources"] = [{
+                    "name": f"example-{kind}.txt",
+                    "role": role,
+                    "extract": f"Synthetic {kind} evidence for this action.",
+                }]
+                enriched["lifecycle"].update({
+                    "generation": 2,
+                    "changed_at": "2030-02-02T12:00:00Z",
+                })
+                enriched["source"]["revision"] = hashlib.sha256(
+                    json.dumps(enriched["evidence"], sort_keys=True).encode("utf-8")
+                ).hexdigest()
+                self.inbox.import_feed(feed(cursor, enriched))
+
+                result = self.intake()
+                cursor = result.current_cursor
+
+                task = self.ledger.get(offset - 9)
+                self.assertEqual(result.tasks_revised, 1)
+                self.assertEqual(task.version, 1)
+                stored = self.inbox.get(enriched["candidate_id"])
+                self.assertEqual(stored.evidence.sources[0].role, role)
 
     def test_withdrawal_before_binding_advances_without_creating_a_task(self):
         self.activate()

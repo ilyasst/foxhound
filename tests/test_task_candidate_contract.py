@@ -221,6 +221,122 @@ class TaskCandidateContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ContractError, "producer pin"):
             parse_task_candidate(pinned)
 
+    def test_version_7_combines_owner_lifecycle_and_source_specific_provenance(self):
+        roles = {
+            "meeting": "transcript",
+            "email": "message",
+            "teams": "message",
+            "issue": "body",
+            "legacy": "record",
+            "review_request": "diff",
+            "mention": "comment",
+            "calendar": "event",
+            "alert": "signal",
+        }
+        for index, (kind, role) in enumerate(roles.items(), start=1):
+            document = fixture("meeting-candidate-v2.json")
+            document["schema_version"] = 7
+            document["source"].update({
+                "kind": kind,
+                "record_id": f"record-{index:03d}",
+                "item_id": f"item-{index:03d}",
+            })
+            document["candidate_id"] = candidate_id_for(
+                system="gw",
+                kind=kind,
+                record_id=document["source"]["record_id"],
+                item_id=document["source"]["item_id"],
+            )
+            document["task"]["owner_ref"] = {
+                "kind": "person",
+                "speaker_id": None,
+                "canonical_speaker_id": None,
+                "speaker_registry_id": None,
+                "pinned": False,
+                "provisional": False,
+            }
+            document["evidence"]["sources"] = [{
+                "name": f"source-{index:03d}.txt",
+                "role": role,
+                "extract": "Person A requested the synthetic work.",
+            }]
+            document["lifecycle"] = {
+                "state": "active",
+                "generation": 1,
+                "changed_at": "2030-02-01T12:00:00Z",
+            }
+
+            candidate = parse_task_candidate(document)
+
+            self.assertEqual(candidate.source.kind, kind)
+            self.assertEqual(candidate.evidence.sources[0].role, role)
+            self.assertEqual(candidate.lifecycle.generation, 1)
+            self.assertEqual(task_candidate_document(candidate), document)
+
+    def test_version_7_provenance_is_optional_and_roles_are_kind_scoped(self):
+        document = fixture("meeting-candidate-v2.json")
+        document["schema_version"] = 7
+        document["source"]["kind"] = "email"
+        document["candidate_id"] = candidate_id_for(
+            system="gw", kind="email",
+            record_id=document["source"]["record_id"],
+            item_id=document["source"]["item_id"],
+        )
+        document["task"]["owner_ref"] = {
+            "kind": "person",
+            "speaker_id": None,
+            "canonical_speaker_id": None,
+            "speaker_registry_id": None,
+            "pinned": False,
+            "provisional": False,
+        }
+        document["lifecycle"] = {
+            "state": "active",
+            "generation": 1,
+            "changed_at": "2030-02-01T12:00:00Z",
+        }
+        self.assertEqual(task_candidate_document(
+            parse_task_candidate(document)
+        ), document)
+
+        wrong_role = copy.deepcopy(document)
+        wrong_role["evidence"]["sources"] = [{
+            "name": "message.txt",
+            "role": "transcript",
+            "extract": "Synthetic source quotation.",
+        }]
+        with self.assertRaisesRegex(ContractError, "role"):
+            parse_task_candidate(wrong_role)
+
+        valid = copy.deepcopy(document)
+        valid["evidence"]["sources"] = [{
+            "name": "message.txt",
+            "role": "message",
+            "extract": "Synthetic source quotation.",
+        }]
+        changes = (
+            lambda value: value["evidence"]["sources"].__setitem__(
+                slice(None), []
+            ),
+            lambda value: value["evidence"]["sources"][0].__setitem__(
+                "name", "../message.txt"
+            ),
+            lambda value: value["evidence"]["sources"][0].__setitem__(
+                "extract", "x" * 1_201
+            ),
+            lambda value: value["evidence"]["sources"][0].__setitem__(
+                "extract", "Synthetic\x00quotation"
+            ),
+            lambda value: value["evidence"]["sources"][0].__setitem__(
+                "secret", "not-permitted"
+            ),
+        )
+        for change in changes:
+            broken = copy.deepcopy(valid)
+            change(broken)
+            with self.assertRaises(ContractError):
+                parse_task_candidate(broken)
+
     def test_version_3_distinguishes_active_from_withdrawn(self):
         for state in ("active", "withdrawn"):
             document = fixture("meeting-candidate-v2.json")
@@ -435,6 +551,17 @@ class TaskCandidateContractTests(unittest.TestCase):
         self.assertFalse(
             version_6["$defs"]["ownerRef"]["additionalProperties"]
         )
+        version_7 = json.loads(
+            schema_path.with_name("task-candidate-v7.schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(version_7["properties"]["schema_version"]["const"], 7)
+        self.assertIn("lifecycle", version_7["required"])
+        self.assertIn(
+            "sources", version_7["properties"]["evidence"]["properties"]
+        )
+        self.assertFalse(version_7["additionalProperties"])
         expected_kinds = {"meeting", "email", "teams", "issue", "legacy"}
         self.assertEqual(
             set(schema["properties"]["source"]["properties"]["kind"]["enum"]),

@@ -14,6 +14,11 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Callable
 
+from .card_provenance import (
+    CardSourceEvidence,
+    origin_lines,
+    stored_origin_sources,
+)
 from .candidate_inbox import CandidateInbox, InboxError, SCHEMA_VERSION
 from .task_ledger import (
     TaskLedgerError,
@@ -88,6 +93,14 @@ class TaskReviewCard:
     text: str = field(repr=False)
     owner: str | None = field(repr=False)
     due: str | None = field(repr=False)
+    first_raised: str | None = field(default=None, repr=False)
+    last_mentioned: str | None = field(default=None, repr=False)
+    origin_kind: str = field(default="", repr=False)
+    origin_record: str = field(default="", repr=False)
+    origin_item: str = field(default="", repr=False)
+    origin_sources: tuple[CardSourceEvidence, ...] = field(
+        default=(), repr=False
+    )
 
 
 @dataclass(frozen=True)
@@ -606,7 +619,33 @@ class TaskCardService:
     def _card_select() -> str:
         return (
             "SELECT c.id,c.task_id,c.task_version,c.status,c.version,c.due_at,"
-            "t.text,t.owner,t.owner_kind,t.due FROM task_review_cards AS c "
+            "t.text,t.owner,t.owner_kind,t.due,"
+            "(SELECT min(h.created_at) FROM task_candidate_bindings AS b "
+            " JOIN candidate_revision_history AS h "
+            " ON h.candidate_id=b.candidate_id WHERE b.task_id=c.task_id) "
+            " AS first_raised,"
+            "(SELECT max(h.created_at) FROM task_candidate_bindings AS b "
+            " JOIN candidate_revision_history AS h "
+            " ON h.candidate_id=b.candidate_id WHERE b.task_id=c.task_id) "
+            " AS last_mentioned,"
+            "(SELECT o.source_kind FROM task_candidate_bindings AS b "
+            " JOIN candidate_inbox AS o ON o.candidate_id=b.candidate_id "
+            " WHERE b.task_id=c.task_id AND b.relation='accepted') "
+            " AS origin_kind,"
+            "(SELECT o.source_record_id FROM task_candidate_bindings AS b "
+            " JOIN candidate_inbox AS o ON o.candidate_id=b.candidate_id "
+            " WHERE b.task_id=c.task_id AND b.relation='accepted') "
+            " AS origin_record,"
+            "(SELECT o.source_item_id FROM task_candidate_bindings AS b "
+            " JOIN candidate_inbox AS o ON o.candidate_id=b.candidate_id "
+            " WHERE b.task_id=c.task_id AND b.relation='accepted') "
+            " AS origin_item,"
+            "(SELECT h.payload_json FROM task_candidate_bindings AS b "
+            " JOIN candidate_revision_history AS h "
+            " ON h.candidate_id=b.candidate_id "
+            " AND h.source_revision=b.source_revision "
+            " WHERE b.task_id=c.task_id AND b.relation='accepted') "
+            " AS origin_payload FROM task_review_cards AS c "
             "JOIN tasks AS t ON t.id=c.task_id"
         )
 
@@ -642,11 +681,24 @@ def render_task_review_card(card: TaskReviewCard) -> tuple[str, dict]:
     if card.status is not CardStatus.DELIVERING:
         raise ValueError("task review card is not claimed for delivery")
     text = html.escape(card.text, quote=False)
-    lines = [f"☑️ <b>Task review</b>  <code>T{card.task_id}</code>", "", f"<b>{text}</b>"]
+    lines = [f"☑️ <b>Task done?</b>  <code>T{card.task_id}</code>", "", f"<b>{text}</b>"]
     if card.owner:
         lines.extend(("", f"👤 <b>Owner:</b> {html.escape(card.owner, quote=False)}"))
     if card.due:
         lines.append(f"📅 <b>Due:</b> {html.escape(card.due, quote=False)}")
+    first = "" if not card.first_raised else str(card.first_raised)[:10]
+    if first:
+        lines.append(f"📌 <b>First raised:</b> {html.escape(first, quote=False)}")
+    last = "" if not card.last_mentioned else str(card.last_mentioned)[:10]
+    if last and last != first:
+        lines.append(f"🕑 <b>Last mentioned:</b> {html.escape(last, quote=False)}")
+    lines.extend(("", *origin_lines(
+        kind=card.origin_kind,
+        record=card.origin_record,
+        item=card.origin_item,
+        sources=card.origin_sources,
+        html_output=True,
+    )))
 
     def callback(action: str) -> str:
         value = f"{CALLBACK_PREFIX}|{card.id}|{card.version}|{action}"
@@ -694,6 +746,12 @@ def _card(row) -> TaskReviewCard:
         text=row["text"],
         owner=canonical_owner_display(row["owner"], row["owner_kind"]),
         due=row["due"],
+        first_raised=row["first_raised"],
+        last_mentioned=row["last_mentioned"],
+        origin_kind=str(row["origin_kind"] or ""),
+        origin_record=str(row["origin_record"] or ""),
+        origin_item=str(row["origin_item"] or ""),
+        origin_sources=stored_origin_sources(row["origin_payload"]),
     )
 
 

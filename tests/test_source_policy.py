@@ -6,6 +6,7 @@ from foxhound.source_policy import (
     SOURCE_POLICIES,
     SourcePolicy,
     planning_grants,
+    provenance_roles_for,
     source_kinds_accepting,
 )
 from foxhound.task_execution import WorkflowStatus, _initial_status
@@ -87,9 +88,19 @@ class SourcePolicyTests(unittest.TestCase):
         # from it is a kind whose authority nobody reviewed.
         for kind, policy in SOURCE_POLICIES.items():
             with self.subTest(kind=kind):
-                for capability in SourcePolicy.__dataclass_fields__:
+                for capability in (
+                    "accepts_candidates",
+                    "accepts_shadow_observations",
+                    "accepts_native_intake",
+                    "addressable_origin",
+                ):
                     self.assertIsInstance(
                         getattr(policy, capability), bool)
+                self.assertIsInstance(policy.provenance_roles, frozenset)
+                self.assertEqual(
+                    provenance_roles_for(kind), policy.provenance_roles
+                )
+                self.assertTrue(policy.provenance_roles)
 
     def test_a_declared_kind_grants_no_authority_on_its_own(self):
         """A kind is declared before anything produces it, so the authority

@@ -28,27 +28,57 @@ class SourcePolicy:
     #: either way — a wrong link is worse than none — but only an
     #: addressable one is offered as a link.
     addressable_origin: bool = False
+    #: Closed evidence roles this kind may place on a cumulative candidate.
+    #: Kept beside the authority grant so accepting a new source never
+    #: inherits another source's document shape by accident.
+    provenance_roles: frozenset[str] = frozenset()
 
 
 SOURCE_POLICIES = {
-    "meeting": SourcePolicy(True, True, True),
-    "email": SourcePolicy(True, True, True),
-    "teams": SourcePolicy(True, True, True),
-    "issue": SourcePolicy(True, True, True, addressable_origin=True),
-    "legacy": SourcePolicy(True, True, True),
+    "meeting": SourcePolicy(
+        True, True, True,
+        provenance_roles=frozenset({"handoff", "protocol", "transcript"}),
+    ),
+    "email": SourcePolicy(
+        True, True, True,
+        provenance_roles=frozenset({"handoff", "subject", "message"}),
+    ),
+    "teams": SourcePolicy(
+        True, True, True,
+        provenance_roles=frozenset({"handoff", "message"}),
+    ),
+    "issue": SourcePolicy(
+        True, True, True, addressable_origin=True,
+        provenance_roles=frozenset({"title", "body"}),
+    ),
+    "legacy": SourcePolicy(
+        True, True, True, provenance_roles=frozenset({"record"}),
+    ),
     #: A pull request awaiting review. Addressable like an issue: the same
     #: host/owner/name and a number.
-    "review_request": SourcePolicy(True, True, True, addressable_origin=True),
+    "review_request": SourcePolicy(
+        True, True, True, addressable_origin=True,
+        provenance_roles=frozenset({"title", "body", "diff"}),
+    ),
     #: Being named on something that is not otherwise yours — the category
     #: most easily missed, because nobody assigned it.
-    "mention": SourcePolicy(True, True, True, addressable_origin=True),
+    "mention": SourcePolicy(
+        True, True, True, addressable_origin=True,
+        provenance_roles=frozenset({"title", "body", "comment"}),
+    ),
     #: A commitment with a date. Distinct from a meeting, which records
     #: what was said rather than what falls due.
-    "calendar": SourcePolicy(True, True, True),
+    "calendar": SourcePolicy(
+        True, True, True,
+        provenance_roles=frozenset({"event", "description"}),
+    ),
     #: Machine-generated: a failing job, a red check, an expiring
     #: credential. High volume, and the kind most likely to need gating
     #: rules of its own.
-    "alert": SourcePolicy(True, True, True),
+    "alert": SourcePolicy(
+        True, True, True,
+        provenance_roles=frozenset({"signal", "detail"}),
+    ),
 }
 
 
@@ -82,10 +112,25 @@ def source_kinds_accepting(capability: str) -> frozenset[str]:
     An unknown capability is a programmer error and fails closed rather than
     silently broadening authority.
     """
-    if capability not in SourcePolicy.__dataclass_fields__:
+    if capability not in {
+        "accepts_candidates",
+        "accepts_shadow_observations",
+        "accepts_native_intake",
+        "addressable_origin",
+    }:
         raise ValueError("unknown source-policy capability")
     return frozenset(
         kind
         for kind, policy in SOURCE_POLICIES.items()
         if getattr(policy, capability)
     )
+
+
+def provenance_roles_for(kind: str) -> frozenset[str]:
+    """Return the closed source-specific vocabulary for evidence extracts."""
+    policy = SOURCE_POLICIES.get(kind)
+    if policy is None or not policy.accepts_candidates:
+        raise ValueError("unknown candidate source kind")
+    if not policy.provenance_roles:
+        raise ValueError("candidate source has no provenance vocabulary")
+    return policy.provenance_roles

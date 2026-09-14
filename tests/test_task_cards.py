@@ -7,10 +7,12 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from foxhound import CandidateInbox
+from foxhound.card_provenance import CardSourceEvidence
 from foxhound.candidate_inbox import SCHEMA_VERSION
 from foxhound.contracts import candidate_id_for, comparable_task_digest
 from foxhound.task_cards import (
@@ -76,7 +78,7 @@ def candidate(index: int) -> dict:
     ).hexdigest()
     return {
         "schema": "foxhound.task-candidate",
-        "schema_version": 2,
+        "schema_version": 7,
         "candidate_id": candidate_id_for(
             system="gw",
             kind="meeting",
@@ -93,11 +95,29 @@ def candidate(index: int) -> dict:
         "task": {
             "text": text,
             "owner": owner,
+            "owner_ref": {
+                "kind": "person",
+                "speaker_id": None,
+                "canonical_speaker_id": None,
+                "speaker_registry_id": None,
+                "pinned": False,
+                "provisional": False,
+            },
             "due": f"2030-03-{index + 10:02d}",
         },
         "evidence": {
             "document_id": f"record-{index:03d}",
             "locator": f"action-item-{index:03d}",
+            "sources": [{
+                "name": f"meeting-{index:03d}.md",
+                "role": "transcript",
+                "extract": "Person A: Please prepare <the synthetic item>.",
+            }],
+        },
+        "lifecycle": {
+            "state": "active",
+            "generation": 1,
+            "changed_at": "2030-02-01T12:00:00Z",
         },
         "created_at": f"2030-01-{index:02d}T12:00:00Z",
     }
@@ -256,6 +276,12 @@ class TaskCardTests(unittest.TestCase):
         self.assertEqual(claim.card.version, 2)
         body, keyboard = render_task_review_card(claim.card)
         self.assertIn("&lt; safely", body)
+        self.assertIn("☑️ <b>Task done?</b>", body)
+        self.assertIn("<b>From:</b> Meeting", body)
+        self.assertIn("<code>meeting-001.md</code> — Transcript", body)
+        self.assertIn(
+            "Person A: Please prepare &lt;the synthetic item&gt;.", body
+        )
         callbacks = [
             button["callback_data"]
             for row in keyboard["inline_keyboard"] for button in row
@@ -264,6 +290,25 @@ class TaskCardTests(unittest.TestCase):
             [parse_task_review_callback(value)[2] for value in callbacks],
             ["done", "keep_open", "drop", "snooze"],
         )
+
+        no_evidence = replace(claim.card, origin_sources=())
+        missing_body, _ = render_task_review_card(no_evidence)
+        self.assertIn("Source extract not provided", missing_body)
+
+        bounded = replace(
+            claim.card,
+            origin_sources=tuple(
+                CardSourceEvidence(
+                    name=f"source-{index}.txt",
+                    role="transcript",
+                    extract="<&" * 600,
+                )
+                for index in range(3)
+            ),
+        )
+        bounded_body, _ = render_task_review_card(bounded)
+        self.assertLess(len(bounded_body.encode("utf-8")), 24 * 1024)
+        self.assertEqual(bounded_body.count("<blockquote>"), 3)
 
         refused = self.cards.complete_delivery(
             claim.card.id,
