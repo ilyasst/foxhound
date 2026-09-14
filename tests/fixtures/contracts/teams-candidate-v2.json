@@ -1,0 +1,22 @@
+{
+  "schema": "foxhound.task-candidate",
+  "schema_version": 2,
+  "candidate_id": "tc_21eec80b8956505fa4fbc541a7cb1cfc743b98b4953c66b51f5e223f5a5c1a24",
+  "source": {
+    "system": "gw",
+    "kind": "teams",
+    "record_id": "conversation-001",
+    "item_id": "action-01",
+    "revision": "cd91bb1aecb7c987ceabded9e9886888baf7b175116875f96f09874b17ad162b"
+  },
+  "task": {
+    "text": "Prepare the synthetic summary",
+    "owner": "Person A",
+    "due": "2030-01-15"
+  },
+  "evidence": {
+    "document_id": "conversation-001",
+    "locator": "message-fragment-01"
+  },
+  "created_at": "2030-01-01T12:00:00Z"
+}

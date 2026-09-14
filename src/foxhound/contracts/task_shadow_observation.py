@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Mapping
 
+from foxhound.source_policy import source_kinds_accepting
+
 from .task_candidate import (
     TaskCandidate,
     ContractError,
@@ -136,6 +138,12 @@ def parse_task_shadow_observation(document: object) -> TaskShadowObservation:
         candidate = parse_task_candidate(root["candidate"])
     except ContractError as exc:
         raise ShadowObservationError(str(exc)) from exc
+    if candidate.source.kind not in source_kinds_accepting(
+        "accepts_shadow_observations"
+    ):
+        raise ShadowObservationError(
+            "candidate.source.kind is unsupported for shadow observations"
+        )
 
     disposition = _choice(
         root["disposition"], "observation.disposition", DISPOSITIONS

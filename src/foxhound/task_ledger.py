@@ -33,6 +33,7 @@ from .contracts import (
     owner_equivalence_request,
     parse_task_candidate,
 )
+from .source_policy import source_kinds_accepting
 
 
 class TaskLedgerError(RuntimeError):
@@ -408,6 +409,9 @@ class TaskLedger:
                         raise _NativeIntakeConflict from exc
                     if (
                         candidate.source.system != producer
+                        or candidate.source.kind not in source_kinds_accepting(
+                            "accepts_native_intake"
+                        )
                         or candidate.candidate_id != row["candidate_id"]
                         or candidate.source.revision != row["source_revision"]
                     ):
