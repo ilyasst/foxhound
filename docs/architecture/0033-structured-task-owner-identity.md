@@ -15,7 +15,10 @@ under two labels.
 ## Decision
 
 Task-candidate version 5 keeps the card label in `task.owner` and adds a
-strict `task.owner_ref`. The reference records a closed owner kind, observed
+strict `task.owner_ref`. Version 6 composes that owner shape with the bounded
+meeting provenance introduced by version 4; it does not discard the extracts
+that justify a task merely to add identity. The reference records a closed
+owner kind, observed
 and canonical speaker identifiers, their registry identity, whether the
 resolution is provisional, and whether a reader pinned it. A speaker
 identifier is accepted only with its registry. Unresolved owners render as
@@ -42,7 +45,8 @@ Authority is intentionally divided:
 ## Consequences
 
 Future owner-aware actions can match canonical, registry-scoped identity
-without parsing display text. Producers can adopt version 5 incrementally;
-versions 1 through 4 remain readable. An older or incomplete owner label is
+without parsing display text. Producers can adopt versions 5 and 6
+incrementally; versions 1 through 4 remain readable. An older or incomplete
+owner label is
 not silently promoted to verified identity, so it remains ineligible for
 identity-conditioned automation until reconciled.
