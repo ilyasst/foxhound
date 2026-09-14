@@ -412,6 +412,21 @@ The command schedules only tasks that have never had an execution workflow;
 it cannot reset a completed, cancelled, parked, or otherwise existing
 workflow. It does not advance Start or launch an agent. See
 [ADR 0019](docs/architecture/0019-new-task-execution-scheduler.md).
+Deployments with an installed role-specific profile can bind new workflows to
+that deterministic default before presenting the Start gate:
+
+```sh
+foxhound-execution-schedule \
+  --database /srv/example/private-foxhound-state/foxhound.sqlite3 \
+  --agent-profile-directory /srv/example/private-agent-profiles \
+  --default-agent-profile example-specialist \
+  --limit 100
+```
+
+Both options are explicit deployment policy. The command fails before
+scheduling if the installed directory is unsafe, the profile is unavailable,
+or that profile cannot plan. Omitting them retains the built-in General
+default.
 
 Execution gates have their own transport-neutral durable review cards. An
 explicit scheduling pass projects only workflows currently awaiting start,

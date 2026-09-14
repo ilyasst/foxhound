@@ -8,16 +8,26 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+from .agent_profiles import AgentProfileError, load_registry
 from .task_bootstrap import TaskBootstrapConfigError, _private_database
 from .task_execution import ExecutionScheduleResult, TaskExecutionService
 from .task_ledger import TaskLedgerError
 
 
 def run_schedule(
-    *, database_path: Path, limit: int = 100
+    *,
+    database_path: Path,
+    limit: int = 100,
+    agent_profile_directory: Path | None = None,
+    default_agent_profile: str = "general",
 ) -> ExecutionScheduleResult:
     database = _private_database(database_path)
-    return TaskExecutionService(database).schedule_new(limit=limit)
+    registry = load_registry(agent_profile_directory)
+    return TaskExecutionService(
+        database,
+        profile_registry=registry,
+        default_profile_id=default_agent_profile,
+    ).schedule_new(limit=limit)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -27,14 +37,21 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--database", required=True, type=Path)
     parser.add_argument("--limit", default=100, type=int)
+    parser.add_argument("--agent-profile-directory", type=Path)
+    parser.add_argument("--default-agent-profile", default="general")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        result = run_schedule(database_path=args.database, limit=args.limit)
-    except (TaskBootstrapConfigError, ValueError):
+        result = run_schedule(
+            database_path=args.database,
+            limit=args.limit,
+            agent_profile_directory=args.agent_profile_directory,
+            default_agent_profile=args.default_agent_profile,
+        )
+    except (AgentProfileError, TaskBootstrapConfigError, ValueError):
         print(
             "foxhound execution schedule: configuration unavailable",
             file=sys.stderr,
