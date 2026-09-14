@@ -11,6 +11,11 @@ REQUEST_SCHEMA = "gw.task-owner-equivalence-request"
 RESPONSE_SCHEMA = "gw.task-owner-equivalence"
 SCHEMA_VERSION = 1
 EQUIVALENCE_BASIS = "speaker_merge"
+PEOPLE_DIRECTORY_BASIS = "people_directory"
+EQUIVALENCE_BASES = frozenset({
+    EQUIVALENCE_BASIS,
+    PEOPLE_DIRECTORY_BASIS,
+})
 
 _ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _CANDIDATE_ID_RE = re.compile(r"^tc_[0-9a-f]{64}$")
@@ -127,7 +132,7 @@ def parse_owner_equivalence_response(
     basis = root["basis"]
     effective_owner = root["effective_owner"]
     if status == "equivalent":
-        if basis != EQUIVALENCE_BASIS:
+        if basis not in EQUIVALENCE_BASES:
             raise OwnerEquivalenceContractError(
                 "owner response basis is invalid"
             )

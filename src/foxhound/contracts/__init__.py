@@ -35,6 +35,8 @@ from .task_shadow_feed import (
 )
 from .task_owner_equivalence import (
     EQUIVALENCE_BASIS,
+    EQUIVALENCE_BASES,
+    PEOPLE_DIRECTORY_BASIS,
     OwnerEquivalenceContractError,
     OwnerEquivalenceResolutionError,
     OwnerEquivalenceRequest,
@@ -68,6 +70,7 @@ __all__ = (
     "ContractError",
     "FeedContractError",
     "EQUIVALENCE_BASIS",
+    "EQUIVALENCE_BASES",
     "LegacyTaskObservation",
     "LegacyTaskCorrelation",
     "LifecycleOutcomeContractError",
@@ -75,6 +78,7 @@ __all__ = (
     "OwnerEquivalenceContractError",
     "OwnerEquivalenceResolutionError",
     "OwnerEquivalenceRequest",
+    "PEOPLE_DIRECTORY_BASIS",
     "ShadowObservationError",
     "ShadowFeedContractError",
     "TaskCandidate",

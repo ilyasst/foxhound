@@ -5,6 +5,7 @@ import unittest
 
 from foxhound.contracts import (
     OwnerEquivalenceContractError,
+    PEOPLE_DIRECTORY_BASIS,
     TaskOwnerEquivalence,
     owner_equivalence_request,
     owner_equivalence_request_document,
@@ -55,6 +56,15 @@ class TaskOwnerEquivalenceContractTests(unittest.TestCase):
         self.assertTrue(parsed.equivalent)
         self.assertEqual(parsed.effective_owner, "Person B (SPK_002)")
         self.assertEqual(task_owner_equivalence_document(parsed), response())
+
+        directory_response = response()
+        directory_response["basis"] = PEOPLE_DIRECTORY_BASIS
+        self.assertEqual(
+            parse_owner_equivalence_response(
+                directory_response, expected_request
+            ).basis,
+            PEOPLE_DIRECTORY_BASIS,
+        )
 
         unresolved = TaskOwnerEquivalence(
             request=expected_request,

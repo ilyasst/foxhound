@@ -14,6 +14,7 @@ from foxhound import CandidateInbox, InboxError
 from foxhound.candidate_inbox import SCHEMA_VERSION
 from foxhound.contracts import (
     EQUIVALENCE_BASIS,
+    PEOPLE_DIRECTORY_BASIS,
     OwnerEquivalenceResolutionError,
     TaskOwnerEquivalence,
     candidate_id_for,
@@ -121,7 +122,8 @@ def observation(
 
 
 def equivalence(
-    item: dict, *, legacy_task_id: int, effective_owner: str
+    item: dict, *, legacy_task_id: int, effective_owner: str,
+    basis: str = EQUIVALENCE_BASIS,
 ) -> TaskOwnerEquivalence:
     digest = comparable_task_digest(
         text=item["task"]["text"],
@@ -137,7 +139,7 @@ def equivalence(
             legacy_digest=digest,
         ),
         status="equivalent",
-        basis=EQUIVALENCE_BASIS,
+        basis=basis,
         effective_owner=effective_owner,
     )
 
@@ -317,6 +319,33 @@ class TaskLedgerTests(unittest.TestCase):
                 )
             with self.assertRaises(sqlite3.IntegrityError):
                 connection.execute("DELETE FROM task_owner_equivalences")
+
+    def test_people_directory_equivalence_basis_is_persisted(self):
+        item = candidate(1, owner="Person A")
+        effective_owner = "Person Alpha"
+        self.import_candidates(item)
+        self.import_observations(observation(
+            item,
+            disposition="minted",
+            legacy_task_id=112,
+            legacy_owner=effective_owner,
+        ))
+
+        result = self.ledger.bootstrap_from_shadow(
+            owner_resolver=lambda **_request: equivalence(
+                item,
+                legacy_task_id=112,
+                effective_owner=effective_owner,
+                basis=PEOPLE_DIRECTORY_BASIS,
+            )
+        )
+
+        self.assertEqual(result.tasks_created, 1)
+        with closing(sqlite3.connect(self.database)) as connection:
+            basis = connection.execute(
+                "SELECT basis FROM task_owner_equivalences"
+            ).fetchone()[0]
+        self.assertEqual(basis, PEOPLE_DIRECTORY_BASIS)
 
     def test_unavailable_or_invalid_owner_equivalence_stays_divergent(self):
         item = candidate(1, owner="Person A (SPK_001)")

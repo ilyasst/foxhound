@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -1295,6 +1295,7 @@ INSERT INTO execution_review_card_events(
     sequence,card_id,task_id,kind,card_version,workflow_version,action,
     occurred_at
 )
+
 SELECT sequence,card_id,task_id,kind,card_version,workflow_version,action,
        occurred_at
 FROM execution_review_card_events_v12;
@@ -1302,6 +1303,30 @@ FROM execution_review_card_events_v12;
     "DROP TABLE execution_review_card_events_v12;",
     _SCHEMA_V9[3],
     _SCHEMA_V9[4],
+)
+
+_SCHEMA_V14_EQUIVALENCE_TABLE = _SCHEMA_V6[0].replace(
+    "CHECK(basis = 'speaker_merge')",
+    "CHECK(basis IN ('speaker_merge','people_directory'))",
+)
+_SCHEMA_V14 = (
+    "DROP TRIGGER task_owner_equivalences_no_update;",
+    "DROP TRIGGER task_owner_equivalences_no_delete;",
+    "ALTER TABLE task_owner_equivalences "
+    "RENAME TO task_owner_equivalences_v13;",
+    _SCHEMA_V14_EQUIVALENCE_TABLE,
+    """
+INSERT INTO task_owner_equivalences(
+    candidate_id,source_revision,legacy_task_id,legacy_digest,
+    effective_owner,basis,resolved_at
+)
+SELECT candidate_id,source_revision,legacy_task_id,legacy_digest,
+       effective_owner,basis,resolved_at
+FROM task_owner_equivalences_v13;
+""",
+    "DROP TABLE task_owner_equivalences_v13;",
+    _SCHEMA_V6[1],
+    _SCHEMA_V6[2],
 )
 
 
@@ -1768,6 +1793,23 @@ class CandidateInbox:
                     for statement in _SCHEMA_V13:
                         connection.execute(statement)
                     connection.execute("PRAGMA user_version = 13")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 13
+            if version == 13:
+                self._require_tables(
+                    connection,
+                    ("task_owner_equivalences",),
+                    columns=_SCHEMA_COLUMNS,
+                )
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V14:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 14")
                     connection.commit()
                 except Exception:
                     connection.rollback()
