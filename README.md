@@ -206,7 +206,11 @@ are injected from owner-only run state rather than trusted from agent output.
 Before recording, the worker can construct a correctly named draft from fixed
 owner-only summary, work, and optional string-array files beside that run
 state. Private result content is never passed in command-line arguments, and
-the existing strict hand-authored draft path remains compatible.
+the existing strict hand-authored draft path remains compatible. Work-context
+version 3 also reports the authoritative local date, exact profile toolsets,
+and phase-derived worker capabilities so versioned guidance does not depend on
+ambient Hermes configuration. See
+[ADR 0030](docs/architecture/0030-versioned-runtime-guidance.md).
 
 The runner neither schedules itself nor advances reader gates. A deployment
 must keep the database, run directory, and knowledge token in approved private
@@ -529,3 +533,11 @@ See [ADR 0025](docs/architecture/0025-start-card-agent-selector.md) for the
 reader-controlled Start-card selection protocol.
 See [ADR 0026](docs/architecture/0026-shared-private-agent-profiles.md) for
 shared private role profiles and the synthetic public example.
+See [ADR 0027](docs/architecture/0027-versioned-private-profile-store.md) for
+immutable published profile revisions and editable private prompt fragments.
+See [ADR 0028](docs/architecture/0028-fenced-instruction-delivery.md) for
+private revision-pinned prompt delivery through the worker.
+See [ADR 0029](docs/architecture/0029-legacy-workflow-card-compatibility.md) for
+the legacy-compatible card projection.
+See [ADR 0030](docs/architecture/0030-versioned-runtime-guidance.md) for
+versioned operating guidance and explicit runtime capabilities.

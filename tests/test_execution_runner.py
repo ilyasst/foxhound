@@ -616,20 +616,15 @@ class ExecutionRunnerTests(unittest.TestCase):
         self.assertLess(len(bootstrap), len(instructions) // 2)
         self.assertNotIn(bootstrap, rendered.replace(json.dumps(bootstrap), ""))
         for sentence in (
-            "`summary` and `work_markdown` must each be one JSON string",
-            "`questions`, `external_actions`, and `deliverables` must each "
-            "be a JSON array of strings",
+            "result-summary.txt",
+            "result-work.md",
+            "draft --outcome OUTCOME",
+            "Do not hand-author or experimentally probe the envelope schema",
         ):
             with self.subTest(sentence=sentence[:32]):
                 self.assertIn(sentence, instructions)
                 self.assertNotIn(sentence, bootstrap)
         prompt = instructions
-        example = prompt.split("Shape example: ", 1)[1].splitlines()[0]
-        draft = json.loads(example)
-        self.assertIsInstance(draft["summary"], str)
-        self.assertIsInstance(draft["work_markdown"], str)
-        for field in ("questions", "external_actions", "deliverables"):
-            self.assertIsInstance(draft[field], list)
         self.assertNotIn("Synthetic task", prompt + rendered)
         self.assertNotIn("claim_token", prompt + rendered)
         self.assertNotIn(str(self.database), prompt + rendered)

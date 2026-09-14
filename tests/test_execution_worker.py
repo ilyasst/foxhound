@@ -27,9 +27,14 @@ from foxhound.execution_worker import (
     load_result_draft,
     load_run_state,
     main,
+    _worker_operations,
 )
 from foxhound.knowledge_client import KnowledgeClientConfig
-from foxhound.task_execution import TaskExecutionService, WorkflowStatus
+from foxhound.task_execution import (
+    TaskExecutionService,
+    WorkflowPhase,
+    WorkflowStatus,
+)
 
 
 TOKEN = "synthetic-knowledge-token-with-sufficient-length"
@@ -215,16 +220,36 @@ class ExecutionWorkerTests(unittest.TestCase):
         )
 
     def test_context_and_search_are_bounded_and_hide_the_capability(self):
-        with knowledge_server() as endpoint:
-            worker = self._worker(endpoint)
-            context = worker.context()
-            result = worker.search("synthetic query", max_results_per_layer=2)
+        with mock.patch(
+            "foxhound.execution_worker._local_today",
+            return_value="2030-01-02",
+        ):
+            with knowledge_server() as endpoint:
+                worker = self._worker(endpoint)
+                context = worker.context()
+                result = worker.search(
+                    "synthetic query", max_results_per_layer=2
+                )
 
         rendered = json.dumps({"context": context, "search": result})
         self.assertNotIn(CLAIM_TOKEN, rendered)
         self.assertNotIn(str(self.database), rendered)
         self.assertEqual(context["task"]["text"], "Synthetic task")
-        self.assertEqual(context["schema_version"], 2)
+        self.assertEqual(context["schema_version"], 3)
+        self.assertEqual(context["runtime"]["today"], "2030-01-02")
+        self.assertEqual(
+            context["runtime"]["toolsets"], ["terminal", "file", "web"]
+        )
+        self.assertEqual(
+            context["capabilities"],
+            {
+                "knowledge_layers": ["kb", "secondary", "emails"],
+                "worker_operations": [
+                    "context", "search", "draft", "record", "release"
+                ],
+                "external_effects_allowed": False,
+            },
+        )
         self.assertEqual(context["workflow"]["phase"], "plan")
         self.assertEqual(
             context["workflow"]["agent_profile_id"],
@@ -238,6 +263,17 @@ class ExecutionWorkerTests(unittest.TestCase):
         self.assertEqual(result["layers"][0]["documents"][0]["excerpt"],
                          "Synthetic evidence.")
         self.assertNotIn(CLAIM_TOKEN, repr(load_run_state(self.state_path)))
+
+    def test_worker_capabilities_follow_the_phase_gate(self):
+        self.assertNotIn(
+            "act.worktree", _worker_operations(WorkflowPhase.PLAN)
+        )
+        self.assertIn(
+            "act.worktree", _worker_operations(WorkflowPhase.EXECUTE)
+        )
+        external = _worker_operations(WorkflowPhase.EXTERNAL_ACTION)
+        self.assertIn("act.worktree", external)
+        self.assertIn("act.pull-request", external)
 
     def test_instructions_come_from_the_pinned_revision_or_not_at_all(self):
         """The launch arguments say how to ask for instructions, not what
