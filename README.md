@@ -455,8 +455,12 @@ foxhound-execution-schedule \
 
 The command schedules only tasks that have never had an execution workflow;
 it cannot reset a completed, cancelled, parked, or otherwise existing
-workflow. It does not advance Start or launch an agent. See
-[ADR 0019](docs/architecture/0019-new-task-execution-scheduler.md).
+workflow. It fills two independent GW-compatible capacities: at most five
+newly scheduled workflows may be queued or running, while at most twenty may
+actively wait for a reader. Existing over-cap rows are preserved and drain
+normally. It does not advance Start or launch an agent. See
+[ADR 0019](docs/architecture/0019-new-task-execution-scheduler.md) and
+[ADR 0035](docs/architecture/0035-separate-execution-capacities.md).
 Deployments with an installed role-specific profile can bind new workflows to
 that deterministic default before presenting the Start gate:
 
@@ -477,8 +481,11 @@ Execution gates have their own transport-neutral durable review cards. An
 explicit scheduling pass projects only workflows currently awaiting start,
 plan review, external-action review, or final-result review. Each card is
 bound to exact task, workflow, phase, and result state; delivery uses an
-expiring digest-fenced claim. Start cards retain the established task context
-and Done/Continue, Drop/Update, and Snooze 24h/Reassign layout. When a task has
+expiring digest-fenced claim. Unrelated queued, running, or review-waiting
+workflows do not suppress a Start card; the gateway's one-card presentation
+limit queues reader decisions without silencing them. Start cards retain the
+established task context and Done/Continue, Drop/Update, and Snooze
+24h/Reassign layout. When a task has
 a resolved, non-provisional person owner other than the reader, a deployment
 with the GW condition boundary enabled also shows **Until next meeting with
 Person B**. The first Start card is always shown; Foxhound never silently

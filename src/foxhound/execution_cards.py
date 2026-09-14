@@ -304,12 +304,7 @@ class ExecutionCardService:
                     # its workflow quietly abandoned and no card anywhere.
                     " ((w.status IN ('awaiting_start','parked') OR "
                     "   (w.status='snoozed' AND w.due_at<=? "
-                    "    AND w.last_result_id IS NULL)) "
-                    "  AND NOT EXISTS("
-                    "   SELECT 1 FROM task_execution_workflows AS busy "
-                    "   WHERE busy.status IN "
-                    "   ('queued','running','awaiting_review')"
-                    "  )) OR "
+                    "    AND w.last_result_id IS NULL))) OR "
                     " (w.status='snoozed' AND w.due_at<=? "
                     "  AND w.last_result_id IS NOT NULL) OR "
                     " (w.status='awaiting_review' AND w.phase='plan' "

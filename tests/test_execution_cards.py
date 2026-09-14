@@ -392,7 +392,7 @@ class ExecutionCardTests(unittest.TestCase):
             ExecutionCardRefusal.INVALID_ARGUMENT,
         )
 
-    def test_active_workflow_keeps_unrelated_start_cards_off_surface(self):
+    def test_work_and_reader_waiting_are_independent_card_conditions(self):
         first = self._schedule_workflow(1)
         self._schedule_workflow(2)
 
@@ -400,12 +400,21 @@ class ExecutionCardTests(unittest.TestCase):
             1, expected_version=first.version, action="start"
         )
         self.assertEqual(queued.status, WorkflowStatus.QUEUED)
-        self.assertEqual(self.cards.schedule(limit=6).created, 0)
+        self.assertEqual(self.cards.schedule(limit=6).created, 1)
+        with closing(sqlite3.connect(self.database)) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT task_id,kind FROM execution_review_cards "
+                    "ORDER BY id"
+                ).fetchall(),
+                [(2, "start")],
+            )
 
         claim = self.execution.claim_next()
         self.assertIsNotNone(claim)
         self.assertEqual(claim.task_id, 1)
-        self.assertEqual(self.cards.schedule(limit=6).created, 0)
+        self._schedule_workflow(3)
+        self.assertEqual(self.cards.schedule(limit=6).created, 1)
 
         recorded = self.execution.record_result(ExecutionResultEnvelope(
             result_id="priority-plan",
@@ -420,25 +429,50 @@ class ExecutionCardTests(unittest.TestCase):
         ))
         self.assertTrue(recorded.accepted)
 
-        self.assertEqual(self.cards.schedule(limit=6).created, 1)
-        review = self._claim_and_deliver()
+        self._schedule_workflow(4)
+        self.assertEqual(self.cards.schedule(limit=6).created, 2)
+        with closing(sqlite3.connect(self.database)) as connection:
+            rows = connection.execute(
+                "SELECT task_id,kind FROM execution_review_cards "
+                "ORDER BY id"
+            ).fetchall()
         self.assertEqual(
-            (review.card.task_id, review.card.kind),
-            (1, ExecutionCardKind.PLAN_REVIEW),
+            rows,
+            [
+                (2, "start"),
+                (3, "start"),
+                (1, "plan_review"),
+                (4, "start"),
+            ],
         )
-        finished = self.cards.act(
-            review.card.id,
-            expected_version=review.card.version,
-            action="done",
-        )
-        self.assertEqual(finished.workflow_status, WorkflowStatus.COMPLETED)
 
-        self.assertEqual(self.cards.schedule(limit=6).created, 1)
-        next_start = self.cards.claim_next()
-        self.assertEqual(
-            (next_start.card.task_id, next_start.card.kind),
-            (2, ExecutionCardKind.START),
-        )
+    def test_existing_over_capacity_work_does_not_hide_a_start_card(self):
+        for task_id in range(1, 7):
+            workflow = self._schedule_workflow(task_id)
+            queued = self.execution.start_action(
+                task_id,
+                expected_version=workflow.version,
+                action="start",
+            )
+            self.assertEqual(queued.status, WorkflowStatus.QUEUED)
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "INSERT INTO tasks(id,status,text,owner,due,version,"
+                "created_at,updated_at,closed_at) "
+                "VALUES(7,'open','Synthetic task 7','Person A',NULL,1,?,?,NULL)",
+                (self.clock().isoformat(), self.clock().isoformat()),
+            )
+            connection.commit()
+        self._schedule_workflow(7)
+
+        self.assertEqual(self.cards.schedule(limit=1).created, 1)
+        with closing(sqlite3.connect(self.database)) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT task_id,kind FROM execution_review_cards"
+                ).fetchone(),
+                (7, "start"),
+            )
 
     def test_delivery_retry_expiry_acknowledgement_and_callbacks(self):
         self._schedule_workflow(1)
