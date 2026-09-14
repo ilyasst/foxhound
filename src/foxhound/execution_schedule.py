@@ -20,6 +20,7 @@ def run_schedule(
     limit: int = 100,
     agent_profile_directory: Path | None = None,
     default_agent_profile: str = "general",
+    plan_without_asking: Sequence[str] | None = None,
 ) -> ExecutionScheduleResult:
     database = _private_database(database_path)
     registry = load_registry(agent_profile_directory)
@@ -27,6 +28,7 @@ def run_schedule(
         database,
         profile_registry=registry,
         default_profile_id=default_agent_profile,
+        planning_grants=plan_without_asking,
     ).schedule_new(limit=limit)
 
 
@@ -39,6 +41,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", default=100, type=int)
     parser.add_argument("--agent-profile-directory", type=Path)
     parser.add_argument("--default-agent-profile", default="general")
+    parser.add_argument(
+        "--plan-without-asking",
+        action="append",
+        metavar="SOURCE_KIND",
+        help=(
+            "let this machine plan tasks from SOURCE_KIND without asking "
+            "first; repeat for each kind. Omitted means every task is "
+            "asked about, which is the default and the cautious answer."
+        ),
+    )
     return parser
 
 
@@ -50,6 +62,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             limit=args.limit,
             agent_profile_directory=args.agent_profile_directory,
             default_agent_profile=args.default_agent_profile,
+            plan_without_asking=args.plan_without_asking,
         )
     except (AgentProfileError, TaskBootstrapConfigError, ValueError):
         print(
