@@ -18,6 +18,8 @@ from foxhound.agent_profiles import (
 )
 from foxhound.candidate_inbox import CandidateInbox, SCHEMA_VERSION
 from foxhound.task_execution import (
+    AWAITING_READER_CAP,
+    WORK_IN_PROGRESS_CAP,
     ExecutionOutcome,
     ExecutionResultEnvelope,
     TaskExecutionService,
@@ -633,6 +635,86 @@ class TaskExecutionTests(unittest.TestCase):
 
         replay = self.service.schedule_new(limit=10)
         self.assertEqual((replay.scheduled, replay.remaining), (0, 0))
+
+    def test_new_work_and_reader_waiting_have_separate_gw_caps(self):
+        with closing(sqlite3.connect(self.database)) as connection:
+            for task_id in range(2, 36):
+                connection.execute(
+                    "INSERT INTO tasks(id,status,text,owner,due,version,"
+                    "created_at,updated_at,closed_at) "
+                    "VALUES(?,'open',?,'Person A',NULL,1,?,?,NULL)",
+                    (
+                        task_id,
+                        f"Synthetic task {task_id}",
+                        self._now(),
+                        self._now(),
+                    ),
+                )
+                kind = "issue" if task_id <= 11 else "meeting"
+                connection.execute(
+                    "INSERT INTO candidate_inbox(candidate_id,source_system,"
+                    "source_kind,source_record_id,source_item_id,"
+                    "source_revision,payload_json,created_at,"
+                    "first_imported_at,updated_at) "
+                    "VALUES(?,'gw',?,?,?,?,'{}',?,?,?)",
+                    (
+                        f"candidate-{task_id}",
+                        kind,
+                        f"record-{task_id}",
+                        f"item-{task_id}",
+                        "c" * 64,
+                        self._now(),
+                        self._now(),
+                        self._now(),
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO task_candidate_bindings(candidate_id,"
+                    "source_revision,task_id,relation,decided_at) "
+                    "VALUES(?,?,?,'accepted',?)",
+                    (
+                        f"candidate-{task_id}",
+                        "c" * 64,
+                        task_id,
+                        self._now(),
+                    ),
+                )
+            connection.commit()
+
+        result = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            planning_grants=["issue"],
+        ).schedule_new(limit=100)
+        self.assertEqual(
+            (WORK_IN_PROGRESS_CAP, AWAITING_READER_CAP), (5, 20)
+        )
+        self.assertEqual(
+            (result.scheduled, result.remaining),
+            (WORK_IN_PROGRESS_CAP + AWAITING_READER_CAP, 10),
+        )
+        with closing(sqlite3.connect(self.database)) as connection:
+            counts = dict(connection.execute(
+                "SELECT status,COUNT(*) FROM task_execution_workflows "
+                "GROUP BY status"
+            ).fetchall())
+        self.assertEqual(counts, {"awaiting_start": 20, "queued": 5})
+
+        # A capacity-bound pass is passive: no existing row is removed or
+        # rewritten merely to make room for another candidate.
+        replay = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            planning_grants=["issue"],
+        ).schedule_new(limit=100)
+        self.assertEqual((replay.scheduled, replay.remaining), (0, 10))
+        with closing(sqlite3.connect(self.database)) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM task_execution_workflows"
+                ).fetchone()[0],
+                WORK_IN_PROGRESS_CAP + AWAITING_READER_CAP,
+            )
 
     def test_start_gate_snooze_cancel_and_stale_taps_are_fenced(self):
         scheduled = self.service.schedule(1, expected_task_version=1)
