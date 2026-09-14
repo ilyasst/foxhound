@@ -341,6 +341,54 @@ class ExecutionCardTests(unittest.TestCase):
             ExecutionCardRefusal.INVALID_ARGUMENT,
         )
 
+    def test_active_workflow_keeps_unrelated_start_cards_off_surface(self):
+        first = self._schedule_workflow(1)
+        self._schedule_workflow(2)
+
+        queued = self.execution.start_action(
+            1, expected_version=first.version, action="start"
+        )
+        self.assertEqual(queued.status, WorkflowStatus.QUEUED)
+        self.assertEqual(self.cards.schedule(limit=6).created, 0)
+
+        claim = self.execution.claim_next()
+        self.assertIsNotNone(claim)
+        self.assertEqual(claim.task_id, 1)
+        self.assertEqual(self.cards.schedule(limit=6).created, 0)
+
+        recorded = self.execution.record_result(ExecutionResultEnvelope(
+            result_id="priority-plan",
+            task_id=1,
+            task_version=1,
+            workflow_version=claim.workflow_version,
+            phase=WorkflowPhase.PLAN,
+            claim_token=claim.token,
+            outcome=ExecutionOutcome.AWAITING_PLAN,
+            summary="Synthetic priority plan.",
+            work_markdown="Review this synthetic plan.",
+        ))
+        self.assertTrue(recorded.accepted)
+
+        self.assertEqual(self.cards.schedule(limit=6).created, 1)
+        review = self._claim_and_deliver()
+        self.assertEqual(
+            (review.card.task_id, review.card.kind),
+            (1, ExecutionCardKind.PLAN_REVIEW),
+        )
+        finished = self.cards.act(
+            review.card.id,
+            expected_version=review.card.version,
+            action="done",
+        )
+        self.assertEqual(finished.workflow_status, WorkflowStatus.COMPLETED)
+
+        self.assertEqual(self.cards.schedule(limit=6).created, 1)
+        next_start = self.cards.claim_next()
+        self.assertEqual(
+            (next_start.card.task_id, next_start.card.kind),
+            (2, ExecutionCardKind.START),
+        )
+
     def test_delivery_retry_expiry_acknowledgement_and_callbacks(self):
         self._schedule_workflow(1)
         self.cards.schedule()
@@ -1127,6 +1175,12 @@ class ExecutionCardTests(unittest.TestCase):
             ),
             "Check the deployment story first.",
         )
+        self.assertTrue(
+            self.ledger.transition(
+                5, expected_version=1, action="done"
+            ).accepted
+        )
+        self.assertIsNone(self.execution.claim_next())
 
         card_id, version = delivered_gate(6)
         moved = self.cards.submit_input(
