@@ -27,6 +27,7 @@ from foxhound.execution_worker import (
     load_result_draft,
     load_run_state,
     main,
+    _local_calendar,
     _worker_operations,
 )
 from foxhound.knowledge_client import KnowledgeClientConfig
@@ -235,8 +236,18 @@ class ExecutionWorkerTests(unittest.TestCase):
         self.assertNotIn(CLAIM_TOKEN, rendered)
         self.assertNotIn(str(self.database), rendered)
         self.assertEqual(context["task"]["text"], "Synthetic task")
-        self.assertEqual(context["schema_version"], 3)
+        self.assertEqual(context["schema_version"], 4)
         self.assertEqual(context["runtime"]["today"], "2030-01-02")
+        self.assertEqual(context["runtime"]["today_weekday"], "Wednesday")
+        self.assertEqual(
+            context["runtime"]["next_week"],
+            {
+                "start": "2030-01-07",
+                "start_weekday": "Monday",
+                "end": "2030-01-13",
+                "end_weekday": "Sunday",
+            },
+        )
         self.assertEqual(
             context["runtime"]["toolsets"], ["terminal", "file", "web"]
         )
@@ -274,6 +285,24 @@ class ExecutionWorkerTests(unittest.TestCase):
         external = _worker_operations(WorkflowPhase.EXTERNAL_ACTION)
         self.assertIn("act.worktree", external)
         self.assertIn("act.pull-request", external)
+
+    def test_calendar_context_computes_the_subsequent_week_across_years(self):
+        with mock.patch(
+            "foxhound.execution_worker._local_today",
+            return_value="2030-12-30",
+        ):
+            calendar = _local_calendar()
+
+        self.assertEqual(calendar["today_weekday"], "Monday")
+        self.assertEqual(
+            calendar["next_week"],
+            {
+                "start": "2031-01-06",
+                "start_weekday": "Monday",
+                "end": "2031-01-12",
+                "end_weekday": "Sunday",
+            },
+        )
 
     def test_instructions_come_from_the_pinned_revision_or_not_at_all(self):
         """The launch arguments say how to ask for instructions, not what

@@ -14,7 +14,7 @@ import re
 import stat
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -45,7 +45,7 @@ RUN_STATE_SCHEMA = "foxhound.execution-run-state"
 RUN_STATE_SCHEMA_VERSION = 3
 INSTRUCTIONS_NAME = "agent-instructions.json"
 WORK_CONTEXT_SCHEMA = "foxhound.execution-work-context"
-WORK_CONTEXT_SCHEMA_VERSION = 3
+WORK_CONTEXT_SCHEMA_VERSION = 4
 WORKER_SEARCH_SCHEMA = "foxhound.execution-worker-search"
 RESULT_DRAFT_SCHEMA = "foxhound.execution-result-draft"
 RESULT_DRAFT_READY_SCHEMA = "foxhound.execution-result-draft-ready"
@@ -77,6 +77,26 @@ _RESULT_INPUTS = (
 def _local_today() -> str:
     """Return the host's authoritative local calendar date."""
     return datetime.now().astimezone().date().isoformat()
+
+
+def _local_calendar() -> dict[str, object]:
+    today = datetime.fromisoformat(_local_today()).date()
+    next_week_start = today + timedelta(days=7 - today.weekday())
+    next_week_end = next_week_start + timedelta(days=6)
+    weekdays = (
+        "Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+        "Saturday", "Sunday",
+    )
+    return {
+        "today": today.isoformat(),
+        "today_weekday": weekdays[today.weekday()],
+        "next_week": {
+            "start": next_week_start.isoformat(),
+            "start_weekday": weekdays[next_week_start.weekday()],
+            "end": next_week_end.isoformat(),
+            "end_weekday": weekdays[next_week_end.weekday()],
+        },
+    }
 
 
 def _worker_operations(phase: WorkflowPhase) -> list[str]:
@@ -165,7 +185,7 @@ class ExecutionWorker:
                 # Agents cannot safely infer the host's local date from task
                 # timestamps or their model cutoff.  This is the authoritative
                 # date for deadlines, drafts, and proposed actions.
-                "today": _local_today(),
+                **_local_calendar(),
                 "toolsets": instructions["toolsets"],
             },
             "capabilities": {
