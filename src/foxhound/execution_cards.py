@@ -145,6 +145,11 @@ class ExecutionReviewCard:
     origin_record: str = field(default="", repr=False)
     origin_item: str = field(default="", repr=False)
     prior_task_id: int | None = None
+    #: How a parked workflow got there. A reader told only that nothing
+    #: happened cannot tell a task nobody reached from one that was
+    #: abandoned.
+    failure_count: int = 0
+    failure_reason: str = field(default="", repr=False)
     task_work_directory: str = field(default="", repr=False)
     task_kb_file: str = field(default="", repr=False)
     origin_sources: tuple["CardSourceEvidence", ...] = field(
@@ -247,7 +252,12 @@ class ExecutionCardService:
                     " WHERE active.task_id=w.task_id AND active.status IN "
                     " ('pending','delivering','delivered')"
                     ") AND ("
-                    " ((w.status='awaiting_start' OR "
+                    # `parked` is included deliberately. It means the
+                    # agent gave up after repeated failure, and that is
+                    # exactly when a reader needs telling — it used to be
+                    # terminal and silent, so a task sat open forever with
+                    # its workflow quietly abandoned and no card anywhere.
+                    " ((w.status IN ('awaiting_start','parked') OR "
                     "   (w.status='snoozed' AND w.due_at<=? "
                     "    AND w.last_result_id IS NULL)) "
                     "  AND NOT EXISTS("
@@ -1163,6 +1173,8 @@ class ExecutionCardService:
             "SELECT c.*,t.text AS task_text,t.owner,t.owner_kind,t.due,"
             "t.status AS task_status_current,t.version AS task_version_current,"
             "w.status AS workflow_status_current,"
+            "w.failure_count AS workflow_failure_count,"
+            "w.last_failure_reason AS workflow_failure_reason,"
             "w.phase AS workflow_phase_current,"
             "w.version AS workflow_version_current,"
             "w.task_version AS workflow_task_version_current,"
@@ -1421,7 +1433,14 @@ def parse_execution_agent_callback(
 
 def _kind_for_workflow(row: Mapping[str, object]) -> ExecutionCardKind:
     if (
-        row["status"] in {WorkflowStatus.AWAITING_START, WorkflowStatus.SNOOZED}
+        row["status"] in {
+            WorkflowStatus.AWAITING_START,
+            WorkflowStatus.SNOOZED,
+            # A workflow that gave up is asked about like one that has not
+            # begun: the question is whether to run it, and the card says
+            # it already tried.
+            WorkflowStatus.PARKED,
+        }
         and row["last_result_id"] is None
     ):
         return ExecutionCardKind.START
@@ -1470,7 +1489,11 @@ def _current_card(row: Mapping[str, object]) -> bool:
             return (
                 row["result_id"] is None
                 and row["workflow_status_current"]
-                in {WorkflowStatus.AWAITING_START, WorkflowStatus.SNOOZED}
+                in {
+                    WorkflowStatus.AWAITING_START,
+                    WorkflowStatus.SNOOZED,
+                    WorkflowStatus.PARKED,
+                }
             )
         expected = {
             ExecutionCardKind.PLAN_REVIEW: {ExecutionOutcome.AWAITING_PLAN},
@@ -1528,6 +1551,8 @@ def _card(
             version=int(row["version"]),
             created_at=str(row["created_at"]),
             workflow_status=WorkflowStatus(row["workflow_status_current"]),
+            failure_count=int(row["workflow_failure_count"] or 0),
+            failure_reason=str(row["workflow_failure_reason"] or ""),
             agent_profile_id=profile_id,
             agent_profile_revision=profile_revision,
             agent_display_name=profile_name,
@@ -1773,6 +1798,19 @@ def _start_card_lines(
         )
     lines.extend(_origin_lines(card, html=html))
     lines.extend(_continues_lines(card, html=html))
+    if card.workflow_status is WorkflowStatus.PARKED:
+        # A reader who is never told has no way to distinguish a task
+        # nobody has reached from one the agent abandoned.
+        stopped = (
+            f"⚠️ Stopped after {card.failure_count} failed attempt"
+            f"{'s' if card.failure_count != 1 else ''}"
+            + (f" ({card.failure_reason})" if card.failure_reason else "")
+        )
+        lines.append(f"<b>{_escape(stopped)}</b>" if html else stopped)
+        explanation = (
+            "Continue tries again. The runs so far left nothing recorded."
+        )
+        return lines + ["", explanation]
     explanation = "No agent has looked at this yet. "
     explanation += (
         "<b>Continue</b> starts the investigation."

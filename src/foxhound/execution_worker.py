@@ -565,9 +565,15 @@ class ExecutionWorker:
         )
         try:
             validated = _validated_result(envelope)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as exc:
+            # The ledger says which input it refused and why. Discarding
+            # that left an agent to guess: one wrote a correct review, was
+            # told only "operation refused" three times, and the workflow
+            # parked with the review still on disk. The message names a
+            # field and a rule, never task content.
             raise ExecutionWorkerDraftError(
-                "execution result inputs are invalid"
+                f"execution result inputs are invalid: {exc}",
+                reason="invalid_result_inputs",
             ) from None
         self._renew(service, state)
         draft_name = f"result-{result_id}.json"
@@ -1187,10 +1193,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("foxhound task worker: claim unavailable", file=sys.stderr)
         return 75
     except ExecutionWorkerDraftError as exc:
+        # The message, not only the token. An agent told "refused" cannot
+        # tell a thing it could fix from one it cannot, so it does the safe
+        # thing and gives up — which cost a complete review and three runs.
+        #
+        # Every message raised as this error is built from field names,
+        # rules and enum values. None of them may carry task content, and
+        # any new one must keep that true: this goes to an agent's terminal
+        # and into its transcript.
         reason = getattr(exc, "reason", None)
+        detail = str(exc) or "operation refused"
         print(
-            "foxhound task worker: operation refused"
-            + (f" ({reason})" if reason else ""),
+            f"foxhound task worker: {detail}"
+            + (f" [{reason}]" if reason else ""),
             file=sys.stderr,
         )
         return 65

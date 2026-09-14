@@ -1324,7 +1324,14 @@ def _apply_start_action(
     refusal = _workflow_guard(
         row,
         expected_version,
-        {WorkflowStatus.AWAITING_START, WorkflowStatus.SNOOZED},
+        # `parked` included: the card that reports the failure offers to
+        # try again, and a button that reports a refusal would make the
+        # report useless.
+        {
+            WorkflowStatus.AWAITING_START,
+            WorkflowStatus.SNOOZED,
+            WorkflowStatus.PARKED,
+        },
     )
     if refusal is None:
         refusal = _task_guard(row, int(row["task_version"]))
@@ -1361,6 +1368,9 @@ def _apply_start_action(
         "UPDATE task_execution_workflows SET status=?,phase='plan',version=?,"
         "due_at=?,claim_token_digest=NULL,claimed_at=NULL,"
         "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
+        # Restarting clears what parked it, so a retry gets a full set of
+        # attempts rather than immediately parking again on the next slip.
+        "failure_count=0,last_failure_reason=NULL,last_failure_at=NULL,"
         "next_attempt_at=NULL,parked_at=NULL,updated_at=?,completed_at=? "
         "WHERE task_id=? AND version=?",
         (
@@ -1695,8 +1705,12 @@ def _validated_result(envelope: ExecutionResultEnvelope) -> dict[str, object]:
         raise ValueError("execution result state is invalid") from None
     if _result_target(phase, outcome) is None:
         raise ValueError("execution result transition is invalid")
+    # Multi-line: a summary is read by a person on a card, and the card
+    # renders line breaks. Requiring one line refused a correct 597-character
+    # review for containing paragraphs, three times, until the workflow
+    # parked — the length bound is the one that protects the card.
     summary = _bounded_text(
-        envelope.summary, "summary", MAX_SUMMARY_CHARS, single_line=True
+        envelope.summary, "summary", MAX_SUMMARY_CHARS, single_line=False
     )
     work = _bounded_text(
         envelope.work_markdown,

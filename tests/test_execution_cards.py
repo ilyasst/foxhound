@@ -1146,6 +1146,68 @@ class ExecutionCardTests(unittest.TestCase):
         # And the surface refills on its own, cancelling what it replaced.
         self.assertEqual(self.cards.schedule().cancelled, 1)
 
+    def _park(self, task_id: int):
+        """Fail a workflow until it parks, the way a broken run does."""
+        self._schedule_workflow(task_id)
+        started = self.execution.start_action(
+            task_id, expected_version=self.execution.get(task_id).version,
+            action="start")
+        self.assertEqual(started.status, WorkflowStatus.QUEUED)
+        for _ in range(3):
+            # Each failure schedules the next attempt with a backoff, so
+            # the clock has to reach it before the claim is available.
+            self.clock.advance(timedelta(hours=1))
+            claim = self.execution.claim_next()
+            self.assertIsNotNone(claim)
+            self.execution.fail(
+                task_id,
+                expected_version=claim.workflow_version,
+                claim_token=claim.token,
+                reason="process_exit",
+            )
+        return self.execution.get(task_id)
+
+    def test_a_workflow_that_gave_up_says_so_instead_of_going_quiet(self):
+        """Parking is the retry limiter, and it used to be terminal and
+        silent: the task stayed open, its workflow was abandoned, and no
+        card appeared anywhere. A reader waited for something the system
+        had already stopped working on.
+
+        Five workflows reached that state on one machine before anyone
+        noticed, one of them holding a complete review.
+        """
+        task_id = 1
+        parked = self._park(task_id)
+        self.assertEqual(parked.status, WorkflowStatus.PARKED)
+
+        self.assertEqual(self.cards.schedule().created, 1)
+        card = self.cards.claim_next().card
+        body, keyboard = render_execution_review_card(card)
+
+        self.assertIn("Stopped after 3 failed attempt", body)
+        self.assertIn("process_exit", body)
+        actions = [
+            parse_execution_review_callback(button["callback_data"])[2]
+            for row in keyboard["inline_keyboard"] for button in row
+        ]
+        self.assertIn("start", actions)
+
+    def test_trying_again_gives_a_full_set_of_attempts(self):
+        # Restarting with the count still at its limit would park again on
+        # the first slip, which is a retry in name only.
+        task_id = 1
+        self._park(task_id)
+        self.assertEqual(self.cards.schedule().created, 1)
+        claim = self._claim_and_deliver()
+
+        restarted = self.cards.act(
+            claim.card.id, expected_version=claim.card.version,
+            action="start")
+
+        self.assertTrue(restarted.accepted, restarted.refusal)
+        self.assertEqual(restarted.workflow_status, WorkflowStatus.QUEUED)
+        self.assertEqual(self.execution.get(task_id).failure_count, 0)
+
     def test_a_gate_says_which_issue_it_is_asking_about(self):
         """Naming the task is not naming the thing.
 
