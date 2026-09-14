@@ -1898,6 +1898,10 @@ def _card_lines(card: ExecutionReviewCard) -> list[str]:
         if card.questions:
             lines.extend(("", "Needs your input:",
                       *[f"- {q}" for q in card.questions]))
+        if card.deliverables:
+            # The effect being approved is often "send this". A reader
+            # cannot judge that from a summary of it.
+            lines.extend(("", "Deliverables:", *_drafted(card.deliverables)))
         return lines
     if card.kind is ExecutionCardKind.RESULT_REVIEW:
         lines = [
@@ -2023,6 +2027,14 @@ def _html_card_lines(card: ExecutionReviewCard) -> list[str]:
                 "",
                 "<b>Needs your input:</b>",
                 *_html_question_lines(card.questions),
+            ))
+        if card.deliverables:
+            # The effect being approved is often "send this". A reader
+            # cannot judge that from a summary of it.
+            lines.extend((
+                "",
+                "<b>Deliverables:</b>",
+                *_html_drafted(card.deliverables),
             ))
         return lines
     if card.kind is ExecutionCardKind.RESULT_REVIEW:
