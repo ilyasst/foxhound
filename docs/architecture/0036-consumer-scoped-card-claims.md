@@ -117,7 +117,7 @@ disclosed only to the consumer whose claim produced that state: no route
 (`stats`, `claim`, or any other) hands that card's content, id, or version to
 a different consumer while it is held. This is enforced by non-disclosure,
 not by an access check on the card itself — `act()` stays consumer-agnostic
-(summary invariant 12 below), so anyone who does come to hold a delivered card's
+(summary invariant 13 below), so anyone who does come to hold a delivered card's
 exact id and version can resolve it regardless of who claimed it. The
 guarantee therefore depends entirely on this decision never handing that
 identifier to a second consumer through any route, and it is only as strong
@@ -211,20 +211,25 @@ identity if it is still `pending` or `snoozed` at that version, and refuses
 if it has moved (the same stale-version refusal `act()` already gives for
 the same reason). A successful claim proceeds through the existing
 delivering → delivered → act lifecycle exactly as the drip gateway's claims
-do. The console is expected to carry it straight through to delivery and
-action rather than leaving it delivering, so in ordinary operation a
-`queue_view` consumer holds at most one claim at a time, for as long as one
-reader decision is in flight — not because a ceiling forbids more (decision 5
-still sets one), but because claim-on-demand gives it no reason to want more.
+do. The console is expected to carry each claim straight through to delivery
+and action rather than holding it open. Ordinarily this means a `queue_view`
+consumer holds very few claims at once — one for a single reader working one
+card at a time, or a small handful if the reader has more than one page open,
+which is an entirely normal way to use a browser and not a misuse this record
+should design against. Decision 5 gives that headroom a fixed size rather
+than assuming a single claim is always enough.
 
 **Rejected alternative: claim-to-display, where `queue_view` claims up to a
 fixed ceiling of cards purely to have their content ready to render.** This
 was this record's original decision, and it is rejected here in favor of
 claim-on-demand for three reasons. First, it manufactures a much larger
-stranding surface: a vanished console under claim-to-display could strand as
-many cards as its display ceiling, where claim-on-demand strands at most the
-one card a reader happened to be acting on when it vanished — the same order
-of magnitude as any other consumer's worst case. Second, its ceiling had to
+stranding surface in proportion to its own ceiling: claim-to-display's
+ceiling had to be sized for "one screenful," so an abandoned session strands
+a large fraction of a large number, where claim-on-demand's ceiling (decision
+5) is sized for how many cards a reader plausibly has open at once, so an
+abandoned session strands at most that same small headroom — a proportional
+cost closer to the `drip` role's, not the outsized one this record's earlier
+draft accepted. Second, its ceiling had to
 be picked from something; the only candidate in this codebase was `due()`'s
 own default page size, which sizes a read, not a lease, and using it to size
 a lease ceiling was exactly the kind of unverified number this decision
@@ -239,24 +244,35 @@ cost is smaller and more targeted than a role-ceiling system paired with the
 extended manual repair decision 6 would otherwise have had to lean on as its
 primary mitigation.
 
-### 5. A per-role concurrency ceiling still bounds how many cards one consumer may hold
+### 5. A per-role concurrency ceiling, sized for real use and self-explaining when reached
 
 `claim_next()` (including the claim-by-identifier path) refuses to hand out
 a card to a consumer already holding its role's ceiling of cards
 (`delivering` + `delivered` — the same two terms `stats()` reports as
-"mine"). "Refuses" means the same thing an empty or already-claimed queue
-means today: no card, not an error.
+"mine"). Reaching that ceiling and finding no due card are different
+conditions, and this decision requires them to be reported differently: the
+response distinguishes "no due card exists for anyone" from "you already
+hold your role's ceiling." The at-ceiling report contains nothing about any
+other consumer or any card — only the caller's own held count and its own
+role's ceiling, both of which the caller already implicitly knows from its
+own request history. Reporting them back is self-disclosure, not a breach of
+decision 2's guarantee, and it is what lets a console tell its reader "you
+already have one open, finish it first" instead of showing a queue that
+looks empty or stalled for no stated reason.
 
-With claim-on-demand in place, this ceiling is no longer the mechanism that
-keeps either role's footprint small — decision 4 already does that for
-`queue_view`, and the drip gateway's own client-side pacing already does it
-for `drip`. It survives as a fixed backstop against a misbehaving or buggy
-caller of either role, in the same spirit as the fixed capacities in ADR
-0035.
+Sizing the ceiling matters independently of that fix. This record's earlier
+draft set `queue_view` to one on the assumption that claim-on-demand gives a
+console no reason to hold more than one claim. That assumption does not
+survive contact with an ordinary reader: acting on a second card before
+resolving the first, or simply having more than one browser tab open, are
+both unremarkable ways to use a page, and a ceiling of one refuses both
+silently, before the reporting fix above even has a chance to explain why.
+The ceiling is sized instead for a small amount of ordinary concurrent
+reader activity, not for the smallest number that would technically work:
 
 | Role | Ceiling (delivering + delivered) | Basis |
 |---|---|---|
-| `queue_view` | one | Matches decision 4's claim-on-demand model: a correctly behaved console never legitimately needs a second concurrent claim. |
+| `queue_view` | three | Sized for ordinary reader concurrency — one card actually in front of the reader, one more they switched to before finishing the first, and one tab of headroom — not for a vanished-consumer worst case. This is a judgment call about how a person uses a browser, not a value read off another system's configuration; unlike the `drip` figure below, there is no external source of truth to cite, and it should be revisited if real use shows it too small or unnecessarily large. |
 | `drip` | twenty | The existing chat gateway's own on-screen pacing setting — a value the operator configures on the gateway side — defaults to five and is permitted up to twenty; the gateway sizes each pacing pass as that configured cap minus its own current on-screen count. |
 
 The `drip` figure corrects this record's earlier draft, which set the
@@ -276,13 +292,18 @@ throttle by a different route.
 **Invariants:**
 
 4. `claim_next` (both the due-order and claim-by-identifier paths) never
-   lets a consumer's held count exceed its role's fixed ceiling: one for
+   lets a consumer's held count exceed its role's fixed ceiling: three for
    `queue_view`, twenty for `drip`.
 5. Ceilings are fixed per role, not accepted from a request and not
    runtime-configurable. Changing either number is a decision for a future
    ADR, and any future reduction of the `drip` ceiling must first confirm
    what the chat gateway's own pacing setting actually permits at that time,
    exactly the check this draft skipped the first time.
+6. A claim attempt that fails because the caller already holds its role's
+   ceiling reports that fact — its own held count and its own ceiling, and
+   nothing else — distinctly from a claim attempt that fails because no due
+   card exists. Neither report ever names a card, a task, or another
+   consumer.
 
 **Rejected alternative: no ceiling at all, relying entirely on decision 4's
 claim-on-demand model and the drip gateway's client-side pacing.** Rejected
@@ -298,6 +319,16 @@ in decision 1 — it reopens a self-asserted value where a fixed, reasoned
 server-side constant is safer, and it departs from this repository's existing
 preference (ADR 0035) for small fixed capacities over runtime-configurable
 ones.
+
+**Rejected alternative: raise `queue_view`'s ceiling without also making the
+at-ceiling refusal distinguishable from an empty queue (or the reverse).**
+Rejected because the two only work as a pair. Headroom alone still fails
+silently once it is exhausted — it only raises how much ordinary use it
+takes to get there, which is exactly the mistake this record's earlier draft
+made with the number one and would still be making with a bigger number.
+Distinguishability alone, with the ceiling still at one, would let a console
+explain a failure that a single ordinary reader action still causes
+constantly. Neither is a fix by itself; this decision adopts both.
 
 ### 6. A consumer that goes away
 
@@ -324,20 +355,72 @@ ADR 0016 describes, so the stale presentation becomes unusable without
 rerunning any lifecycle transition. It remains absent from the remote,
 authenticated API, available only to a trusted local operator tool.
 
-Because decision 4 keeps a `queue_view` consumer's ordinary footprint to at
-most one claim, a vanished console now strands at most one card. A vanished
-`drip` consumer can still strand up to its own ceiling of twenty, but that
-exposure is not created by this decision — it is the chat gateway's existing
-design, holding as many cards on screen as its own configured setting
-permits, unrelated to how many other consumers exist. This decision does not
-make the `drip` exposure worse and does not need to fix it to answer the
-question this record is about; it is noted here because it is now, after
-this revision, the larger of the two stranding risks, and any future work on
-the delivered-card recovery path should size itself against that one, not
-against the `queue_view` figure this record's earlier draft focused on. The
-trade-off that earlier draft accepted — a vanished console stranding up to
-twenty cards — no longer applies; it was a consequence of claim-to-display,
-not of consumer identity itself.
+**The abandoned reader action is the case that matters here, not only a
+vanished process.** A console does not need to crash to strand a card: a
+reader claims one by acting on it, the console carries it to `delivered`,
+and the reader simply closes the page, switches away, or is interrupted
+before resolving it — an entirely ordinary lapse, not a failure of any
+component. That card now sits `delivered` forever, exactly as a `drip`
+gateway's acknowledged-but-never-acted card would, with no lease to expire
+it, per the earlier paragraphs of this decision.
+
+Card counts alone understate what that costs a `queue_view` consumer,
+because the two roles do not have the same ceiling. One abandoned card costs
+`drip` one twentieth of its capacity to claim further work — noticeable, but
+far from disabling. The same one abandoned card costs `queue_view`, at its
+ceiling of three, a third of its capacity, and a second abandoned card
+(equally ordinary — two forgotten tabs, not one) costs it two-thirds.
+Measuring the earlier draft's "at most one card" against `drip`'s absolute
+worst case of twenty made claim-on-demand look like a strict improvement in
+every respect; measured as a share of each role's own ceiling, `queue_view`
+is structurally the more exposed role, because its ceiling is deliberately
+the smaller of the two.
+
+This is exactly why decision 5 does not treat headroom as the whole answer.
+Three invariants now work together on this specific case: the ceiling gives
+a reader room for a small amount of ordinary concurrent activity before any
+abandonment matters at all; the distinguishable at-ceiling report lets the
+console tell the reader "you have unfinished cards claimed" as capacity
+tightens, so an attentive reader can resolve or explicitly abandon one
+before the ceiling is reached rather than discovering the problem only once
+it is silent; and the operator repair below remains the backstop for
+whatever this does not catch — a reader who never comes back at all. None of
+the three removes the exposure by itself; together they make it visible
+early, keep its ordinary cost low, and bound its worst case to a small,
+named number instead of leaving it structurally hidden as an unowned
+"'active' minus everything else."
+
+The remedy for a card that does end up stuck despite all of that is the same
+one described above: the local-operator recovery extended from ADR 0016.
+Running it against a `queue_view`-held card is identical in mechanism to
+running it against a `drip`-held one; nothing about this decision gives the
+two roles different recovery paths, only different points at which an
+operator is likely to need one.
+
+**Rejected alternative: bound a `queue_view`-held `delivered` card with a
+short action-completion window instead of, or in addition to, the headroom
+and reporting fix above.** Considered, because a claim-on-demand console is
+a genuinely different case from a chat card that may legitimately sit
+unanswered for a day — the console commits to a claim only once a reader has
+already clicked something, so in the overwhelmingly common case it would
+resolve within seconds. Rejected as this decision's mechanism for three
+reasons. First, "overwhelmingly common" is not "always": a slow connection,
+a confirmation the reader pauses to read, or a backgrounded browser tab
+throttling its own network activity can all legitimately take longer than a
+short window without the reader having abandoned anything, and a window
+short enough to bound stranding meaningfully would then convert a rare
+silent stall into a routine, confusing action failure for entirely correct
+use. Second, it only addresses the vanished-or-abandoned case; it does
+nothing for the ordinary multiple-tabs case this section opened with, which
+still needs headroom regardless of whether an expiry also exists. Third, it
+would add a new kind of expiry — `delivered` is permanent by design today,
+and giving it a role-specific timeout reopens a version of the exact
+liveness-inference problem this decision already declines to solve for
+`drip`, just at a shorter timescale, rather than reusing a mechanism (a
+fixed per-role constant, a self-reported capacity signal) this record has
+already justified elsewhere. If headroom and reporting later prove
+insufficient in practice, a bounded window remains available as a targeted
+follow-up specifically for `queue_view`, but it is not adopted here.
 
 ### 7. Migration and rollback
 
@@ -354,9 +437,12 @@ left to the follow-up change; this decision fixes only the column's shape
 exist today: a `queue_view`-gated read equivalent to `due()`, and a
 claim-by-identifier path alongside the existing due-order `claim`. Both are
 additive to the route table; no existing route's request or response shape
-changes because of them. Their exact paths, request/response schemas, and
-contract-version numbers are implementation details left to the follow-up
-change.
+changes because of them. The existing `claim` response's `status` field
+gains a third value per decision 5 (claimed, empty, or at-ceiling), reported
+identically by the claim-by-identifier path. Exact paths, request/response
+schemas, and contract-version numbers are implementation details left to the
+follow-up change; this record fixes only that the three outcomes exist and
+what the at-ceiling one may and may not disclose.
 
 **Configuration.** Each accepted bearer token is paired with a role at
 startup. The existing single-token invocation shape from ADR 0011 is
@@ -407,7 +493,7 @@ decision relies on that existing gate rather than adding a second one.
 5. While `delivering` or `delivered`, a card's content, id, and version are
    disclosed only to the consumer whose claim produced that state; this is a
    non-disclosure guarantee, not an access check, since `act()` (invariant
-   12) remains consumer-agnostic once a card's id and version are known.
+   13) remains consumer-agnostic once a card's id and version are known.
 6. A resolved or re-pooled card carries no consumer affinity into its next
    claim.
 7. `stats()` reports `pending` and `snoozed` identically to every caller,
@@ -419,16 +505,22 @@ decision relies on that existing gate rather than adding a second one.
    version only when a reader acts on it; it does not claim in due order to
    pre-populate a display.
 9. `claim_next` (due-order or by-identifier) never lets a consumer exceed
-   its role's fixed ceiling (`queue_view`: one; `drip`: twenty, matching the
-   existing chat gateway's own configurable maximum) of held cards.
+   its role's fixed ceiling (`queue_view`: three; `drip`: twenty, matching
+   the existing chat gateway's own configurable maximum) of held cards.
 10. Ceilings are fixed per role by this decision, not accepted from a
     request and not runtime-configurable; lowering `drip`'s below the chat
     gateway's own configured range is not permitted without first checking
     that range.
-11. A `delivering` card recovers only through the existing lease expiry; a
+11. A claim attempt refused because the caller already holds its role's
+    ceiling is reported distinctly from one refused because no due card
+    exists, using only the caller's own held count and ceiling; it never
+    names a card, a task, or another consumer.
+12. A `delivering` card recovers only through the existing lease expiry; a
     `delivered` card recovers only through an explicit, transport-absent
-    local operator repair, never automatically, for either role.
-12. `act()`'s existing authorization — card id, exact version, `delivered`
+    local operator repair, never automatically, for either role — this
+    record considered and rejected a bounded action-completion window for
+    `queue_view` as a substitute (decision 6).
+13. `act()`'s existing authorization — card id, exact version, `delivered`
     status, nothing else — is unchanged by this decision.
 
 ## Out of scope
@@ -445,8 +537,10 @@ It also does not design more than two concurrently configured consumers or
 any role beyond `drip` and `queue_view`; the two-role set is deliberately
 closed, and extending it needs its own decision. It does not change `act()`'s
 existing consumer-agnostic authorization. It does not design an automatic
-liveness or heartbeat mechanism for a `delivered` card, and it does not
-design a way to explicitly hand a specific card's content from one named
+liveness or heartbeat mechanism for a `delivered` card — including the
+bounded action-completion window decision 6 considers and rejects for
+`queue_view` — and it does not design a way to explicitly hand a specific
+card's content from one named
 consumer to another — the only handoff this decision provides is the
 decision-6 repair, which returns a card to the shared, unowned pool rather
 than moving it directly to a chosen consumer. It does not decide anything
@@ -477,10 +571,21 @@ races a card's own resolution elsewhere relies entirely on the same
 stale-version refusal `act()` already uses, which is a reasonable bet but an
 unverified one.
 
-Decision 6 also surfaces, without resolving, that a vanished `drip` consumer
-can strand up to twenty cards — larger than the `queue_view` figure this
-record spent the most attention on. That exposure predates this decision and
-is not made worse by it, but this record does not fix it either, and a
-reader who takes decision 6's repair as an adequate answer to "what happens
-when a gateway disappears" should notice that its worst case is now sized by
-`drip`, not by `queue_view`.
+A second draft of this record compared the two roles' stranding risk in raw
+card counts and concluded `drip`'s exposure (up to twenty) was now the
+larger of the two, since `queue_view`'s had shrunk from twenty to one. That
+comparison was itself the wrong measure, corrected in this revision: what
+matters is how much of a role's own capacity an ordinary lapse can remove.
+`queue_view` remains the structurally easier role to fully exhaust — it
+takes three ordinary abandoned reader actions to disable it completely,
+against `drip` needing something close to a full, fully-abandoned on-screen
+load (up to twenty independently un-acted cards, or a process vanishing
+while carrying one) to reach the same state. Decision 5's headroom and
+distinguishable refusal narrow that gap without closing it, and this record
+does not claim they close it — a `queue_view` consumer can still reach
+exhaustion from ordinary use alone, faster than `drip` realistically will,
+and the honest position is that the repair tool in decision 6, not a design
+guarantee, is what bounds the consequence when it does. The number three
+itself is the same kind of judgment call the `drip` ceiling was mistakenly
+treated as in the first draft, except this time it is labeled as one
+plainly, in decision 5's own table, rather than asserted as settled fact.
