@@ -37,6 +37,7 @@ from foxhound.task_execution import (
     WorkflowPhase,
     WorkflowStatus,
 )
+from foxhound.task_archive import prepare_task_archive
 
 
 TOKEN = "synthetic-knowledge-token-with-sufficient-length"
@@ -220,6 +221,27 @@ class ExecutionWorkerTests(unittest.TestCase):
         self._write_result_input(
             "result-work.md", "# Synthetic work\n\nNo private evidence.\n"
         )
+
+    def _enable_archive(self):
+        paths = prepare_task_archive(
+            working_root=self.root / "Project Alpha" / "Tasks",
+            kb_root=self.root / "Project Alpha KB" / "Tasks",
+            task_id=1,
+            task_text="Synthetic task",
+            run_id=RUN_ID,
+            phase="plan",
+            agent_display_name="General",
+        )
+        document = json.loads(self.state_path.read_text(encoding="utf-8"))
+        document.update({
+            "schema_version": 4,
+            "task_work_directory": str(paths.working_directory),
+            "task_kb_file": str(paths.task_file),
+            "task_run_directory": str(paths.run_directory),
+        })
+        self.state_path.write_text(json.dumps(document), encoding="utf-8")
+        self.state_path.chmod(0o600)
+        return paths
 
     def test_context_and_search_are_bounded_and_hide_the_capability(self):
         with mock.patch(
@@ -531,6 +553,40 @@ class ExecutionWorkerTests(unittest.TestCase):
             "result-deliverables.json",
         ):
             self.assertFalse((self.run_directory / name).exists())
+
+    def test_record_preserves_result_and_records_review_locations(self):
+        paths = self._enable_archive()
+        self._write_result_inputs()
+        artifact = self.run_directory / "verification.txt"
+        artifact.write_text("Synthetic verification.\n", encoding="utf-8")
+        artifact.chmod(0o600)
+        self._write_result_input("result-artifacts.json", ["verification.txt"])
+
+        with knowledge_server() as endpoint:
+            worker = self._worker(endpoint)
+            context = worker.context()
+            ready = worker.draft(outcome="awaiting_plan")
+            worker.record(ready["draft"])
+
+        self.assertNotIn("review", context)
+        self.assertTrue((paths.run_directory / "verification.txt").is_file())
+        self.assertTrue((paths.run_directory / "result-work.md").is_file())
+        archived_draft = json.loads(
+            (paths.run_directory / f"result-{RUN_ID}.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(archived_draft["schema"], "foxhound.execution-result-draft")
+        self.assertFalse((paths.run_directory / INSTRUCTIONS_NAME).exists())
+        with closing(sqlite3.connect(self.database)) as connection:
+            stored = connection.execute(
+                "SELECT task_work_directory,task_kb_file "
+                "FROM task_execution_results WHERE result_id=?",
+                (RUN_ID,),
+            ).fetchone()
+        self.assertEqual(stored, (
+            str(paths.working_directory), str(paths.task_file)
+        ))
 
     def test_draft_rejects_invalid_inputs_before_writing(self):
         self._write_result_inputs()

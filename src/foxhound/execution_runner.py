@@ -48,6 +48,14 @@ from .task_execution import (
     WorkflowPhase,
     WorkflowStatus,
 )
+from .task_archive import (
+    TaskArchiveError,
+    TaskArchivePaths,
+    TRANSCRIPT_NAME,
+    prepare_task_archive,
+    preserve_run_files,
+)
+from .task_ledger import TaskLedger, TaskLedgerError
 
 
 NO_PROGRESS_EXIT_CODE = 70
@@ -82,6 +90,11 @@ class ExecutionRunnerConfig:
     #: Where this machine keeps the knowledge base. Per host, never derived:
     #: the sync roots differ across the fleet.
     knowledge_root: Path | None = field(default=None, repr=False)
+    #: Explicit per-machine Syncthing destinations. They are a pair because a
+    #: task must never become searchable without retaining its working evidence,
+    #: or retain evidence without leaving the searchable task note.
+    task_work_root: Path | None = field(default=None, repr=False)
+    task_kb_root: Path | None = field(default=None, repr=False)
     allowed_phases: tuple[WorkflowPhase, ...] = tuple(WorkflowPhase)
     poll_seconds: float = 0.1
 
@@ -116,6 +129,13 @@ class ExecutionRunnerConfig:
             or self.poll_seconds <= 0
         ):
             raise ValueError("execution poll interval is invalid")
+        if (self.task_work_root is None) != (self.task_kb_root is None):
+            raise ValueError("task archive roots must be configured together")
+        for path in (self.task_work_root, self.task_kb_root):
+            if path is not None and (
+                not isinstance(path, Path) or not path.is_absolute()
+            ):
+                raise ValueError("task archive root is invalid")
 
 
 @dataclass(frozen=True)
@@ -297,13 +317,28 @@ def _run_claim(
         _fail_claim(service, claim, "startup_failed")
         return ExecutionRunResult("startup_failed", STARTUP_EXIT_CODE, claim.task_id)
     directory = root / f"run-{run_id}"
+    archive: TaskArchivePaths | None = None
     try:
         directory.mkdir(mode=0o700)
+        if config.task_work_root is not None and config.task_kb_root is not None:
+            origin = TaskLedger(config.database_path).origin(claim.task_id)
+            archive = prepare_task_archive(
+                working_root=config.task_work_root,
+                kb_root=config.task_kb_root,
+                task_id=claim.task_id,
+                task_text=claim.text,
+                run_id=run_id,
+                phase=claim.phase.value,
+                agent_display_name=profile.display_name,
+                origin_kind=None if origin is None else origin.kind,
+                origin_record=None if origin is None else origin.record_id,
+                origin_item=None if origin is None else origin.item_id,
+            )
         state_path = directory / "run-state.json"
         instructions_path = directory / INSTRUCTIONS_NAME
-        _write_state(state_path, config, claim, profile, run_id)
+        _write_state(state_path, config, claim, profile, run_id, archive)
         _write_instructions(instructions_path, profile)
-    except OSError:
+    except (OSError, TaskArchiveError, TaskLedgerError):
         _fail_claim(service, claim, "startup_failed")
         return ExecutionRunResult("startup_failed", STARTUP_EXIT_CODE, claim.task_id)
 
@@ -471,6 +506,8 @@ def _run_claim(
         _scrub_state_receipt(state_path, run_id, claim.task_id)
         with contextlib.suppress(OSError):
             instructions_path.unlink(missing_ok=True)
+        if archive is not None:
+            preserve_run_files(directory, archive.run_directory)
 
 
 def _terminal_result(
@@ -502,9 +539,6 @@ def _terminal_result(
 #: Owner-only, beside the result the agent writes, and never anywhere a
 #: repository or a log aggregator can reach. The contents are the agent's
 #: own working output and are as private as the task it was given.
-TRANSCRIPT_NAME = "agent-output.log"
-
-
 def _open_transcript(directory: Path):
     """Keep what the agent said, so a failed run can be explained.
 
@@ -638,6 +672,7 @@ def _write_state(
     claim: ExecutionClaim,
     profile: AgentProfile,
     run_id: str,
+    archive: TaskArchivePaths | None,
 ) -> None:
     document = {
         "schema": RUN_STATE_SCHEMA,
@@ -655,6 +690,13 @@ def _write_state(
         "knowledge_root": (
             None if config.knowledge_root is None
             else str(config.knowledge_root)
+        ),
+        "task_work_directory": (
+            None if archive is None else str(archive.working_directory)
+        ),
+        "task_kb_file": None if archive is None else str(archive.task_file),
+        "task_run_directory": (
+            None if archive is None else str(archive.run_directory)
         ),
         "worker_command": config.worker_command,
     }
@@ -808,6 +850,16 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--task-work-root",
+        type=Path,
+        help="machine-local sync root for durable task working folders",
+    )
+    parser.add_argument(
+        "--task-kb-root",
+        type=Path,
+        help="machine-local knowledge-base Tasks root for task Markdown files",
+    )
+    parser.add_argument(
         "--allowed-phase",
         action="append",
         choices=tuple(phase.value for phase in WorkflowPhase),
@@ -833,6 +885,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             profile_registry=load_registry(args.agent_profile_directory),
             worker_command=args.worker_command,
             knowledge_root=args.knowledge_root,
+            task_work_root=args.task_work_root,
+            task_kb_root=args.task_kb_root,
             allowed_phases=(
                 tuple(WorkflowPhase(value) for value in args.allowed_phases)
                 if args.allowed_phases
@@ -845,6 +899,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ValueError,
         ExecutionRunnerError,
         ExecutionWorkerConfigError,
+        TaskArchiveError,
     ):
         print("foxhound execution runner: configuration unavailable", file=sys.stderr)
         return 78

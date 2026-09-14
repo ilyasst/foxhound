@@ -162,6 +162,36 @@ class ExecutionRunnerTests(unittest.TestCase):
         # Beside the run's own state, never outside the run directory.
         self.assertTrue((path.parent / "run-state.json").exists())
 
+    def test_failed_run_is_copied_to_configured_task_locations(self):
+        self._ready()
+        work_root = self.root / "Project Alpha" / "Tasks"
+        kb_root = self.root / "Project Alpha KB" / "Tasks"
+
+        def popen(_argv, **kwargs):
+            handle = kwargs["stdout"]
+            handle.write(b"synthetic failed run\n")
+            handle.flush()
+            return FakeProcess(exit_code=1)
+
+        result = run_once(
+            self._config(task_work_root=work_root, task_kb_root=kb_root),
+            popen=popen,
+            run_id_factory=lambda: "d" * 32,
+            terminate=self._terminator,
+        )
+
+        self.assertEqual(result.outcome, "process_exit")
+        task_directory = work_root / "T1-synthetic-task"
+        evidence = task_directory / "runs" / ("plan-" + "d" * 32)
+        self.assertEqual(
+            (evidence / "agent-output.log").read_text(encoding="utf-8"),
+            "synthetic failed run\n",
+        )
+        self.assertFalse((evidence / "run-state.json").exists())
+        self.assertFalse((evidence / INSTRUCTIONS_NAME).exists())
+        self.assertTrue((task_directory / "README.md").is_file())
+        self.assertTrue((kb_root / "T1-synthetic-task.md").is_file())
+
     def test_runner_records_and_scrubs_capability_without_shell_or_output(self):
         self._ready()
         launched = {}
