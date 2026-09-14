@@ -1679,6 +1679,13 @@ def _heading_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
         done = "✅ done — close it with Mark as done"
         phase = f"{phase} {done}" if not html else f"{phase} <b>{done}</b>"
     lines.append(f"<b>Phase:</b> {phase}" if html else f"Phase: {phase}")
+    if card.kind is not ExecutionCardKind.START:
+        agent = (
+            _escape(card.agent_display_name)
+            if html
+            else card.agent_display_name
+        )
+        lines.append(f"<b>Agent:</b> {agent}" if html else f"Agent: {agent}")
     if card.revisions:
         revised = f"Revision {card.revisions}"
         lines.append(f"<b>{revised}</b>" if html else revised)
