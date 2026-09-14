@@ -15,9 +15,10 @@ reached a service path that refused the action.
 ## Decision
 
 Foxhound treats the established workflow-card presentation as a compatibility
-contract. A Start card shows the task reference, project and owner when known,
-first and last source dates when known, and states that no agent has looked at
-the task. Its controls have this fixed layout:
+contract. A Start card shows the task reference, owner when known, first and
+last source dates when known, and states that no agent has looked at the task.
+Project metadata is deliberately absent from the header. Its controls have
+this fixed layout:
 
 | Row | Left | Right |
 |---|---|---|
