@@ -62,6 +62,8 @@ class NativeIntakeRefusal(StrEnum):
     NOT_ACTIVATED = "not_activated"
     CURSOR_MISMATCH = "cursor_mismatch"
     UNRECONCILED_PREFIX = "unreconciled_prefix"
+    EXPECTED_COUNT_MISMATCH = "expected_count_mismatch"
+    ALREADY_ACTIVATED = "already_activated"
     STATE_CONFLICT = "state_conflict"
 
 
@@ -117,6 +119,21 @@ class NativeIntakeActivationResult:
 
     disposition: NativeIntakeDisposition
     activation_cursor: int | None = None
+    refusal: NativeIntakeRefusal | None = None
+
+    @property
+    def accepted(self) -> bool:
+        return self.disposition is not NativeIntakeDisposition.REFUSED
+
+
+@dataclass(frozen=True)
+class HistoricalRefusalResult:
+    """Aggregate-only result for an explicit pre-activation decision."""
+
+    disposition: NativeIntakeDisposition
+    candidates_matched: int = 0
+    refusals_recorded: int = 0
+    refusals_unchanged: int = 0
     refusal: NativeIntakeRefusal | None = None
 
     @property
@@ -223,6 +240,123 @@ class TaskLedger:
     def initialize(self) -> None:
         CandidateInbox(self.database_path, clock=self._clock).initialize()
 
+    def refuse_divergent_history(
+        self,
+        *,
+        producer: str,
+        stream_id: str,
+        expected_count: int,
+        reason_code: str,
+    ) -> HistoricalRefusalResult:
+        """Record exactly the selected divergent historical revisions once."""
+        if (
+            not _valid_native_identity(producer, stream_id, 0)
+            or isinstance(expected_count, bool)
+            or not isinstance(expected_count, int)
+            or expected_count < 1
+            or reason_code != "preserved_legacy_owner"
+        ):
+            return HistoricalRefusalResult(
+                NativeIntakeDisposition.REFUSED,
+                refusal=NativeIntakeRefusal.INVALID_ARGUMENT,
+            )
+        now = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                activated = connection.execute(
+                    "SELECT 1 FROM native_candidate_intakes "
+                    "WHERE producer=? AND stream_id=?",
+                    (producer, stream_id),
+                ).fetchone()
+                if activated is not None:
+                    connection.rollback()
+                    return HistoricalRefusalResult(
+                        NativeIntakeDisposition.REFUSED,
+                        refusal=NativeIntakeRefusal.ALREADY_ACTIVATED,
+                    )
+
+                rows = connection.execute(
+                    "SELECT DISTINCT c.candidate_id,c.source_revision "
+                    "FROM candidate_inbox AS c "
+                    "JOIN candidate_lifecycle AS l "
+                    "ON l.candidate_id=c.candidate_id "
+                    "AND l.source_revision=c.source_revision "
+                    "JOIN task_shadow_observations AS o "
+                    "ON o.candidate_id=c.candidate_id "
+                    "AND o.source_revision=c.source_revision "
+                    "JOIN candidate_feed_items AS i "
+                    "ON i.candidate_id=c.candidate_id "
+                    "AND i.source_revision=c.source_revision "
+                    "WHERE c.source_system=? AND l.state='active' "
+                    "AND o.comparison='divergent' "
+                    "AND i.producer=? AND i.stream_id=? "
+                    "AND NOT EXISTS("
+                    " SELECT 1 FROM task_candidate_bindings AS b "
+                    " WHERE b.candidate_id=c.candidate_id "
+                    " AND b.source_revision=c.source_revision"
+                    ") ORDER BY c.candidate_id,c.source_revision",
+                    (producer, producer, stream_id),
+                ).fetchall()
+                if len(rows) != expected_count:
+                    connection.rollback()
+                    return HistoricalRefusalResult(
+                        NativeIntakeDisposition.REFUSED,
+                        candidates_matched=len(rows),
+                        refusal=NativeIntakeRefusal.EXPECTED_COUNT_MISMATCH,
+                    )
+
+                recorded = unchanged = 0
+                for row in rows:
+                    existing = connection.execute(
+                        "SELECT producer,stream_id,reason_code "
+                        "FROM native_intake_historical_refusals "
+                        "WHERE candidate_id=? AND source_revision=?",
+                        (row["candidate_id"], row["source_revision"]),
+                    ).fetchone()
+                    if existing is not None:
+                        if (
+                            existing["producer"] != producer
+                            or existing["stream_id"] != stream_id
+                            or existing["reason_code"] != reason_code
+                        ):
+                            raise _NativeIntakeConflict
+                        unchanged += 1
+                        continue
+                    connection.execute(
+                        "INSERT INTO native_intake_historical_refusals("
+                        "candidate_id,source_revision,producer,stream_id,"
+                        "reason_code,refused_at) VALUES(?,?,?,?,?,?)",
+                        (
+                            row["candidate_id"],
+                            row["source_revision"],
+                            producer,
+                            stream_id,
+                            reason_code,
+                            now,
+                        ),
+                    )
+                    recorded += 1
+                connection.commit()
+                return HistoricalRefusalResult(
+                    NativeIntakeDisposition.APPLIED
+                    if recorded
+                    else NativeIntakeDisposition.UNCHANGED,
+                    candidates_matched=len(rows),
+                    refusals_recorded=recorded,
+                    refusals_unchanged=unchanged,
+                )
+            except _NativeIntakeConflict:
+                connection.rollback()
+                return HistoricalRefusalResult(
+                    NativeIntakeDisposition.REFUSED,
+                    refusal=NativeIntakeRefusal.STATE_CONFLICT,
+                )
+            except Exception:
+                connection.rollback()
+                raise
+
     def activate_native_intake(
         self,
         *,
@@ -284,8 +418,13 @@ class TaskLedger:
                     " WHERE o.candidate_id=c.candidate_id "
                     " AND o.source_revision=c.source_revision "
                     " AND o.comparison='refused'"
+                    ") AND NOT EXISTS("
+                    " SELECT 1 FROM native_intake_historical_refusals AS r "
+                    " WHERE r.candidate_id=c.candidate_id "
+                    " AND r.source_revision=c.source_revision "
+                    " AND r.producer=? AND r.stream_id=?"
                     ")",
-                    (producer,),
+                    (producer, producer, stream_id),
                 ).fetchone()
                 if int(unreconciled["total"]):
                     connection.rollback()
