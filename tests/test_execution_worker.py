@@ -623,6 +623,22 @@ class ExecutionWorkerTests(unittest.TestCase):
         self.assertEqual(receipt["status"], "queued")
         self.assertNotIn(CLAIM_TOKEN, json.dumps(receipt))
 
+    def test_release_refuses_to_discard_result_inputs(self):
+        self._write_result_inputs()
+        service = TaskExecutionService(self.database)
+        before = service.get(1)
+
+        with knowledge_server() as endpoint:
+            with self.assertRaisesRegex(
+                ExecutionWorkerDraftError,
+                "result inputs must be drafted or removed",
+            ):
+                self._worker(endpoint).release()
+
+        after = service.get(1)
+        self.assertEqual(after.status, WorkflowStatus.RUNNING)
+        self.assertEqual(after.version, before.version)
+
     def test_cli_failure_does_not_echo_private_configuration(self):
         private_value = "synthetic-private-config-value"
         output = StringIO()
