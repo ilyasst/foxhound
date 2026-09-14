@@ -151,7 +151,13 @@ def feed(from_cursor: int, *items: dict) -> dict:
     }
 
 
-def observation(item: dict, *, disposition: str, task_id: int | None) -> dict:
+def observation(
+    item: dict,
+    *,
+    disposition: str,
+    task_id: int | None,
+    legacy_owner: str | None = None,
+) -> dict:
     legacy = None
     if task_id is not None:
         legacy = {
@@ -159,7 +165,11 @@ def observation(item: dict, *, disposition: str, task_id: int | None) -> dict:
             "comparable_digest": comparable_task_digest(
                 text=item["task"]["text"],
                 project=None,
-                owner=item["task"]["owner"],
+                owner=(
+                    item["task"]["owner"]
+                    if legacy_owner is None
+                    else legacy_owner
+                ),
             ),
         }
     return {
@@ -244,6 +254,95 @@ class NativeCandidateIntakeTests(unittest.TestCase):
 
         self.assertEqual(activated.disposition, NativeIntakeDisposition.APPLIED)
         self.assertEqual(activated.activation_cursor, 1)
+
+    def test_divergent_history_requires_exact_immutable_reconciliation(self):
+        item = candidate(1, owner="Person A")
+        self.inbox.import_feed(feed(0, item))
+        self.inbox.import_shadow_feed(shadow_feed(observation(
+            item,
+            disposition="minted",
+            task_id=1001,
+            legacy_owner="Person B",
+        )))
+        self.assertEqual(
+            self.activate(1).refusal,
+            NativeIntakeRefusal.UNRECONCILED_PREFIX,
+        )
+
+        mismatch = self.ledger.refuse_divergent_history(
+            producer="gw",
+            stream_id="primary",
+            expected_count=2,
+            reason_code="preserved_legacy_owner",
+        )
+        self.assertEqual(
+            mismatch.refusal,
+            NativeIntakeRefusal.EXPECTED_COUNT_MISMATCH,
+        )
+
+        applied = self.ledger.refuse_divergent_history(
+            producer="gw",
+            stream_id="primary",
+            expected_count=1,
+            reason_code="preserved_legacy_owner",
+        )
+        self.assertEqual(
+            (applied.disposition, applied.candidates_matched,
+             applied.refusals_recorded, applied.refusals_unchanged),
+            (NativeIntakeDisposition.APPLIED, 1, 1, 0),
+        )
+        unchanged = self.ledger.refuse_divergent_history(
+            producer="gw",
+            stream_id="primary",
+            expected_count=1,
+            reason_code="preserved_legacy_owner",
+        )
+        self.assertEqual(
+            (unchanged.disposition, unchanged.refusals_recorded,
+             unchanged.refusals_unchanged),
+            (NativeIntakeDisposition.UNCHANGED, 0, 1),
+        )
+
+        with closing(sqlite3.connect(self.database)) as connection:
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "UPDATE native_intake_historical_refusals "
+                    "SET refused_at='2031-01-01T00:00:00+00:00'"
+                )
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "DELETE FROM native_intake_historical_refusals"
+                )
+
+        self.assertEqual(
+            self.activate(1).disposition,
+            NativeIntakeDisposition.APPLIED,
+        )
+        fenced = self.ledger.refuse_divergent_history(
+            producer="gw",
+            stream_id="primary",
+            expected_count=1,
+            reason_code="preserved_legacy_owner",
+        )
+        self.assertEqual(fenced.refusal, NativeIntakeRefusal.ALREADY_ACTIVATED)
+
+    def test_schema_fifteen_migration_is_passive(self):
+        item = candidate(1)
+        self.assertTrue(self.inbox.import_document(item).accepted)
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute("DROP TABLE native_intake_historical_refusals")
+            connection.execute("PRAGMA user_version = 15")
+
+        CandidateInbox(self.database, clock=lambda: NOW).initialize()
+
+        with closing(sqlite3.connect(self.database)) as connection:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            rows = connection.execute(
+                "SELECT COUNT(*) FROM native_intake_historical_refusals"
+            ).fetchone()[0]
+        self.assertEqual((version, rows), (SCHEMA_VERSION, 0))
+        self.assertEqual(self.inbox.get(item["candidate_id"]).task.text,
+                         item["task"]["text"])
 
     def test_bounded_ordered_intake_creates_once_and_replays_without_writes(self):
         self.assertEqual(self.activate().disposition, NativeIntakeDisposition.APPLIED)
@@ -794,6 +893,28 @@ class NativeCandidateIntakeTests(unittest.TestCase):
             stderr.getvalue().strip(),
             "foxhound native intake: configuration unavailable",
         )
+
+    def test_reconciliation_cli_reports_only_aggregate_counts(self):
+        private_text = "Prepare private-looking synthetic reconciliation"
+        item = candidate(1, text=private_text, owner="Person A")
+        self.inbox.import_feed(feed(0, item))
+        self.inbox.import_shadow_feed(shadow_feed(observation(
+            item,
+            disposition="minted",
+            task_id=1001,
+            legacy_owner="Person B",
+        )))
+
+        stdout = StringIO()
+        with redirect_stdout(stdout):
+            self.assertEqual(main([
+                "refuse-divergent", "--database", str(self.database),
+                "--stream-id", "primary", "--expected-count", "1",
+                "--reason", "preserved_legacy_owner",
+            ]), 0)
+        document = json.loads(stdout.getvalue())
+        self.assertEqual(document["refusals_recorded"], 1)
+        self.assertNotIn(private_text, stdout.getvalue())
 
     def _intake_cursor(self) -> int:
         with closing(sqlite3.connect(self.database)) as connection:
