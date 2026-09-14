@@ -76,7 +76,7 @@ WORK_IN_PROGRESS_CAP = 5
 AWAITING_READER_CAP = 20
 WORKING_STATUSES = frozenset({"queued", "running"})
 READER_WAITING_STATUSES = frozenset({
-    "awaiting_start", "awaiting_review", "parked", "completed",
+    "awaiting_start", "awaiting_review", "completed",
 })
 MAX_ACTION_CHARS = 4_000
 MAX_DELIVERABLE_CHARS = 16_000
