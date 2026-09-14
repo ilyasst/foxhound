@@ -27,9 +27,12 @@ from foxhound.agent_profiles import (
 
 
 EXPECTED_GENERAL_PROMPT_SHA256 = (
-    "659c89e6a0d743767efdf36d5a2b30270a2ba512a4895dc0b8ef79371e27676d"
+    "e66c0bae30959a58f7f7f87919f9c1fce774a884b5a0343dfe72b2045b727af2"
 )
 EXPECTED_GENERAL_REVISION = (
+    "9b80c488634e614127dd1da15facbfbf78fe3f38ac000c0f2dde30c394aeb23a"
+)
+IMMEDIATE_PREVIOUS_GENERAL_REVISION = (
     "6f999d7bbb0210f186d83bff149fb5828f1d177026b6cbe76455352d71b08b74"
 )
 PREVIOUS_GENERAL_REVISION = (
@@ -148,6 +151,8 @@ class AgentProfileTests(unittest.TestCase):
         ))
         for required in (
             "runtime.today",
+            "`next week` means the subsequent calendar week",
+            "verify every weekday/date pair before recording",
             "one bounded pass",
             "Do not narrate intended work instead of doing it",
             "search before concluding that evidence is missing",
@@ -172,8 +177,13 @@ class AgentProfileTests(unittest.TestCase):
         legacy = registry.resolve("general", LEGACY_GENERAL_REVISION)
         superseded = registry.resolve("general", SUPERSEDED_GENERAL_REVISION)
         previous = registry.resolve("general", PREVIOUS_GENERAL_REVISION)
+        immediate_previous = registry.resolve(
+            "general", IMMEDIATE_PREVIOUS_GENERAL_REVISION
+        )
 
-        for retained in (legacy, superseded, previous):
+        for retained in (
+            legacy, superseded, previous, immediate_previous
+        ):
             with self.subTest(revision=retained.revision):
                 with self.assertRaises(AgentProfileError):
                     registry.resolve_current("general", retained.revision)
@@ -188,6 +198,9 @@ class AgentProfileTests(unittest.TestCase):
             legacy.prompt_template, superseded.prompt_template
         )
         self.assertNotEqual(previous.prompt_template, legacy.prompt_template)
+        self.assertNotEqual(
+            immediate_previous.prompt_template, previous.prompt_template
+        )
         self.assertEqual(
             (
                 legacy.max_turns,
