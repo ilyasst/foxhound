@@ -498,8 +498,13 @@ class ExecutionWorker:
         }
 
     def release(self) -> dict[str, Any]:
-        state = load_run_state(self._state_path)
-        result = TaskExecutionService(state.database_path).release(
+        state, service = self._active()
+        if _result_inputs_present(self._state_path.parent):
+            raise ExecutionWorkerDraftError(
+                "execution result inputs must be drafted or removed before "
+                "release"
+            )
+        result = service.release(
             state.task_id,
             expected_version=state.workflow_version,
             claim_token=state.claim_token,
@@ -931,6 +936,19 @@ def _remove_result_inputs(run_directory: Path) -> None:
             (run_directory / name).unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def _result_inputs_present(run_directory: Path) -> bool:
+    """Fail closed when this run has any agent-authored result artifact."""
+    for name in _RESULT_INPUTS:
+        try:
+            (run_directory / name).lstat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return True
+        return True
+    return False
 
 
 def _exact_fields(
