@@ -43,7 +43,10 @@
     },
     "status": {"enum": ["equivalent", "unresolved"]},
     "basis": {
-      "oneOf": [{"const": "speaker_merge"}, {"type": "null"}]
+      "oneOf": [
+        {"enum": ["speaker_merge", "people_directory"]},
+        {"type": "null"}
+      ]
     },
     "effective_owner": {
       "oneOf": [
@@ -57,7 +60,7 @@
       "if": {"properties": {"status": {"const": "equivalent"}}},
       "then": {
         "properties": {
-          "basis": {"const": "speaker_merge"},
+          "basis": {"enum": ["speaker_merge", "people_directory"]},
           "effective_owner": {"type": "string"}
         }
       }

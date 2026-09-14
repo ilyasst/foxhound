@@ -15,7 +15,8 @@ boundary and could create a task with the wrong assignee.
 Foxhound defines closed version-1 request and response contracts for one
 GW-attested owner-equivalence check. A request binds the configured GW alias,
 candidate ID, source revision, legacy task ID, and observed comparable digest.
-The only accepted equivalence basis is `speaker_merge`. The response must echo
+The accepted equivalence bases are `speaker_merge` and `people_directory`.
+The response must echo
 the complete request identity and supply one bounded effective owner.
 
 The GW client exposes only a fixed POST to
