@@ -2225,6 +2225,12 @@ def _start_card_lines(
         )
     lines.extend(_origin_lines(card, html=html))
     lines.extend(_continues_lines(card, html=html))
+    # Which agent would run this, before it runs. A reader who cannot see
+    # it cannot tell that a pull request is about to be reviewed by a
+    # compatibility profile, which is how one review was lost.
+    agent = (_escape(card.agent_display_name) if html
+             else card.agent_display_name)
+    lines.append(f"🤖 <b>Agent:</b> {agent}" if html else f"🤖 Agent: {agent}")
     if card.workflow_status is WorkflowStatus.PARKED:
         # A reader who is never told has no way to distinguish a task
         # nobody has reached from one the agent abandoned.
@@ -2891,6 +2897,10 @@ def _button_rows(
             rows += ((
                 (_owner_hold_button_label(card.owner), OWNER_HOLD_ACTION),
             ),)
+        if card.workflow_status is WorkflowStatus.AWAITING_START:
+            # Only before it starts: once a workflow is running, changing
+            # the agent underneath it would rebind work already in flight.
+            rows += ((("🤖 Agent", "agent"),),)
         return rows if approvable else rows[1:]
     stop_row = (("👥 Reassign", "reassign"), ("🗑 Drop task", "drop"))
     if kind is ExecutionCardKind.EXTERNAL_REVIEW:
