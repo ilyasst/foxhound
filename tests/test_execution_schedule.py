@@ -12,6 +12,7 @@ from io import StringIO
 from pathlib import Path
 from unittest import mock
 
+from foxhound.agent_profiles import AgentProfile, WORKER_COMMAND_TOKEN
 from foxhound.candidate_inbox import CandidateInbox
 from foxhound.execution_schedule import main
 from foxhound.task_execution import TaskExecutionService, WorkflowStatus
@@ -91,6 +92,79 @@ class ExecutionScheduleCommandTests(unittest.TestCase):
                 "foxhound execution schedule: configuration unavailable\n",
             )
 
+    def test_installed_default_profile_is_bound_before_start(self):
+        directory = self.root / "profiles"
+        directory.mkdir(mode=0o700)
+        profile = self._profile()
+        manifest = directory / f"{profile.profile_id}.json"
+        manifest.write_text(json.dumps(profile.document()), encoding="utf-8")
+        manifest.chmod(0o600)
+
+        stdout = StringIO()
+        with redirect_stdout(stdout):
+            self.assertEqual(main([
+                "--database", str(self.database),
+                "--agent-profile-directory", str(directory),
+                "--default-agent-profile", profile.profile_id,
+                "--limit", "1",
+            ]), 0)
+        scheduled = TaskExecutionService(self.database).get(1)
+        self.assertEqual(scheduled.agent_profile_id, profile.profile_id)
+        self.assertEqual(scheduled.agent_profile_revision, profile.revision)
+        self.assertEqual(
+            json.loads(stdout.getvalue()),
+            {"ok": True, "remaining": 1, "scheduled": 1},
+        )
+
+    def test_invalid_default_profile_configuration_schedules_nothing(self):
+        missing = self.root / "missing-profile"
+        missing.mkdir(mode=0o700)
+
+        execute_only = self.root / "execute-only"
+        execute_only.mkdir(mode=0o700)
+        profile = self._profile(phases=("execute",))
+        manifest = execute_only / f"{profile.profile_id}.json"
+        manifest.write_text(json.dumps(profile.document()), encoding="utf-8")
+        manifest.chmod(0o600)
+
+        malformed = self.root / "malformed"
+        malformed.mkdir(mode=0o700)
+        invalid = malformed / "example-specialist.json"
+        invalid.write_text("{}", encoding="utf-8")
+        invalid.chmod(0o600)
+
+        unsafe = self.root / "unsafe"
+        unsafe.mkdir(mode=0o755)
+
+        cases = (
+            (missing, "missing"),
+            (execute_only, profile.profile_id),
+            (malformed, "example-specialist"),
+            (unsafe, "general"),
+        )
+        for directory, profile_id in cases:
+            with self.subTest(profile_id=profile_id):
+                stdout = StringIO()
+                stderr = StringIO()
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    self.assertEqual(main([
+                        "--database", str(self.database),
+                        "--agent-profile-directory", str(directory),
+                        "--default-agent-profile", profile_id,
+                    ]), 78)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(
+                    stderr.getvalue(),
+                    "foxhound execution schedule: configuration unavailable\n",
+                )
+        with closing(sqlite3.connect(self.database)) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM task_execution_workflows"
+                ).fetchone()[0],
+                0,
+            )
+
     def test_internal_failure_is_content_free(self):
         private_text = "Synthetic private task content"
         stderr = StringIO()
@@ -104,6 +178,26 @@ class ExecutionScheduleCommandTests(unittest.TestCase):
             "foxhound execution schedule: scheduling failed\n",
         )
         self.assertNotIn(private_text, stderr.getvalue())
+
+    @staticmethod
+    def _profile(
+        *, phases: tuple[str, ...] = ("plan", "execute", "external_action")
+    ) -> AgentProfile:
+        return AgentProfile(
+            profile_id="example-specialist",
+            display_name="Example Specialist",
+            runtime="hermes",
+            prompt_template=(
+                f"Use {WORKER_COMMAND_TOKEN} and synthetic evidence only."
+            ),
+            toolsets=("terminal",),
+            max_turns=12,
+            timeout_seconds=300,
+            claim_lease_seconds=600,
+            heartbeat_seconds=60,
+            kill_grace_seconds=30,
+            allowed_phases=phases,
+        )
 
 
 if __name__ == "__main__":
