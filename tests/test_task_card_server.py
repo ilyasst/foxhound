@@ -728,7 +728,9 @@ class TaskCardServerTests(unittest.TestCase):
             "<b>Start this task?</b>",
             selected["presentation"]["body"],
         )
-        self.assertNotIn(
+        # The refreshed card names the agent that was just chosen: a
+        # selection with no visible effect reads as a tap that failed.
+        self.assertIn(
             "Synthetic Specialist",
             selected["presentation"]["body"],
         )

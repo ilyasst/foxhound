@@ -467,7 +467,8 @@ class ExecutionCardTests(unittest.TestCase):
         ]
         self.assertEqual(
             [parse_execution_review_callback(value)[2] for value in callbacks],
-            ["done", "start", "drop", "discuss", "snooze", "reassign"],
+            ["done", "start", "drop", "discuss", "snooze", "reassign",
+             "agent"],
         )
         self.assertEqual(
             [[button["text"] for button in row]
@@ -476,6 +477,7 @@ class ExecutionCardTests(unittest.TestCase):
                 ["✅ Done", "▶️ Continue"],
                 ["🗑 Drop", "✏️ Update"],
                 ["🕓 Snooze", "👥 Reassign"],
+                ["🤖 Agent"],
             ],
         )
         self.assertTrue(all(
@@ -951,7 +953,9 @@ class ExecutionCardTests(unittest.TestCase):
             selected.card
         )
         self.assertIn("<b>Start this task?</b>", refreshed_body)
-        self.assertNotIn("Synthetic Specialist", refreshed_body)
+        # Choosing an agent shows on the card. Selecting one and seeing no
+        # sign of it is indistinguishable from the tap not working.
+        self.assertIn("Synthetic Specialist", refreshed_body)
         self.assertTrue(all(
             parse_execution_review_callback(button["callback_data"])[1]
             == selected.card_version
@@ -1751,7 +1755,10 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertNotIn("plan refinement", body)
         self.assertIn("No agent has looked at this yet.", body)
         self.assertIn("<b>Continue</b> starts the investigation.", body)
-        self.assertNotIn("<b>Agent:</b>", body)
+        # The gate names its agent. A reader who cannot see it cannot tell
+        # that a pull request is about to be reviewed by a compatibility
+        # profile, which is how one review was lost.
+        self.assertIn("<b>Agent:</b>", body)
 
     def test_every_post_run_card_identifies_its_bound_agent(self):
         self._plan_review(1, "agent-plan")

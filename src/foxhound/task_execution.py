@@ -41,6 +41,15 @@ REVIEW_SNOOZE_INTERVALS = {
     "snooze_14d": timedelta(days=14),
     "snooze_30d": timedelta(days=30),
 }
+#: The agent a kind of work starts on, when that machine has it installed.
+#: A preference, not a rule: the reader may change it at the gate, and a
+#: machine without the profile falls back to its default rather than
+#: refusing the task.
+SOURCE_KIND_PROFILES = {
+    "issue": "sigint",
+    "review_request": "sigint",
+}
+
 DEFAULT_LEASE_SECONDS = 300
 MIN_LEASE_SECONDS = 5
 MAX_LEASE_SECONDS = 3_600
@@ -266,6 +275,27 @@ class TaskExecutionService:
         self._planning_grants = _planning_grants(planning_grants)
         self._default_profile = profile
 
+    def _profile_for(self, origin_kind: object) -> AgentProfile:
+        """Which agent a task of this kind starts on.
+
+        A default that ignores what the task is sends repository work to a
+        compatibility profile. One review of a pull request went to
+        `general`, produced nothing recordable three times, and parked —
+        with the review already written.
+
+        Falls back to the default when a preferred profile is not installed
+        on this machine, because a machine that lacks it should still work
+        rather than refuse every task of that kind.
+        """
+        preferred = SOURCE_KIND_PROFILES.get(origin_kind)
+        if preferred:
+            profile = self._profile_registry.get(preferred)
+            if profile is not None and (
+                WorkflowPhase.PLAN.value in profile.allowed_phases
+            ):
+                return profile
+        return self._default_profile
+
     def initialize(self) -> None:
         CandidateInbox(self.database_path, clock=self._clock).initialize()
 
@@ -317,6 +347,7 @@ class TaskExecutionService:
                     task_version = int(row["version"])
                     status = _initial_status(
                         row["origin_kind"], self._planning_grants)
+                    profile = self._profile_for(row["origin_kind"])
                     connection.execute(
                         "INSERT INTO task_execution_workflows("
                         "task_id,task_version,status,phase,version,due_at,"
@@ -325,8 +356,8 @@ class TaskExecutionService:
                         "VALUES(?,?,?,'plan',1,NULL,0,?,?,?,?)",
                         (
                             task_id, task_version, status.value, now, now,
-                            self._default_profile.profile_id,
-                            self._default_profile.revision,
+                            profile.profile_id,
+                            profile.revision,
                         ),
                     )
                     self._event(
