@@ -33,6 +33,14 @@ class TaskCandidateContractTests(unittest.TestCase):
         self.assertIsNone(candidate.task.owner)
         self.assertIsNone(candidate.task.due)
 
+    def test_accepts_and_round_trips_synthetic_teams_candidate(self):
+        document = fixture("teams-candidate-v2.json")
+
+        candidate = parse_task_candidate(document)
+
+        self.assertEqual(candidate.source.kind, "teams")
+        self.assertEqual(task_candidate_document(candidate), document)
+
     def test_accepts_and_round_trips_projectless_version_2(self):
         document = fixture("meeting-candidate-v2.json")
         candidate = parse_task_candidate(document)
@@ -165,7 +173,7 @@ class TaskCandidateContractTests(unittest.TestCase):
             version_2["properties"]["task"]["additionalProperties"]
         )
         self.assertNotIn("project", version_2["properties"]["task"]["properties"])
-        expected_kinds = {"meeting", "email", "issue", "legacy"}
+        expected_kinds = {"meeting", "email", "teams", "issue", "legacy"}
         self.assertEqual(
             set(schema["properties"]["source"]["properties"]["kind"]["enum"]),
             expected_kinds,

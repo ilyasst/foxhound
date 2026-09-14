@@ -43,6 +43,27 @@ class TaskShadowObservationContractTests(unittest.TestCase):
         self.assertEqual(observation.disposition, "unmapped")
         self.assertIsNone(observation.legacy_task)
 
+    def test_shadow_contract_preserves_teams_source_kind(self):
+        document = fixture("meeting-shadow-observation-v1.json")
+        document["candidate"] = fixture("teams-candidate-v2.json")
+        document["legacy_task"]["comparable_digest"] = (
+            candidate_comparable_digest(
+                parse_task_shadow_observation({
+                    **document,
+                    "disposition": "unmapped",
+                    "legacy_task": None,
+                    "reason_code": "ambiguous_retrofit",
+                }).candidate
+            )
+        )
+
+        observation = parse_task_shadow_observation(document)
+
+        self.assertEqual(observation.candidate.source.kind, "teams")
+        self.assertEqual(
+            task_shadow_observation_document(observation), document
+        )
+
     def test_round_trip_preserves_the_canonical_document(self):
         document = fixture("meeting-shadow-observation-v1.json")
         observation = parse_task_shadow_observation(document)

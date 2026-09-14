@@ -96,6 +96,19 @@ def legacy_candidate(index: int) -> dict:
     return item
 
 
+def teams_candidate(index: int) -> dict:
+    """A fictional action discovered in a bounded chat context."""
+    item = candidate(index)
+    item["source"]["kind"] = "teams"
+    item["candidate_id"] = candidate_id_for(
+        system="gw",
+        kind="teams",
+        record_id=item["source"]["record_id"],
+        item_id=item["source"]["item_id"],
+    )
+    return item
+
+
 def feed(from_cursor: int, *items: dict) -> dict:
     return {
         "schema": "foxhound.task-candidate-feed",
@@ -254,6 +267,26 @@ class NativeCandidateIntakeTests(unittest.TestCase):
             self.intake().disposition, NativeIntakeDisposition.UNCHANGED
         )
         self.assertEqual(self.ledger.count(), 1)
+
+    def test_teams_kind_survives_feed_inbox_and_native_intake(self):
+        self.activate()
+        item = teams_candidate(1)
+
+        self.assertTrue(self.inbox.import_feed(feed(0, item)).accepted)
+        self.assertEqual(
+            self.inbox.get(item["candidate_id"]).source.kind, "teams"
+        )
+        self.assertEqual(self.intake().tasks_created, 1)
+
+        origin = self.ledger.origin(1)
+        self.assertEqual(
+            (origin.kind, origin.record_id, origin.item_id),
+            (
+                "teams",
+                item["source"]["record_id"],
+                item["source"]["item_id"],
+            ),
+        )
 
     def test_exact_historically_bound_candidate_advances_as_unchanged(self):
         item = candidate(1)
