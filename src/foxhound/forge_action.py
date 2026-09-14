@@ -44,6 +44,14 @@ PROVENANCE = (
     "#{issue}. Review before merging._\n"
 )
 
+#: The same attribution on a review. A reviewer reading it should be able
+#: to tell an agent wrote it, even when the credential belongs to a person.
+REVIEW_PROVENANCE = (
+    "\n\n---\n_Reviewed by Foxhound for task {task_id} on {repository}"
+    "#{number}. A person has approved posting this; its contents are the "
+    "agent's._\n"
+)
+
 _PUSH_TIMEOUT_S = 120
 _CLONE_TIMEOUT_S = 600
 
@@ -169,6 +177,64 @@ def push_branch(*, repository: str, path: Path, head_branch: str,
     if rc != 0:
         raise ForgeActionError(
             f"{repository}: the branch could not be pushed ({_detail(err)})")
+
+
+@dataclass(frozen=True)
+class ReviewReceipt:
+    repository: str
+    number: int
+    url: str
+
+
+def post_review(
+    *,
+    repository: str,
+    number: str,
+    task_id: int,
+    body: str,
+) -> ReviewReceipt:
+    """Comment one review on a pull request the caller does not choose.
+
+    ``repository`` and ``number`` come from the task's binding, so there is
+    no parameter that could name another pull request. The body is content.
+
+    Posted as a comment rather than an approval or a rejection. Approving a
+    pull request is a statement about whether it should merge, and that is
+    the reader's to make; an agent's job here is to say what it found.
+    """
+    if not repository or repository.count("/") != 2:
+        raise ForgeActionError(
+            "the task's repository is not a canonical locator")
+    host, _, name_with_owner = repository.partition("/")
+    if host != "github.com":
+        raise ForgeActionError(f"{host}: posting a review is not supported here")
+    digits = (number or "").strip()
+    if not digits.isdigit() or int(digits) < 1:
+        raise ForgeActionError("the task does not name a pull request")
+    if not (body or "").strip():
+        # An empty review is worse than none: it reads as a considered
+        # verdict of nothing.
+        raise ForgeActionError("a review body is required")
+
+    body = body.rstrip() + REVIEW_PROVENANCE.format(
+        task_id=task_id, repository=repository, number=digits)
+    rc, _out, err = _run(
+        "gh", "pr", "comment", digits, "--repo", name_with_owner,
+        "--body", body)
+    if rc != 0:
+        raise ForgeActionError(
+            f"{repository}#{digits}: the forge refused the review "
+            f"({_detail(err)})")
+    url = ""
+    rc, detail, _err = _run("gh", "pr", "view", digits, "--repo",
+                            name_with_owner, "--json", "url")
+    if rc == 0:
+        try:
+            url = str(json.loads(detail).get("url") or "")
+        except (ValueError, TypeError):
+            pass
+    return ReviewReceipt(
+        repository=repository, number=int(digits), url=url)
 
 
 def open_pull_request(
