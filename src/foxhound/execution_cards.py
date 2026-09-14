@@ -302,14 +302,18 @@ class ExecutionCardService:
                     # exactly when a reader needs telling — it used to be
                     # terminal and silent, so a task sat open forever with
                     # its workflow quietly abandoned and no card anywhere.
-                    " ((w.status IN ('awaiting_start','parked') OR "
-                    "   (w.status='snoozed' AND w.due_at<=? "
-                    "    AND w.last_result_id IS NULL)) "
-                    "  AND NOT EXISTS("
-                    "   SELECT 1 FROM task_execution_workflows AS busy "
-                    "   WHERE busy.status IN "
-                    "   ('queued','running','awaiting_review')"
-                    "  )) OR "
+                    # No "is anything else busy" condition. It used to
+                    # suppress every gate whenever ANY workflow anywhere was
+                    # queued, running or awaiting review — one machine had
+                    # 143 tasks invisible behind seven in flight, with a
+                    # free card surface and nothing to show on it. How many
+                    # cards a reader sees at once is the drip's business,
+                    # and it already bounds that; a gate is how work gets
+                    # queued in the first place, so suppressing it while
+                    # work runs is how a queue empties and never refills.
+                    " (w.status IN ('awaiting_start','parked') OR "
+                    "  (w.status='snoozed' AND w.due_at<=? "
+                    "   AND w.last_result_id IS NULL)) OR "
                     " (w.status='snoozed' AND w.due_at<=? "
                     "  AND w.last_result_id IS NOT NULL) OR "
                     " (w.status='awaiting_review' AND w.phase='plan' "
