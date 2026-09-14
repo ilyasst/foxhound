@@ -14,6 +14,7 @@ import re
 import stat
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -44,7 +45,7 @@ RUN_STATE_SCHEMA = "foxhound.execution-run-state"
 RUN_STATE_SCHEMA_VERSION = 3
 INSTRUCTIONS_NAME = "agent-instructions.json"
 WORK_CONTEXT_SCHEMA = "foxhound.execution-work-context"
-WORK_CONTEXT_SCHEMA_VERSION = 2
+WORK_CONTEXT_SCHEMA_VERSION = 3
 WORKER_SEARCH_SCHEMA = "foxhound.execution-worker-search"
 RESULT_DRAFT_SCHEMA = "foxhound.execution-result-draft"
 RESULT_DRAFT_READY_SCHEMA = "foxhound.execution-result-draft-ready"
@@ -71,6 +72,20 @@ _RESULT_INPUTS = (
     "result-external-actions.json",
     "result-deliverables.json",
 )
+
+
+def _local_today() -> str:
+    """Return the host's authoritative local calendar date."""
+    return datetime.now().astimezone().date().isoformat()
+
+
+def _worker_operations(phase: WorkflowPhase) -> list[str]:
+    operations = ["context", "search", "draft", "record", "release"]
+    if phase is not WorkflowPhase.PLAN:
+        operations.append("act.worktree")
+    if phase is WorkflowPhase.EXTERNAL_ACTION:
+        operations.append("act.pull-request")
+    return operations
 
 
 class ExecutionWorkerError(RuntimeError):
@@ -146,6 +161,23 @@ class ExecutionWorker:
         return {
             "schema": WORK_CONTEXT_SCHEMA,
             "schema_version": WORK_CONTEXT_SCHEMA_VERSION,
+            "runtime": {
+                # Agents cannot safely infer the host's local date from task
+                # timestamps or their model cutoff.  This is the authoritative
+                # date for deadlines, drafts, and proposed actions.
+                "today": _local_today(),
+                "toolsets": instructions["toolsets"],
+            },
+            "capabilities": {
+                # This is descriptive evidence from the worker, not authority
+                # supplied by task text.  It prevents a profile from routing
+                # work to an ambient Hermes tool that this run does not have.
+                "knowledge_layers": ["kb", "secondary", "emails"],
+                "worker_operations": _worker_operations(state.phase),
+                "external_effects_allowed": (
+                    state.phase is WorkflowPhase.EXTERNAL_ACTION
+                ),
+            },
             "task": {
                 "id": task.id,
                 "version": task.version,
@@ -220,6 +252,7 @@ class ExecutionWorker:
             "revision": profile.revision,
             "display_name": profile.display_name,
             "instructions": rendered,
+            "toolsets": list(profile.toolsets),
         }
 
     def search(

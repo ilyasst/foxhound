@@ -27,9 +27,12 @@ from foxhound.agent_profiles import (
 
 
 EXPECTED_GENERAL_PROMPT_SHA256 = (
-    "05fd19d75ce8263c1fc4d884bc34cce0472953366927b3a2eb405d90479ff563"
+    "659c89e6a0d743767efdf36d5a2b30270a2ba512a4895dc0b8ef79371e27676d"
 )
 EXPECTED_GENERAL_REVISION = (
+    "6f999d7bbb0210f186d83bff149fb5828f1d177026b6cbe76455352d71b08b74"
+)
+PREVIOUS_GENERAL_REVISION = (
     "1143d16a81afd8ad52240ca92c6a66ac8d9e95d822b807bba53bdb8385629523"
 )
 SUPERSEDED_GENERAL_REVISION = (
@@ -143,6 +146,17 @@ class AgentProfileTests(unittest.TestCase):
         self.assertIn("synthetic-worker context", profile.render_prompt(
             "synthetic-worker"
         ))
+        for required in (
+            "runtime.today",
+            "one bounded pass",
+            "Do not narrate intended work instead of doing it",
+            "search before concluding that evidence is missing",
+            "draft --outcome OUTCOME",
+            "Do not hand-author or experimentally probe the envelope schema",
+            "only the exact reviewed action",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, prompt)
         with self.assertRaises(AgentProfileError):
             profile.render_prompt("worker; command")
 
@@ -157,8 +171,9 @@ class AgentProfileTests(unittest.TestCase):
         )
         legacy = registry.resolve("general", LEGACY_GENERAL_REVISION)
         superseded = registry.resolve("general", SUPERSEDED_GENERAL_REVISION)
+        previous = registry.resolve("general", PREVIOUS_GENERAL_REVISION)
 
-        for retained in (legacy, superseded):
+        for retained in (legacy, superseded, previous):
             with self.subTest(revision=retained.revision):
                 with self.assertRaises(AgentProfileError):
                     registry.resolve_current("general", retained.revision)
@@ -172,6 +187,7 @@ class AgentProfileTests(unittest.TestCase):
         self.assertEqual(
             legacy.prompt_template, superseded.prompt_template
         )
+        self.assertNotEqual(previous.prompt_template, legacy.prompt_template)
         self.assertEqual(
             (
                 legacy.max_turns,

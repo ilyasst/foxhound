@@ -33,7 +33,6 @@ from foxhound.task_execution import TaskExecutionService, WorkflowStatus
 from test_execution_worker import knowledge_server
 
 
-RESULT_ID = "d" * 32
 SOURCE = Path(__file__).resolve().parents[1] / "src"
 
 SYNTHETIC_AGENT = '''
@@ -49,25 +48,24 @@ context = json.loads(
                    text=True).stdout
 )
 instructions = context["agent"]["instructions"]
-if "result-<32 lowercase hex characters>.json" not in instructions:
+if "draft --outcome OUTCOME" not in instructions:
     raise SystemExit("instructions did not arrive")
 if context["agent"]["revision"] != sys.argv[1]:
     raise SystemExit("instructions were not the pinned revision")
 os.umask(0o077)
-path = pathlib.Path("result-%s.json" % ("d" * 32))
-path.write_text(json.dumps({
-    "schema": "foxhound.execution-result-draft",
-    "schema_version": 1,
-    "result_id": "d" * 32,
-    "outcome": "awaiting_plan",
-    "summary": "Synthetic plan summary.",
-    "work_markdown": "# Synthetic plan\\n\\nNo private evidence.",
-    "questions": [],
-    "external_actions": [],
-    "deliverables": [],
-}), encoding="utf-8")
-path.chmod(0o600)
-subprocess.run(worker + ["record", str(path)], check=True, capture_output=True)
+pathlib.Path("result-summary.txt").write_text(
+    "Synthetic plan summary.", encoding="utf-8"
+)
+pathlib.Path("result-work.md").write_text(
+    "# Synthetic plan\\n\\nNo private evidence.", encoding="utf-8"
+)
+ready = json.loads(subprocess.run(
+    worker + ["draft", "--outcome", "awaiting_plan"],
+    check=True, capture_output=True, text=True,
+).stdout)
+subprocess.run(
+    worker + ["record", ready["draft"]], check=True, capture_output=True
+)
 '''
 
 
@@ -139,7 +137,9 @@ class FencedInstructionDeliveryTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0)
         workflow = self.service.get(1)
         self.assertIs(workflow.status, WorkflowStatus.AWAITING_REVIEW)
-        self.assertEqual(workflow.last_result_id, RESULT_ID)
+        self.assertIsNotNone(workflow.last_result_id)
+        self.assertEqual(len(workflow.last_result_id), 32)
+        int(workflow.last_result_id, 16)
 
         directory = launched["directory"]
         self.assertFalse((directory / INSTRUCTIONS_NAME).exists())
