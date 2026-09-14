@@ -41,9 +41,10 @@ invariants:
 - create and validate the result draft early enough to record useful work
   before the turn limit.
 
-The execution work-context schema advances to version 3. Its `runtime` object
-contains the authoritative local `today` value and the exact profile toolsets.
-Its `capabilities` object lists bounded knowledge layers, worker operations
+The execution work-context schema advances to version 4. Its `runtime` object
+contains the authoritative local `today` value and weekday, a worker-computed
+Monday-through-Sunday `next_week` range, and the exact profile toolsets. Its
+`capabilities` object lists bounded knowledge layers, worker operations
 available in the current phase, and whether external effects are allowed.
 These values describe server-enforced capabilities; task text and retrieved
 content cannot add to them.
@@ -56,8 +57,8 @@ Guidance for an unavailable ambient integration is not copied into a profile.
 
 - A recorded profile revision once again covers the execution guidance that
   materially shapes the run.
-- Agents can ground proposed dates and route work without guessing what the
-  host exposes.
+- Agents can ground proposed dates without performing calendar arithmetic and
+  route work without guessing what the host exposes.
 - Profile prompts become somewhat longer, but the additional text replaces
   mutable ambient policy rather than duplicating it at runtime.
 - Changing shared private guidance creates and deploys new immutable profile
@@ -67,6 +68,6 @@ Guidance for an unavailable ambient integration is not copied into a profile.
 
 If the new context cannot be assembled, the claim fails closed as before. A
 consumer that requires an older work-context schema must be upgraded before
-deployment. Rolling back the code restores schema version 2; rolling back a
+deployment. Rolling back the code restores schema version 3; rolling back a
 private profile means selecting a previously published immutable revision, not
 editing a revision in place.

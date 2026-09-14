@@ -27,12 +27,15 @@ from foxhound.agent_profiles import (
 
 
 EXPECTED_GENERAL_PROMPT_SHA256 = (
-    "e66c0bae30959a58f7f7f87919f9c1fce774a884b5a0343dfe72b2045b727af2"
+    "e6508e28cdb500163815c366c7bdbb1b1d8310cf443bfc5ee5dcbecc8066398c"
 )
 EXPECTED_GENERAL_REVISION = (
-    "9b80c488634e614127dd1da15facbfbf78fe3f38ac000c0f2dde30c394aeb23a"
+    "0e20873704f124560bca5b8d925c223c066a477278573a29cd8d18fb71e2b70b"
 )
 IMMEDIATE_PREVIOUS_GENERAL_REVISION = (
+    "9b80c488634e614127dd1da15facbfbf78fe3f38ac000c0f2dde30c394aeb23a"
+)
+EARLIER_GENERAL_REVISION = (
     "6f999d7bbb0210f186d83bff149fb5828f1d177026b6cbe76455352d71b08b74"
 )
 PREVIOUS_GENERAL_REVISION = (
@@ -151,8 +154,9 @@ class AgentProfileTests(unittest.TestCase):
         ))
         for required in (
             "runtime.today",
-            "`next week` means the subsequent calendar week",
-            "verify every weekday/date pair before recording",
+            "runtime.next_week",
+            "do not calculate or substitute another range",
+            "verify every weekday/date pair against the worker-provided values",
             "one bounded pass",
             "Do not narrate intended work instead of doing it",
             "search before concluding that evidence is missing",
@@ -180,9 +184,10 @@ class AgentProfileTests(unittest.TestCase):
         immediate_previous = registry.resolve(
             "general", IMMEDIATE_PREVIOUS_GENERAL_REVISION
         )
+        earlier = registry.resolve("general", EARLIER_GENERAL_REVISION)
 
         for retained in (
-            legacy, superseded, previous, immediate_previous
+            legacy, superseded, previous, earlier, immediate_previous
         ):
             with self.subTest(revision=retained.revision):
                 with self.assertRaises(AgentProfileError):

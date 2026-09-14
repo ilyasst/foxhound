@@ -207,9 +207,9 @@ Before recording, the worker can construct a correctly named draft from fixed
 owner-only summary, work, and optional string-array files beside that run
 state. Private result content is never passed in command-line arguments, and
 the existing strict hand-authored draft path remains compatible. Work-context
-version 3 also reports the authoritative local date, exact profile toolsets,
-and phase-derived worker capabilities so versioned guidance does not depend on
-ambient Hermes configuration. See
+version 4 also reports authoritative local calendar anchors, exact profile
+toolsets, and phase-derived worker capabilities so versioned guidance does not
+depend on ambient Hermes configuration or model date arithmetic. See
 [ADR 0030](docs/architecture/0030-versioned-runtime-guidance.md).
 
 The runner neither schedules itself nor advances reader gates. A deployment
