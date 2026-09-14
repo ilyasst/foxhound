@@ -126,7 +126,6 @@ class ExecutionReviewCard:
     agent_profile_revision: str = field(repr=False)
     agent_display_name: str = field(repr=False)
     task_text: str = field(repr=False)
-    project: str | None = field(repr=False)
     owner: str | None = field(repr=False)
     due: str | None = field(repr=False)
     first_raised: str | None = field(repr=False)
@@ -1149,11 +1148,6 @@ class ExecutionCardService:
             "r.task_version AS result_task_version,r.phase AS result_phase,"
             "r.outcome AS result_outcome,r.summary,r.work_markdown,"
             "r.questions_json,r.external_actions_json,r.deliverables_json,"
-            "(SELECT json_extract(o.payload_json,'$.task.project') "
-            " FROM task_candidate_bindings AS b "
-            " JOIN candidate_inbox AS o ON o.candidate_id=b.candidate_id "
-            " WHERE b.task_id=c.task_id AND b.relation='accepted') "
-            " AS project,"
             "(SELECT min(h.created_at) "
             " FROM task_candidate_bindings AS b "
             " JOIN candidate_revision_history AS h "
@@ -1488,7 +1482,6 @@ def _card(
             agent_profile_revision=profile_revision,
             agent_display_name=profile_name,
             task_text=str(row["task_text"]),
-            project=row["project"],
             owner=row["owner"],
             due=row["due"],
             first_raised=row["first_raised"],
@@ -1617,13 +1610,9 @@ def _start_card_lines(
     handle = f"T{card.task_id}"
     if html:
         head = f"🚦 <b>Start this task?</b>  <code>{handle}</code>"
-        if card.project:
-            head += f"  <i>({_escape(card.project)})</i>"
         task = f"<b>{_escape(card.task_text)}</b>"
     else:
         head = f"🚦 Start this task?  {handle}"
-        if card.project:
-            head += f"  ({card.project})"
         task = card.task_text
     lines = [head, "", task]
     if card.owner:
@@ -1663,13 +1652,9 @@ def _heading_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
     title = "Task workflow"
     if html:
         head = f"🤖 <b>{title}</b>  <code>{handle}</code>"
-        if card.project:
-            head += f"  <i>({_escape(card.project)})</i>"
         body = f"<b>{_escape(card.task_text)}</b>"
     else:
         head = f"🤖 {title}  {handle}"
-        if card.project:
-            head += f"  ({card.project})"
         body = card.task_text
     lines = [head, body, ""]
     phase = _phase_name(card.phase)
