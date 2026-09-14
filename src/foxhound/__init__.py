@@ -59,6 +59,7 @@ from .knowledge_client import (
     KnowledgeResponseError,
     KnowledgeSearchResult,
     KnowledgeTransportError,
+    OwnerUpcomingMeeting,
 )
 from .task_cards import (
     CardDisposition,
@@ -159,6 +160,7 @@ __all__ = (
     "TransitionResult",
     "GwKnowledgeClient",
     "ExecutionContext",
+    "OwnerUpcomingMeeting",
     "KnowledgeClientConfig",
     "KnowledgeClientError",
     "KnowledgeConfigError",

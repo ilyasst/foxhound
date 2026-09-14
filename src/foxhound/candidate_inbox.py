@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -347,6 +347,37 @@ _SCHEMA_COLUMNS = {
         "to_owner",
         "occurred_at",
     ),
+    "task_execution_owner_holds": (
+        "id",
+        "task_id",
+        "task_version",
+        "workflow_version",
+        "status",
+        "owner_display",
+        "owner_ref_version",
+        "owner_kind",
+        "owner_speaker_id",
+        "owner_canonical_speaker_id",
+        "owner_speaker_registry_id",
+        "owner_pinned",
+        "owner_provisional",
+        "backstop_at",
+        "last_checked_at",
+        "last_evidence_revision",
+        "last_match",
+        "release_reason",
+        "created_at",
+        "released_at",
+    ),
+    "task_execution_owner_hold_events": (
+        "sequence",
+        "hold_id",
+        "task_id",
+        "kind",
+        "matched",
+        "evidence_revision",
+        "occurred_at",
+    ),
     "candidate_lifecycle": (
         "candidate_id",
         "source_revision",
@@ -366,6 +397,15 @@ _SCHEMA_COLUMNS = {
     ),
 }
 
+_SCHEMA_V18_COLUMNS = {
+    name: columns
+    for name, columns in _SCHEMA_COLUMNS.items()
+    if name not in {
+        "task_execution_owner_holds",
+        "task_execution_owner_hold_events",
+    }
+}
+
 _OWNER_COLUMNS = {
     "owner_ref_version",
     "owner_kind",
@@ -378,7 +418,7 @@ _OWNER_COLUMNS = {
 
 _SCHEMA_V17_COLUMNS = {
     name: tuple(column for column in columns if column not in _OWNER_COLUMNS)
-    for name, columns in _SCHEMA_COLUMNS.items()
+    for name, columns in _SCHEMA_V18_COLUMNS.items()
 }
 
 _SCHEMA_V16_COLUMNS = {
@@ -442,6 +482,9 @@ _SCHEMA_OBJECTS = {
     "execution_reader_inputs_no_delete": "trigger",
     "task_owner_events_no_update": "trigger",
     "task_owner_events_no_delete": "trigger",
+    "task_execution_owner_holds_one_active": "index",
+    "task_execution_owner_hold_events_no_update": "trigger",
+    "task_execution_owner_hold_events_no_delete": "trigger",
 }
 
 _SCHEMA_V1 = """
@@ -1556,6 +1599,94 @@ _SCHEMA_V18 = (
     "DEFAULT 1 CHECK(owner_provisional IN (0,1));",
 )
 
+_SCHEMA_V19 = (
+    """
+CREATE TABLE IF NOT EXISTS task_execution_owner_holds (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id                     INTEGER NOT NULL,
+    task_version                INTEGER NOT NULL CHECK(task_version >= 1),
+    workflow_version            INTEGER NOT NULL CHECK(workflow_version >= 1),
+    status                      TEXT NOT NULL CHECK(status IN (
+                                    'active','released','cancelled'
+                                )),
+    owner_display               TEXT NOT NULL CHECK(
+                                    length(owner_display) BETWEEN 1 AND 200
+                                ),
+    owner_ref_version           INTEGER NOT NULL CHECK(owner_ref_version = 1),
+    owner_kind                  TEXT NOT NULL CHECK(owner_kind IN (
+                                    'person','external'
+                                )),
+    owner_speaker_id            TEXT,
+    owner_canonical_speaker_id  TEXT,
+    owner_speaker_registry_id   TEXT,
+    owner_pinned                INTEGER NOT NULL CHECK(owner_pinned IN (0,1)),
+    owner_provisional           INTEGER NOT NULL CHECK(owner_provisional = 0),
+    backstop_at                 TEXT NOT NULL,
+    last_checked_at             TEXT,
+    last_evidence_revision      TEXT CHECK(
+                                    last_evidence_revision IS NULL
+                                    OR length(last_evidence_revision) = 64
+                                ),
+    last_match                  INTEGER CHECK(last_match IS NULL OR last_match IN (0,1)),
+    release_reason              TEXT CHECK(release_reason IS NULL OR release_reason IN (
+                                    'meeting','backstop','stale'
+                                )),
+    created_at                  TEXT NOT NULL,
+    released_at                 TEXT,
+    CHECK(
+        (status = 'active' AND release_reason IS NULL AND released_at IS NULL)
+        OR (status != 'active' AND release_reason IS NOT NULL
+            AND released_at IS NOT NULL)
+    ),
+    CHECK(
+        (owner_speaker_id IS NULL AND owner_canonical_speaker_id IS NULL
+         AND owner_speaker_registry_id IS NULL)
+        OR (owner_speaker_id IS NOT NULL
+            AND owner_canonical_speaker_id IS NOT NULL
+            AND owner_speaker_registry_id IS NOT NULL)
+    ),
+    FOREIGN KEY(task_id) REFERENCES task_execution_workflows(task_id)
+);
+""",
+    """
+CREATE UNIQUE INDEX IF NOT EXISTS task_execution_owner_holds_one_active
+    ON task_execution_owner_holds(task_id)
+    WHERE status = 'active';
+""",
+    """
+CREATE TABLE IF NOT EXISTS task_execution_owner_hold_events (
+    sequence          INTEGER PRIMARY KEY AUTOINCREMENT,
+    hold_id           INTEGER NOT NULL,
+    task_id           INTEGER NOT NULL,
+    kind              TEXT NOT NULL CHECK(kind IN (
+                          'created','condition_checked','released','cancelled'
+                      )),
+    matched           INTEGER CHECK(matched IS NULL OR matched IN (0,1)),
+    evidence_revision TEXT CHECK(
+                          evidence_revision IS NULL
+                          OR length(evidence_revision) = 64
+                      ),
+    occurred_at       TEXT NOT NULL,
+    FOREIGN KEY(hold_id) REFERENCES task_execution_owner_holds(id),
+    FOREIGN KEY(task_id) REFERENCES task_execution_workflows(task_id)
+);
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS task_execution_owner_hold_events_no_update
+BEFORE UPDATE ON task_execution_owner_hold_events
+BEGIN
+    SELECT RAISE(ABORT, 'task execution owner hold events are append-only');
+END;
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS task_execution_owner_hold_events_no_delete
+BEFORE DELETE ON task_execution_owner_hold_events
+BEGIN
+    SELECT RAISE(ABORT, 'task execution owner hold events are append-only');
+END;
+""",
+)
+
 
 class InboxError(RuntimeError):
     """The inbox cannot safely initialize or read its state."""
@@ -2108,6 +2239,23 @@ class CandidateInbox:
                     for statement in _SCHEMA_V18:
                         connection.execute(statement)
                     connection.execute("PRAGMA user_version = 18")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 18
+            if version == 18:
+                self._require_tables(
+                    connection,
+                    tuple(_SCHEMA_V18_COLUMNS),
+                    columns=_SCHEMA_V18_COLUMNS,
+                )
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V19:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 19")
                     connection.commit()
                 except Exception:
                     connection.rollback()

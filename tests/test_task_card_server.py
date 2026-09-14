@@ -27,6 +27,7 @@ from foxhound.execution_cards import (
     parse_execution_agent_callback,
     parse_execution_review_callback,
 )
+from foxhound.knowledge_client import OwnerUpcomingMeeting
 from foxhound.task_card_server import (
     CLAIM_SCHEMA,
     ERROR_SCHEMA,
@@ -825,6 +826,48 @@ class TaskCardServerTests(unittest.TestCase):
                         input_kind=kind,
                         value=value,
                     ))
+
+    def test_execution_action_route_forwards_owner_hold_exactly(self):
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "UPDATE tasks SET owner='Person B',owner_ref_version=1,"
+                "owner_kind='external',owner_pinned=1,owner_provisional=0 "
+                "WHERE id=1"
+            )
+            connection.commit()
+        cards = ExecutionCardService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: EXECUTION_DELIVERY_TOKEN,
+            owner_condition=lambda _owner, _ref: OwnerUpcomingMeeting(
+                False, NOW.isoformat(timespec="seconds"), "b" * 64
+            ),
+            reader_aliases=("Person A",),
+        )
+        app = TaskCardApplication(
+            self.cards, TOKEN, execution_cards=cards
+        )
+        self.execution.schedule(1, expected_task_version=1)
+        cards.schedule()
+        claim = cards.claim_next()
+        cards.complete_delivery(
+            claim.card.id,
+            expected_version=claim.card.version,
+            claim_token=claim.token,
+            transport="synthetic",
+            delivery_ref="synthetic-owner-hold",
+        )
+
+        result = app.dispatch("execution_action", request_document(
+            card_id=claim.card.id,
+            card_version=claim.card.version,
+            action="until_meeting",
+        ))
+
+        self.assertEqual(
+            (result["ok"], result["workflow_status"]),
+            (True, "snoozed"),
+        )
 
     def test_access_logs_exclude_content_tokens_and_identifiers(self):
         stream = io.StringIO()

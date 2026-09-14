@@ -42,6 +42,10 @@ from foxhound.task_execution import (
     WorkflowStatus,
 )
 from foxhound.task_ledger import TaskLedger, TaskStatus
+from foxhound.knowledge_client import (
+    KnowledgeTransportError,
+    OwnerUpcomingMeeting,
+)
 from foxhound.task_lifecycle_outcome_export import export_outcomes
 
 
@@ -147,6 +151,35 @@ class ExecutionCardTests(unittest.TestCase):
         result = self.execution.schedule(task_id, expected_task_version=1)
         self.assertTrue(result.accepted)
         return result
+
+    def _set_structured_owner(
+        self,
+        task_id: int,
+        owner: str,
+        *,
+        kind: str = "person",
+        speaker_id: str | None = "SPK_002",
+        canonical_speaker_id: str | None = None,
+        provisional: int = 0,
+    ) -> None:
+        registry_id = "registry-1" if speaker_id is not None else None
+        canonical = (
+            speaker_id
+            if canonical_speaker_id is None
+            else canonical_speaker_id
+        )
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "UPDATE tasks SET owner=?,owner_ref_version=1,owner_kind=?,"
+                "owner_speaker_id=?,owner_canonical_speaker_id=?,"
+                "owner_speaker_registry_id=?,owner_pinned=0,"
+                "owner_provisional=? WHERE id=?",
+                (
+                    owner, kind, speaker_id, canonical, registry_id,
+                    provisional, task_id,
+                ),
+            )
+            connection.commit()
 
     def _claim_and_deliver(self):
         claim = self.cards.claim_next(lease_seconds=60)
@@ -478,6 +511,189 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertEqual(replay.disposition, ExecutionCardDisposition.UNCHANGED)
         self.assertIsNone(parse_execution_review_callback("fhe|01|1|start"))
         self.assertIsNone(parse_execution_review_callback("fhc|1|1|start"))
+
+    def test_other_owner_can_be_held_until_meeting_and_wakes_with_fresh_card(self):
+        self._set_structured_owner(
+            1,
+            "Person B",
+            speaker_id="SPK_010",
+            canonical_speaker_id="SPK_002",
+        )
+        matches = [False]
+        requests = []
+
+        def condition(owner, owner_ref):
+            requests.append((owner, owner_ref))
+            return OwnerUpcomingMeeting(
+                matches[0],
+                self.clock().isoformat(timespec="seconds"),
+                "a" * 64,
+            )
+
+        cards = ExecutionCardService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: DELIVERY_TOKEN,
+            owner_condition=condition,
+            reader_aliases=("Person A", "A. Person"),
+        )
+        self._schedule_workflow(1)
+        self.assertEqual(cards.schedule().created, 1)
+        claim = cards.claim_next()
+        body, keyboard = render_execution_review_card(claim.card)
+        self.assertIn("Person B", body)
+        labels = [
+            button["text"]
+            for row in keyboard["inline_keyboard"]
+            for button in row
+        ]
+        self.assertIn("🗓 Until next meeting with Person B", labels)
+        callback = next(
+            button["callback_data"]
+            for row in keyboard["inline_keyboard"]
+            for button in row
+            if button["text"].startswith("🗓")
+        )
+        self.assertEqual(
+            parse_execution_review_callback(callback)[2], "until_meeting"
+        )
+        delivered = cards.complete_delivery(
+            claim.card.id,
+            expected_version=claim.card.version,
+            claim_token=claim.token,
+            transport="synthetic",
+            delivery_ref="message-hold",
+        )
+        held = cards.act(
+            claim.card.id,
+            expected_version=delivered.card_version,
+            action="until_meeting",
+        )
+        self.assertEqual(held.workflow_status, WorkflowStatus.SNOOZED)
+        self.assertEqual(
+            held.wake_at,
+            (NOW + timedelta(days=21)).isoformat(timespec="seconds"),
+        )
+        self.assertIsNone(self.execution.claim_next())
+        with closing(sqlite3.connect(self.database)) as connection:
+            hold = connection.execute(
+                "SELECT status,owner_display,owner_speaker_id,backstop_at "
+                "FROM task_execution_owner_holds"
+            ).fetchone()
+            events = connection.execute(
+                "SELECT kind FROM task_execution_owner_hold_events "
+                "ORDER BY sequence"
+            ).fetchall()
+        self.assertEqual(
+            hold,
+            (
+                "active", "Person B", "SPK_010",
+                (NOW + timedelta(days=21)).isoformat(timespec="seconds"),
+            ),
+        )
+        self.assertEqual(events, [("created",)])
+
+        restarted = ExecutionCardService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: DELIVERY_TOKEN,
+            owner_condition=condition,
+            reader_aliases=("Person A",),
+        )
+        self.assertEqual(restarted.schedule().created, 0)
+        self.assertEqual(requests[-1][0], "Person B")
+        self.assertEqual(
+            requests[-1][1]["canonical_speaker_id"], "SPK_002"
+        )
+        self.assertEqual(requests[-1][1]["speaker_id"], "SPK_010")
+        matches[0] = True
+        self.assertEqual(restarted.schedule().created, 1)
+        replacement = restarted.claim_next()
+        self.assertEqual(replacement.card.task_id, 1)
+        self.assertGreater(
+            replacement.card.workflow_version, claim.card.workflow_version
+        )
+        stale = restarted.act(
+            claim.card.id,
+            expected_version=delivered.card_version,
+            action="start",
+        )
+        self.assertEqual(stale.refusal, ExecutionCardRefusal.STALE_VERSION)
+        with closing(sqlite3.connect(self.database)) as connection:
+            released = connection.execute(
+                "SELECT status,release_reason FROM task_execution_owner_holds"
+            ).fetchone()
+        self.assertEqual(released, ("released", "meeting"))
+
+    def test_owner_hold_is_conservative_and_backstop_is_exact(self):
+        for task_id, owner, kind, speaker, provisional in (
+            (1, "Person A", "person", "SPK_001", 0),
+            (2, "Team Alpha", "group", None, 0),
+            (3, "Person C", "person", "SPK_003", 1),
+            (4, "Person B", "person", "SPK_002", 0),
+            (5, "Person " + "É" * 180, "person", "SPK_005", 0),
+        ):
+            self._set_structured_owner(
+                task_id,
+                owner,
+                kind=kind,
+                speaker_id=speaker,
+                provisional=provisional,
+            )
+            self._schedule_workflow(task_id)
+
+        def unavailable(_owner, _owner_ref):
+            raise KnowledgeTransportError("synthetic unavailable")
+
+        cards = ExecutionCardService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: DELIVERY_TOKEN,
+            owner_condition=unavailable,
+            reader_aliases=("Pérson A",),
+        )
+        self.assertEqual(cards.schedule(limit=5).created, 5)
+        eligibility = {}
+        long_label = None
+        for _ in range(5):
+            claim = cards.claim_next()
+            eligibility[claim.card.task_id] = claim.card.owner_hold_eligible
+            if claim.card.task_id == 5:
+                _body, keyboard = render_execution_review_card(claim.card)
+                long_label = next(
+                    button["text"]
+                    for row in keyboard["inline_keyboard"]
+                    for button in row
+                    if button["text"].startswith("🗓")
+                )
+            delivered = cards.complete_delivery(
+                claim.card.id,
+                expected_version=claim.card.version,
+                claim_token=claim.token,
+                transport="synthetic",
+                delivery_ref=f"message-{claim.card.id}",
+            )
+            if claim.card.task_id == 4:
+                cards.act(
+                    claim.card.id,
+                    expected_version=delivered.card_version,
+                    action="until_meeting",
+                )
+        self.assertEqual(
+            eligibility,
+            {1: False, 2: False, 3: False, 4: True, 5: True},
+        )
+        self.assertLessEqual(len(long_label.encode("utf-8")), 64)
+        self.assertNotIn("SPK_", long_label)
+        self.clock.advance(timedelta(days=21) - timedelta(seconds=1))
+        self.assertEqual(cards.schedule().created, 0)
+        self.clock.advance(timedelta(seconds=1))
+        self.assertEqual(cards.schedule().created, 1)
+        with closing(sqlite3.connect(self.database)) as connection:
+            released = connection.execute(
+                "SELECT status,release_reason FROM task_execution_owner_holds"
+            ).fetchone()
+        self.assertEqual(released, ("released", "backstop"))
 
     def test_operator_can_retry_only_a_current_delivered_presentation(self):
         workflow = self._schedule_workflow(1)

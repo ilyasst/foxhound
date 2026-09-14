@@ -11,6 +11,7 @@ import socket
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit
 
@@ -29,6 +30,9 @@ SEARCH_SCHEMA_VERSION = 1
 EXECUTION_CONTEXT_REQUEST_SCHEMA = "gw.execution-context-request"
 EXECUTION_CONTEXT_RESPONSE_SCHEMA = "gw.execution-context"
 EXECUTION_CONTEXT_SCHEMA_VERSION = 1
+OWNER_MEETING_REQUEST_SCHEMA = "gw.owner-upcoming-meeting-request"
+OWNER_MEETING_RESPONSE_SCHEMA = "gw.owner-upcoming-meeting"
+OWNER_MEETING_SCHEMA_VERSION = 1
 LAYER_ORDER = ("kb", "secondary", "emails")
 
 _ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -125,6 +129,13 @@ class ExecutionContext:
     institution_domains: tuple[str, ...] = field(default=(), repr=False)
 
 
+@dataclass(frozen=True)
+class OwnerUpcomingMeeting:
+    match: bool
+    checked_at: str
+    evidence_revision: str
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -202,6 +213,20 @@ class GwKnowledgeClient:
         }
         document = self._request_json("/v1/execution-context", request)
         return _parse_execution_context(document, self._config.alias)
+
+    def owner_upcoming_meeting(
+        self, *, owner: str, owner_ref: Mapping[str, object]
+    ) -> OwnerUpcomingMeeting:
+        """Check one exact owner identity without receiving calendar content."""
+        request = _owner_meeting_request(
+            alias=self._config.alias,
+            owner=owner,
+            owner_ref=owner_ref,
+        )
+        document = self._request_json(
+            "/v1/owner-upcoming-meeting", request
+        )
+        return _parse_owner_meeting_response(document)
 
     def _request_json(
         self, route: str, request: Mapping[str, Any]
@@ -481,6 +506,99 @@ def _parse_execution_context(value: object, alias: str) -> ExecutionContext:
         operator_context=operator_context,
         self_aliases=self_aliases,
         institution_domains=institution_domains,
+    )
+
+
+def _owner_meeting_request(
+    *, alias: str, owner: object, owner_ref: Mapping[str, object]
+) -> dict[str, object]:
+    if not isinstance(owner_ref, Mapping):
+        raise KnowledgeRequestError("owner meeting reference is invalid")
+    fields = {
+        "kind", "speaker_id", "canonical_speaker_id",
+        "speaker_registry_id", "pinned", "provisional",
+    }
+    if set(owner_ref) != fields:
+        raise KnowledgeRequestError("owner meeting reference is invalid")
+    kind = owner_ref["kind"]
+    scoped = (
+        owner_ref["speaker_id"],
+        owner_ref["canonical_speaker_id"],
+        owner_ref["speaker_registry_id"],
+    )
+    if (
+        kind not in {"person", "external"}
+        or not isinstance(owner_ref["pinned"], bool)
+        or owner_ref["provisional"] is not False
+        or not (
+            all(value is None for value in scoped)
+            or all(
+                isinstance(value, str)
+                and value
+                and value == value.strip()
+                and len(value) <= 200
+                for value in scoped
+            )
+        )
+    ):
+        raise KnowledgeRequestError("owner meeting reference is invalid")
+    if (
+        not isinstance(owner, str)
+        or not owner
+        or owner != owner.strip()
+        or len(owner) > 200
+        or any(ord(char) < 32 or ord(char) == 127 for char in owner)
+    ):
+        raise KnowledgeRequestError("owner meeting display is invalid")
+    return {
+        "schema": OWNER_MEETING_REQUEST_SCHEMA,
+        "schema_version": OWNER_MEETING_SCHEMA_VERSION,
+        "alias": alias,
+        "owner": owner,
+        "owner_ref": dict(owner_ref),
+    }
+
+
+def _parse_owner_meeting_response(value: object) -> OwnerUpcomingMeeting:
+    root = _object(value, "owner meeting response")
+    _exact_fields(
+        root,
+        "owner meeting response",
+        {
+            "schema", "schema_version", "ok", "match", "checked_at",
+            "evidence_revision",
+        },
+    )
+    version = root["schema_version"]
+    checked_at = root["checked_at"]
+    revision = root["evidence_revision"]
+    if (
+        root["schema"] != OWNER_MEETING_RESPONSE_SCHEMA
+        or isinstance(version, bool)
+        or version != OWNER_MEETING_SCHEMA_VERSION
+        or root["ok"] is not True
+        or not isinstance(root["match"], bool)
+        or not isinstance(checked_at, str)
+        or not isinstance(revision, str)
+        or not _DIGEST_RE.fullmatch(revision)
+    ):
+        raise KnowledgeResponseError(
+            "GW owner meeting response identity is invalid"
+        )
+    try:
+        parsed_at = datetime.fromisoformat(checked_at)
+    except ValueError:
+        raise KnowledgeResponseError(
+            "GW owner meeting response time is invalid"
+        ) from None
+    if parsed_at.tzinfo is None or parsed_at.utcoffset() is None:
+        raise KnowledgeResponseError(
+            "GW owner meeting response time is invalid"
+        )
+    return OwnerUpcomingMeeting(
+        match=root["match"],
+        checked_at=checked_at,
+        evidence_revision=revision,
     )
 
 
