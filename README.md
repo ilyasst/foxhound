@@ -204,7 +204,7 @@ release through the narrow `foxhound-task-worker` command. See
 [ADR 0028](docs/architecture/0028-fenced-instruction-delivery.md). Result identity and all task/workflow fencing
 are injected from owner-only run state rather than trusted from agent output.
 Before recording, the worker can construct a correctly named draft from fixed
-owner-only summary, work, and optional string-array files beside that run
+owner-only summary, work, and optional JSON-array files beside that run
 state. Private result content is never passed in command-line arguments, and
 the existing strict hand-authored draft path remains compatible. A plan-phase
 release with result inputs validates and records them as `awaiting_plan`;
@@ -227,8 +227,19 @@ foxhound-execution-runner \
   --gw-endpoint http://127.0.0.1:8787 \
   --gw-alias example-operator \
   --gw-token-file /srv/example/private-foxhound-state/knowledge.token \
-  --agent-profile-directory /srv/example/private-agent-profiles
+  --agent-profile-directory /srv/example/private-agent-profiles \
+  --task-work-root /srv/example/private-sync/ProjectAlpha/Tasks \
+  --task-kb-root /srv/example/private-sync/ProjectAlpha-KB/Tasks
 ```
+
+The two task roots are an inseparable, explicit per-machine mapping. Each run
+creates `T<id>-<slug>/` under the working root and `T<id>-<slug>.md` under the
+KB root. The folder retains its human README, standard result files, transcript,
+and only agent files explicitly named in `result-artifacts.json`; run state and
+compiled instructions are never copied. Result cards show both paths and
+reviewable forge links before the detailed work. Omitting both options keeps
+the pre-archive behavior; providing only one fails configuration. See
+[ADR 0031](docs/architecture/0031-durable-task-review-files.md).
 
 Starting this command with no queued workflow exits successfully without
 launching an agent. See

@@ -347,6 +347,19 @@ def _historical_general_profiles() -> tuple[AgentProfile, ...]:
             kill_grace_seconds=30,
             allowed_phases=_PHASES,
         ),
+        AgentProfile(
+            profile_id="general",
+            display_name="General",
+            runtime="hermes",
+            prompt_template=_GENERAL_PROMPT_TEMPLATE_V6,
+            toolsets=("terminal", "file", "web"),
+            max_turns=50,
+            timeout_seconds=1_800,
+            claim_lease_seconds=2_700,
+            heartbeat_seconds=60,
+            kill_grace_seconds=30,
+            allowed_phases=_PHASES,
+        ),
     )
 
 
@@ -888,9 +901,20 @@ _GENERAL_PROMPT_TEMPLATE_V5 = _GENERAL_PROMPT_TEMPLATE_V4.replace(
 )
 
 
-_GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V5.replace(
+_GENERAL_PROMPT_TEMPLATE_V6 = _GENERAL_PROMPT_TEMPLATE_V5.replace(
     f"If useful work cannot be completed, call `{WORKER_COMMAND_TOKEN} release`.",
     f"When the full objective cannot be completed but a truthful plan, analysis, draft, or blocked result is still useful, draft and record that partial result. Call `{WORKER_COMMAND_TOKEN} release` only when no truthful reviewable artifact can be produced.",
+)
+
+
+_GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V6.replace(
+    "Prepare the reviewable result early enough that useful work cannot be lost to the turn limit. Write owner-only `result-summary.txt` and `result-work.md` in the starting directory, plus `result-questions.json`, `result-external-actions.json`, and `result-deliverables.json` only when those arrays are non-empty.",
+    "\n".join((
+        "Prepare the reviewable result early enough that useful work cannot be lost to the turn limit. Write owner-only `result-summary.txt` and `result-work.md` in the starting directory, plus `result-questions.json`, `result-external-actions.json`, and `result-deliverables.json` only when those arrays are non-empty.",
+        "When you create working files that a reader needs to verify the result, list their relative paths as strings in owner-only `result-artifacts.json`. Foxhound preserves only that explicit list plus the transcript and standard result files; never list run state, instructions, repository checkouts, dependencies, caches, or copied private source material.",
+        "Questions are strings. External actions may be strings or objects with `action` plus optional `requires` and `channel`; deliverables may be strings or objects with `body` plus optional `label`, `recipient`, and `subject`. Use objects when the extra fields make the review card complete.",
+        "Put every verified source issue, related issue, pull request, commit, and check needed for review in `result-work.md` as a descriptive Markdown link. Do not make the reader reconstruct or search for those references.",
+    )),
 )
 
 

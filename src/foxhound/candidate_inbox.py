@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -273,6 +273,8 @@ _SCHEMA_COLUMNS = {
         "created_at",
         "agent_profile_id",
         "agent_profile_revision",
+        "task_work_directory",
+        "task_kb_file",
     ),
     "task_execution_events": (
         "sequence",
@@ -357,9 +359,18 @@ _SCHEMA_COLUMNS = {
     ),
 }
 
+_SCHEMA_V16_COLUMNS = {
+    name: tuple(
+        column
+        for column in columns
+        if column not in {"task_work_directory", "task_kb_file"}
+    )
+    for name, columns in _SCHEMA_COLUMNS.items()
+}
+
 _SCHEMA_V15_COLUMNS = {
     name: columns
-    for name, columns in _SCHEMA_COLUMNS.items()
+    for name, columns in _SCHEMA_V16_COLUMNS.items()
     if name != "native_intake_historical_refusals"
 }
 
@@ -1497,6 +1508,17 @@ END;
 """,
 )
 
+_SCHEMA_V17 = (
+    "ALTER TABLE task_execution_results ADD COLUMN task_work_directory TEXT "
+    "CHECK(task_work_directory IS NULL OR "
+    "(length(task_work_directory) BETWEEN 1 AND 4096 "
+    "AND substr(task_work_directory,1,1)='/'));",
+    "ALTER TABLE task_execution_results ADD COLUMN task_kb_file TEXT "
+    "CHECK(task_kb_file IS NULL OR "
+    "(length(task_kb_file) BETWEEN 1 AND 4096 "
+    "AND substr(task_kb_file,1,1)='/'));",
+)
+
 
 class InboxError(RuntimeError):
     """The inbox cannot safely initialize or read its state."""
@@ -2015,6 +2037,23 @@ class CandidateInbox:
                     for statement in _SCHEMA_V16:
                         connection.execute(statement)
                     connection.execute("PRAGMA user_version = 16")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 16
+            if version == 16:
+                self._require_tables(
+                    connection,
+                    tuple(_SCHEMA_V16_COLUMNS),
+                    columns=_SCHEMA_V16_COLUMNS,
+                )
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V17:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 17")
                     connection.commit()
                 except Exception:
                     connection.rollback()

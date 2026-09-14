@@ -331,6 +331,13 @@ class NativeCandidateIntakeTests(unittest.TestCase):
         self.assertTrue(self.inbox.import_document(item).accepted)
         with closing(sqlite3.connect(self.database)) as connection:
             connection.execute("DROP TABLE native_intake_historical_refusals")
+            connection.execute(
+                "ALTER TABLE task_execution_results DROP COLUMN task_kb_file"
+            )
+            connection.execute(
+                "ALTER TABLE task_execution_results "
+                "DROP COLUMN task_work_directory"
+            )
             connection.execute("PRAGMA user_version = 15")
 
         CandidateInbox(self.database, clock=lambda: NOW).initialize()
