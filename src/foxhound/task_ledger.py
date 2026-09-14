@@ -192,6 +192,13 @@ class TaskRecord:
     created_at: str
     updated_at: str
     closed_at: str | None
+    owner_ref_version: int
+    owner_kind: str | None
+    owner_speaker_id: str | None
+    owner_canonical_speaker_id: str | None
+    owner_speaker_registry_id: str | None
+    owner_pinned: bool
+    owner_provisional: bool
 
 
 @dataclass(frozen=True)
@@ -644,19 +651,27 @@ class TaskLedger:
                         )
                         tasks_revised += 1
                         continue
-                    previous = self._bound_candidate(connection, binding)
-                    if previous.task == candidate.task:
+                    task = connection.execute(
+                        "SELECT * FROM tasks WHERE id=?",
+                        (int(binding["task_id"]),),
+                    ).fetchone()
+                    if task is None or task["status"] != TaskStatus.OPEN:
+                        raise _NativeIntakeConflict
+                    desired_owner = (
+                        _row_owner_values(task)
+                        if bool(task["owner_pinned"])
+                        else _candidate_owner_values(candidate)
+                    )
+                    if (
+                        task["text"] == candidate.task.text
+                        and task["due"] == candidate.task.due
+                        and _row_owner_values(task) == desired_owner
+                    ):
                         # A producer may enrich the evidence for an already
                         # accepted task without changing the work itself.
                         # Advancing the binding is necessary so cards read the
                         # new evidence; advancing the task version would make
                         # an active workflow stale for no task-level change.
-                        task = connection.execute(
-                            "SELECT version FROM tasks WHERE id=?",
-                            (int(binding["task_id"]),),
-                        ).fetchone()
-                        if task is None:
-                            raise _NativeIntakeConflict
                         connection.execute(
                             "UPDATE task_candidate_bindings SET "
                             "source_revision=?,decided_at=? "
@@ -695,22 +710,20 @@ class TaskLedger:
                         )
                         tasks_revised += 1
                         continue
-                    task = connection.execute(
-                        "SELECT status,version FROM tasks WHERE id=?",
-                        (int(binding["task_id"]),),
-                    ).fetchone()
-                    if task is None or task["status"] != TaskStatus.OPEN:
-                        raise _NativeIntakeConflict
                     version = int(task["version"]) + 1
                     connection.execute(
                         "UPDATE tasks SET text=?,owner=?,due=?,version=?,"
-                        "updated_at=? WHERE id=?",
+                        "updated_at=?,owner_ref_version=?,owner_kind=?,"
+                        "owner_speaker_id=?,owner_canonical_speaker_id=?,"
+                        "owner_speaker_registry_id=?,owner_pinned=?,"
+                        "owner_provisional=? WHERE id=?",
                         (
                             candidate.task.text,
-                            candidate.task.owner,
+                            desired_owner[0],
                             candidate.task.due,
                             version,
                             now,
+                            *desired_owner[1:],
                             int(binding["task_id"]),
                         ),
                     )
@@ -1334,7 +1347,7 @@ class TaskLedger:
         now: str,
     ) -> None:
         task = connection.execute(
-            "SELECT status,text,owner,due,version FROM tasks WHERE id=?",
+            "SELECT * FROM tasks WHERE id=?",
             (int(binding["task_id"]),),
         ).fetchone()
         if task is None:
@@ -1345,11 +1358,16 @@ class TaskLedger:
             "AND status NOT IN ('awaiting_start','completed','cancelled')",
             (int(binding["task_id"]),),
         ).fetchone()
+        previous_owner = (
+            _row_owner_values(task)
+            if bool(task["owner_pinned"])
+            else _candidate_owner_values(previous)
+        )
         reader_conflict = (
             task["status"] != TaskStatus.OPEN
             or int(task["version"]) != int(binding["task_version"])
             or task["text"] != previous.task.text
-            or task["owner"] != previous.task.owner
+            or _row_owner_values(task) != previous_owner
             or task["due"] != previous.task.due
             or active_workflow is not None
         )
@@ -1411,7 +1429,7 @@ class TaskLedger:
         now: str,
     ) -> None:
         task = connection.execute(
-            "SELECT status,version FROM tasks WHERE id=?",
+            "SELECT * FROM tasks WHERE id=?",
             (int(binding["task_id"]),),
         ).fetchone()
         if task is None:
@@ -1432,15 +1450,23 @@ class TaskLedger:
         resolution = "reader_conflict"
         if not reader_conflict:
             version += 1
+            desired_owner = (
+                _row_owner_values(task)
+                if bool(task["owner_pinned"])
+                else _candidate_owner_values(candidate)
+            )
             connection.execute(
-                "UPDATE tasks SET text=?,owner=?,due=?,version=?,updated_at=? "
-                "WHERE id=?",
+                "UPDATE tasks SET text=?,owner=?,due=?,version=?,updated_at=?,"
+                "owner_ref_version=?,owner_kind=?,owner_speaker_id=?,"
+                "owner_canonical_speaker_id=?,owner_speaker_registry_id=?,"
+                "owner_pinned=?,owner_provisional=? WHERE id=?",
                 (
                     candidate.task.text,
-                    candidate.task.owner,
+                    desired_owner[0],
                     candidate.task.due,
                     version,
                     now,
+                    *desired_owner[1:],
                     int(binding["task_id"]),
                 ),
             )
@@ -1540,10 +1566,17 @@ class TaskLedger:
         now: str,
     ) -> int:
         task = candidate.task
+        owner_values = _candidate_owner_values(
+            candidate, effective_owner=effective_owner
+        )
         cursor = connection.execute(
             "INSERT INTO tasks(status,text,owner,due,version,created_at,"
-            "updated_at,closed_at) VALUES('open',?,?,?,?,?,?,NULL)",
-            (task.text, effective_owner, task.due, 1, now, now),
+            "updated_at,closed_at,owner_ref_version,owner_kind,"
+            "owner_speaker_id,owner_canonical_speaker_id,"
+            "owner_speaker_registry_id,owner_pinned,owner_provisional) "
+            "VALUES('open',?,?,?,?,?,?,NULL,?,?,?,?,?,?,?)",
+            (task.text, owner_values[0], task.due, 1, now, now,
+             *owner_values[1:]),
         )
         task_id = int(cursor.lastrowid)
         connection.execute(
@@ -1587,6 +1620,54 @@ class TaskLedger:
         return value.isoformat(timespec="seconds")
 
 
+_USE_CANDIDATE_OWNER = object()
+
+
+def _candidate_owner_values(
+    candidate: TaskCandidate,
+    *,
+    effective_owner: object = _USE_CANDIDATE_OWNER,
+) -> tuple[object, ...]:
+    """Return the complete persisted owner state for one candidate.
+
+    A bootstrap equivalence can replace only the historical display value. It
+    must not inherit a structured reference that names a different owner.
+    """
+    display = (
+        candidate.task.owner
+        if effective_owner is _USE_CANDIDATE_OWNER
+        else effective_owner
+    )
+    reference = candidate.task.owner_ref
+    if display != candidate.task.owner:
+        reference = None
+    if reference is None:
+        return (display, 0, None, None, None, None, 0, 1)
+    return (
+        display,
+        1,
+        reference.kind,
+        reference.speaker_id,
+        reference.canonical_speaker_id,
+        reference.speaker_registry_id,
+        int(reference.pinned),
+        int(reference.provisional),
+    )
+
+
+def _row_owner_values(row: sqlite3.Row) -> tuple[object, ...]:
+    return (
+        row["owner"],
+        int(row["owner_ref_version"]),
+        row["owner_kind"],
+        row["owner_speaker_id"],
+        row["owner_canonical_speaker_id"],
+        row["owner_speaker_registry_id"],
+        int(row["owner_pinned"]),
+        int(row["owner_provisional"]),
+    )
+
+
 def _task_record(row: sqlite3.Row) -> TaskRecord:
     try:
         return TaskRecord(
@@ -1599,6 +1680,13 @@ def _task_record(row: sqlite3.Row) -> TaskRecord:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             closed_at=row["closed_at"],
+            owner_ref_version=int(row["owner_ref_version"]),
+            owner_kind=row["owner_kind"],
+            owner_speaker_id=row["owner_speaker_id"],
+            owner_canonical_speaker_id=row["owner_canonical_speaker_id"],
+            owner_speaker_registry_id=row["owner_speaker_registry_id"],
+            owner_pinned=bool(row["owner_pinned"]),
+            owner_provisional=bool(row["owner_provisional"]),
         )
     except (IndexError, KeyError, TypeError, ValueError) as exc:
         raise InboxError("task ledger contains invalid state") from exc

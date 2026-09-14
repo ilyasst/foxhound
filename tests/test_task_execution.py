@@ -70,6 +70,19 @@ def _drop_native_intake_schema(connection: sqlite3.Connection) -> None:
     connection.execute("DROP TABLE candidate_feed_items")
 
 
+def _drop_owner_schema(connection: sqlite3.Connection) -> None:
+    for column in (
+        "owner_provisional",
+        "owner_pinned",
+        "owner_speaker_registry_id",
+        "owner_canonical_speaker_id",
+        "owner_speaker_id",
+        "owner_kind",
+        "owner_ref_version",
+    ):
+        connection.execute(f"ALTER TABLE tasks DROP COLUMN {column}")
+
+
 def _drop_agent_profile_schema(connection: sqlite3.Connection) -> None:
     connection.execute(
         "ALTER TABLE task_execution_results DROP COLUMN task_kb_file"
@@ -173,6 +186,7 @@ class TaskExecutionTests(unittest.TestCase):
 
     def test_schema_seven_migration_is_passive_and_append_only(self):
         with closing(sqlite3.connect(self.database)) as connection:
+            _drop_owner_schema(connection)
             _drop_native_intake_schema(connection)
             connection.execute(
                 "DROP TRIGGER execution_review_card_events_no_update"
@@ -220,6 +234,7 @@ class TaskExecutionTests(unittest.TestCase):
         before = self.service.get(1)
 
         with closing(sqlite3.connect(self.database)) as connection:
+            _drop_owner_schema(connection)
             _drop_agent_profile_schema(connection)
             connection.execute("PRAGMA user_version = 11")
             connection.commit()
@@ -227,7 +242,7 @@ class TaskExecutionTests(unittest.TestCase):
         CandidateInbox(self.database, clock=self.clock).initialize()
 
         after = self.service.get(1)
-        self.assertEqual(SCHEMA_VERSION, 17)
+        self.assertEqual(SCHEMA_VERSION, 18)
         self.assertEqual(
             (after.status, after.phase, after.version, after.task_version),
             (before.status, before.phase, before.version, before.task_version),

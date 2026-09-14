@@ -44,6 +44,19 @@ def _drop_native_intake_schema(connection: sqlite3.Connection) -> None:
     connection.execute("DROP TABLE candidate_feed_items")
 
 
+def _drop_owner_schema(connection: sqlite3.Connection) -> None:
+    for column in (
+        "owner_provisional",
+        "owner_pinned",
+        "owner_speaker_registry_id",
+        "owner_canonical_speaker_id",
+        "owner_speaker_id",
+        "owner_kind",
+        "owner_ref_version",
+    ):
+        connection.execute(f"ALTER TABLE tasks DROP COLUMN {column}")
+
+
 class Clock:
     def __init__(self):
         self.value = NOW
@@ -160,6 +173,7 @@ class TaskCardTests(unittest.TestCase):
 
     def test_schema_six_migration_is_passive(self):
         with closing(sqlite3.connect(self.database)) as connection:
+            _drop_owner_schema(connection)
             _drop_native_intake_schema(connection)
             connection.execute(
                 "DROP TRIGGER execution_review_card_events_no_update"

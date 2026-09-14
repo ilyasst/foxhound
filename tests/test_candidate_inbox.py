@@ -44,6 +44,46 @@ class CandidateInboxTests(unittest.TestCase):
         self.assertEqual(version, SCHEMA_VERSION)
         self.assertEqual(self.inbox.count(), 0)
 
+    def test_version_seventeen_migration_does_not_invent_owner_identity(self):
+        with closing(sqlite3.connect(self.database)) as connection:
+            for column in (
+                "owner_provisional",
+                "owner_pinned",
+                "owner_speaker_registry_id",
+                "owner_canonical_speaker_id",
+                "owner_speaker_id",
+                "owner_kind",
+                "owner_ref_version",
+            ):
+                connection.execute(f"ALTER TABLE tasks DROP COLUMN {column}")
+            now = NOW.isoformat(timespec="seconds")
+            connection.execute(
+                "INSERT INTO tasks(status,text,owner,due,version,created_at,"
+                "updated_at,closed_at) VALUES('open','Synthetic task',"
+                "'Person A',NULL,1,?,?,NULL)",
+                (now, now),
+            )
+            connection.execute("PRAGMA user_version = 17")
+            connection.commit()
+
+        CandidateInbox(self.database, clock=lambda: NOW).initialize()
+
+        with closing(sqlite3.connect(self.database)) as connection:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(tasks)")
+            }
+            owner = connection.execute(
+                "SELECT owner,owner_ref_version,owner_kind,owner_pinned,"
+                "owner_provisional FROM tasks"
+            ).fetchone()
+        self.assertEqual(version, SCHEMA_VERSION)
+        self.assertEqual(owner, ("Person A", 0, None, 0, 1))
+        self.assertTrue({
+            "owner_ref_version", "owner_kind", "owner_pinned",
+            "owner_provisional",
+        } <= columns)
+
     def test_first_import_inserts_candidate(self):
         result = self.inbox.import_document(fixture())
         self.assertEqual(result.disposition, ImportDisposition.INSERTED)

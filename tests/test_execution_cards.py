@@ -65,6 +65,16 @@ def _drop_native_intake_schema(connection: sqlite3.Connection) -> None:
 
 
 def _drop_agent_profile_schema(connection: sqlite3.Connection) -> None:
+    for column in (
+        "owner_provisional",
+        "owner_pinned",
+        "owner_speaker_registry_id",
+        "owner_canonical_speaker_id",
+        "owner_speaker_id",
+        "owner_kind",
+        "owner_ref_version",
+    ):
+        connection.execute(f"ALTER TABLE tasks DROP COLUMN {column}")
     connection.execute(
         "ALTER TABLE task_execution_results DROP COLUMN task_kb_file"
     )
@@ -1886,7 +1896,12 @@ class ExecutionCardTests(unittest.TestCase):
                 "SELECT from_owner,to_owner,task_version "
                 "FROM task_owner_events WHERE task_id=1"
             ).fetchone()
+            owner_identity = connection.execute(
+                "SELECT owner_ref_version,owner_kind,owner_pinned,"
+                "owner_provisional FROM tasks WHERE id=1"
+            ).fetchone()
         self.assertEqual(event, ("Person 1", "Person Example", 2))
+        self.assertEqual(owner_identity, (1, "external", 1, 0))
 
     def test_plan_drop_and_result_done_atomically_close_task_and_workflow(self):
         self._plan_review(1, "drop-plan")

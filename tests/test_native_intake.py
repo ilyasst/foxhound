@@ -121,6 +121,29 @@ def provenance_candidate(index: int) -> dict:
     return item
 
 
+def owner_candidate(
+    index: int,
+    *,
+    owner: str = "Person A",
+    speaker_id: str = "SPK_101",
+    canonical_speaker_id: str = "SPK_001",
+) -> dict:
+    item = candidate(index, owner=owner)
+    item["schema_version"] = 5
+    item["task"]["owner_ref"] = {
+        "kind": "person",
+        "speaker_id": speaker_id,
+        "canonical_speaker_id": canonical_speaker_id,
+        "speaker_registry_id": "registry-alpha",
+        "pinned": False,
+        "provisional": False,
+    }
+    item["source"]["revision"] = hashlib.sha256(
+        json.dumps(item["task"], sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return item
+
+
 def legacy_candidate(index: int) -> dict:
     """A fictional open task offered only for a bounded cutover."""
     item = candidate(
@@ -357,6 +380,16 @@ class NativeCandidateIntakeTests(unittest.TestCase):
         item = candidate(1)
         self.assertTrue(self.inbox.import_document(item).accepted)
         with closing(sqlite3.connect(self.database)) as connection:
+            for column in (
+                "owner_provisional",
+                "owner_pinned",
+                "owner_speaker_registry_id",
+                "owner_canonical_speaker_id",
+                "owner_speaker_id",
+                "owner_kind",
+                "owner_ref_version",
+            ):
+                connection.execute(f"ALTER TABLE tasks DROP COLUMN {column}")
             connection.execute("DROP TABLE native_intake_historical_refusals")
             connection.execute(
                 "ALTER TABLE task_execution_results DROP COLUMN task_kb_file"
@@ -426,6 +459,54 @@ class NativeCandidateIntakeTests(unittest.TestCase):
             self.intake().disposition, NativeIntakeDisposition.UNCHANGED
         )
         self.assertEqual(self.ledger.count(), 1)
+
+    def test_structured_owner_is_persisted_separately_from_display(self):
+        self.activate()
+        item = owner_candidate(1)
+        self.assertTrue(self.inbox.import_feed(feed(0, item)).accepted)
+
+        self.assertEqual(self.intake().tasks_created, 1)
+
+        task = self.ledger.get(1)
+        self.assertEqual(task.owner, "Person A")
+        self.assertEqual(task.owner_ref_version, 1)
+        self.assertEqual(task.owner_kind, "person")
+        self.assertEqual(task.owner_speaker_id, "SPK_101")
+        self.assertEqual(task.owner_canonical_speaker_id, "SPK_001")
+        self.assertEqual(task.owner_speaker_registry_id, "registry-alpha")
+        self.assertFalse(task.owner_pinned)
+        self.assertFalse(task.owner_provisional)
+
+    def test_pinned_owner_survives_a_later_candidate_revision(self):
+        self.activate()
+        initial = owner_candidate(1)
+        self.inbox.import_feed(feed(0, initial))
+        self.intake()
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "UPDATE tasks SET owner='Reader choice',owner_ref_version=1,"
+                "owner_kind='external',owner_speaker_id=NULL,"
+                "owner_canonical_speaker_id=NULL,"
+                "owner_speaker_registry_id=NULL,owner_pinned=1,"
+                "owner_provisional=0 WHERE id=1"
+            )
+        revised = owner_candidate(
+            1,
+            owner="Person B",
+            speaker_id="SPK_202",
+            canonical_speaker_id="SPK_002",
+        )
+        self.inbox.import_feed(feed(1, revised))
+
+        result = self.intake()
+
+        task = self.ledger.get(1)
+        self.assertEqual(result.tasks_revised, 1)
+        self.assertEqual(task.owner, "Reader choice")
+        self.assertEqual(task.owner_kind, "external")
+        self.assertTrue(task.owner_pinned)
+        self.assertFalse(task.owner_provisional)
+        self.assertEqual(task.version, 1)
 
     def test_teams_kind_survives_feed_inbox_and_native_intake(self):
         self.activate()
@@ -773,6 +854,40 @@ class NativeCandidateIntakeTests(unittest.TestCase):
 
         self.assertEqual(stale.refusal, CardRefusal.STALE_VERSION)
         self.assertEqual(self.ledger.get(1).status.value, "open")
+
+    def test_owner_identity_only_revision_invalidates_an_existing_card(self):
+        self.activate()
+        initial = owner_candidate(1)
+        self.inbox.import_feed(feed(0, initial))
+        self.intake()
+        cards = TaskCardService(
+            self.database, clock=lambda: NOW, token_factory=lambda: "a" * 43
+        )
+        self.assertEqual(cards.schedule().created, 1)
+        claim = cards.claim_next()
+        delivered = cards.complete_delivery(
+            claim.card.id,
+            expected_version=claim.card.version,
+            claim_token=claim.token,
+            transport="synthetic",
+            delivery_ref="message-1",
+        )
+        revised = owner_candidate(
+            1,
+            owner="Person A",
+            speaker_id="SPK_102",
+            canonical_speaker_id="SPK_001",
+        )
+        self.inbox.import_feed(feed(1, revised))
+
+        self.assertEqual(self.intake().tasks_revised, 1)
+        self.assertEqual(self.ledger.get(1).version, 2)
+        stale = cards.act(
+            claim.card.id,
+            expected_version=delivered.version,
+            action="done",
+        )
+        self.assertEqual(stale.refusal, CardRefusal.STALE_VERSION)
 
     def test_conflict_rolls_back_complete_pass_and_keeps_cursor(self):
         self.activate()
