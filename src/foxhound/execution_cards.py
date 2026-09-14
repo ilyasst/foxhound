@@ -311,7 +311,13 @@ class ExecutionCardService:
                     # and it already bounds that; a gate is how work gets
                     # queued in the first place, so suppressing it while
                     # work runs is how a queue empties and never refills.
-                    " (w.status IN ('awaiting_start','parked') OR "
+                    # A parked workflow is offered as a gate, and the
+                    # schema requires a gate to be in `plan`. One parked
+                    # later than that is deliberately left out rather than
+                    # written as a card the constraint would refuse — it
+                    # needs a card of its own, which does not exist yet.
+                    " (w.status='awaiting_start' OR "
+                    "  (w.status='parked' AND w.phase='plan') OR "
                     "  (w.status='snoozed' AND w.due_at<=? "
                     "   AND w.last_result_id IS NULL)) OR "
                     " (w.status='snoozed' AND w.due_at<=? "
@@ -1681,7 +1687,15 @@ def _kind_for_workflow(row: Mapping[str, object]) -> ExecutionCardKind:
             # it already tried.
             WorkflowStatus.PARKED,
         }
-        and row["last_result_id"] is None
+        and (
+            row["last_result_id"] is None
+            # A parked workflow may carry a result from an earlier phase
+            # that succeeded. It is still a "run this again?" question, and
+            # requiring no result here left it matching the eligibility
+            # query and no card kind at all — which raised, and took the
+            # whole sweep down with it, including cards that were fine.
+            or row["status"] == WorkflowStatus.PARKED
+        )
     ):
         return ExecutionCardKind.START
     if (
