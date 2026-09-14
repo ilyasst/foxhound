@@ -522,7 +522,12 @@ class TaskExecutionTests(unittest.TestCase):
 
         bind(2, "issue", "forge.example/acme/widget", "42")
         bind(3, "meeting", "record_synthetic", "action-1")
-        self.service.schedule_new(limit=10)
+        # This machine grants issues and nothing else.
+        TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            planning_grants=["issue"],
+        ).schedule_new(limit=10)
 
         def status(task_id):
             with closing(sqlite3.connect(self.database)) as connection:

@@ -5,6 +5,7 @@ import unittest
 from foxhound.source_policy import (
     SOURCE_POLICIES,
     SourcePolicy,
+    planning_grants,
     source_kinds_accepting,
 )
 from foxhound.task_execution import WorkflowStatus, _initial_status
@@ -18,16 +19,41 @@ class SourcePolicyTests(unittest.TestCase):
         self.assertTrue(policy.accepts_shadow_observations)
         self.assertTrue(policy.accepts_native_intake)
 
-    def test_teams_does_not_pre_authorize_agent_planning(self):
-        self.assertNotIn(
-            "teams", source_kinds_accepting("pre_authorized_planning")
-        )
+    def test_a_machine_that_declares_nothing_asks_about_everything(self):
+        """Planning authority is no longer decided in this registry. It is
+        a judgement about one machine and its operator, so a machine that
+        has declared nothing must ask about every task rather than inherit
+        a decision made elsewhere.
+        """
+        nothing = planning_grants(None)
+        self.assertEqual(nothing, frozenset())
+        for kind in SOURCE_POLICIES:
+            with self.subTest(kind=kind):
+                self.assertEqual(
+                    _initial_status(kind, nothing),
+                    WorkflowStatus.AWAITING_START,
+                )
+
+    def test_a_machine_grants_exactly_what_it_names(self):
+        granted = planning_grants(["issue"])
         self.assertEqual(
-            source_kinds_accepting("pre_authorized_planning"), {"issue"}
-        )
-        self.assertEqual(
-            _initial_status("teams"), WorkflowStatus.AWAITING_START
-        )
+            _initial_status("issue", granted), WorkflowStatus.QUEUED)
+        for kind in SOURCE_POLICIES:
+            if kind == "issue":
+                continue
+            with self.subTest(kind=kind):
+                self.assertEqual(
+                    _initial_status(kind, granted),
+                    WorkflowStatus.AWAITING_START,
+                )
+
+    def test_a_misspelled_grant_is_refused_not_ignored(self):
+        # Silently dropping an unrecognised kind would narrow authority
+        # without telling anyone; silently accepting it would widen it.
+        for bad in (["isue"], ["issue", "nonsense"], "issue", 7):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    planning_grants(bad)
 
     def test_only_an_addressable_source_is_offered_as_a_link(self):
         """A card states where work came from whichever source it is. Only
@@ -65,14 +91,19 @@ class SourcePolicyTests(unittest.TestCase):
                     self.assertIsInstance(
                         getattr(policy, capability), bool)
 
-    def test_a_declared_kind_grants_no_planning_authority_by_default(self):
+    def test_a_declared_kind_grants_no_authority_on_its_own(self):
         """A kind is declared before anything produces it, so the authority
-        question is answered while it is still cheap. Declaring one must
-        grant nothing: only `issue` plans without being asked, and every
-        kind added since was added with that answer withheld.
+        question is answered while it is still cheap. Declaring one grants
+        nothing anywhere: authority is a machine's own decision, and a
+        machine that has not made it is asked about every kind.
         """
-        self.assertEqual(
-            source_kinds_accepting("pre_authorized_planning"), {"issue"})
+        nothing = planning_grants(None)
+        for kind in SOURCE_POLICIES:
+            with self.subTest(kind=kind):
+                self.assertEqual(
+                    _initial_status(kind, nothing),
+                    WorkflowStatus.AWAITING_START,
+                )
 
     def test_unknown_capability_fails_closed(self):
         with self.assertRaisesRegex(ValueError, "unknown source-policy"):
