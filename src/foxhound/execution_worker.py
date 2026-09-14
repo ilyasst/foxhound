@@ -583,6 +583,15 @@ def load_result_draft(
 ) -> tuple[Path, dict[str, Any]]:
     if not isinstance(name, str):
         raise ExecutionWorkerDraftError("execution result draft is invalid")
+    supplied = Path(name)
+    if supplied.is_absolute():
+        if supplied.parent != run_directory:
+            raise ExecutionWorkerDraftError(
+                "execution result draft is invalid"
+            )
+        name = supplied.name
+    elif supplied.parent != Path("."):
+        raise ExecutionWorkerDraftError("execution result draft is invalid")
     match = _RESULT_NAME_RE.fullmatch(name)
     if match is None:
         raise ExecutionWorkerDraftError("execution result draft is invalid")
