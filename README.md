@@ -317,13 +317,15 @@ phase-ineligible profiles fail closed without claiming or launching an agent.
 There are no runner-level overrides for those profile policies. See
 [ADR 0024](docs/architecture/0024-workflow-agent-binding.md).
 
-Every Start card displays the exact selected profile's name. While the
-workflow is still awaiting Start, its Agent button returns a bounded list of
-installed profiles that can plan. The reader's choice atomically increments
-the workflow and card versions and returns a refreshed presentation for the
-gateway to edit in place; it neither starts work nor changes task lifecycle.
-The card service and runner must load the same owner-only profile directory.
-See [ADR 0025](docs/architecture/0025-start-card-agent-selector.md).
+Every execution workflow remains bound to an exact selected profile revision.
+The established Start-card presentation deliberately keeps agent selection
+out of its six task-decision controls; deployment scheduling selects the
+profile before the card is created. The authenticated agent-options and
+agent-selection operations remain available to trusted integrations and
+atomically version both workflow and card without starting work or changing
+task lifecycle. The card service and runner must load the same owner-only
+profile directory. See
+[ADR 0029](docs/architecture/0029-legacy-workflow-card-compatibility.md).
 
 For a parallel comparison in which Foxhound may prepare plans but must never
 execute work, restrict the runner's atomic claim selection:
@@ -441,9 +443,10 @@ Execution gates have their own transport-neutral durable review cards. An
 explicit scheduling pass projects only workflows currently awaiting start,
 plan review, external-action review, or final-result review. Each card is
 bound to exact task, workflow, phase, and result state; delivery uses an
-expiring digest-fenced claim. Start cards show their selected agent and allow
-the reader to choose another eligible installed profile before starting.
-Plan and result cards can request more
+expiring digest-fenced claim. Start cards retain the established task context
+and Done/Continue, Drop/Update, and Snooze 24h/Reassign layout. Update records
+private steering but does not start work; Continue is the explicit planning
+approval. Plan and result cards can request more
 investigation, collect one private discussion instruction, execute, snooze for
 a bounded interval, complete, reassign, or drop as appropriate. External
 effects still require their own exact authorization. Every delivered decision
@@ -459,8 +462,9 @@ separate `/v1/execution-cards/*` route family. A trusted local gateway can read
 aggregate stats, run the explicit scheduler, claim one rendered card,
 acknowledge or retry delivery, submit one versioned reader action, and submit
 one bounded discussion or reassignment response. Its agent-options and
-agent-selection operations support a two-step Telegram interaction with
-opaque, transport-bounded callbacks and a refreshed Start-card presentation.
+agent-selection operations remain a bounded integration contract with opaque
+callbacks and a refreshed Start-card presentation; they are not exposed as an
+extra control in the legacy-compatible Start keyboard.
 The packaged service accepts `--agent-profile-directory`; deployments with
 private profiles must give it the same directory as the execution runner. The
 existing `/v1/task-cards/*` contracts are unchanged. Starting the service

@@ -724,7 +724,11 @@ class TaskCardServerTests(unittest.TestCase):
             ),
         )
         self.assertIn(
-            "<b>Agent:</b> Synthetic Specialist",
+            "<b>Start this task?</b>",
+            selected["presentation"]["body"],
+        )
+        self.assertNotIn(
+            "Synthetic Specialist",
             selected["presentation"]["body"],
         )
         callbacks = [

@@ -30,7 +30,7 @@ The four card kinds have closed action sets:
 
 | Card | Allowed reader actions |
 |---|---|
-| Start | Choose agent, start planning, snooze one day, cancel execution |
+| Start | Complete, continue into planning, drop, update instructions, snooze one day, or reassign |
 | Plan review | Investigate, discuss, execute, snooze, complete, reassign, or drop |
 | External review | Authorize the exact action, return for revision, discuss, snooze, complete, reassign, or drop |
 | Result review | Discuss, snooze, complete, reassign, or drop |
@@ -43,10 +43,11 @@ lifecycle event, making the existing outcome feed authoritative. Reassignment
 versions the task, records an append-only owner event, discards the obsolete
 result binding, and returns execution to a fresh Start gate.
 
-Every Start projection resolves and displays the workflow's exact installed
-profile revision. Only a current delivered card whose workflow remains
-`awaiting_start` exposes Agent. Selecting a different eligible profile updates
-the workflow binding and the same delivered card in one transaction, versions
+Every Start projection still resolves the workflow's exact installed profile
+revision. Profile selection remains an authenticated integration operation,
+but the legacy-compatible Start keyboard contains only its established six
+task-decision controls. Selecting a different eligible profile updates the
+workflow binding and the same delivered card in one transaction, versions
 both, appends content-free workflow and card events, and returns the refreshed
 presentation. Selecting the current exact revision is unchanged. No selection
 queues work or changes task lifecycle.
@@ -54,9 +55,12 @@ queues work or changes task lifecycle.
 Discussion and reassignment use a separate bounded input operation because
 their values cannot safely fit in callback data. The gateway may collect text,
 but Foxhound validates and commits it against the exact delivered card version.
-Discussion queues a planning pass and becomes its private reader instruction;
-the next immutable result consumes it. Snooze choices are fixed at 1, 7, 14,
-or 30 days and retain the same review kind when the deadline is reached.
+Discussion from a Start card records an Update and returns to a fresh Start
+projection without queuing work. Discussion from a review card queues a
+planning pass. In both cases it becomes the private reader instruction for the
+next run and the next immutable result consumes it. Snooze choices are fixed at
+1, 7, 14, or 30 days and retain the same review kind when the deadline is
+reached.
 
 Card bodies are private, line-oriented HTML projections with a strict local
 service byte ceiling and a distinct callback namespace. A small Markdown

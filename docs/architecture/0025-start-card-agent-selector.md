@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted.
+Accepted for the service contract; Start-card presentation superseded by
+[ADR 0029](0029-legacy-workflow-card-compatibility.md).
 
 ## Context
 
@@ -14,9 +15,9 @@ delivered card would leave valid-looking stale controls on screen.
 
 ## Decision
 
-Every Start card resolves the workflow's exact installed profile revision and
-displays its reviewed name. The Agent button is present only when the current
-delivered card still matches a workflow in `awaiting_start`.
+Every Start card resolves the workflow's exact installed profile revision.
+The selector remains an authenticated integration operation, but the
+legacy-compatible Start keyboard no longer exposes an Agent button.
 
 The interaction has two authenticated loopback operations. Agent options
 validate the delivered card and return only installed profiles whose phase
@@ -44,14 +45,15 @@ missing.
 
 ## Consequences
 
-- The reader can verify and control the receiving agent at the Start gate.
+- A trusted integration can verify and control the receiving agent before
+  Start.
 - Telegram receives bounded callbacks and a complete edit-ready presentation.
 - Old buttons become stale immediately after a changed selection.
 - Profile installation remains a reviewed deployment action outside Git.
 
 ## Failure and rollback
 
-Stop routing Agent callbacks or omit private profiles from the card server.
-Existing Start, snooze, and cancel controls remain governed by their original
-versions. Do not update workflow bindings directly or let the gateway access
-SQLite as a fallback.
+Stop routing agent-selection operations or omit private profiles from the card
+server. Existing Start controls remain governed by their original versions.
+Do not update workflow bindings directly or let the gateway access SQLite as a
+fallback.
