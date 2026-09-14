@@ -267,11 +267,17 @@ class TaskExecutionService:
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("BEGIN IMMEDIATE")
             try:
+                self._cancel_stale(connection, now)
                 eligible = int(connection.execute(
                     "SELECT COUNT(*) FROM tasks AS t "
                     "LEFT JOIN task_execution_workflows AS w "
                     "ON w.task_id=t.id WHERE t.status='open' "
-                    "AND w.task_id IS NULL"
+                    "AND w.task_id IS NULL AND NOT EXISTS("
+                    " SELECT 1 FROM task_candidate_bindings AS b JOIN "
+                    " task_candidate_lifecycle AS l ON l.candidate_id=b.candidate_id "
+                    " WHERE b.task_id=t.id AND b.relation='accepted' "
+                    " AND l.state='withdrawn' AND l.resolution='preserved_open'"
+                    ")"
                 ).fetchone()[0])
                 rows = connection.execute(
                     "SELECT t.id,t.version,("
@@ -282,7 +288,13 @@ class TaskExecutionService:
                     ") AS origin_kind FROM tasks AS t "
                     "LEFT JOIN task_execution_workflows AS w "
                     "ON w.task_id=t.id WHERE t.status='open' "
-                    "AND w.task_id IS NULL ORDER BY t.id LIMIT ?",
+                    "AND w.task_id IS NULL AND NOT EXISTS("
+                    " SELECT 1 FROM task_candidate_bindings AS blocked JOIN "
+                    " task_candidate_lifecycle AS l "
+                    " ON l.candidate_id=blocked.candidate_id "
+                    " WHERE blocked.task_id=t.id AND blocked.relation='accepted' "
+                    " AND l.state='withdrawn' AND l.resolution='preserved_open'"
+                    ") ORDER BY t.id LIMIT ?",
                     (limit,),
                 ).fetchall()
                 for row in rows:
@@ -331,9 +343,17 @@ class TaskExecutionService:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 task = connection.execute(
-                    "SELECT status,version FROM tasks WHERE id=?", (task_id,)
+                    "SELECT t.status,t.version,EXISTS("
+                    " SELECT 1 FROM task_candidate_bindings AS b JOIN "
+                    " task_candidate_lifecycle AS l ON l.candidate_id=b.candidate_id "
+                    " WHERE b.task_id=t.id AND b.relation='accepted' "
+                    " AND l.state='withdrawn' AND l.resolution='preserved_open'"
+                    ") AS source_withdrawn FROM tasks AS t WHERE t.id=?",
+                    (task_id,),
                 ).fetchone()
                 refusal = _task_guard(task, expected_task_version)
+                if refusal is None and task["source_withdrawn"]:
+                    refusal = WorkflowRefusal.INVALID_STATE
                 if refusal is not None:
                     connection.rollback()
                     return _refused(task_id, refusal)
@@ -1039,7 +1059,12 @@ class TaskExecutionService:
             "SELECT w.* FROM task_execution_workflows AS w "
             "JOIN tasks AS t ON t.id=w.task_id "
             "WHERE w.status NOT IN ('completed','cancelled') "
-            "AND (t.status!='open' OR t.version!=w.task_version) "
+            "AND (t.status!='open' OR t.version!=w.task_version OR EXISTS("
+            " SELECT 1 FROM task_candidate_bindings AS b JOIN "
+            " task_candidate_lifecycle AS l ON l.candidate_id=b.candidate_id "
+            " WHERE b.task_id=t.id AND b.relation='accepted' "
+            " AND l.state='withdrawn' AND l.resolution='preserved_open'"
+            ")) "
             "ORDER BY w.task_id"
         ).fetchall()
         for row in rows:

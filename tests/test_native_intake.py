@@ -18,12 +18,14 @@ from foxhound.candidate_inbox import CandidateInbox, SCHEMA_VERSION
 from foxhound.contracts import candidate_id_for, comparable_task_digest
 from foxhound.native_intake import main
 from foxhound.task_cards import CardRefusal, TaskCardService
+from foxhound.task_execution import TaskExecutionService, WorkflowStatus
 from foxhound.task_ledger import (
     BootstrapDisposition,
     BootstrapRefusal,
     NativeIntakeDisposition,
     NativeIntakeRefusal,
     TaskLedger,
+    TaskStatus,
 )
 
 
@@ -66,6 +68,30 @@ def candidate(
         },
         "created_at": "2030-01-01T12:00:00Z",
     }
+
+
+def lifecycle_candidate(
+    index: int,
+    *,
+    generation: int,
+    state: str = "active",
+    text: str | None = None,
+) -> dict:
+    item = candidate(index, text=text)
+    item["schema_version"] = 3
+    item["lifecycle"] = {
+        "state": state,
+        "generation": generation,
+        "changed_at": f"2030-02-{generation:02d}T12:00:00Z",
+    }
+    item["source"]["revision"] = hashlib.sha256(
+        json.dumps(
+            [generation, state, item["task"]],
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return item
 
 
 def legacy_candidate(index: int) -> dict:
@@ -373,6 +399,181 @@ class NativeCandidateIntakeTests(unittest.TestCase):
         self.assertEqual(binding, revised["source"]["revision"])
         self.assertEqual(event, ("candidate_revised", 2, binding))
 
+    def test_withdrawal_before_binding_advances_without_creating_a_task(self):
+        self.activate()
+        withdrawn = lifecycle_candidate(1, generation=1, state="withdrawn")
+        self.assertTrue(self.inbox.import_feed(feed(0, withdrawn)).accepted)
+
+        result = self.intake()
+
+        self.assertEqual(result.candidates_withdrawn, 1)
+        self.assertEqual((result.current_cursor, self.ledger.count()), (1, 0))
+        self.assertEqual(self.intake().disposition, NativeIntakeDisposition.UNCHANGED)
+
+    def test_withdrawal_preserves_open_task_and_appends_auditable_event(self):
+        self.activate()
+        active = lifecycle_candidate(1, generation=1)
+        self.inbox.import_feed(feed(0, active))
+        self.intake()
+        withdrawn = lifecycle_candidate(1, generation=2, state="withdrawn")
+        self.inbox.import_feed(feed(1, withdrawn))
+
+        result = self.intake()
+
+        task = self.ledger.get(1)
+        self.assertEqual(result.candidates_withdrawn, 1)
+        self.assertEqual((task.status, task.version), (TaskStatus.OPEN, 2))
+        with closing(sqlite3.connect(self.database)) as connection:
+            lifecycle = connection.execute(
+                "SELECT state,resolution,task_version FROM "
+                "task_candidate_lifecycle"
+            ).fetchone()
+            event = connection.execute(
+                "SELECT kind,task_version FROM task_events "
+                "ORDER BY sequence DESC LIMIT 1"
+            ).fetchone()
+        self.assertEqual(lifecycle, ("withdrawn", "preserved_open", 2))
+        self.assertEqual(event, ("candidate_withdrawn", 2))
+
+    def test_reader_decision_wins_when_candidate_is_withdrawn(self):
+        self.activate()
+        active = lifecycle_candidate(1, generation=1)
+        self.inbox.import_feed(feed(0, active))
+        self.intake()
+        self.assertTrue(
+            self.ledger.transition(1, expected_version=1, action="done").accepted
+        )
+        withdrawn = lifecycle_candidate(1, generation=2, state="withdrawn")
+        self.inbox.import_feed(feed(1, withdrawn))
+
+        self.assertEqual(self.intake().candidates_withdrawn, 1)
+
+        task = self.ledger.get(1)
+        self.assertEqual((task.status, task.version), (TaskStatus.DONE, 2))
+        with closing(sqlite3.connect(self.database)) as connection:
+            lifecycle = connection.execute(
+                "SELECT state,resolution FROM task_candidate_lifecycle"
+            ).fetchone()
+            event = connection.execute(
+                "SELECT kind FROM task_events ORDER BY sequence DESC LIMIT 1"
+            ).fetchone()[0]
+        self.assertEqual(lifecycle, ("withdrawn", "reader_conflict"))
+        self.assertEqual(event, "candidate_withdrawal_conflict")
+
+    def test_stale_generation_cannot_reactivate_withdrawn_candidate(self):
+        active = lifecycle_candidate(1, generation=1)
+        withdrawn = lifecycle_candidate(1, generation=2, state="withdrawn")
+        self.assertTrue(self.inbox.import_document(active).accepted)
+        self.assertTrue(self.inbox.import_document(withdrawn).accepted)
+
+        stale = self.inbox.import_document(active)
+
+        self.assertEqual(stale.disposition.value, "refused")
+        self.assertEqual(stale.refusal.value, "stale_generation")
+        self.assertEqual(
+            self.inbox.get(active["candidate_id"]).lifecycle.state,
+            "withdrawn",
+        )
+
+    def test_reactivation_is_explicit_and_keeps_stable_task_identity(self):
+        self.activate()
+        active = lifecycle_candidate(1, generation=1)
+        self.inbox.import_feed(feed(0, active))
+        self.intake()
+        withdrawn = lifecycle_candidate(1, generation=2, state="withdrawn")
+        self.inbox.import_feed(feed(1, withdrawn))
+        self.intake()
+        reactivated = lifecycle_candidate(
+            1, generation=3, text="Prepare the restored synthetic summary"
+        )
+        self.inbox.import_feed(feed(2, reactivated))
+
+        result = self.intake()
+
+        self.assertEqual((result.tasks_revised, self.ledger.count()), (1, 1))
+        self.assertEqual(self.ledger.get(1).text, reactivated["task"]["text"])
+        with closing(sqlite3.connect(self.database)) as connection:
+            event = connection.execute(
+                "SELECT kind FROM task_events ORDER BY sequence DESC LIMIT 1"
+            ).fetchone()[0]
+        self.assertEqual(event, "candidate_reactivated")
+
+    def test_withdrawal_cancels_stale_cards_without_dropping_task(self):
+        self.activate()
+        active = lifecycle_candidate(1, generation=1)
+        self.inbox.import_feed(feed(0, active))
+        self.intake()
+        cards = TaskCardService(
+            self.database, clock=lambda: NOW, token_factory=lambda: "a" * 43
+        )
+        self.assertEqual(cards.schedule().created, 1)
+        withdrawn = lifecycle_candidate(1, generation=2, state="withdrawn")
+        self.inbox.import_feed(feed(1, withdrawn))
+        self.intake()
+
+        converged = cards.schedule()
+
+        self.assertEqual((converged.created, converged.cancelled), (0, 1))
+        self.assertEqual(cards.due(), ())
+        self.assertEqual(self.ledger.get(1).status, TaskStatus.OPEN)
+
+    def test_withdrawal_after_newer_revision_preserves_latest_task_text(self):
+        self.activate()
+        first = lifecycle_candidate(1, generation=1)
+        self.inbox.import_feed(feed(0, first))
+        self.intake()
+        revised = lifecycle_candidate(
+            1, generation=2, text="Prepare the newer synthetic summary"
+        )
+        self.inbox.import_feed(feed(1, revised))
+        self.intake()
+        withdrawn = lifecycle_candidate(1, generation=3, state="withdrawn")
+        self.inbox.import_feed(feed(2, withdrawn))
+
+        self.assertEqual(self.intake().candidates_withdrawn, 1)
+
+        self.assertEqual(self.ledger.get(1).text, revised["task"]["text"])
+
+    def test_withdrawal_cancels_start_gated_execution_without_rescheduling(self):
+        self.activate()
+        active = lifecycle_candidate(1, generation=1)
+        self.inbox.import_feed(feed(0, active))
+        self.intake()
+        execution = TaskExecutionService(self.database, clock=lambda: NOW)
+        scheduled = execution.schedule(1, expected_task_version=1)
+        self.assertEqual(scheduled.status, WorkflowStatus.AWAITING_START)
+        withdrawn = lifecycle_candidate(1, generation=2, state="withdrawn")
+        self.inbox.import_feed(feed(1, withdrawn))
+        self.intake()
+
+        self.assertEqual(execution.schedule_new().scheduled, 0)
+
+        self.assertEqual(execution.get(1).status, WorkflowStatus.CANCELLED)
+
+    def test_already_active_execution_is_preserved_as_withdrawal_conflict(self):
+        self.activate()
+        active = lifecycle_candidate(1, generation=1)
+        self.inbox.import_feed(feed(0, active))
+        self.intake()
+        execution = TaskExecutionService(self.database, clock=lambda: NOW)
+        scheduled = execution.schedule(1, expected_task_version=1)
+        started = execution.start_action(
+            1, expected_version=scheduled.version, action="start"
+        )
+        self.assertEqual(started.status, WorkflowStatus.QUEUED)
+        withdrawn = lifecycle_candidate(1, generation=2, state="withdrawn")
+        self.inbox.import_feed(feed(1, withdrawn))
+
+        self.assertEqual(self.intake().candidates_withdrawn, 1)
+
+        self.assertEqual(self.ledger.get(1).version, 1)
+        self.assertEqual(execution.get(1).status, WorkflowStatus.QUEUED)
+        with closing(sqlite3.connect(self.database)) as connection:
+            resolution = connection.execute(
+                "SELECT resolution FROM task_candidate_lifecycle"
+            ).fetchone()[0]
+        self.assertEqual(resolution, "reader_conflict")
+
     def test_revision_invalidates_an_existing_task_card(self):
         self.activate()
         initial = candidate(1)
@@ -479,10 +680,31 @@ class NativeCandidateIntakeTests(unittest.TestCase):
                 ),
             )
             connection.execute(
+                "INSERT INTO candidate_lifecycle("
+                "candidate_id,source_revision,state,generation,changed_at,"
+                "updated_at) VALUES(?,?,'active',0,NULL,?)",
+                (
+                    other["candidate_id"],
+                    other["source"]["revision"],
+                    NOW.isoformat(),
+                ),
+            )
+            connection.execute(
                 "INSERT INTO task_candidate_bindings("
                 "candidate_id,source_revision,task_id,relation,decided_at) "
                 "VALUES(?,?,1,'folded',?)",
                 (other["candidate_id"], other["source"]["revision"], NOW.isoformat()),
+            )
+            connection.execute(
+                "INSERT INTO task_candidate_lifecycle("
+                "candidate_id,source_revision,task_version,state,resolution,"
+                "changed_at,decided_at) "
+                "VALUES(?,?,1,'active','current',NULL,?)",
+                (
+                    other["candidate_id"],
+                    other["source"]["revision"],
+                    NOW.isoformat(),
+                ),
             )
         folded_revision = candidate(2, text="Revise a folded synthetic task")
         self.inbox.import_feed(feed(1, folded_revision))

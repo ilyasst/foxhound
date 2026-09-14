@@ -46,12 +46,13 @@ The knowledge system owns:
 
 ## Integration contracts
 
-The candidate boundary supports two immutable shapes. Version 1 retains its
+The candidate boundary supports three immutable shapes. Version 1 retains its
 required project field for already-produced pages. Version 2 requires that
-field to be absent so the producer can stop asserting a filing taxonomy. Both
-contain a small action description and opaque source references, with no body,
-transcript, email address, filesystem path, host detail, environment value, or
-credential.
+field to be absent so the producer can stop asserting a filing taxonomy.
+Version 3 keeps the project-less task and adds ordered producer lifecycle.
+All contain a small action description and opaque source references, with no
+body, transcript, email address, filesystem path, host detail, environment
+value, or credential.
 
 Candidate identity is derived from:
 
@@ -81,9 +82,9 @@ page identifies one producer stream and carries a bounded, contiguous range of
 integer cursor positions. The cursor is delivery metadata; Foxhound never
 interprets candidate revision digests as ordered values.
 
-A feed page may carry either candidate version. The embedded candidate version
-selects its exact shape; it does not change stable candidate identity. Version
-1 pages remain valid and immutable when version 2 begins arriving.
+A feed page may carry any supported candidate version. The embedded candidate
+version selects its exact shape; it does not change stable candidate identity.
+Earlier pages remain valid and immutable when a later version begins arriving.
 
 The producer also selects the source-revision digest by candidate version.
 Version 1 retains its established compact JSON input:

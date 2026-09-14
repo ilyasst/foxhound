@@ -73,6 +73,26 @@ class CandidateFeedContractTests(unittest.TestCase):
         self.assertEqual(feed.items[0].candidate.schema_version, 2)
         self.assertIsNone(feed.items[0].candidate.task.project)
 
+    def test_feed_preserves_lifecycle_aware_candidate(self):
+        document = fixture()
+        candidate = json.loads(
+            (FIXTURES / "meeting-candidate-v2.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        candidate["schema_version"] = 3
+        candidate["lifecycle"] = {
+            "state": "withdrawn",
+            "generation": 2,
+            "changed_at": "2030-03-01T12:00:00Z",
+        }
+        document["items"] = [{"sequence": 1, "candidate": candidate}]
+        document["to_cursor"] = 1
+
+        parsed = parse_candidate_feed(document)
+
+        self.assertEqual(parsed.items[0].candidate.lifecycle.state, "withdrawn")
+
     def test_cursor_range_must_match_item_count(self):
         document = fixture()
         document["to_cursor"] = 3
@@ -126,7 +146,11 @@ class CandidateFeedContractTests(unittest.TestCase):
         ]["oneOf"]
         self.assertEqual(
             [item["$ref"] for item in candidates],
-            ["task-candidate-v1.schema.json", "task-candidate-v2.schema.json"],
+            [
+                "task-candidate-v1.schema.json",
+                "task-candidate-v2.schema.json",
+                "task-candidate-v3.schema.json",
+            ],
         )
 
 
