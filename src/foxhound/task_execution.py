@@ -27,7 +27,10 @@ from .agent_profiles import (
     load_registry,
 )
 from .candidate_inbox import CandidateInbox, InboxError, SCHEMA_VERSION
-from .source_policy import source_kinds_accepting
+from .source_policy import (
+    planning_grants as _planning_grants,
+    source_kinds_accepting,
+)
 from .task_ledger import TaskLedgerError, TaskStatus
 
 
@@ -230,6 +233,7 @@ class TaskExecutionService:
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         profile_registry: AgentProfileRegistry | None = None,
         default_profile_id: str = "general",
+        planning_grants: object = None,
     ) -> None:
         if (isinstance(max_attempts, bool)
                 or not isinstance(max_attempts, int)
@@ -251,6 +255,10 @@ class TaskExecutionService:
         ):
             raise ValueError("default agent profile is unavailable")
         self._profile_registry = registry
+        # Empty unless this machine says otherwise: an operator who has not
+        # decided is asked, rather than having the decision made for them
+        # by whichever machine edited a shared file first.
+        self._planning_grants = _planning_grants(planning_grants)
         self._default_profile = profile
 
     def initialize(self) -> None:
@@ -302,7 +310,8 @@ class TaskExecutionService:
                 for row in rows:
                     task_id = int(row["id"])
                     task_version = int(row["version"])
-                    status = _initial_status(row["origin_kind"])
+                    status = _initial_status(
+                        row["origin_kind"], self._planning_grants)
                     connection.execute(
                         "INSERT INTO task_execution_workflows("
                         "task_id,task_version,status,phase,version,due_at,"
@@ -1759,25 +1768,27 @@ def _result_path(value: object, label: str) -> str | None:
     return value
 
 
-#: An origin that already carries the reader's permission to spend a
-#: planning pass on it.
-PRE_AUTHORIZED_ORIGINS = source_kinds_accepting("pre_authorized_planning")
-
-
-def _initial_status(origin_kind: object) -> WorkflowStatus:
-    """Whether this task needs to be asked about before it is planned.
+def _initial_status(
+    origin_kind: object, granted: frozenset[str]
+) -> WorkflowStatus:
+    """Whether this task must be asked about before it is planned.
 
     A gate exists so no agent time is spent on a task the reader never
-    wanted. That question is already answered for an issue from a
-    repository they enrolled: enrolling it was the permission, and the
-    gate then asks again about every issue in it, using a card that can
-    only name the issue's title because nothing has looked at it yet.
+    wanted. For some sources that question is already answered: enrolling
+    a repository is the permission for its issues, and the gate then asks
+    again about every one of them, using a card that can only show a title
+    because nothing has looked at the issue yet.
 
-    Planning is read-only and produces no external effect, so going
-    straight to it costs one agent pass and yields a card that can
-    actually be judged. Everything after the plan is still gated.
+    Which sources those are is a judgement about this machine and the
+    operator's appetite for it, not a fact about the source. It is
+    declared per machine and defaults to empty, so a machine that says
+    nothing is asked about everything.
+
+    Planning is read-only and produces no external effect, so granting it
+    costs one agent pass and yields a card that can actually be judged.
+    Everything after the plan is still gated.
     """
-    if isinstance(origin_kind, str) and origin_kind in PRE_AUTHORIZED_ORIGINS:
+    if isinstance(origin_kind, str) and origin_kind in granted:
         return WorkflowStatus.QUEUED
     return WorkflowStatus.AWAITING_START
 
