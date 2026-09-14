@@ -35,6 +35,8 @@ invariants:
   affects a decision, action, or deliverable;
 - inspect evidence before declaring it missing, stop when the result is
   supported, and label assumptions;
+- record a truthful reviewable partial result when the full objective cannot
+  be completed, reserving release for runs with no useful artifact;
 - use only the runtime toolsets and worker operations reported by the worker;
 - distinguish preparing correspondence from contacting someone;
 - preserve the plan/execute/external-action authority boundary; and
