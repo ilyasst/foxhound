@@ -558,6 +558,7 @@ The authenticated loopback card service exposes execution cards through a
 separate `/v1/execution-cards/*` route family. A trusted local gateway can read
 aggregate stats, read the bounded non-mutating `queue_view` projection at
 `POST /v1/execution-cards/queue`, run the explicit scheduler, claim one rendered card,
+or resolve one queue card atomically at `POST /v1/execution-cards/resolve`,
 acknowledge or retry delivery, submit one versioned reader action, submit
 one bounded discussion or reassignment response, submit one bounded
 Comment-and-Go note, and read one delivered card's
@@ -568,6 +569,8 @@ card's controls with a sub-menu -- the snooze picker is the one in use -- can
 put the card back when the reader backs out, instead of stranding them with a
 card they can only defer. An undelivered, superseded or differently versioned
 card is refused and carries no presentation at all. The response names the
+queue resolve route rejects `selection_token`; agent selection remains on its
+separate bounded integration route.
 card's kind alongside its presentation, because a caller restoring a card
 holds only its identifier and version -- the claim that told it the kind is
 long gone -- and the checks worth keeping on a restored keyboard are the

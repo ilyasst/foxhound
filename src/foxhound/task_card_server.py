@@ -72,6 +72,8 @@ EXECUTION_BRIEF_SCHEMA = "foxhound.execution-card-service.brief"
 EXECUTION_VIEW_SCHEMA = "foxhound.execution-card-service.view"
 EXECUTION_QUEUE_SCHEMA = "foxhound.execution-card-service.queue"
 EXECUTION_QUEUE_SCHEMA_VERSION = 1
+EXECUTION_RESOLVE_SCHEMA = "foxhound.execution-card-service.resolve"
+EXECUTION_RESOLVE_SCHEMA_VERSION = 1
 EXECUTION_AGENT_OPTIONS_SCHEMA = (
     "foxhound.execution-card-service.agent-options"
 )
@@ -114,6 +116,7 @@ ROUTES = {
     "/v1/execution-cards/brief": "execution_brief",
     "/v1/execution-cards/view": "execution_view",
     "/v1/execution-cards/queue": "execution_queue",
+    "/v1/execution-cards/resolve": "execution_resolve",
 }
 
 
@@ -597,6 +600,52 @@ class TaskCardApplication:
                 "ok": True,
                 "cards": [_execution_queue_card_document(card) for card in cards],
             }
+        if operation == "execution_resolve":
+            request = _strict_request(
+                payload, required={"card_id", "card_version", "action"},
+                optional={"input_kind", "value", "selection_token"},
+            )
+            identity = self.resolve_execution_consumer(authorization)
+            if identity is None:
+                raise TaskCardServerRequestError(
+                    "consumer_unresolved", "execution card consumer role is unresolved",
+                    HTTPStatus.FORBIDDEN,
+                )
+            if identity.role != QUEUE_VIEW_ROLE:
+                raise TaskCardServerRequestError(
+                    "role_forbidden", "execution card resolve requires the queue_view role",
+                    HTTPStatus.FORBIDDEN,
+                )
+            action = request["action"]
+            if not isinstance(action, str):
+                raise TaskCardServerRequestError("invalid_request", "execution card action is invalid")
+            input_kind = request.get("input_kind")
+            value = request.get("value")
+            if input_kind is not None:
+                if input_kind not in {"discussion", "reassignment"}:
+                    raise TaskCardServerRequestError("invalid_request", "execution card input kind is invalid")
+                value = _reader_input(value, kind=input_kind)
+            selection = request.get("selection_token")
+            if selection is not None:
+                raise TaskCardServerRequestError(
+                    "invalid_request",
+                    "agent selection is not supported by queue resolve",
+                )
+            result = self._execution_cards().resolve_queue_view(
+                _integer(request["card_id"], minimum=1),
+                expected_version=_integer(request["card_version"], minimum=1),
+                action=action, input_kind=input_kind, value=value,
+                selection_token=selection, consumer_digest=identity.digest,
+            )
+            if isinstance(result, ExecutionClaimAtCeiling):
+                return {
+                    "schema": EXECUTION_RESOLVE_SCHEMA,
+                    "schema_version": EXECUTION_RESOLVE_SCHEMA_VERSION,
+                    "ok": True, "status": "at_ceiling",
+                    "held_count": result.held_count, "ceiling": result.ceiling,
+                    "resolution": None,
+                }
+            return _execution_resolve_document(result)
         if operation == "execution_claim":
             request = _request(payload, required={"lease_seconds"})
             lease = _integer(request["lease_seconds"], minimum=5, maximum=300)
@@ -1066,6 +1115,24 @@ def _request(payload: object, *, required: set[str]) -> dict[str, Any]:
     return payload
 
 
+def _strict_request(
+    payload: object, *, required: set[str], optional: set[str]
+) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise TaskCardServerRequestError(
+            "invalid_request", "request body must be a JSON object"
+        )
+    if not isinstance(payload, dict) or not required.issubset(payload):
+        raise TaskCardServerRequestError("invalid_request", "request fields are invalid")
+    if set(payload) - ({"schema", "schema_version"} | required | optional):
+        raise TaskCardServerRequestError(
+            "invalid_request", "request contains an unknown field"
+        )
+    if payload.get("schema") != REQUEST_SCHEMA or payload.get("schema_version") != SERVICE_VERSION:
+        raise TaskCardServerRequestError("invalid_request", "request contract is unsupported")
+    return payload
+
+
 def _integer(value: object, *, minimum: int, maximum: int | None = None) -> int:
     upper = 9_223_372_036_854_775_807 if maximum is None else maximum
     if (
@@ -1310,6 +1377,19 @@ def _execution_operation_document(
             else result.workflow_phase.value
         ),
         "wake_at": result.wake_at,
+        "refusal": None if result.refusal is None else result.refusal.value,
+    }
+
+
+def _execution_resolve_document(result: ExecutionCardOperationResult) -> dict[str, Any]:
+    return {
+        "schema": EXECUTION_RESOLVE_SCHEMA,
+        "schema_version": EXECUTION_RESOLVE_SCHEMA_VERSION,
+        "ok": result.accepted,
+        "status": "resolved" if result.accepted else "refused",
+        "disposition": result.disposition.value,
+        "card_id": result.card_id,
+        "card_version": result.card_version,
         "refusal": None if result.refusal is None else result.refusal.value,
     }
 
