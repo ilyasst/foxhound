@@ -1425,6 +1425,85 @@ def _apply_agent_selection(
     )
 
 
+def _apply_plan_review_agent_selection(
+    connection: sqlite3.Connection,
+    task_id: int,
+    *,
+    expected_version: int,
+    profile: AgentProfile,
+    stamp: datetime,
+) -> WorkflowOperationResult:
+    """Bind the exact executor chosen while a plan awaits approval.
+
+    The plan has already been produced, so this selection is deliberately
+    constrained to profiles that may execute.  Keeping the workflow at its
+    review gate means the reader still has to approve the plan after making
+    the choice; it cannot turn a selector tap into execution.
+    """
+    if not _valid_identity(task_id, expected_version):
+        return _refused(task_id, WorkflowRefusal.INVALID_ARGUMENT)
+    if not isinstance(profile, AgentProfile):
+        return _refused(task_id, WorkflowRefusal.AGENT_PROFILE_UNAVAILABLE)
+    if WorkflowPhase.EXECUTE.value not in profile.allowed_phases:
+        return _refused(task_id, WorkflowRefusal.AGENT_PROFILE_UNAVAILABLE)
+    if stamp.tzinfo is None or stamp.utcoffset() is None:
+        raise TaskLedgerError("task execution clock must include a timezone")
+    now = stamp.astimezone(timezone.utc).isoformat(timespec="seconds")
+    row = TaskExecutionService._workflow_with_task(connection, task_id)
+    refusal = _workflow_guard(
+        row,
+        expected_version,
+        {WorkflowStatus.AWAITING_REVIEW},
+    )
+    if refusal is None and row["phase"] != WorkflowPhase.PLAN:
+        refusal = WorkflowRefusal.INVALID_STATE
+    if refusal is None:
+        refusal = _task_guard(row, int(row["task_version"]))
+    if refusal is not None:
+        return _refused_row(task_id, row, refusal)
+    if (
+        row["agent_profile_id"] == profile.profile_id
+        and row["agent_profile_revision"] == profile.revision
+    ):
+        return _operation(row, WorkflowDisposition.UNCHANGED)
+    version = expected_version + 1
+    updated = connection.execute(
+        "UPDATE task_execution_workflows SET version=?,"
+        "agent_profile_id=?,agent_profile_revision=?,updated_at=? "
+        "WHERE task_id=? AND version=? AND status='awaiting_review' "
+        "AND phase='plan'",
+        (
+            version,
+            profile.profile_id,
+            profile.revision,
+            now,
+            task_id,
+            expected_version,
+        ),
+    )
+    if updated.rowcount != 1:
+        return _refused_row(task_id, row, WorkflowRefusal.STALE_WORKFLOW)
+    TaskExecutionService._event(
+        connection,
+        task_id,
+        "agent_selected",
+        version,
+        int(row["task_version"]),
+        WorkflowPhase.EXECUTE,
+        WorkflowStatus.AWAITING_REVIEW,
+        now,
+    )
+    return WorkflowOperationResult(
+        WorkflowDisposition.APPLIED,
+        task_id,
+        version,
+        WorkflowStatus.AWAITING_REVIEW,
+        WorkflowPhase.PLAN,
+        agent_profile_id=profile.profile_id,
+        agent_profile_revision=profile.revision,
+    )
+
+
 def _calendar_snooze_until(action: str, stamp: datetime) -> str:
     """Resolve one snooze choice to 09:00 in the service host timezone.
 
