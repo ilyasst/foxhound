@@ -24,6 +24,13 @@ delivered, snoozed, and total active counts. A gateway computes its on-screen
 load as `delivering + delivered`; it never needs task/card identities merely
 to pace delivery.
 
+The versioned `POST /v1/task-cards/queue` route is a separate, read-only
+projection for the `queue_view` role. It returns the content-bearing pending
+and snoozed cards selected by `due()` without claiming or leasing them; cards
+already `delivering` or `delivered` are excluded. Its response uses the
+`foxhound.task-card-service.queue` schema version 1 and is not available to
+the legacy `drip` role.
+
 Every application route requires one bearer token loaded from a nonsymlink,
 owner-owned, mode-0600 regular file. Request contracts are versioned and exact:
 unknown or duplicate JSON fields, invalid types, extra headers that change body
