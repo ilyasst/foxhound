@@ -94,15 +94,19 @@ MAX_RENDER_SOURCE_LINE_CHARS = 500
 MAX_TRUNCATED_CARD_BODY_BYTES = 3_500
 ACTIVE_STATUSES = ("pending", "delivering", "delivered")
 REVIEW_DIRECT_ACTIONS = {
-    "approve", "revise", "cancel", "done", "drop",
+    "approve", "revise", "cancel", "done", "drop", "snooze",
     *REVIEW_SNOOZE_ACTIONS,
 }
-SNOOZE_BUTTON_ROWS = (
-    (("🕓 Tomorrow · 9 AM", "snooze_1d"),
-     ("Friday · 9 AM", "snooze_7d")),
-    (("Next Monday · 9 AM", "snooze_14d"),
-     ("In 2 weeks · 9 AM", "snooze_30d")),
-)
+#: One control, not four. The intervals live behind it: a gateway rewrites
+#: this verb into its own picker and offers the same four choices there. Four
+#: rows of deferral on the keyboard made every card argue for putting itself
+#: off, and on a start gate they outnumbered the two controls that answer the
+#: question the gate asks.
+#:
+#: The interval each choice resolves to is decided here, in
+#: `_calendar_snooze_until`; a picker only names them. The verb stays plain
+#: `snooze` because that is what the gateway looks for.
+SNOOZE_BUTTON_ROW = (("🕓 Snooze", "snooze"),)
 READER_INPUT_KINDS = {"discussion", "reassignment"}
 MAX_DISCUSSION_CHARS = 16_000
 MAX_OWNER_CHARS = 200
@@ -3234,7 +3238,7 @@ def _button_rows(
         rows: tuple[tuple[tuple[str, str], ...], ...] = (
             (("✅ Done", "done"), ("▶️ Continue", "start")),
             (("🗑 Drop", "drop"), ("✏️ Update", "discuss")),
-            *SNOOZE_BUTTON_ROWS,
+            SNOOZE_BUTTON_ROW,
             (("👥 Reassign", "reassign"),),
         )
         if card.owner_hold_eligible and card.owner:
@@ -3251,7 +3255,7 @@ def _button_rows(
     if kind is ExecutionCardKind.EXTERNAL_REVIEW:
         rows = (
             (("✅ Authorize action", "approve"), ("⛔ Not now", "revise")),
-            *SNOOZE_BUTTON_ROWS,
+            SNOOZE_BUTTON_ROW,
             (("💬 Discuss", "discuss"), ("✅ Mark as done", "done")),
             stop_row,
         )
@@ -3259,14 +3263,14 @@ def _button_rows(
         rows = (
             (("✅ Mark as done", "done"),),
             (("💬 Discuss", "discuss"),),
-            *SNOOZE_BUTTON_ROWS,
+            SNOOZE_BUTTON_ROW,
             stop_row,
         )
     else:
         rows = (
             (("🔎 Investigate further", "revise"), ("💬 Discuss", "discuss")),
             (("▶️ Execute plan", "approve"),),
-            *SNOOZE_BUTTON_ROWS,
+            SNOOZE_BUTTON_ROW,
             (("✅ Mark as done", "done"),),
             stop_row,
         )
@@ -3311,9 +3315,9 @@ def _direct_actions_for_kind(kind: ExecutionCardKind) -> set[str]:
             *REVIEW_SNOOZE_ACTIONS,
         }
     if kind is ExecutionCardKind.RESULT_REVIEW:
-        return {"done", "drop", *REVIEW_SNOOZE_ACTIONS}
+        return {"done", "drop", "snooze", *REVIEW_SNOOZE_ACTIONS}
     return {
-        "approve", "revise", "cancel", "done", "drop",
+        "approve", "revise", "cancel", "done", "drop", "snooze",
         *REVIEW_SNOOZE_ACTIONS,
     }
 
