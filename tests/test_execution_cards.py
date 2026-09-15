@@ -355,6 +355,9 @@ class ExecutionCardTests(unittest.TestCase):
             connection.execute(
                 "ALTER TABLE task_review_cards DROP COLUMN consumer_digest"
             )
+            connection.execute(
+                "ALTER TABLE task_review_cards DROP COLUMN source_revision"
+            )
             connection.execute("PRAGMA user_version = 8")
             connection.commit()
 

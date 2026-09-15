@@ -212,6 +212,51 @@ class TaskCardTests(unittest.TestCase):
         self.assertEqual(delivered.disposition, CardDisposition.APPLIED)
         return claim
 
+    def revise_source_without_task_change(self, task_id: int) -> str:
+        """Model an evidence-only #254 refresh already applied by the ledger."""
+        with closing(sqlite3.connect(self.database)) as connection:
+            row = connection.execute(
+                "SELECT candidate_id,source_revision FROM task_candidate_bindings "
+                "WHERE task_id=? AND relation='accepted'",
+                (task_id,),
+            ).fetchone()
+            self.assertIsNotNone(row)
+            revised = hashlib.sha256(
+                (str(row[1]) + "-synthetic-source-update").encode("utf-8")
+            ).hexdigest()
+            payload = connection.execute(
+                "SELECT payload_json FROM candidate_revision_history "
+                "WHERE candidate_id=? AND source_revision=?",
+                row,
+            ).fetchone()[0]
+            document = json.loads(payload)
+            document["source"]["revision"] = revised
+            document["evidence"]["sources"] = [{
+                "name": "latest-update.md",
+                "role": "transcript",
+                "extract": "Synthetic source update after the first review.",
+            }]
+            payload = json.dumps(document, sort_keys=True, separators=(",", ":"))
+            connection.execute(
+                "INSERT INTO candidate_revision_history("
+                "candidate_id,source_revision,payload_json,created_at,imported_at) "
+                "VALUES(?,?,?,?,?)",
+                (row[0], revised, payload,
+                 "2030-03-02T12:00:00+00:00", "2030-03-02T12:00:00+00:00"),
+            )
+            connection.execute(
+                "UPDATE candidate_inbox SET source_revision=?,payload_json=? "
+                "WHERE candidate_id=?",
+                (revised, payload, row[0]),
+            )
+            connection.execute(
+                "UPDATE task_candidate_bindings SET source_revision=? "
+                "WHERE candidate_id=?",
+                (revised, row[0]),
+            )
+            connection.commit()
+        return revised
+
     def test_schema_six_migration_is_passive(self):
         with closing(sqlite3.connect(self.database)) as connection:
             _drop_owner_schema(connection)
@@ -251,6 +296,33 @@ class TaskCardTests(unittest.TestCase):
             self.assertEqual(connection.execute(
                 "SELECT count(*) FROM task_review_cards"
             ).fetchone()[0], 0)
+
+    def test_schema_twenty_six_snapshots_current_source_revisions(self):
+        self.cards.schedule(limit=1)
+        with closing(sqlite3.connect(self.database)) as connection:
+            expected = connection.execute(
+                "SELECT b.source_revision FROM task_candidate_bindings AS b "
+                "WHERE b.task_id=1 AND b.relation='accepted'"
+            ).fetchone()[0]
+            connection.execute(
+                "ALTER TABLE task_review_cards DROP COLUMN source_revision"
+            )
+            connection.execute("PRAGMA user_version = 25")
+            connection.commit()
+
+        CandidateInbox(self.database, clock=self.clock).initialize()
+
+        with closing(sqlite3.connect(self.database)) as connection:
+            self.assertEqual(
+                connection.execute("PRAGMA user_version").fetchone()[0],
+                SCHEMA_VERSION,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT source_revision FROM task_review_cards"
+                ).fetchall(),
+                [(expected,)],
+            )
 
     def test_explicit_schedule_is_bounded_ordered_and_idempotent(self):
         first = self.cards.schedule(limit=2)
@@ -536,6 +608,45 @@ class TaskCardTests(unittest.TestCase):
         # transition out of `delivered` too: the card must carry no
         # consumer affinity afterward (ADR 0036 invariant 6).
         self.assertIsNone(self._consumer_digest(claim.card.id))
+
+    def test_source_update_resurfaces_once_and_fences_the_old_card(self):
+        self.cards.schedule(limit=1)
+        first = self.claim_and_deliver()
+        task_id = first.card.task_id
+
+        first_revision = self.revise_source_without_task_change(task_id)
+        stale = self.cards.act(
+            first.card.id,
+            expected_version=first.card.version,
+            action="keep_open",
+        )
+        self.assertEqual(stale.refusal, CardRefusal.STALE_VERSION)
+
+        raised = self.cards.schedule(limit=1)
+        self.assertEqual((raised.cancelled, raised.created), (1, 1))
+        replay = self.cards.schedule(limit=1)
+        self.assertEqual(replay.cancelled, 0)
+        self.assertEqual(
+            len([card for card in self.cards.due(limit=20)
+                 if card.task_id == task_id]),
+            1,
+        )
+
+        # A second change before this re-surface is delivered does not put a
+        # second question in front of the reader: the old pending card is
+        # cancelled and exactly one current card remains due.
+        second_revision = self.revise_source_without_task_change(task_id)
+        self.assertNotEqual(first_revision, second_revision)
+        coalesced = self.cards.schedule(limit=1)
+        self.assertEqual((coalesced.cancelled, coalesced.created), (1, 1))
+        latest = next(
+            card for card in self.cards.due(limit=20) if card.task_id == task_id
+        )
+        self.assertTrue(latest.source_changed)
+        body, _ = render_task_review_card(
+            replace(latest, status=CardStatus.DELIVERING)
+        )
+        self.assertIn("Source updated since you last saw this task", body)
 
     def test_invalid_inputs_and_append_only_history_fail_closed(self):
         self.assertEqual(self.cards.schedule(limit=0).refusal,
