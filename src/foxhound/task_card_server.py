@@ -245,7 +245,13 @@ class TaskCardApplication:
                 matched = role
         return matched
 
-    def dispatch(self, operation: str, payload: object) -> dict[str, Any]:
+    def dispatch(
+        self,
+        operation: str,
+        payload: object,
+        *,
+        authorization: str | None = None,
+    ) -> dict[str, Any]:
         if operation == "stats":
             _request(payload, required=set())
             stats = self.cards.stats()
@@ -266,7 +272,34 @@ class TaskCardApplication:
         if operation == "claim":
             request = _request(payload, required={"lease_seconds"})
             lease = _integer(request["lease_seconds"], minimum=5, maximum=300)
-            claim = self.cards.claim_next(lease_seconds=lease)
+            # ADR 0036 decision 2: a claim is a consumer-scoped operation
+            # (invariant 2) -- the resolved identity is bound to the card
+            # inside `claim_next` itself, in the same transaction as the
+            # claim. A token whose role cannot be resolved must fail closed
+            # here, before any card is touched, rather than claim under a
+            # null identity.
+            try:
+                identity = self.resolve_consumer(authorization)
+            except TaskCardConsumerIdentityError as exc:
+                raise TaskCardServerRequestError(
+                    "consumer_unresolved",
+                    "task card consumer role is unresolved",
+                    HTTPStatus.FORBIDDEN,
+                ) from exc
+            if identity is None:
+                # Unreachable in practice: `do_POST` already requires
+                # `authorized()` to accept the same header before dispatch
+                # is ever called. Treated the same as an unresolved role
+                # rather than trusted to proceed, so a future caller of
+                # `dispatch` that skips that gate still fails closed.
+                raise TaskCardServerRequestError(
+                    "consumer_unresolved",
+                    "task card consumer role is unresolved",
+                    HTTPStatus.FORBIDDEN,
+                )
+            claim = self.cards.claim_next(
+                lease_seconds=lease, consumer_digest=identity.digest
+            )
             if claim is None:
                 return {
                     "schema": CLAIM_SCHEMA,
@@ -575,7 +608,11 @@ class TaskCardRequestHandler(BaseHTTPRequestHandler):
             self._audit(HTTPStatus.UNAUTHORIZED, started)
             return
         try:
-            result = self.app.dispatch(operation, self._read_json_body())
+            result = self.app.dispatch(
+                operation,
+                self._read_json_body(),
+                authorization=auth_headers[0],
+            )
             self._json(HTTPStatus.OK, result)
             self._audit(HTTPStatus.OK, started)
         except TaskCardServerRequestError as exc:

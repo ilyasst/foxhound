@@ -221,11 +221,15 @@ class TaskCardService:
             ).fetchall()
         return tuple(_card(row) for row in rows)
 
-    def claim_next(self, *, lease_seconds: int = 60) -> DeliveryClaim | None:
+    def claim_next(
+        self, *, lease_seconds: int = 60, consumer_digest: str
+    ) -> DeliveryClaim | None:
         if (isinstance(lease_seconds, bool)
                 or not isinstance(lease_seconds, int)
                 or not 5 <= lease_seconds <= 300):
             raise TaskLedgerError("task card delivery lease is invalid")
+        if not _valid_digest(consumer_digest):
+            raise TaskLedgerError("task card consumer digest is invalid")
         now_dt = self._clock_value()
         now = now_dt.isoformat(timespec="seconds")
         expires_at = (now_dt + timedelta(seconds=lease_seconds)).isoformat(
@@ -250,6 +254,7 @@ class TaskCardService:
                     connection.execute(
                         "UPDATE task_review_cards SET status='pending',"
                         "version=?,claim_token_digest=NULL,claim_expires_at=NULL,"
+                        "consumer_digest=NULL,"
                         "updated_at=? WHERE id=? AND status='delivering' "
                         "AND version=?",
                         (next_version, now, int(row["id"]), int(row["version"])),
@@ -278,6 +283,7 @@ class TaskCardService:
                 updated = connection.execute(
                     "UPDATE task_review_cards SET status='delivering',"
                     "version=?,claim_token_digest=?,claim_expires_at=?,"
+                    "consumer_digest=?,"
                     "transport=NULL,delivery_ref=NULL,delivered_at=NULL,"
                     "updated_at=? WHERE id=? AND version=? "
                     "AND status IN ('pending','snoozed')",
@@ -285,6 +291,7 @@ class TaskCardService:
                         next_version,
                         digest,
                         expires_at,
+                        consumer_digest,
                         now,
                         int(row["id"]),
                         int(row["version"]),
@@ -403,7 +410,8 @@ class TaskCardService:
                 next_version = expected_version + 1
                 connection.execute(
                     "UPDATE task_review_cards SET status='pending',version=?,"
-                    "claim_token_digest=NULL,claim_expires_at=NULL,updated_at=? "
+                    "claim_token_digest=NULL,claim_expires_at=NULL,"
+                    "consumer_digest=NULL,updated_at=? "
                     "WHERE id=? AND version=?",
                     (next_version, now, card_id, expected_version),
                 )
@@ -484,7 +492,8 @@ class TaskCardService:
                     connection.execute(
                         "UPDATE task_review_cards SET status='snoozed',"
                         "version=?,due_at=?,claim_token_digest=NULL,"
-                        "claim_expires_at=NULL,transport=NULL,delivery_ref=NULL,"
+                        "claim_expires_at=NULL,consumer_digest=NULL,"
+                        "transport=NULL,delivery_ref=NULL,"
                         "delivered_at=NULL,updated_at=? WHERE id=? AND version=?",
                         (next_version, wake, now, card_id, expected_version),
                     )
@@ -498,6 +507,7 @@ class TaskCardService:
                     connection.execute(
                         "UPDATE task_review_cards SET status='resolved',"
                         "version=?,resolution=?,review_after=?,resolved_at=?,"
+                        "consumer_digest=NULL,"
                         "updated_at=? WHERE id=? AND version=?",
                         (
                             next_version,
@@ -581,7 +591,8 @@ class TaskCardService:
             next_version = int(row["version"]) + 1
             connection.execute(
                 "UPDATE task_review_cards SET status='cancelled',version=?,"
-                "claim_token_digest=NULL,claim_expires_at=NULL,resolved_at=?,"
+                "claim_token_digest=NULL,claim_expires_at=NULL,"
+                "consumer_digest=NULL,resolved_at=?,"
                 "updated_at=? WHERE id=? AND version=?",
                 (next_version, now, now, int(row["id"]), int(row["version"])),
             )
@@ -794,6 +805,18 @@ def _valid_opaque(value: object, maximum: int) -> bool:
 
 def _token_digest(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _valid_digest(value: object) -> bool:
+    """A resolved consumer identity, shaped exactly like ``_token_digest``'s
+    output: a lowercase hex sha256 digest, never the token itself (ADR 0036
+    decision 1, invariant 1) and never empty or null-in-disguise.
+    """
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in "0123456789abcdef" for char in value)
+    )
 
 
 def _card_guard(row, expected_version: int) -> CardRefusal | None:

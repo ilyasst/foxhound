@@ -31,6 +31,12 @@ from foxhound.task_ledger import TaskLedger, TaskLedgerError, TaskStatus
 
 NOW = datetime(2030, 3, 1, 12, 0, tzinfo=timezone.utc)
 TOKEN = "a" * 43
+# Synthetic resolved consumer identities (ADR 0036 decision 1): the digest a
+# server would compute from an authenticating bearer token, not a token
+# itself. Two distinct values let tests prove a second claim by a different
+# consumer is independent of what a card held before.
+CONSUMER_A = hashlib.sha256(b"synthetic-consumer-a").hexdigest()
+CONSUMER_B = hashlib.sha256(b"synthetic-consumer-b").hexdigest()
 
 
 def _drop_native_intake_schema(connection: sqlite3.Connection) -> None:
@@ -181,8 +187,20 @@ class TaskCardTests(unittest.TestCase):
             token_factory=lambda: TOKEN,
         )
 
-    def claim_and_deliver(self):
-        claim = self.cards.claim_next()
+    def _consumer_digest(self, card_id: int):
+        """Read the raw ``consumer_digest`` column directly -- it is
+        content-free server-side bookkeeping (ADR 0036 decision 2), not
+        something any service method hands back to a caller.
+        """
+        with closing(sqlite3.connect(self.database)) as connection:
+            row = connection.execute(
+                "SELECT consumer_digest FROM task_review_cards WHERE id=?",
+                (card_id,),
+            ).fetchone()
+        return row[0]
+
+    def claim_and_deliver(self, *, consumer_digest=CONSUMER_A):
+        claim = self.cards.claim_next(consumer_digest=consumer_digest)
         self.assertIsNotNone(claim)
         delivered = self.cards.complete_delivery(
             claim.card.id,
@@ -262,7 +280,7 @@ class TaskCardTests(unittest.TestCase):
             expected_version=first.card.version,
             action="snooze",
         )
-        self.cards.claim_next()
+        self.cards.claim_next(consumer_digest=CONSUMER_A)
 
         stats = self.cards.stats()
 
@@ -274,7 +292,9 @@ class TaskCardTests(unittest.TestCase):
 
     def test_delivery_claim_render_ack_and_replay_are_fenced(self):
         self.cards.schedule()
-        claim = self.cards.claim_next(lease_seconds=60)
+        claim = self.cards.claim_next(
+            lease_seconds=60, consumer_digest=CONSUMER_A
+        )
         self.assertEqual(claim.card.status, CardStatus.DELIVERING)
         self.assertEqual(claim.card.version, 2)
         body, keyboard = render_task_review_card(claim.card)
@@ -369,6 +389,7 @@ class TaskCardTests(unittest.TestCase):
         for action in actions:
             claim = self.claim_and_deliver()
             claims.append(claim)
+            self.assertEqual(self._consumer_digest(claim.card.id), CONSUMER_A)
             before = self.cards.event_count()
             result = self.cards.act(
                 claim.card.id,
@@ -376,6 +397,15 @@ class TaskCardTests(unittest.TestCase):
                 action=action,
             )
             self.assertEqual(result.disposition, CardDisposition.APPLIED)
+            # Every act() outcome here -- "done"/"drop"/"keep_open" leave
+            # the card `resolved`, "snooze" leaves it `snoozed` -- clears
+            # the consumer digest independently of which outcome it was
+            # (ADR 0036 invariant 6). Checked per-action, not just once,
+            # since each is a distinct code path in `act()`.
+            self.assertIsNone(
+                self._consumer_digest(claim.card.id),
+                f"consumer digest survived action={action!r}",
+            )
             replay = self.cards.act(
                 claim.card.id,
                 expected_version=claim.card.version,
@@ -406,13 +436,19 @@ class TaskCardTests(unittest.TestCase):
 
     def test_failed_and_expired_delivery_claims_can_be_retried(self):
         self.cards.schedule(limit=1)
-        first = self.cards.claim_next(lease_seconds=60)
+        first = self.cards.claim_next(
+            lease_seconds=60, consumer_digest=CONSUMER_A
+        )
+        self.assertEqual(
+            self._consumer_digest(first.card.id), CONSUMER_A
+        )
         failed = self.cards.fail_delivery(
             first.card.id,
             expected_version=first.card.version,
             claim_token=first.token,
         )
         self.assertEqual((failed.status, failed.version), (CardStatus.PENDING, 3))
+        self.assertIsNone(self._consumer_digest(first.card.id))
         self.assertEqual(self.cards.complete_delivery(
             first.card.id,
             expected_version=first.card.version,
@@ -421,12 +457,23 @@ class TaskCardTests(unittest.TestCase):
             delivery_ref="message-1",
         ).refusal, CardRefusal.STALE_VERSION)
 
-        second = self.cards.claim_next(lease_seconds=60)
+        # A second claim by a different consumer after re-pooling records
+        # that consumer's own digest, independent of what the card held
+        # before (ADR 0036 decision 2).
+        second = self.cards.claim_next(
+            lease_seconds=60, consumer_digest=CONSUMER_B
+        )
         self.assertEqual(second.card.version, 4)
+        self.assertEqual(self._consumer_digest(second.card.id), CONSUMER_B)
         self.clock.advance(timedelta(seconds=61))
-        third = self.cards.claim_next(lease_seconds=60)
+        third = self.cards.claim_next(
+            lease_seconds=60, consumer_digest=CONSUMER_A
+        )
         self.assertEqual(third.card.id, second.card.id)
         self.assertEqual(third.card.version, 6)
+        # Lease expiry (inside `claim_next`) cleared consumer B's digest
+        # before the third claim recorded consumer A's.
+        self.assertEqual(self._consumer_digest(third.card.id), CONSUMER_A)
         self.assertEqual(self.cards.complete_delivery(
             second.card.id,
             expected_version=second.card.version,
@@ -438,6 +485,7 @@ class TaskCardTests(unittest.TestCase):
     def test_external_task_change_invalidates_active_card(self):
         self.cards.schedule(limit=1)
         claim = self.claim_and_deliver()
+        self.assertEqual(self._consumer_digest(claim.card.id), CONSUMER_A)
         self.assertTrue(self.ledger.transition(
             claim.card.task_id,
             expected_version=claim.card.task_version,
@@ -454,6 +502,11 @@ class TaskCardTests(unittest.TestCase):
         scheduled = self.cards.schedule()
         self.assertEqual(scheduled.cancelled, 1)
         self.assertEqual(self.ledger.get(claim.card.task_id).status, TaskStatus.DONE)
+        # `_cancel_stale` (driven here by `schedule()`, since the
+        # underlying task changed under the delivered card) is a terminal
+        # transition out of `delivered` too: the card must carry no
+        # consumer affinity afterward (ADR 0036 invariant 6).
+        self.assertIsNone(self._consumer_digest(claim.card.id))
 
     def test_invalid_inputs_and_append_only_history_fail_closed(self):
         self.assertEqual(self.cards.schedule(limit=0).refusal,
@@ -465,7 +518,12 @@ class TaskCardTests(unittest.TestCase):
         with self.assertRaisesRegex(TaskLedgerError, "limit"):
             self.cards.due(limit=0)
         with self.assertRaisesRegex(TaskLedgerError, "lease"):
-            self.cards.claim_next(lease_seconds=1)
+            self.cards.claim_next(lease_seconds=1, consumer_digest=CONSUMER_A)
+        for bad_digest in (None, "", "not-hex" * 8, "a" * 63, "A" * 64):
+            with self.assertRaisesRegex(TaskLedgerError, "consumer digest"):
+                self.cards.claim_next(
+                    lease_seconds=60, consumer_digest=bad_digest
+                )
         self.cards.schedule(limit=1)
         before = self.cards.event_count()
         with self.assertRaises(sqlite3.IntegrityError):
