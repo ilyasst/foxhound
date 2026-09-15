@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -261,6 +261,7 @@ _SCHEMA_COLUMNS = {
         "updated_at",
         "resolved_at",
         "consumer_digest",
+        "source_revision",
     ),
     "task_review_card_events": (
         "sequence",
@@ -432,16 +433,28 @@ _SCHEMA_COLUMNS = {
 # Every historical map is derived from the current one by subtraction, so
 # anything added now has to be taken back out of the version before it
 # existed -- otherwise a migration step verifies its own future. Four
-# subtractions, applied in version order: `task_completion_evidence` arrives
-# at v25, `consumer_digest` (task review cards, ADR 0036 decision 2) at v23,
+# subtractions, applied in version order: `source_revision` (task review
+# cards) arrives at v26, `task_completion_evidence` arrives at v25,
+# `consumer_digest` (task review cards, ADR 0036 decision 2) at v23,
 # `work_digest` at v22, and `task_relations` at v21 -- so the v24 state has
 # the new table removed, the v22 state also has the card column removed but
 # keeps `work_digest`, the v21 state has neither column but keeps
 # `task_relations`, and the v20 state has none of the four.
 _SCHEMA_V24_COLUMNS = {
-    name: columns
+    name: tuple(
+        column for column in columns
+        if not (name == "task_review_cards" and column == "source_revision")
+    )
     for name, columns in _SCHEMA_COLUMNS.items()
     if name != "task_completion_evidence"
+}
+
+_SCHEMA_V25_COLUMNS = {
+    name: tuple(
+        column for column in columns
+        if not (name == "task_review_cards" and column == "source_revision")
+    )
+    for name, columns in _SCHEMA_COLUMNS.items()
 }
 
 _SCHEMA_V22_COLUMNS = {
@@ -1959,6 +1972,20 @@ END;
 """,
 )
 
+# A review card is an assertion about the source revision the reader was
+# shown, not merely about the task row. A task's version is deliberately
+# unchanged for provenance-only enrichment, so it cannot be the fence for a
+# later source comment. The migration snapshots the currently-bound revision
+# on historical cards; cards without a bound candidate stay NULL.
+_SCHEMA_V26 = (
+    "ALTER TABLE task_review_cards ADD COLUMN source_revision TEXT "
+    "CHECK(source_revision IS NULL OR length(source_revision) = 64);",
+    "UPDATE task_review_cards SET source_revision=("
+    " SELECT b.source_revision FROM task_candidate_bindings AS b "
+    " WHERE b.task_id=task_review_cards.task_id "
+    " AND b.relation='accepted') WHERE source_revision IS NULL;",
+)
+
 
 _SCHEMA_V20 = (
     # SQLite cannot alter a CHECK in place, and three tables carry a foreign
@@ -2732,6 +2759,22 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 25
+            if version == 25:
+                self._require_tables(
+                    connection,
+                    ("task_review_cards",),
+                    columns=_SCHEMA_V25_COLUMNS,
+                )
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V26:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 26")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 26
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:

@@ -272,6 +272,9 @@ class TaskExecutionTests(unittest.TestCase):
             connection.execute(
                 "ALTER TABLE task_review_cards DROP COLUMN consumer_digest"
             )
+            connection.execute(
+                "ALTER TABLE task_review_cards DROP COLUMN source_revision"
+            )
             connection.execute("PRAGMA user_version = 7")
             connection.commit()
 
@@ -312,6 +315,9 @@ class TaskExecutionTests(unittest.TestCase):
             # has not got it yet.
             connection.execute(
                 "ALTER TABLE task_review_cards DROP COLUMN consumer_digest"
+            )
+            connection.execute(
+                "ALTER TABLE task_review_cards DROP COLUMN source_revision"
             )
             connection.execute("PRAGMA user_version = 11")
             connection.commit()

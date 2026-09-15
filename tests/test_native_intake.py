@@ -463,6 +463,11 @@ class NativeCandidateIntakeTests(unittest.TestCase):
             connection.execute(
                 "ALTER TABLE task_review_cards DROP COLUMN consumer_digest"
             )
+            # Source-revision snapshots arrive at v26. This fixture models
+            # v15, before review cards carried that fence.
+            connection.execute(
+                "ALTER TABLE task_review_cards DROP COLUMN source_revision"
+            )
             connection.execute("PRAGMA user_version = 15")
 
         CandidateInbox(self.database, clock=lambda: NOW).initialize()
