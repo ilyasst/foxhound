@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import hmac
 import http.client
 import io
@@ -966,14 +967,16 @@ class TaskCardServerTests(unittest.TestCase):
         maximum = 0
 
         class SlowApplication(TaskCardApplication):
-            def dispatch(self, operation, payload):
+            def dispatch(self, operation, payload, *, authorization=None):
                 nonlocal active, maximum
                 with lock:
                     active += 1
                     maximum = max(maximum, active)
                 try:
                     time.sleep(0.05)
-                    return super().dispatch(operation, payload)
+                    return super().dispatch(
+                        operation, payload, authorization=authorization
+                    )
                 finally:
                     with lock:
                         active -= 1
@@ -1267,6 +1270,141 @@ class TaskCardTokenRoleTests(unittest.TestCase):
             load_role_tokens(
                 [f"drip={drip_path}", f"queue_view={missing_path}"]
             )
+
+
+class TaskCardClaimConsumerIdentityTests(unittest.TestCase):
+    """ADR 0036 decision 2 (issue #193): `claim_next` records the resolved
+    consumer identity in the same transaction as the claim, and this is the
+    first real HTTP-reachable caller of `resolve_consumer` (added, but
+    uncalled, by issue #192)."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.database = Path(self.temporary.name) / "foxhound.sqlite3"
+        self.clock = Clock()
+        CandidateInbox(self.database, clock=self.clock).initialize()
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            for index in range(1, 3):
+                connection.execute(
+                    "INSERT INTO tasks(status,text,owner,due,version,created_at,"
+                    "updated_at,closed_at) VALUES('open',?,?,?,?,?,?,NULL)",
+                    (
+                        f"Synthetic task {index} <private>",
+                        f"Person {index}",
+                        None,
+                        1,
+                        f"2030-01-{index:02d}T12:00:00+00:00",
+                        NOW.isoformat(timespec="seconds"),
+                    ),
+                )
+        self.cards = TaskCardService(
+            self.database, clock=self.clock, token_factory=lambda: CLAIM_TOKEN
+        )
+        self.cards.schedule()
+
+    def _consumer_digest(self, card_id: int):
+        with closing(sqlite3.connect(self.database)) as connection:
+            row = connection.execute(
+                "SELECT consumer_digest FROM task_review_cards WHERE id=?",
+                (card_id,),
+            ).fetchone()
+        return row[0]
+
+    def test_single_gateway_claim_is_unchanged_but_leaves_a_digest(self):
+        """The acceptance test that matters most: with one configured
+        token defaulting to role `drip`, the existing chat gateway must
+        claim exactly as it does today -- same status code, same response
+        keys, same claim fields -- it simply now leaves a digest behind
+        server-side."""
+        app = TaskCardApplication(self.cards, TOKEN)
+        with running_server(app) as endpoint:
+            status, _, claimed = request(
+                endpoint,
+                "/v1/task-cards/claim",
+                request_document(lease_seconds=60),
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                set(claimed),
+                {"schema", "schema_version", "ok", "status", "claim"},
+            )
+            self.assertEqual(claimed["status"], "claimed")
+            self.assertEqual(
+                set(claimed["claim"]),
+                {
+                    "card_id", "card_version", "claim_token", "expires_at",
+                    "delivery_key", "body", "reply_markup",
+                },
+            )
+            card_id = claimed["claim"]["card_id"]
+        self.assertEqual(
+            self._consumer_digest(card_id),
+            hashlib.sha256(TOKEN.encode("utf-8")).hexdigest(),
+        )
+
+    def test_claim_records_distinct_digest_per_configured_token(self):
+        """Claiming under token A sets the column to digest(A); claiming
+        under token B sets it to digest(B) -- independent identities, both
+        HTTP-reachable through the one `claim` route."""
+        app = TaskCardApplication(
+            self.cards, {DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: QUEUE_VIEW_TOKEN}
+        )
+        with running_server(app) as endpoint:
+            _, _, first = request(
+                endpoint,
+                "/v1/task-cards/claim",
+                request_document(lease_seconds=60),
+                token=TOKEN,
+            )
+            _, _, second = request(
+                endpoint,
+                "/v1/task-cards/claim",
+                request_document(lease_seconds=60),
+                token=QUEUE_VIEW_TOKEN,
+            )
+        first_digest = self._consumer_digest(first["claim"]["card_id"])
+        second_digest = self._consumer_digest(second["claim"]["card_id"])
+        self.assertEqual(
+            first_digest, hashlib.sha256(TOKEN.encode("utf-8")).hexdigest()
+        )
+        self.assertEqual(
+            second_digest,
+            hashlib.sha256(QUEUE_VIEW_TOKEN.encode("utf-8")).hexdigest(),
+        )
+        self.assertNotEqual(first_digest, second_digest)
+
+    def test_unresolvable_role_fails_closed_over_http_and_claims_nothing(self):
+        """The fail-closed branch issue #192 added but never called from
+        any route (its acknowledged weak point): an authenticated token
+        whose role cannot be resolved must refuse the claim outright, never
+        claim with a null identity."""
+        stray_token = "z" * 43
+        app = TaskCardApplication(self.cards, TOKEN)
+        app.tokens = {**app.tokens, "not_a_real_role": stray_token}
+        before = self.cards.stats()
+        with running_server(app) as endpoint:
+            status, _, body = request(
+                endpoint,
+                "/v1/task-cards/claim",
+                request_document(lease_seconds=60),
+                token=stray_token,
+            )
+        self.assertEqual(status, 403)
+        self.assertEqual(body["schema"], ERROR_SCHEMA)
+        self.assertEqual(body["error"]["code"], "consumer_unresolved")
+        # Nothing was claimed: the pool is exactly as it was before the
+        # refused attempt, and the legitimate drip token can still claim.
+        self.assertEqual(self.cards.stats(), before)
+        with running_server(app) as endpoint:
+            status, _, claimed = request(
+                endpoint,
+                "/v1/task-cards/claim",
+                request_document(lease_seconds=60),
+                token=TOKEN,
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(claimed["status"], "claimed")
 
 
 if __name__ == "__main__":
