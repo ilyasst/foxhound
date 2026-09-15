@@ -90,7 +90,7 @@ def origin_lines(
         ]
         for source in sources:
             role = source.role.replace("_", " ").title()
-            extract = _quotable(source.extract)
+            extract = quotable(source.extract)
             if html_output:
                 lines.extend((
                     f"• <code>{_escape(source.name)}</code> — {_escape(role)}",
@@ -171,7 +171,7 @@ def _origin_identity_lines(
     return [f'<b>From:</b> <a href="{_escape(url)}">{_escape(shown)}</a>']
 
 
-def _quotable(value: str) -> str:
+def quotable(value: str) -> str:
     """As much of one extract as recognising a source takes.
 
     Cut on a word boundary where there is one near the end, so the quote
