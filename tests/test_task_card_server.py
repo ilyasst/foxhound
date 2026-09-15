@@ -273,6 +273,57 @@ class TaskCardServerTests(unittest.TestCase):
         result = app.dispatch("execution_resolve", request_document(card_id=third.id, card_version=third.version, action="start"), authorization=f"Bearer {queue}")
         self.assertEqual(result["status"], "at_ceiling")
 
+    def test_execution_queue_resolve_rolls_back_after_internal_delivery(self):
+        card = self._queue_card()
+        digest = hashlib.sha256(("q" * 43).encode()).hexdigest()
+        before_events = self.execution_cards.event_count()
+        original_event = self.execution_cards._event
+        calls = 0
+
+        def fail_after_delivery(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("synthetic injected failure")
+            return original_event(*args, **kwargs)
+
+        with mock.patch.object(self.execution_cards, "_event", fail_after_delivery):
+            with self.assertRaisesRegex(RuntimeError, "synthetic injected failure"):
+                self.execution_cards.resolve_queue_view(
+                    card.id, expected_version=card.version, action="start",
+                    consumer_digest=digest,
+                )
+        with closing(sqlite3.connect(self.database)) as db:
+            state = db.execute(
+                "SELECT status,version,consumer_digest FROM execution_review_cards WHERE id=?",
+                (card.id,),
+            ).fetchone()
+            self.assertEqual(state, ("pending", 1, None))
+            self.assertEqual(
+                db.execute("SELECT version,status FROM task_execution_workflows WHERE task_id=?", (card.task_id,)).fetchone(),
+                (1, "awaiting_start"),
+            )
+            self.assertEqual(db.execute("SELECT count(*) FROM execution_reader_inputs").fetchone()[0], 0)
+        self.assertEqual(self.execution_cards.event_count(), before_events)
+
+    def test_execution_queue_resolve_rejects_agent_selection_input(self):
+        card = self._queue_card()
+        queue = "q" * 43
+        app = TaskCardApplication(
+            self.cards, {DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: queue},
+            execution_cards=self.execution_cards,
+            execution_tokens={DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: queue},
+        )
+        with self.assertRaisesRegex(TaskCardServerRequestError, "agent selection"):
+            app.dispatch(
+                "execution_resolve",
+                request_document(
+                    card_id=card.id, card_version=card.version,
+                    action="start", selection_token="a" * 20,
+                ),
+                authorization=f"Bearer {queue}",
+            )
+
     def test_execution_queue_is_scoped_bounded_and_non_mutating(self):
         self.execution.schedule(1, expected_task_version=1)
         self.execution_cards.schedule()

@@ -627,9 +627,10 @@ class TaskCardApplication:
                 value = _reader_input(value, kind=input_kind)
             selection = request.get("selection_token")
             if selection is not None:
-                if not isinstance(selection, str) or not selection.strip():
-                    raise TaskCardServerRequestError("invalid_request", "execution card selection is invalid")
-                selection = _opaque(selection, maximum=AGENT_SELECTION_TOKEN_CHARS)
+                raise TaskCardServerRequestError(
+                    "invalid_request",
+                    "agent selection is not supported by queue resolve",
+                )
             result = self._execution_cards().resolve_queue_view(
                 _integer(request["card_id"], minimum=1),
                 expected_version=_integer(request["card_version"], minimum=1),
