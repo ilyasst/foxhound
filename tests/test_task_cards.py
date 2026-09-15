@@ -505,6 +505,66 @@ class TaskCardTests(unittest.TestCase):
         self.assertEqual(replay.disposition, CardDisposition.UNCHANGED)
         self.assertEqual(self.cards.event_count(), before + 1)
 
+    def test_delivered_card_can_be_repaired_by_local_operator(self):
+        self.cards.schedule(limit=1)
+        claim = self.claim_and_deliver()
+        before_events = self.cards.event_count()
+
+        repaired = self.cards.retry_delivery(
+            claim.card.id, expected_version=claim.card.version
+        )
+
+        self.assertEqual(repaired.disposition, CardDisposition.APPLIED)
+        self.assertEqual(
+            (repaired.status, repaired.version),
+            (CardStatus.PENDING, claim.card.version + 1),
+        )
+        with closing(sqlite3.connect(self.database)) as connection:
+            row = connection.execute(
+                "SELECT status,version,claim_token_digest,claim_expires_at,"
+                "consumer_digest,transport,delivery_ref,delivered_at "
+                "FROM task_review_cards WHERE id=?",
+                (claim.card.id,),
+            ).fetchone()
+            event = connection.execute(
+                "SELECT kind,card_version FROM task_review_card_events "
+                "WHERE card_id=? ORDER BY sequence DESC LIMIT 1",
+                (claim.card.id,),
+            ).fetchone()
+        self.assertEqual(row, (
+            "pending", claim.card.version + 1, None, None, None, None, None, None
+        ))
+        self.assertEqual(event, ("delivery_failed", claim.card.version + 1))
+        self.assertEqual(self.cards.event_count(), before_events + 1)
+
+    def test_delivered_card_repair_refuses_stale_or_noncurrent_cards(self):
+        self.cards.schedule(limit=1)
+        claim = self.claim_and_deliver()
+        before_events = self.cards.event_count()
+        stale = self.cards.retry_delivery(
+            claim.card.id, expected_version=claim.card.version - 1
+        )
+        self.assertEqual(stale.refusal, CardRefusal.STALE_VERSION)
+        self.assertEqual(self.cards.event_count(), before_events)
+        with closing(sqlite3.connect(self.database)) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT status,version FROM task_review_cards WHERE id=?",
+                    (claim.card.id,),
+                ).fetchone(),
+                ("delivered", claim.card.version),
+            )
+
+        self.cards.act(
+            claim.card.id, expected_version=claim.card.version, action="snooze"
+        )
+        before_events = self.cards.event_count()
+        not_delivered = self.cards.retry_delivery(
+            claim.card.id, expected_version=claim.card.version + 1
+        )
+        self.assertEqual(not_delivered.refusal, CardRefusal.INVALID_STATE)
+        self.assertEqual(self.cards.event_count(), before_events)
+
     def test_actions_are_atomic_and_stale_replays_write_nothing(self):
         self.cards.schedule()
         actions = ("done", "keep_open", "drop", "snooze")
