@@ -475,6 +475,16 @@ that resolve is one request from the console's perspective regardless of how
 many internal steps implement it, and what each outcome may and may not
 disclose.
 
+The queue read is exposed as `POST /v1/task-cards/queue`. It accepts the
+standard request contract with one additional `limit` integer (1–1,000), and
+returns schema `foxhound.task-card-service.queue`, version 1, with a `cards`
+array containing the content-bearing `due()` projection. Only a token with
+role `queue_view` may call it; an authenticated token with another role gets
+HTTP 403 `role_forbidden`, while an absent or invalid token keeps the normal
+HTTP 401 `unauthorized` response. The route performs no claim, lease, event,
+or other mutation, and `due()` excludes every `delivering` and `delivered`
+card before content is serialized.
+
 **Configuration.** Each accepted bearer token is paired with a role at
 startup. The existing single-token invocation shape from ADR 0011 is
 unchanged; a role defaults to `drip` when none is configured, so an upgraded
