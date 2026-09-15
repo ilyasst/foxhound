@@ -2,6 +2,28 @@
 
 Status: proposed.
 
+## Issue 197 implementation decision
+
+The resolve operation is exposed as `POST /v1/task-cards/resolve` with the
+ordinary service request envelope and the versioned schema
+`foxhound.task-card-service.resolve` (schema version 1). It accepts only a
+card id, exact card version, and one action from `done`, `keep_open`, `drop`,
+or `snooze`. It is restricted to the authenticated `queue_view` role: this
+is the role that owns the read-only queue projection and the resolve-at-
+submit interaction; the existing `drip` role retains its separate delivery
+flow and request shapes.
+
+The service uses three tightly sequenced, separately committed operations:
+claim the exact `(id, version)` while it is `pending` or `snoozed`, complete
+delivery with internal transport `resolved` and an opaque resolve reference,
+then call the existing `act()` operation. The resolve response contains no
+claim token, transport, or delivery reference. The delivery completion commits
+before `act()` is attempted. Therefore a crash or injected failure between
+those steps can leave a card `delivered` and attributed to the caller, but can
+never apply the reader action without a durable delivery record. This is the
+partial-failure ordering guarantee required here, explicitly weaker than full
+atomicity; operator repair (#198) is the recovery path for a stranded card.
+
 Implementation note (issue 194): the existing `/v1/task-cards/stats` route
 and response remain unchanged (schema version 1 and its original field set)
 for legacy/drip clients. Consumer-scoped stats, including `elsewhere`, are

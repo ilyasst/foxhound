@@ -61,6 +61,8 @@ STATS_SCHEMA = "foxhound.task-card-service.stats"
 STATS_SCHEMA_VERSION = 2
 QUEUE_SCHEMA = "foxhound.task-card-service.queue"
 QUEUE_SCHEMA_VERSION = 1
+RESOLVE_SCHEMA = "foxhound.task-card-service.resolve"
+RESOLVE_SCHEMA_VERSION = 1
 EXECUTION_SCHEDULE_SCHEMA = "foxhound.execution-card-service.schedule"
 EXECUTION_CLAIM_SCHEMA = "foxhound.execution-card-service.claim"
 EXECUTION_OPERATION_SCHEMA = "foxhound.execution-card-service.operation"
@@ -88,6 +90,7 @@ ROUTES = {
     "/v1/task-cards/stats": "stats",
     "/v2/task-cards/stats": "stats_scoped",
     "/v1/task-cards/queue": "queue",
+    "/v1/task-cards/resolve": "resolve",
     "/v1/task-cards/schedule": "schedule",
     "/v1/task-cards/claim": "claim",
     "/v1/task-cards/delivered": "delivered",
@@ -340,6 +343,58 @@ class TaskCardApplication:
             request = _request(payload, required={"limit"})
             limit = _integer(request["limit"], minimum=1, maximum=1_000)
             return _schedule_document(self.cards.schedule(limit=limit))
+        if operation == "resolve":
+            request = _request(
+                payload, required={"card_id", "card_version", "action"}
+            )
+            try:
+                identity = self.resolve_consumer(authorization)
+            except TaskCardConsumerIdentityError as exc:
+                raise TaskCardServerRequestError(
+                    "consumer_unresolved",
+                    "task card consumer role is unresolved",
+                    HTTPStatus.FORBIDDEN,
+                ) from exc
+            if identity is None or identity.role != QUEUE_VIEW_ROLE:
+                raise TaskCardServerRequestError(
+                    "role_forbidden",
+                    "task card resolve requires the queue_view role",
+                    HTTPStatus.FORBIDDEN,
+                )
+            action = request["action"]
+            if not isinstance(action, str) or action not in {
+                "done", "keep_open", "drop", "snooze"
+            }:
+                raise TaskCardServerRequestError(
+                    "invalid_request", "task card action is invalid"
+                )
+            result = self.cards.resolve(
+                _integer(request["card_id"], minimum=1),
+                expected_version=_integer(request["card_version"], minimum=1),
+                action=action, consumer_digest=identity.digest,
+                consumer_role=identity.role,
+            )
+            if isinstance(result, ClaimAtCeiling):
+                return {
+                    "schema": RESOLVE_SCHEMA,
+                    "schema_version": RESOLVE_SCHEMA_VERSION,
+                    "ok": True, "status": "at_ceiling",
+                    "held_count": result.held_count, "ceiling": result.ceiling,
+                    "resolution": None,
+                }
+            if result is None:
+                return {
+                    "schema": RESOLVE_SCHEMA,
+                    "schema_version": RESOLVE_SCHEMA_VERSION,
+                    "ok": True, "status": "empty", "resolution": None,
+                }
+            return {
+                "schema": RESOLVE_SCHEMA,
+                "schema_version": RESOLVE_SCHEMA_VERSION,
+                "ok": result.accepted,
+                "status": "resolved" if result.accepted else "refused",
+                "resolution": _operation_document(result),
+            }
         if operation == "claim":
             request = _request(payload, required={"lease_seconds"})
             lease = _integer(request["lease_seconds"], minimum=5, maximum=300)

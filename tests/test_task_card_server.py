@@ -1270,6 +1270,62 @@ class TaskCardQueueProjectionTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertNotIn(held_id, {card["id"] for card in body["cards"]})
 
+    def _resolve_request(self, card, action="done"):
+        return self.app.dispatch(
+            "resolve",
+            {"schema": REQUEST_SCHEMA, "schema_version": 1,
+             "card_id": card.id, "card_version": card.version,
+             "action": action},
+            authorization=f"Bearer {QUEUE_VIEW_TOKEN}",
+        )
+
+    def test_resolve_claims_delivers_and_acts_in_one_operation(self):
+        card = self.cards.due(limit=1)[0]
+        result = self._resolve_request(card)
+        self.assertEqual((result["status"], result["ok"]), ("resolved", True))
+        self.assertNotIn("claim_token", result)
+        self.assertNotIn("transport", result)
+        self.assertEqual(result["resolution"]["card_status"], "resolved")
+
+    def test_resolve_stale_version_does_not_act(self):
+        card = self.cards.due(limit=1)[0]
+        self.assertEqual(self._resolve_request(card, "snooze")["status"], "resolved")
+        stale = self._resolve_request(card, "done")
+        self.assertEqual(stale["status"], "refused")
+        self.assertEqual(stale["resolution"]["refusal"], "stale_version")
+
+    def test_resolve_at_ceiling_is_distinct(self):
+        cards = self.cards.due(limit=3)
+        for card in cards[:2]:
+            claim = self.cards.claim_next(
+                consumer_digest=hashlib.sha256(QUEUE_VIEW_TOKEN.encode()).hexdigest(),
+                consumer_role=QUEUE_VIEW_ROLE,
+            )
+            self.assertIsNotNone(claim)
+        result = self._resolve_request(cards[2])
+        self.assertEqual(result["status"], "at_ceiling")
+        self.assertEqual((result["held_count"], result["ceiling"]), (2, 2))
+
+    def test_resolve_failure_after_delivery_leaves_delivered_card(self):
+        card = self.cards.due(limit=1)[0]
+        original = self.cards.act
+        self.cards.act = lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("synthetic action failure")
+        )
+        try:
+            with self.assertRaises(RuntimeError):
+                self._resolve_request(card)
+        finally:
+            self.cards.act = original
+        with closing(sqlite3.connect(self.database)) as connection:
+            row = connection.execute(
+                "SELECT status,consumer_digest,transport FROM task_review_cards WHERE id=?",
+                (card.id,),
+            ).fetchone()
+        self.assertEqual(row[0], "delivered")
+        self.assertEqual(row[1], hashlib.sha256(QUEUE_VIEW_TOKEN.encode()).hexdigest())
+        self.assertEqual(row[2], "resolved")
+
 
 class TaskCardTokenRoleTests(unittest.TestCase):
     """ADR 0036 decision 1: token-to-role configuration and fail-closed

@@ -424,6 +424,94 @@ class TaskCardService:
                 connection.rollback()
                 raise
 
+    def resolve(
+        self, card_id: int, *, expected_version: int, action: str,
+        consumer_digest: str, consumer_role: str,
+    ) -> CardOperationResult | ClaimAtCeiling | None:
+        """Claim one exact card, record internal delivery, then apply action.
+
+        These are intentionally three committed operations, not one database
+        transaction. Delivery is committed before ``act`` is attempted, so a
+        failure after delivery can leave a delivered card for operator repair,
+        but can never apply an action without its delivery record.
+        """
+        if (not _valid_identity(card_id, expected_version)
+                or action not in {"done", "keep_open", "drop", "snooze"}
+                or not _valid_digest(consumer_digest)):
+            return _refused(card_id, CardRefusal.INVALID_ARGUMENT)
+        try:
+            ceiling = TASK_CARD_CLAIM_CEILINGS[consumer_role]
+        except (KeyError, TypeError) as exc:
+            raise TaskLedgerError("task card consumer role is invalid") from exc
+        now_dt = self._clock_value()
+        now = now_dt.isoformat(timespec="seconds")
+        token = self._token_factory()
+        if not _valid_secret(token):
+            raise TaskLedgerError("task card token factory returned invalid state")
+        token_digest = _token_digest(token)
+        with closing(self._connect()) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                held = connection.execute(
+                    "SELECT count(*) FROM task_review_cards WHERE "
+                    "status IN ('delivering','delivered') AND consumer_digest=?",
+                    (consumer_digest,),
+                ).fetchone()[0]
+                if held >= ceiling:
+                    connection.commit()
+                    return ClaimAtCeiling(int(held), ceiling)
+                row = connection.execute(
+                    self._card_select() + " WHERE c.id=?", (card_id,)
+                ).fetchone()
+                if row is None:
+                    connection.rollback()
+                    return None
+                if int(row["version"]) != expected_version:
+                    connection.rollback()
+                    return _refused_row(card_id, row, CardRefusal.STALE_VERSION)
+                if row["status"] not in (CardStatus.PENDING, CardStatus.SNOOZED):
+                    connection.rollback()
+                    return _refused_row(card_id, row, CardRefusal.STALE_VERSION)
+                if (row["task_status_current"] != TaskStatus.OPEN
+                        or int(row["task_version_current"])
+                        != int(row["task_version"])
+                        or (row["source_revision"] or None)
+                        != (row["source_revision_current"] or None)):
+                    connection.rollback()
+                    return _refused_row(card_id, row, CardRefusal.STALE_VERSION)
+                next_version = expected_version + 1
+                expires = (now_dt + timedelta(seconds=60)).isoformat(
+                    timespec="seconds"
+                )
+                updated = connection.execute(
+                    "UPDATE task_review_cards SET status='delivering',"
+                    "version=?,claim_token_digest=?,claim_expires_at=?,"
+                    "consumer_digest=?,transport=NULL,delivery_ref=NULL,"
+                    "delivered_at=NULL,updated_at=? WHERE id=? AND version=? "
+                    "AND status IN ('pending','snoozed')",
+                    (next_version, token_digest, expires, consumer_digest,
+                     now, card_id, expected_version),
+                )
+                if updated.rowcount != 1:
+                    connection.rollback()
+                    return _refused_row(card_id, row, CardRefusal.STALE_VERSION)
+                self._event(connection, card_id=card_id,
+                            task_id=int(row["task_id"]),
+                            kind="delivery_claimed", card_version=next_version,
+                            task_version=int(row["task_version"]), now=now)
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        delivered = self.complete_delivery(
+            card_id, expected_version=next_version, claim_token=token,
+            transport="resolved", delivery_ref=f"resolve-{card_id}-v{next_version}",
+        )
+        if not delivered.accepted:
+            return delivered
+        return self.act(card_id, expected_version=next_version, action=action)
+
     def complete_delivery(
         self,
         card_id: int,
@@ -943,7 +1031,9 @@ class TaskCardService:
             "e.observed_at AS completion_observed,"
             "e.quotation AS completion_quotation,"
             "e.reason AS completion_reason,"
-            "e.confidence AS completion_confidence "
+            "e.confidence AS completion_confidence,"
+            "t.status AS task_status_current,t.version AS task_version_current,"
+            + _bound_source_revision("t.id") + " AS source_revision_current "
             "FROM task_review_cards AS c "
             "JOIN tasks AS t ON t.id=c.task_id "
             "LEFT JOIN task_completion_evidence AS e "
