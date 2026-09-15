@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import hmac
 import ipaddress
 import json
@@ -16,7 +17,7 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from .agent_profiles import AgentProfileError, load_registry
 from .execution_cards import (
@@ -64,6 +65,17 @@ EXECUTION_AGENT_SELECTION_SCHEMA = (
     "foxhound.execution-card-service.agent-selection"
 )
 
+# ADR 0036 decision 1: every accepted bearer token is configured with
+# exactly one role from this closed set. A single legacy token with no
+# explicit role is `DRIP_ROLE`, reproducing today's behavior -- the existing
+# chat gateway's drip delivery -- with no configuration change (invariant 3).
+# `QUEUE_VIEW_ROLE` is the console's read/resolve pattern; no route uses it
+# yet (that is issues #195/#197), but the role itself must exist now so a
+# token's role can be resolved, or refused, before any such route lands.
+DRIP_ROLE = "drip"
+QUEUE_VIEW_ROLE = "queue_view"
+TASK_CARD_CONSUMER_ROLES = frozenset({DRIP_ROLE, QUEUE_VIEW_ROLE})
+
 ROUTES = {
     "/v1/task-cards/stats": "stats",
     "/v1/task-cards/schedule": "schedule",
@@ -105,6 +117,23 @@ class TaskCardServerResponseTooLarge(RuntimeError):
     pass
 
 
+class TaskCardConsumerIdentityError(RuntimeError):
+    """Fail-closed: an authenticated token's role could not be resolved.
+
+    ADR 0036 decision 1, invariant 2 requires that a token accepted by
+    ``authorized()`` whose role cannot be resolved never default to any
+    role. This service's chosen fail-closed behavior (documented on issue
+    #192) is that construction already refuses to build an application with
+    any token configured outside the closed role set -- see
+    ``_normalize_role_tokens`` -- so this state cannot arise through normal
+    configuration and the server never starts with it. This exception is
+    the runtime backstop for that same guarantee: if a token's resolved
+    role is ever found outside ``TASK_CARD_CONSUMER_ROLES`` regardless,
+    identity resolution refuses with this fixed error rather than guessing
+    a role or resolving no identity at all.
+    """
+
+
 @dataclass(frozen=True)
 class TaskCardServerLimits:
     max_body_bytes: int = 16 * 1024
@@ -129,21 +158,32 @@ class TaskCardServerLimits:
             )
 
 
+@dataclass(frozen=True)
+class ConsumerIdentity:
+    """A request's consumer identity, resolved only from the token that
+    authenticated it (ADR 0036 decision 1, invariant 1). ``digest`` reuses
+    the same digest approach as ``claim_token_digest`` -- a hex SHA-256 of
+    the credential -- so a consumer identity never carries the token
+    itself, only a stable, non-reversible reference to it.
+    """
+
+    role: str
+    digest: str
+
+
 class TaskCardApplication:
     """Strict request validation around one task-card aggregate."""
 
     def __init__(
         self,
         cards: TaskCardService,
-        token: str,
+        token: str | Mapping[str, str],
         *,
         execution_cards: ExecutionCardService | None = None,
         limits: TaskCardServerLimits | None = None,
     ) -> None:
         if not isinstance(cards, TaskCardService):
             raise TaskCardServerConfigError("task card service is invalid")
-        if not _valid_secret(token):
-            raise TaskCardServerConfigError("task card bearer token is invalid")
         if execution_cards is not None and not isinstance(
             execution_cards, ExecutionCardService
         ):
@@ -152,17 +192,58 @@ class TaskCardApplication:
             )
         self.cards = cards
         self.execution_cards = execution_cards
-        self.token = token
+        # `tokens` maps role -> bearer token. A bare string is today's
+        # single shared token, normalized to role `drip` -- this is what
+        # keeps an existing single-token deployment behaving exactly as it
+        # does today with no configuration change (ADR 0036, invariant 3).
+        self.tokens = _normalize_role_tokens(token)
         self.limits = limits or TaskCardServerLimits()
         self.limits.validate()
 
     def authorized(self, header: str | None) -> bool:
+        return self._match_role(header) is not None
+
+    def resolve_consumer(self, header: str | None) -> ConsumerIdentity | None:
+        """Return the consumer identity of whichever configured token
+        authenticated ``header``, or ``None`` if none did.
+
+        Raises ``TaskCardConsumerIdentityError`` if the accepting token's
+        role cannot be resolved to a member of ``TASK_CARD_CONSUMER_ROLES``
+        -- a fail-closed condition that never defaults to any role (ADR
+        0036 decision 1, invariant 2). Construction already refuses to
+        build an application with a token configured outside that closed
+        set (see ``_normalize_role_tokens``), so this branch is a runtime
+        backstop rather than a state reachable through ordinary
+        configuration.
+        """
+        role = self._match_role(header)
+        if role is None:
+            return None
+        if role not in TASK_CARD_CONSUMER_ROLES:
+            raise TaskCardConsumerIdentityError(
+                "task card consumer role is unresolved"
+            )
         prefix = "Bearer "
-        return bool(
-            header
-            and header.startswith(prefix)
-            and hmac.compare_digest(header[len(prefix):], self.token)
-        )
+        token = header[len(prefix):]  # type: ignore[index]
+        return ConsumerIdentity(role=role, digest=_consumer_digest(token))
+
+    def _match_role(self, header: str | None) -> str | None:
+        """Return the role of whichever configured token matches
+        ``header``, or ``None`` if it matches none of them.
+
+        Every configured token is compared -- the loop never returns
+        early -- so which one matched (if any) cannot be inferred from
+        comparison timing.
+        """
+        prefix = "Bearer "
+        if not header or not header.startswith(prefix):
+            return None
+        candidate = header[len(prefix):]
+        matched: str | None = None
+        for role, value in self.tokens.items():
+            if hmac.compare_digest(candidate, value):
+                matched = role
+        return matched
 
     def dispatch(self, operation: str, payload: object) -> dict[str, Any]:
         if operation == "stats":
@@ -727,6 +808,58 @@ def _valid_secret(value: object) -> bool:
     )
 
 
+def _normalize_role_tokens(token: str | Mapping[str, str]) -> dict[str, str]:
+    """Validate and normalize the ``token`` constructor argument.
+
+    Accepts either today's single bearer-token string (normalized to role
+    ``drip``) or a role-to-token mapping over the closed
+    ``TASK_CARD_CONSUMER_ROLES`` set. Every token is checked with the same
+    length/whitespace discipline ``load_token`` already applies, and no two
+    roles may share the same token -- an ambiguous token would make role
+    resolution meaningless.
+
+    A role outside the closed set is rejected here, at construction: this
+    is this service's chosen fail-closed behavior for ADR 0036 decision 1,
+    invariant 2 (the server refuses to start rather than run with an
+    unresolvable role -- see ``TaskCardConsumerIdentityError`` for the
+    accompanying runtime backstop).
+    """
+    if isinstance(token, str):
+        candidate: dict[str, str] = {DRIP_ROLE: token}
+    elif isinstance(token, Mapping):
+        candidate = dict(token)
+    else:
+        raise TaskCardServerConfigError(
+            "task card token must be a bearer token string or a "
+            "role-to-token mapping"
+        )
+    if not candidate:
+        raise TaskCardServerConfigError("at least one bearer token is required")
+    seen: set[str] = set()
+    for role, value in candidate.items():
+        if role not in TASK_CARD_CONSUMER_ROLES:
+            raise TaskCardServerConfigError(
+                "token role must be one of "
+                + ", ".join(sorted(TASK_CARD_CONSUMER_ROLES))
+            )
+        if not _valid_secret(value):
+            raise TaskCardServerConfigError("task card bearer token is invalid")
+        if value in seen:
+            raise TaskCardServerConfigError(
+                "bearer token is configured for more than one role"
+            )
+        seen.add(value)
+    return candidate
+
+
+def _consumer_digest(token: str) -> str:
+    """The same digest approach already used for ``claim_token_digest`` in
+    ``task_cards.py``: a hex SHA-256 of the credential, never the
+    credential itself.
+    """
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
 def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -890,6 +1023,49 @@ def load_token(path: str | os.PathLike[str]) -> str:
     return token
 
 
+def load_role_tokens(specs: list[str]) -> dict[str, str]:
+    """Load one or more ``--token-file`` specs into a role-to-token map.
+
+    A single spec with no ``=`` is today's invocation shape: the file it
+    names is loaded exactly as ``load_token`` always has, with no role
+    written anywhere, and normalized to role ``drip`` by
+    ``TaskCardApplication`` itself. This is what keeps an existing
+    single-token deployment working unchanged with no configuration edit
+    (ADR 0036, invariant 3).
+
+    Once more than one ``--token-file`` is configured, each one must name
+    its role explicitly as ``ROLE=PATH``, because there is no longer a
+    single implicit default to fall back on.
+    """
+    if not specs:
+        raise TaskCardServerConfigError("at least one --token-file is required")
+    if len(specs) == 1 and "=" not in specs[0]:
+        return {DRIP_ROLE: load_token(specs[0])}
+    tokens: dict[str, str] = {}
+    for spec in specs:
+        if "=" not in spec:
+            raise TaskCardServerConfigError(
+                "--token-file must have the form ROLE=PATH once more than "
+                "one is configured"
+            )
+        role, path = spec.split("=", 1)
+        if role not in TASK_CARD_CONSUMER_ROLES:
+            raise TaskCardServerConfigError(
+                "token role must be one of "
+                + ", ".join(sorted(TASK_CARD_CONSUMER_ROLES))
+            )
+        if role in tokens:
+            raise TaskCardServerConfigError("token role is duplicated")
+        if not path:
+            raise TaskCardServerConfigError("token file path must not be empty")
+        tokens[role] = load_token(path)
+    if len(set(tokens.values())) != len(tokens):
+        raise TaskCardServerConfigError(
+            "bearer token is configured for more than one role"
+        )
+    return tokens
+
+
 def is_canonical_loopback(host: object) -> bool:
     if not isinstance(host, str):
         return False
@@ -932,7 +1108,18 @@ def main(argv: list[str] | None = None) -> int:
         description="Serve Foxhound review cards on an authenticated loopback API"
     )
     parser.add_argument("--database", required=True)
-    parser.add_argument("--token-file", required=True)
+    parser.add_argument(
+        "--token-file",
+        action="append",
+        required=True,
+        metavar="PATH|ROLE=PATH",
+        help=(
+            "bearer token file (repeatable); a single bare PATH defaults to "
+            "role 'drip' with no other change, matching today's behavior; "
+            "once more than one is given, each must name its role "
+            "explicitly as ROLE=PATH with ROLE in {drip, queue_view}"
+        ),
+    )
     parser.add_argument("--bind", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8790)
     parser.add_argument("--request-timeout", type=float, default=5.0)
@@ -970,7 +1157,7 @@ def main(argv: list[str] | None = None) -> int:
         execution_cards.count()
         app = TaskCardApplication(
             cards,
-            load_token(arguments.token_file),
+            load_role_tokens(arguments.token_file),
             execution_cards=execution_cards,
             limits=TaskCardServerLimits(
                 request_timeout_seconds=arguments.request_timeout

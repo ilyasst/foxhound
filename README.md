@@ -187,6 +187,34 @@ no cards. Its aggregate stats route lets a gateway cap on-screen delivery
 without listing private tasks or cards. See
 [ADR 0011](docs/architecture/0011-local-task-card-service.md).
 
+Every configured bearer token is paired with exactly one role from a closed
+set: `drip` (the existing chat gateway's pattern) or `queue_view` (reserved
+for a future console; no route uses it yet). A request's role is always the
+role of whichever configured token authenticated it — no route reads or
+trusts a role, scope, or consumer field from the request itself. A single
+`--token-file PATH` needs no change and no new configuration: with exactly
+one token configured, it is the `drip` role, exactly reproducing today's
+behavior. Configuring more than one token requires naming each one's role
+explicitly, `ROLE=PATH`:
+
+```sh
+foxhound-task-cards \
+  --database /srv/example/private-foxhound-state/foxhound.sqlite3 \
+  --token-file drip=/srv/example/private-foxhound-state/card-gateway.token \
+  --token-file queue_view=/srv/example/private-foxhound-state/console.token \
+  --bind 127.0.0.1 \
+  --port 8790
+```
+
+A configured token whose role cannot be resolved to `drip` or `queue_view`
+never lets the server start — construction validates every configured
+role against the closed set up front, so this can only arise from a
+configuration defect, and the service refuses to guess through it rather
+than starting in a state it cannot resolve. Configuration maps each role
+to exactly one token, so two tokens cannot share a role; two callers of
+the same role share that one token file. See
+[ADR 0036](docs/architecture/0036-consumer-scoped-card-claims.md) decision 1.
+
 Foxhound now also owns a transport-neutral execution workflow ledger. An
 explicitly scheduled open task stops at a reader start gate, then advances
 through separately approved plan, execution, and external-action phases under
