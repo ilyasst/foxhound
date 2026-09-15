@@ -167,6 +167,9 @@ class ExecutionRunResult:
     exit_code: int
     task_id: int | None = field(default=None, repr=False)
     forced_kill: bool = False
+    #: Workflows this pass could not run and deferred, by task ID. Reported
+    #: so a queue that is shedding work does not read as an empty one.
+    deferred: tuple[int, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -293,8 +296,9 @@ def run_once(
         claim = service.claim_next(
             allowed_phases=config.allowed_phases,
         )
+        deferred = service.last_claim_deferred
         if claim is None:
-            return ExecutionRunResult("idle", 0)
+            return ExecutionRunResult("idle", 0, deferred=deferred)
         service.schedule_new()
         try:
             profile = config.profile_registry.resolve(
@@ -919,6 +923,31 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _diagnosis(exc: BaseException) -> str:
+    """Name what failed by exception TYPE, following the cause chain.
+
+    The runner used to print one fixed sentence for every unhandled failure.
+    That sentence was true and useless: recovering why a real outage had
+    stopped every task meant rebuilding the config by hand and calling
+    `run_once` directly, because nothing about the cause reached the journal.
+
+    Only class names are printed. A message is not safe to log here -- an
+    `OSError` carries the path it failed on, and a dependency's message can
+    carry an argument -- and the journal is not a private surface. The chain
+    is what actually identifies the fault: `TaskLedgerError <- ` \
+    `AgentProfileError` says which of the two it was, which is the whole
+    question, and it says it without quoting anything.
+    """
+    names: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen and len(names) < 5:
+        seen.add(id(current))
+        names.append(type(current).__name__)
+        current = current.__cause__ or current.__context__
+    return " <- ".join(names)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -950,13 +979,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         ExecutionRunnerError,
         ExecutionWorkerConfigError,
         TaskArchiveError,
-    ):
-        print("foxhound execution runner: configuration unavailable", file=sys.stderr)
+    ) as exc:
+        print(
+            "foxhound execution runner: configuration unavailable: "
+            + _diagnosis(exc),
+            file=sys.stderr,
+        )
         return 78
-    except Exception:
-        print("foxhound execution runner: execution failed", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001
+        print(
+            "foxhound execution runner: execution failed: " + _diagnosis(exc),
+            file=sys.stderr,
+        )
         return 70
-    print(json.dumps({"ok": result.ok, "outcome": result.outcome}))
+    report = {"ok": result.ok, "outcome": result.outcome}
+    if result.deferred:
+        report["deferred"] = list(result.deferred)
+    print(json.dumps(report))
     return result.exit_code
 
 

@@ -504,7 +504,14 @@ class ExecutionRunnerTests(unittest.TestCase):
             historical.revision,
         )
 
-    def test_runner_refuses_a_selected_revision_missing_from_its_registry(self):
+    def test_runner_defers_a_selected_revision_missing_from_its_registry(self):
+        """The run survives a pin this machine cannot resolve.
+
+        Raising here stopped the runner itself, so one workflow pinned to a
+        revision the catalog no longer carried also stopped every healthy
+        workflow behind it. The pin is a property of that workflow: it is
+        deferred, reported, and the run ends cleanly idle.
+        """
         specialist = parse_profile({
             **general_profile().document(),
             "profile_id": "specialist",
@@ -522,12 +529,15 @@ class ExecutionRunnerTests(unittest.TestCase):
             profile_revision=specialist.revision,
         )
         service.start_action(1, expected_version=selected.version, action="start")
-        before = service.get(1)
 
-        with self.assertRaises(TaskLedgerError):
-            run_once(self._config())
+        result = run_once(self._config())
 
-        self.assertEqual(service.get(1), before)
+        self.assertEqual(result.outcome, "idle")
+        self.assertTrue(result.ok)
+        self.assertEqual(result.deferred, (1,))
+        deferred = service.get(1)
+        self.assertEqual(deferred.last_failure_reason, "startup_failed")
+        self.assertIsNotNone(deferred.next_attempt_at)
 
     def test_plan_only_runner_does_not_claim_execute_work(self):
         self._ready()

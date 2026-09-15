@@ -152,6 +152,33 @@ class TaskExecutionTests(unittest.TestCase):
     def _now(self) -> str:
         return self.clock().isoformat(timespec="seconds")
 
+    def _add_task(self, task_id: int, text: str) -> None:
+        """Seed one more open task so the ready queue has depth."""
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "INSERT INTO tasks(id,status,text,owner,due,version,"
+                "created_at,updated_at,closed_at) "
+                "VALUES(?,'open',?,'Person A',NULL,1,?,?,NULL)",
+                (task_id, text, self._now(), self._now()),
+            )
+            connection.execute(
+                "INSERT INTO task_events(task_id,kind,task_version,"
+                "candidate_id,source_revision,from_status,to_status,"
+                "occurred_at) VALUES(?,'created',1,NULL,NULL,NULL,'open',?)",
+                (task_id, self._now()),
+            )
+            connection.commit()
+
+    def _clear_retry_backoff(self, task_id: int) -> None:
+        """Make a deferred workflow ready again without moving the clock."""
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "UPDATE task_execution_workflows SET next_attempt_at=NULL "
+                "WHERE task_id=?",
+                (task_id,),
+            )
+            connection.commit()
+
     def _bind_origin(self, task_id: int, kind: str) -> None:
         """Attach one synthetic accepted origin to an existing task."""
         with closing(sqlite3.connect(self.database)) as connection:
@@ -501,23 +528,73 @@ class TaskExecutionTests(unittest.TestCase):
         )
         service.start_action(1, expected_version=selected.version, action="start")
 
+        # A pin this machine cannot resolve defers THAT workflow instead of
+        # raising out of the claim: the runner keeps working, and the row
+        # carries the same failure reason the post-claim path records.
         without_profile = TaskExecutionService(
             self.database, clock=self.clock, token_factory=lambda: TOKEN
         )
-        with self.assertRaises(TaskLedgerError):
-            without_profile.claim_next()
-        queued = service.get(1)
-        self.assertEqual(queued.status, WorkflowStatus.QUEUED)
+        self.assertIsNone(without_profile.claim_next())
+        self.assertEqual(without_profile.last_claim_deferred, (1,))
+        deferred = without_profile.get(1)
+        self.assertEqual(deferred.status, WorkflowStatus.QUEUED)
+        self.assertEqual(deferred.last_failure_reason, "startup_failed")
+        self.assertIsNotNone(deferred.next_attempt_at)
 
+        self._clear_retry_backoff(1)
         claim = service.claim_next()
         recorded = service.record_result(self._result(claim))
         approved = service.review_action(
             1, expected_version=recorded.version, action="approve"
         )
         self.assertEqual(approved.phase, WorkflowPhase.EXECUTE)
-        with self.assertRaises(TaskLedgerError):
-            service.claim_next()
+        # The specialist allows `plan` only, so `execute` is ineligible. That
+        # is a property of this workflow too, not of the runner.
+        self.assertIsNone(service.claim_next())
+        self.assertEqual(service.last_claim_deferred, (1,))
         self.assertEqual(service.get(1).status, WorkflowStatus.QUEUED)
+
+    def test_an_unresolvable_pin_does_not_block_the_queue_behind_it(self):
+        """One poisoned row must not stop every other ready workflow.
+
+        This is the outage this scan exists to prevent: resolving the head of
+        the queue raised, so a single workflow pinned to a revision the
+        catalog had dropped stopped every healthy workflow behind it for as
+        long as it stayed at the head.
+        """
+        specialist = _profile(phases=("plan", "execute"))
+        registry = AgentProfileRegistry((general_profile(), specialist))
+        self._add_task(2, "Second synthetic task")
+
+        pinning = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: TOKEN,
+            profile_registry=registry,
+        )
+        scheduled = pinning.schedule(1, expected_task_version=1)
+        selected = pinning.select_agent(
+            1,
+            expected_version=scheduled.version,
+            profile_id=specialist.profile_id,
+            profile_revision=specialist.revision,
+        )
+        pinning.start_action(
+            1, expected_version=selected.version, action="start"
+        )
+        second = pinning.schedule(2, expected_task_version=1)
+        pinning.start_action(
+            2, expected_version=second.version, action="start"
+        )
+
+        # Task 1 is at the head and its pin is gone from this registry.
+        without_profile = TaskExecutionService(
+            self.database, clock=self.clock, token_factory=lambda: TOKEN
+        )
+        claim = without_profile.claim_next()
+        self.assertIsNotNone(claim)
+        self.assertEqual(claim.task_id, 2)
+        self.assertEqual(without_profile.last_claim_deferred, (1,))
 
     def test_schedule_is_explicit_idempotent_and_task_version_fenced(self):
         scheduled = self.service.schedule(1, expected_task_version=1)
