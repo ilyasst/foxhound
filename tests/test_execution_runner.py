@@ -237,8 +237,14 @@ class ExecutionRunnerTests(unittest.TestCase):
         self.assertIs(launched["kwargs"]["stderr"], subprocess.STDOUT)
         self.assertIs(launched["kwargs"]["stdin"], subprocess.DEVNULL)
         turn_index = launched["argv"].index("--max-turns")
-        self.assertEqual(launched["argv"][turn_index + 1], "50")
-        self.assertEqual(launched["state"].lease_seconds, 2_700)
+        self.assertEqual(
+            launched["argv"][turn_index + 1],
+            str(general_profile().max_turns),
+        )
+        self.assertEqual(
+            launched["state"].lease_seconds,
+            general_profile().claim_lease_seconds,
+        )
         self.assertEqual(
             launched["state"].agent_profile_revision,
             general_profile().revision,
@@ -588,7 +594,7 @@ class ExecutionRunnerTests(unittest.TestCase):
             terminate=self._terminator,
         )
         self.assertEqual((result.outcome, result.exit_code), ("timeout", 124))
-        self.assertEqual(monotonic.value, 1_800)
+        self.assertEqual(monotonic.value, general_profile().timeout_seconds)
         self.assertTrue(process.terminated)
         self.assertEqual(self.service.get(1).last_failure_reason, "timeout")
 
