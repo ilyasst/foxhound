@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import http.client
 import io
 import json
@@ -15,6 +16,7 @@ import urllib.request
 from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 from foxhound import CandidateInbox
 from foxhound.agent_profiles import (
@@ -30,6 +32,7 @@ from foxhound.execution_cards import (
 from foxhound.knowledge_client import OwnerUpcomingMeeting
 from foxhound.task_card_server import (
     CLAIM_SCHEMA,
+    DRIP_ROLE,
     ERROR_SCHEMA,
     EXECUTION_AGENT_OPTIONS_SCHEMA,
     EXECUTION_AGENT_SELECTION_SCHEMA,
@@ -40,14 +43,19 @@ from foxhound.task_card_server import (
     EXECUTION_STATS_SCHEMA,
     HEALTH_SCHEMA,
     OPERATION_SCHEMA,
+    QUEUE_VIEW_ROLE,
     REQUEST_SCHEMA,
     SCHEDULE_SCHEMA,
     STATS_SCHEMA,
+    TASK_CARD_CONSUMER_ROLES,
+    ConsumerIdentity,
     TaskCardApplication,
+    TaskCardConsumerIdentityError,
     TaskCardServerConfigError,
     TaskCardServerLimits,
     TaskCardServerRequestError,
     is_canonical_loopback,
+    load_role_tokens,
     load_token,
     make_server,
 )
@@ -989,6 +997,276 @@ class TaskCardServerTests(unittest.TestCase):
             for thread in threads:
                 thread.join(timeout=2)
         self.assertEqual(maximum, 1)
+
+
+QUEUE_VIEW_TOKEN = "q" * 43
+
+
+class TaskCardTokenRoleTests(unittest.TestCase):
+    """ADR 0036 decision 1: token-to-role configuration and fail-closed
+    consumer identity resolution (issue #192)."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.database = Path(self.temporary.name) / "foxhound.sqlite3"
+        self.cards = TaskCardService(self.database)
+        self.cards.initialize()
+
+    def test_single_configured_token_defaults_to_drip_role_unchanged(self):
+        """ADR 0036, invariant 3: a lone configured token with no explicit
+        role reproduces today's behavior exactly -- no configuration
+        change, and the deployed chat gateway must not be able to tell
+        this landed."""
+        app = TaskCardApplication(self.cards, TOKEN)
+        self.assertEqual(app.tokens, {DRIP_ROLE: TOKEN})
+        self.assertTrue(app.authorized(f"Bearer {TOKEN}"))
+        identity = app.resolve_consumer(f"Bearer {TOKEN}")
+        self.assertIsInstance(identity, ConsumerIdentity)
+        self.assertIn(identity.role, TASK_CARD_CONSUMER_ROLES)
+        self.assertEqual(identity.role, DRIP_ROLE)
+
+        with running_server(app) as endpoint:
+            # The exact response bytes for /healthz and stats are the same
+            # shape ADR 0011 already documents: no route gains a role or
+            # consumer field, and no new top-level key appears.
+            status, _, body = request(
+                endpoint, "/healthz", None, token=None, method="GET", raw=b""
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                set(body), {"schema", "schema_version", "ok"}
+            )
+
+            status, _, body = request(
+                endpoint, "/v1/task-cards/stats", request_document()
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                set(body),
+                {
+                    "schema", "schema_version", "ok", "pending",
+                    "delivering", "delivered", "snoozed", "active",
+                },
+            )
+            self.assertEqual(body["schema"], STATS_SCHEMA)
+
+    def test_second_token_configured_as_queue_view(self):
+        app = TaskCardApplication(
+            self.cards, {DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: QUEUE_VIEW_TOKEN}
+        )
+        self.assertTrue(app.authorized(f"Bearer {TOKEN}"))
+        self.assertTrue(app.authorized(f"Bearer {QUEUE_VIEW_TOKEN}"))
+
+        drip_identity = app.resolve_consumer(f"Bearer {TOKEN}")
+        queue_identity = app.resolve_consumer(f"Bearer {QUEUE_VIEW_TOKEN}")
+        self.assertEqual(drip_identity.role, DRIP_ROLE)
+        self.assertEqual(queue_identity.role, QUEUE_VIEW_ROLE)
+        # Consumer identity is the digest of the accepting token, never the
+        # token itself, and the two tokens resolve to different digests.
+        self.assertNotEqual(drip_identity.digest, queue_identity.digest)
+        self.assertNotIn(TOKEN, drip_identity.digest)
+        self.assertNotIn(QUEUE_VIEW_TOKEN, queue_identity.digest)
+
+        # No route gains role-scoped behavior in this issue: both tokens
+        # can still call the existing routes exactly as one shared token
+        # could before.
+        with running_server(app) as endpoint:
+            for token in (TOKEN, QUEUE_VIEW_TOKEN):
+                status, _, body = request(
+                    endpoint,
+                    "/v1/task-cards/stats",
+                    request_document(),
+                    token=token,
+                )
+                self.assertEqual(status, 200)
+                self.assertTrue(body["ok"])
+
+    def test_consumer_identity_is_never_accepted_from_the_request(self):
+        """ADR 0036 invariant 1: no route reads or trusts a client-supplied
+        consumer field; identity comes only from the authenticating
+        token."""
+        app = TaskCardApplication(
+            self.cards, {DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: QUEUE_VIEW_TOKEN}
+        )
+        with running_server(app) as endpoint:
+            status, _, body = request(
+                endpoint,
+                "/v1/task-cards/stats",
+                {
+                    "schema": REQUEST_SCHEMA,
+                    "schema_version": 1,
+                    "consumer": QUEUE_VIEW_ROLE,
+                },
+                token=TOKEN,
+            )
+            # An unrecognized "consumer" field is rejected exactly like any
+            # other unexpected field -- no route defines a request
+            # parameter for it at all.
+            self.assertEqual(status, 400)
+            self.assertEqual(body["error"]["code"], "invalid_request")
+
+    def test_unresolvable_role_fails_closed_and_never_defaults(self):
+        """ADR 0036 decision 1, invariant 2: a token accepted as *some*
+        known bearer value but whose role cannot be resolved must refuse
+        with a fixed error, never default to either role. Construction
+        already refuses to build a service in this state (every configured
+        role is validated up front against the closed set); this test
+        breaks that invariant directly on the built object to prove the
+        runtime resolution path itself -- not just construction-time
+        validation -- fails closed rather than guessing."""
+        stray_token = "z" * 43
+        app = TaskCardApplication(self.cards, TOKEN)
+        app.tokens = {**app.tokens, "not_a_real_role": stray_token}
+
+        # The token still authenticates -- it matches a configured value --
+        # but its role cannot be resolved, so identity resolution must
+        # refuse rather than default it to `drip` or `queue_view`.
+        self.assertTrue(app.authorized(f"Bearer {stray_token}"))
+        with self.assertRaises(TaskCardConsumerIdentityError):
+            app.resolve_consumer(f"Bearer {stray_token}")
+
+        # The legitimate drip token is unaffected by the stray entry.
+        identity = app.resolve_consumer(f"Bearer {TOKEN}")
+        self.assertEqual(identity.role, DRIP_ROLE)
+
+    def test_construction_refuses_to_start_with_an_unresolvable_role(self):
+        """This service's chosen fail-closed behavior (documented on issue
+        #192): a configured token whose role is outside the closed set
+        never lets the server start at all, rather than starting and
+        refusing requests one at a time."""
+        with self.assertRaises(TaskCardServerConfigError):
+            TaskCardApplication(self.cards, {"not_a_role": TOKEN})
+
+    def test_service_config_rejects_ambiguous_or_unknown_roles(self):
+        with self.assertRaises(TaskCardServerConfigError):
+            TaskCardApplication(self.cards, {"not_a_role": TOKEN})
+        with self.assertRaises(TaskCardServerConfigError):
+            TaskCardApplication(
+                self.cards, {DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: TOKEN}
+            )
+        with self.assertRaises(TaskCardServerConfigError):
+            TaskCardApplication(self.cards, {})
+        with self.assertRaises(TaskCardServerConfigError):
+            TaskCardApplication(self.cards, "too-short")
+
+    def test_comparison_checks_every_token_without_early_return(self):
+        """A wrong-role or unmatched token must not be distinguishable by
+        timing from a matched one: every configured token is compared, in
+        both orders, regardless of where (or whether) a match occurs."""
+        app = TaskCardApplication(
+            self.cards, {DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: QUEUE_VIEW_TOKEN}
+        )
+        calls = []
+        real_compare = hmac.compare_digest
+
+        def counting_compare(a, b):
+            calls.append((a, b))
+            return real_compare(a, b)
+
+        with mock.patch(
+            "foxhound.task_card_server.hmac.compare_digest",
+            side_effect=counting_compare,
+        ):
+            calls.clear()
+            app.authorized(f"Bearer {TOKEN}")
+            self.assertEqual(len(calls), len(app.tokens))
+
+            calls.clear()
+            app.authorized(f"Bearer {QUEUE_VIEW_TOKEN}")
+            self.assertEqual(len(calls), len(app.tokens))
+
+            calls.clear()
+            app.authorized("Bearer " + "n" * 43)
+            self.assertEqual(len(calls), len(app.tokens))
+
+    def test_access_log_stays_content_free_with_multiple_tokens(self):
+        app = TaskCardApplication(
+            self.cards, {DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: QUEUE_VIEW_TOKEN}
+        )
+        with running_server(app) as endpoint:
+            with self.assertLogs(
+                "foxhound.task_card_server", level="INFO"
+            ) as captured:
+                request(
+                    endpoint,
+                    "/v1/task-cards/stats",
+                    request_document(),
+                    token=QUEUE_VIEW_TOKEN,
+                )
+        [line] = captured.output
+        self.assertIn("method=POST", line)
+        self.assertIn("route=/v1/task-cards/stats", line)
+        self.assertIn("status=200", line)
+        self.assertNotIn(QUEUE_VIEW_TOKEN, line)
+        self.assertNotIn(QUEUE_VIEW_ROLE, line)
+        self.assertNotIn("127.0.0.1", line)
+
+    def test_load_role_tokens_syntax_and_backward_compatibility(self):
+        root = Path(self.temporary.name)
+        drip_path = root / "drip.token"
+        drip_path.write_text(TOKEN + "\n", encoding="utf-8")
+        drip_path.chmod(0o600)
+        queue_path = root / "queue.token"
+        queue_path.write_text(QUEUE_VIEW_TOKEN + "\n", encoding="utf-8")
+        queue_path.chmod(0o600)
+
+        # A single bare path is the legacy, unchanged invocation shape.
+        self.assertEqual(
+            load_role_tokens([str(drip_path)]), {DRIP_ROLE: TOKEN}
+        )
+        # A single spec may still name its role explicitly.
+        self.assertEqual(
+            load_role_tokens([f"drip={drip_path}"]), {DRIP_ROLE: TOKEN}
+        )
+        # Two roles, mirroring the repeated ROLE=PATH syntax.
+        self.assertEqual(
+            load_role_tokens(
+                [f"drip={drip_path}", f"queue_view={queue_path}"]
+            ),
+            {DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: QUEUE_VIEW_TOKEN},
+        )
+
+        for bad_specs in (
+            [str(drip_path), str(queue_path)],  # ambiguous once plural
+            [f"unknown_role={drip_path}"],
+            [f"drip={drip_path}", f"drip={queue_path}"],
+            [f"drip={drip_path}", f"queue_view={drip_path}"],
+            [],
+        ):
+            with self.assertRaises(TaskCardServerConfigError):
+                load_role_tokens(bad_specs)
+
+    def test_every_configured_token_file_keeps_existing_discipline(self):
+        """Duplicate, malformed, symlinked, or wrong-permission token files
+        are rejected for every configured token, not just the first."""
+        root = Path(self.temporary.name)
+        drip_path = root / "drip.token"
+        drip_path.write_text(TOKEN + "\n", encoding="utf-8")
+        drip_path.chmod(0o600)
+
+        # A bad *second* file is still rejected even though the first one
+        # is perfectly valid.
+        wrong_mode_path = root / "queue-wrong-mode.token"
+        wrong_mode_path.write_text(QUEUE_VIEW_TOKEN + "\n", encoding="utf-8")
+        wrong_mode_path.chmod(0o644)
+        with self.assertRaisesRegex(TaskCardServerConfigError, "0600"):
+            load_role_tokens(
+                [f"drip={drip_path}", f"queue_view={wrong_mode_path}"]
+            )
+
+        symlinked_path = root / "queue-symlink.token"
+        symlinked_path.symlink_to(drip_path)
+        with self.assertRaisesRegex(TaskCardServerConfigError, "unavailable"):
+            load_role_tokens(
+                [f"drip={drip_path}", f"queue_view={symlinked_path}"]
+            )
+
+        missing_path = root / "queue-missing.token"
+        with self.assertRaisesRegex(TaskCardServerConfigError, "unavailable"):
+            load_role_tokens(
+                [f"drip={drip_path}", f"queue_view={missing_path}"]
+            )
 
 
 if __name__ == "__main__":
