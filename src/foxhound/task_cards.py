@@ -23,6 +23,8 @@ from .card_provenance import (
 )
 
 from . import task_completion as completion
+from . import task_duplicate_proposals as duplicates
+from . import task_relations
 from .candidate_inbox import CandidateInbox, InboxError, SCHEMA_VERSION
 from .task_ledger import (
     TaskLedgerError,
@@ -122,6 +124,21 @@ class CardCompletionQuestion:
 
 
 @dataclass(frozen=True)
+class CardDuplicateProposal:
+    """Private side-by-side task comparison carried by one review card."""
+
+    id: int
+    other_task_id: int
+    other_text: str = field(repr=False)
+    other_origin_kind: str = field(repr=False)
+    other_origin_record: str = field(repr=False)
+    other_origin_item: str = field(repr=False)
+    other_origin_sources: tuple[CardSourceEvidence, ...] = field(
+        default=(), repr=False
+    )
+
+
+@dataclass(frozen=True)
 class TaskReviewCard:
     """Private card projection; callers must not log or persist its content."""
 
@@ -148,6 +165,7 @@ class TaskReviewCard:
     completion: CardCompletionQuestion | None = field(
         default=None, repr=False
     )
+    duplicate: CardDuplicateProposal | None = field(default=None, repr=False)
     #: The source revision displayed by this card. It is the stale-action
     #: fence, not reader content.
     source_revision: str | None = field(default=None, repr=False)
@@ -227,6 +245,12 @@ class TaskCardService:
                     + _bound_source_revision("t.id") + " AS source_revision "
                     "FROM tasks AS t "
                     "WHERE t.status='open' "
+                    "AND NOT EXISTS(SELECT 1 FROM task_relations AS relation "
+                    " WHERE relation.subject_id=t.id AND relation.kind='duplicate_of' "
+                    " AND relation.withdrawn_at IS NULL) "
+                    "AND NOT EXISTS(SELECT 1 FROM task_duplicate_proposals AS proposal "
+                    " WHERE proposal.state='proposed' "
+                    " AND (proposal.left_task_id=t.id OR proposal.right_task_id=t.id)) "
                     "AND NOT EXISTS("
                     " SELECT 1 FROM task_candidate_bindings AS b JOIN "
                     " task_candidate_lifecycle AS l ON l.candidate_id=b.candidate_id "
@@ -277,7 +301,12 @@ class TaskCardService:
                 asked, raised = self._ask_completion_questions(
                     connection, now, limit=limit
                 )
+                duplicate_asked, duplicate_raised = self._ask_duplicate_proposals(
+                    connection, now, limit=limit
+                )
                 created += raised
+                created += duplicate_raised
+                asked += duplicate_asked
                 connection.commit()
                 return ScheduleResult(
                     CardDisposition.APPLIED
@@ -299,7 +328,10 @@ class TaskCardService:
             rows = connection.execute(
                 self._card_select()
                 + " WHERE c.status IN ('pending','snoozed') AND c.due_at<=? "
-                    "AND t.status='open' AND t.version=c.task_version "
+                "AND t.status='open' AND t.version=c.task_version "
+                "AND NOT EXISTS(SELECT 1 FROM task_relations AS relation "
+                " WHERE relation.subject_id=t.id AND relation.kind='duplicate_of' "
+                " AND relation.withdrawn_at IS NULL) "
                     "AND COALESCE(c.source_revision,'')=COALESCE("
                     + _bound_source_revision("t.id") + ",'') "
                 "ORDER BY c.due_at,c.id LIMIT ?",
@@ -374,6 +406,9 @@ class TaskCardService:
                     self._card_select()
                     + " WHERE c.status IN ('pending','snoozed') "
                     "AND c.due_at<=? AND t.status='open' "
+                    "AND NOT EXISTS(SELECT 1 FROM task_relations AS relation "
+                    " WHERE relation.subject_id=t.id AND relation.kind='duplicate_of' "
+                    " AND relation.withdrawn_at IS NULL) "
                     "AND t.version=c.task_version "
                     "AND COALESCE(c.source_revision,'')=COALESCE("
                     + _bound_source_revision("t.id") + ",'') "
@@ -639,7 +674,10 @@ class TaskCardService:
     ) -> CardOperationResult:
         if not _valid_identity(card_id, expected_version):
             return _refused(card_id, CardRefusal.INVALID_ARGUMENT)
-        if action not in {"done", "keep_open", "drop", "snooze"}:
+        if action not in {
+            "done", "keep_open", "drop", "snooze",
+            "duplicate_confirm", "duplicate_reject",
+        }:
             return _refused(card_id, CardRefusal.INVALID_ACTION)
         now_dt = self._clock_value()
         now = now_dt.isoformat(timespec="seconds")
@@ -669,6 +707,16 @@ class TaskCardService:
                         != (row["source_revision_current"] or None)):
                     connection.rollback()
                     return _refused_row(card_id, row, CardRefusal.STALE_VERSION)
+
+                if action in {"duplicate_confirm", "duplicate_reject"}:
+                    result = self._act_duplicate(
+                        connection, row=row, action=action, now=now
+                    )
+                    if result is None:
+                        connection.rollback()
+                        return _refused_row(card_id, row, CardRefusal.STALE_VERSION)
+                    connection.commit()
+                    return result
 
                 task_version = int(row["task_version"])
                 task_status = TaskStatus.OPEN
@@ -768,6 +816,42 @@ class TaskCardService:
         """Per-detector accept/reject totals, so a bad matcher is visible."""
         with closing(self._connect()) as connection:
             return completion.counts(connection)
+
+    def reverse_duplicate(self, relation_id: int) -> bool:
+        """Withdraw one reader-confirmed duplicate relation and re-offer it."""
+        if not isinstance(relation_id, int) or isinstance(relation_id, bool):
+            return False
+        now = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                relation = task_relations.get(connection, relation_id)
+                if (not relation.live or relation.kind != "duplicate_of"
+                        or relation.asserted_by != "reader"):
+                    connection.rollback()
+                    return False
+                proposal = connection.execute(
+                    "SELECT id FROM task_duplicate_proposals "
+                    "WHERE left_task_id=? AND right_task_id=? AND state='confirmed'",
+                    (relation.object_id, relation.subject_id),
+                ).fetchone()
+                if proposal is None:
+                    connection.rollback()
+                    return False
+                task_relations.withdraw(
+                    connection, relation_id, withdrawn_by="reader"
+                )
+                if not duplicates.reopen_confirmed(
+                    connection, proposal_id=int(proposal["id"]),
+                    actor="reader", now=now,
+                ):
+                    connection.rollback()
+                    return False
+                connection.commit()
+                return True
+            except (task_relations.TaskRelationError, sqlite3.Error):
+                connection.rollback()
+                return False
 
     def count(self) -> int:
         with closing(self._connect()) as connection:
@@ -927,6 +1011,142 @@ class TaskCardService:
             asked += 1
         return asked, raised
 
+    def _ask_duplicate_proposals(
+        self, connection: sqlite3.Connection, now: str, *, limit: int
+    ) -> tuple[int, int]:
+        """Bind one unread duplicate proposal to its canonical task card."""
+        rows = connection.execute(
+            "SELECT d.id AS proposal_id,d.left_task_id AS task_id,"
+            "d.left_task_version AS task_version,"
+            + _bound_source_revision("t.id") + " AS source_revision,"
+            "(SELECT c.id FROM task_review_cards AS c WHERE c.task_id=t.id "
+            " AND c.status IN ('pending','delivering','delivered','snoozed')) "
+            " AS active_id,"
+            "(SELECT c.status FROM task_review_cards AS c WHERE c.task_id=t.id "
+            " AND c.status IN ('pending','delivering','delivered','snoozed')) "
+            " AS active_status "
+            "FROM task_duplicate_proposals AS d JOIN tasks AS t "
+            "ON t.id=d.left_task_id JOIN tasks AS other ON other.id=d.right_task_id "
+            "WHERE d.state='proposed' AND d.card_id IS NULL "
+            "AND t.status='open' AND other.status='open' "
+            "AND t.version=d.left_task_version "
+            "AND other.version=d.right_task_version ORDER BY d.id LIMIT ?",
+            (limit,),
+        ).fetchall()
+        asked = raised = 0
+        for row in rows:
+            status = row["active_status"]
+            if status is not None and status != CardStatus.PENDING:
+                continue
+            if status == CardStatus.PENDING:
+                card_id = int(row["active_id"])
+                connection.execute(
+                    "UPDATE task_review_cards SET due_at=?,updated_at=? "
+                    "WHERE id=? AND status='pending'", (now, now, card_id)
+                )
+            else:
+                cursor = connection.execute(
+                    "INSERT INTO task_review_cards("
+                    "task_id,task_version,source_revision,status,version,"
+                    "due_at,created_at,updated_at) VALUES(?,?,?,'pending',1,?,?,?)",
+                    (int(row["task_id"]), int(row["task_version"]),
+                     row["source_revision"], now, now, now),
+                )
+                card_id = int(cursor.lastrowid)
+                self._event(
+                    connection, card_id=card_id, task_id=int(row["task_id"]),
+                    kind="scheduled", card_version=1,
+                    task_version=int(row["task_version"]), now=now,
+                )
+                raised += 1
+            if duplicates.bind(
+                connection, proposal_id=int(row["proposal_id"]),
+                card_id=card_id, now=now,
+            ):
+                asked += 1
+        return asked, raised
+
+    def _act_duplicate(self, connection: sqlite3.Connection, *, row,
+                       action: str, now: str) -> CardOperationResult | None:
+        proposal = connection.execute(
+            "SELECT * FROM task_duplicate_proposals WHERE card_id=? "
+            "AND state='proposed'", (int(row["id"]),)
+        ).fetchone()
+        if proposal is None:
+            return None
+        tasks = connection.execute(
+            "SELECT id,status,version FROM tasks WHERE id IN (?,?) ORDER BY id",
+            (int(proposal["left_task_id"]), int(proposal["right_task_id"])),
+        ).fetchall()
+        if (len(tasks) != 2 or any(item["status"] != "open" for item in tasks)
+                or int(tasks[0]["version"]) != int(proposal["left_task_version"])
+                or int(tasks[1]["version"]) != int(proposal["right_task_version"])):
+            return None
+        proposal_id = int(proposal["id"])
+        if action == "duplicate_confirm":
+            try:
+                task_relations.assert_relation(
+                    connection,
+                    subject_id=int(proposal["right_task_id"]),
+                    object_id=int(proposal["left_task_id"]),
+                    kind="duplicate_of", basis=str(proposal["basis"])[:500],
+                    asserted_by="reader", actor="reader",
+                )
+            except task_relations.TaskRelationError:
+                return None
+            decision = duplicates.Decision.CONFIRMED
+            self._cancel_duplicate_task_cards(
+                connection, task_id=int(proposal["right_task_id"]), now=now
+            )
+        else:
+            decision = duplicates.Decision.REJECTED
+        if not duplicates.settle(
+            connection, proposal_id=proposal_id, decision=decision,
+            actor="reader", now=now,
+        ):
+            return None
+        next_version = int(row["version"]) + 1
+        connection.execute(
+            "UPDATE task_review_cards SET status='cancelled',version=?,"
+            "claim_token_digest=NULL,claim_expires_at=NULL,consumer_digest=NULL,"
+            "resolved_at=?,updated_at=? WHERE id=? AND version=?",
+            (next_version, now, now, int(row["id"]), int(row["version"])),
+        )
+        self._event(
+            connection, card_id=int(row["id"]), task_id=int(row["task_id"]),
+            kind="cancelled", card_version=next_version,
+            task_version=int(row["task_version"]), now=now,
+        )
+        return CardOperationResult(
+            CardDisposition.APPLIED, card_id=int(row["id"]),
+            version=next_version, status=CardStatus.CANCELLED,
+            task_version=int(row["task_version"]), task_status=TaskStatus.OPEN,
+        )
+
+    def _cancel_duplicate_task_cards(
+        self, connection: sqlite3.Connection, *, task_id: int, now: str
+    ) -> None:
+        rows = connection.execute(
+            "SELECT id,task_version,version FROM task_review_cards "
+            "WHERE task_id=? AND status IN ('pending','delivering','delivered','snoozed')",
+            (task_id,),
+        ).fetchall()
+        for stale in rows:
+            next_version = int(stale["version"]) + 1
+            connection.execute(
+                "UPDATE task_review_cards SET status='cancelled',version=?,"
+                "claim_token_digest=NULL,claim_expires_at=NULL,consumer_digest=NULL,"
+                "resolved_at=?,updated_at=? WHERE id=? AND version=?",
+                (next_version, now, now, int(stale["id"]), int(stale["version"])),
+            )
+            completion.release(connection, int(stale["id"]))
+            duplicates.release_for_card(connection, int(stale["id"]), now=now)
+            self._event(
+                connection, card_id=int(stale["id"]), task_id=task_id,
+                kind="cancelled", card_version=next_version,
+                task_version=int(stale["task_version"]), now=now,
+            )
+
     def _cancel_stale(self, connection: sqlite3.Connection, now: str) -> int:
         rows = connection.execute(
             "SELECT c.id,c.task_id,c.task_version,c.version,c.source_revision "
@@ -935,6 +1155,9 @@ class TaskCardService:
             "AND (t.status!='open' OR t.version!=c.task_version "
             "OR COALESCE(c.source_revision,'')!=COALESCE("
             + _bound_source_revision("t.id") + ",'') OR EXISTS("
+            " SELECT 1 FROM task_relations AS relation "
+            " WHERE relation.subject_id=t.id AND relation.kind='duplicate_of' "
+            " AND relation.withdrawn_at IS NULL) OR EXISTS("
             " SELECT 1 FROM task_candidate_bindings AS b JOIN "
             " task_candidate_lifecycle AS l ON l.candidate_id=b.candidate_id "
             " WHERE b.task_id=t.id AND b.relation='accepted' "
@@ -955,6 +1178,7 @@ class TaskCardService:
             # again, because the identity index refuses a second row for the
             # same evidence.
             completion.release(connection, int(row["id"]))
+            duplicates.release_for_card(connection, int(row["id"]), now=now)
             self._event(
                 connection,
                 card_id=int(row["id"]),
@@ -1032,12 +1256,34 @@ class TaskCardService:
             "e.quotation AS completion_quotation,"
             "e.reason AS completion_reason,"
             "e.confidence AS completion_confidence,"
+            "d.id AS duplicate_id,d.right_task_id AS duplicate_other_task_id,"
+            "other.text AS duplicate_other_text,"
+            "(SELECT o.source_kind FROM task_candidate_bindings AS b "
+            " JOIN candidate_inbox AS o ON o.candidate_id=b.candidate_id "
+            " WHERE b.task_id=d.right_task_id AND b.relation='accepted') "
+            " AS duplicate_other_kind,"
+            "(SELECT o.source_record_id FROM task_candidate_bindings AS b "
+            " JOIN candidate_inbox AS o ON o.candidate_id=b.candidate_id "
+            " WHERE b.task_id=d.right_task_id AND b.relation='accepted') "
+            " AS duplicate_other_record,"
+            "(SELECT o.source_item_id FROM task_candidate_bindings AS b "
+            " JOIN candidate_inbox AS o ON o.candidate_id=b.candidate_id "
+            " WHERE b.task_id=d.right_task_id AND b.relation='accepted') "
+            " AS duplicate_other_item,"
+            "(SELECT h.payload_json FROM task_candidate_bindings AS b "
+            " JOIN candidate_revision_history AS h ON h.candidate_id=b.candidate_id "
+            " AND h.source_revision=b.source_revision "
+            " WHERE b.task_id=d.right_task_id AND b.relation='accepted') "
+            " AS duplicate_other_payload,"
             "t.status AS task_status_current,t.version AS task_version_current,"
             + _bound_source_revision("t.id") + " AS source_revision_current "
             "FROM task_review_cards AS c "
             "JOIN tasks AS t ON t.id=c.task_id "
             "LEFT JOIN task_completion_evidence AS e "
-            "ON e.card_id=c.id AND e.state='proposed'"
+            "ON e.card_id=c.id AND e.state='proposed' "
+            "LEFT JOIN task_duplicate_proposals AS d "
+            "ON d.card_id=c.id AND d.state='proposed' "
+            "LEFT JOIN tasks AS other ON other.id=d.right_task_id"
         )
 
     def _connect(self) -> sqlite3.Connection:
@@ -1072,6 +1318,8 @@ def render_task_review_card(card: TaskReviewCard) -> tuple[str, dict]:
     if card.status is not CardStatus.DELIVERING:
         raise ValueError("task review card is not claimed for delivery")
     text = html.escape(card.text, quote=False)
+    if card.duplicate is not None:
+        return _render_duplicate_check(card, text)
     if card.completion is not None:
         return _render_done_check(card, text)
     lines = [f"☑️ <b>Task done?</b>  <code>T{card.task_id}</code>", "", f"<b>{text}</b>"]
@@ -1187,6 +1435,46 @@ def _render_done_check(card: TaskReviewCard, text: str) -> tuple[str, dict]:
     return "\n".join(lines), keyboard
 
 
+def _render_duplicate_check(card: TaskReviewCard, text: str) -> tuple[str, dict]:
+    """Ask the reader to adjudicate one suspected cross-source duplicate."""
+    duplicate = card.duplicate
+    lines = [
+        f"🔀 <b>Same task?</b>  <code>T{card.task_id}</code> and "
+        f"<code>T{duplicate.other_task_id}</code>",
+        "",
+        f"<b>Task T{card.task_id}</b>", text,
+        *origin_lines(
+            kind=card.origin_kind, record=card.origin_record,
+            item=card.origin_item, sources=card.origin_sources,
+            html_output=True,
+        ),
+        "",
+        f"<b>Task T{duplicate.other_task_id}</b>",
+        _escape(duplicate.other_text),
+        *origin_lines(
+            kind=duplicate.other_origin_kind,
+            record=duplicate.other_origin_record,
+            item=duplicate.other_origin_item,
+            sources=duplicate.other_origin_sources,
+            html_output=True,
+        ),
+        "",
+        "Confirming keeps the lower-numbered task and preserves both sources.",
+    ]
+
+    def callback(action: str) -> str:
+        value = f"{CALLBACK_PREFIX}|{card.id}|{card.version}|{action}"
+        if len(value.encode("utf-8")) > CALLBACK_DATA_LIMIT:
+            raise ValueError("task review callback exceeds transport limit")
+        return value
+
+    keyboard = {"inline_keyboard": [[
+        {"text": "✅ Same task", "callback_data": callback("duplicate_confirm")},
+        {"text": "↔️ Keep separate", "callback_data": callback("duplicate_reject")},
+    ]]}
+    return "\n".join(lines), keyboard
+
+
 def _source_line(question: CardCompletionQuestion) -> str:
     """Name the completing source the way the reader would name it."""
     url = origin_url(
@@ -1219,7 +1507,10 @@ def parse_task_review_callback(value: object) -> tuple[int, int, str] | None:
         return None
     action = parts[3]
     if (not _valid_identity(card_id, version)
-            or action not in {"done", "keep_open", "drop", "snooze"}):
+            or action not in {
+                "done", "keep_open", "drop", "snooze",
+                "duplicate_confirm", "duplicate_reject",
+            }):
         return None
     return card_id, version, action
 
@@ -1242,6 +1533,7 @@ def _card(row) -> TaskReviewCard:
         origin_item=str(row["origin_item"] or ""),
         origin_sources=stored_origin_sources(row["origin_payload"]),
         completion=_question(row),
+        duplicate=_duplicate(row),
         source_revision=row["source_revision"],
         source_changed=bool(row["source_changed"]),
     )
@@ -1272,6 +1564,20 @@ def _question(row) -> CardCompletionQuestion | None:
         quotation=str(row["completion_quotation"] or ""),
         reason=str(row["completion_reason"] or ""),
         confidence=str(row["completion_confidence"] or ""),
+    )
+
+
+def _duplicate(row) -> CardDuplicateProposal | None:
+    if row["duplicate_id"] is None:
+        return None
+    return CardDuplicateProposal(
+        id=int(row["duplicate_id"]),
+        other_task_id=int(row["duplicate_other_task_id"]),
+        other_text=str(row["duplicate_other_text"] or ""),
+        other_origin_kind=str(row["duplicate_other_kind"] or ""),
+        other_origin_record=str(row["duplicate_other_record"] or ""),
+        other_origin_item=str(row["duplicate_other_item"] or ""),
+        other_origin_sources=stored_origin_sources(row["duplicate_other_payload"]),
     )
 
 
