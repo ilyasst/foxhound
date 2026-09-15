@@ -1375,6 +1375,12 @@ class TaskCardTokenRoleTests(unittest.TestCase):
             )
             self.assertEqual(body["schema"], STATS_SCHEMA)
 
+    def test_task_role_map_does_not_authorize_execution_without_policy(self):
+        app = TaskCardApplication(self.cards, {DRIP_ROLE: TOKEN})
+        self.assertTrue(app.authorized(f"Bearer {TOKEN}"))
+        self.assertFalse(app.authorized_execution(f"Bearer {TOKEN}"))
+        self.assertIsNone(app.resolve_execution_consumer(f"Bearer {TOKEN}"))
+
     def test_second_token_configured_as_queue_view(self):
         app = TaskCardApplication(
             self.cards, {DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: QUEUE_VIEW_TOKEN}
