@@ -44,6 +44,7 @@ from .task_execution import (
     WorkflowRefusal,
     WorkflowStatus,
     _apply_agent_selection,
+    _apply_plan_review_agent_selection,
     _apply_review_action,
     _apply_start_action,
 )
@@ -923,7 +924,7 @@ class ExecutionCardService:
     def agent_options(
         self, card_id: int, *, expected_version: int
     ) -> ExecutionAgentSelectorResult:
-        """Return bounded installed choices for one current Start card."""
+        """Return bounded choices for a current Start or plan-review card."""
         if not _valid_identity(card_id, expected_version):
             return _agent_refused(
                 card_id, ExecutionCardRefusal.INVALID_ARGUMENT
@@ -1031,7 +1032,7 @@ class ExecutionCardService:
         expected_version: int,
         selection_token: str,
     ) -> ExecutionAgentSelectorResult:
-        """Select an eligible exact profile and refresh the Start card."""
+        """Select an eligible exact profile and refresh its card."""
         if (
             not _valid_identity(card_id, expected_version)
             or not _valid_agent_selection_token(selection_token)
@@ -1039,16 +1040,6 @@ class ExecutionCardService:
             return _agent_refused(
                 card_id, ExecutionCardRefusal.INVALID_ARGUMENT
             )
-        matches = [
-            profile
-            for profile in _eligible_profiles(self._profile_registry)
-            if _agent_selection_token(profile) == selection_token
-        ]
-        if len(matches) != 1:
-            return _agent_refused(
-                card_id, ExecutionCardRefusal.INVALID_ARGUMENT
-            )
-        profile = matches[0]
         stamp = self._clock_value()
         now = stamp.isoformat(timespec="seconds")
         with closing(self._connect()) as connection:
@@ -1063,7 +1054,26 @@ class ExecutionCardService:
                     connection.rollback()
                     return _agent_refused_row(card_id, row, refusal)
                 current = self._render_card(row)
-                workflow = _apply_agent_selection(
+                phase = _agent_selector_phase(current)
+                matches = [
+                    profile
+                    for profile in _eligible_profiles(
+                        self._profile_registry, phase=phase
+                    )
+                    if _agent_selection_token(profile) == selection_token
+                ]
+                if len(matches) != 1:
+                    connection.rollback()
+                    return _agent_refused(
+                        card_id, ExecutionCardRefusal.INVALID_ARGUMENT
+                    )
+                profile = matches[0]
+                apply_selection = (
+                    _apply_agent_selection
+                    if current.kind is ExecutionCardKind.START
+                    else _apply_plan_review_agent_selection
+                )
+                workflow = apply_selection(
                     connection,
                     int(row["task_id"]),
                     expected_version=int(row["workflow_version"]),
@@ -1803,12 +1813,13 @@ def render_execution_agent_selector(
     if not result.accepted or result.card is None or not result.options:
         raise TaskLedgerError("execution agent selector is unavailable")
     body, _ = render_execution_review_card(result.card)
-    suffix = "\n\n<b>Choose the agent for planning:</b>"
+    target = _agent_selector_label(result.card)
+    suffix = f"\n\n<b>Choose the agent for {target}:</b>"
     if len((body + suffix).encode("utf-8")) > MAX_CARD_BODY_BYTES:
         body = _escape_bounded(
             "\n".join(_card_lines(result.card)),
             MAX_TRUNCATED_CARD_BODY_BYTES,
-            suffix="\n\nChoose the agent for planning:",
+            suffix=f"\n\nChoose the agent for {target}:",
         )
         suffix = ""
     keyboard = {
@@ -3341,7 +3352,7 @@ def _button_rows(
     else:
         rows = (
             (("🔎 Investigate further", "revise"), ("💬 Discuss", "discuss")),
-            (("▶️ Execute plan", "approve"),),
+            (("▶️ Execute plan", "approve"), ("🤖 Agents", "agent")),
             SNOOZE_BUTTON_ROW,
             (("✅ Mark as done", "done"),),
             stop_row,
@@ -3510,19 +3521,35 @@ def _valid_agent_selection_token(value: object) -> bool:
     )
 
 
+def _agent_selector_phase(card: ExecutionReviewCard) -> WorkflowPhase:
+    if card.kind is ExecutionCardKind.START:
+        return WorkflowPhase.PLAN
+    if card.kind is ExecutionCardKind.PLAN_REVIEW:
+        return WorkflowPhase.EXECUTE
+    raise TaskLedgerError("execution agent selection is unavailable")
+
+
+def _agent_selector_label(card: ExecutionReviewCard) -> str:
+    return {
+        WorkflowPhase.PLAN: "planning",
+        WorkflowPhase.EXECUTE: "execution",
+    }[_agent_selector_phase(card)]
+
+
 def _eligible_profiles(
-    registry: AgentProfileRegistry,
+    registry: AgentProfileRegistry, *, phase: WorkflowPhase
 ) -> tuple[AgentProfile, ...]:
     return tuple(
         profile
         for profile in registry.list()
-        if WorkflowPhase.PLAN.value in profile.allowed_phases
+        if phase.value in profile.allowed_phases
     )
 
 
 def _agent_options(
     registry: AgentProfileRegistry, card: ExecutionReviewCard
 ) -> tuple[ExecutionAgentOption, ...]:
+    phase = _agent_selector_phase(card)
     options = tuple(
         ExecutionAgentOption(
             profile.display_name,
@@ -3532,7 +3559,9 @@ def _agent_options(
                 and profile.revision == card.agent_profile_revision
             ),
         )
-        for profile in _eligible_profiles(registry)
+        for profile in _eligible_profiles(
+            registry, phase=phase
+        )
     )
     tokens = [option.selection_token for option in options]
     if not options or len(tokens) != len(set(tokens)):
@@ -3549,6 +3578,14 @@ def _agent_options(
             raise TaskLedgerError(
                 "selected execution agent is unavailable"
             ) from exc
+        if (
+            card.kind is ExecutionCardKind.PLAN_REVIEW
+            and phase.value not in historical.allowed_phases
+        ):
+            # The profile that wrote the plan need not be able to perform
+            # it.  The empty checkmark makes that explicit while allowing a
+            # reader to select one of the installed executors.
+            return options
         current = registry.get(card.agent_profile_id)
         if current is None or historical.revision == current.revision:
             raise TaskLedgerError("selected execution agent is unavailable")
@@ -3599,9 +3636,17 @@ def _agent_card_refusal(
         return ExecutionCardRefusal.INVALID_STATE
     if not _current_card(row):
         return ExecutionCardRefusal.STALE_VERSION
-    if ExecutionCardKind(row["kind"]) is not ExecutionCardKind.START:
+    kind = ExecutionCardKind(row["kind"])
+    if kind is ExecutionCardKind.START:
+        if row["workflow_status_current"] != WorkflowStatus.AWAITING_START:
+            return ExecutionCardRefusal.INVALID_STATE
+        return None
+    if kind is not ExecutionCardKind.PLAN_REVIEW:
         return ExecutionCardRefusal.INVALID_ACTION
-    if row["workflow_status_current"] != WorkflowStatus.AWAITING_START:
+    if (
+        row["workflow_status_current"] != WorkflowStatus.AWAITING_REVIEW
+        or row["workflow_phase_current"] != WorkflowPhase.PLAN
+    ):
         return ExecutionCardRefusal.INVALID_STATE
     return None
 

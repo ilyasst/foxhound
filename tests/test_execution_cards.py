@@ -1190,8 +1190,8 @@ class ExecutionCardTests(unittest.TestCase):
                 [parse_execution_review_callback(value)[2]
                  for value in callbacks],
                 [
-                    "revise", "discuss", "approve", "snooze", "done",
-                    "reassign", "drop", "brief",
+                    "revise", "discuss", "approve", "agent", "snooze",
+                    "done", "reassign", "drop", "brief",
                 ],
             )
             self.assertEqual(
@@ -1199,7 +1199,7 @@ class ExecutionCardTests(unittest.TestCase):
                  for row in keyboard["inline_keyboard"]],
                 [
                     ["🔎 Investigate further", "💬 Discuss"],
-                    ["▶️ Execute plan"],
+                    ["▶️ Execute plan", "🤖 Agents"],
                     SNOOZE_LABEL_ROW,
                     ["✅ Mark as done"],
                     ["👥 Reassign", "🗑 Drop task"],
@@ -1216,6 +1216,116 @@ class ExecutionCardTests(unittest.TestCase):
                 targets[action],
             )
             self.assertEqual(self.ledger.get(task_id).status, TaskStatus.OPEN)
+
+    def test_plan_review_selects_an_execute_agent_before_approval(self):
+        execute_document = general_profile().document()
+        execute_document.update({
+            "profile_id": "execute-only",
+            "display_name": "Synthetic Execute Only",
+            "allowed_phases": ["execute"],
+        })
+        execute_only = parse_profile(execute_document)
+        planner_document = general_profile().document()
+        planner_document.update({
+            "profile_id": "planner-only",
+            "display_name": "Synthetic Planner Only",
+            "allowed_phases": ["plan"],
+        })
+        planner_only = parse_profile(planner_document)
+        registry = AgentProfileRegistry((
+            general_profile(), execute_only, planner_only,
+        ))
+        cards = ExecutionCardService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: DELIVERY_TOKEN,
+            profile_registry=registry,
+        )
+        execution = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: CLAIM_TOKEN,
+            profile_registry=registry,
+        )
+        workflow = execution.schedule(1, expected_task_version=1)
+        planner = execution.select_agent(
+            1,
+            expected_version=workflow.version,
+            profile_id=planner_only.profile_id,
+            profile_revision=planner_only.revision,
+        )
+        started = execution.start_action(
+            1, expected_version=planner.version, action="start"
+        )
+        plan_claim = execution.claim_next()
+        self.assertEqual((plan_claim.task_id, plan_claim.phase), (
+            1, WorkflowPhase.PLAN,
+        ))
+        recorded = execution.record_result(ExecutionResultEnvelope(
+            result_id="select-executor",
+            task_id=1,
+            task_version=1,
+            workflow_version=plan_claim.workflow_version,
+            phase=WorkflowPhase.PLAN,
+            claim_token=plan_claim.token,
+            outcome=ExecutionOutcome.AWAITING_PLAN,
+            summary="Synthetic plan",
+            work_markdown="Synthetic plan.",
+            questions=(),
+            external_actions=(),
+            deliverables=(),
+        ))
+        self.assertTrue(recorded.accepted)
+        cards.schedule()
+        claim = cards.claim_next()
+        self.assertEqual(claim.card.kind, ExecutionCardKind.PLAN_REVIEW)
+        cards.complete_delivery(
+            claim.card.id,
+            expected_version=claim.card.version,
+            claim_token=claim.token,
+            transport="synthetic",
+            delivery_ref="plan-review-agent-selector",
+        )
+
+        choices = cards.agent_options(
+            claim.card.id, expected_version=claim.card.version
+        )
+        body, keyboard = render_execution_agent_selector(choices)
+        self.assertIn("Choose the agent for execution", body)
+        self.assertEqual(
+            [row[0]["text"] for row in keyboard["inline_keyboard"]],
+            ["Synthetic Execute Only", "General"],
+        )
+        callback = keyboard["inline_keyboard"][0][0]["callback_data"]
+        card_id, card_version, selection_token = parse_execution_agent_callback(
+            callback
+        )
+        selected = cards.select_agent(
+            card_id,
+            expected_version=card_version,
+            selection_token=selection_token,
+        )
+
+        self.assertEqual(selected.disposition, ExecutionCardDisposition.APPLIED)
+        self.assertEqual(
+            (selected.card.workflow_status, selected.card.phase),
+            (WorkflowStatus.AWAITING_REVIEW, WorkflowPhase.PLAN),
+        )
+        self.assertEqual(selected.card.agent_profile_id, "execute-only")
+        self.assertIn("Synthetic Execute Only", render_execution_review_card(
+            selected.card
+        )[0])
+        approved = cards.act(
+            selected.card.id,
+            expected_version=selected.card.version,
+            action="approve",
+        )
+        self.assertEqual(
+            (approved.workflow_status, approved.workflow_phase),
+            (WorkflowStatus.QUEUED, WorkflowPhase.EXECUTE),
+        )
+        run = execution.claim_next()
+        self.assertEqual((run.task_id, run.phase), (1, WorkflowPhase.EXECUTE))
 
     def test_truncated_private_content_cannot_be_approved(self):
         """A card too long to read is a card too long to authorise.
