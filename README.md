@@ -555,7 +555,8 @@ The authenticated loopback card service exposes execution cards through a
 separate `/v1/execution-cards/*` route family. A trusted local gateway can read
 aggregate stats, run the explicit scheduler, claim one rendered card,
 acknowledge or retry delivery, submit one versioned reader action, submit
-one bounded discussion or reassignment response, and read one delivered card's
+one bounded discussion or reassignment response, submit one bounded
+Comment-and-Go note, and read one delivered card's
 presentation back. That last route is a read like the task brief: it renders a
 current delivered card exactly as the delivery rendered it, at an exact
 expected version, and writes nothing. It exists so a surface that replaces a

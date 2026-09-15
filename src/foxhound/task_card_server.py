@@ -92,6 +92,7 @@ ROUTES = {
     "/v1/execution-cards/delivery-failed": "execution_delivery_failed",
     "/v1/execution-cards/action": "execution_action",
     "/v1/execution-cards/input": "execution_input",
+    "/v1/execution-cards/comment-and-go": "execution_comment_and_go",
     "/v1/execution-cards/agent-options": "execution_agent_options",
     "/v1/execution-cards/agent-selection": "execution_agent_selection",
     "/v1/execution-cards/brief": "execution_brief",
@@ -497,6 +498,19 @@ class TaskCardApplication:
                     ),
                     kind=kind,
                     value=value,
+                )
+            )
+        if operation == "execution_comment_and_go":
+            request = _request(
+                payload, required={"card_id", "card_version", "value"}
+            )
+            return _execution_operation_document(
+                self._execution_cards().comment_and_go(
+                    _integer(request["card_id"], minimum=1),
+                    expected_version=_integer(
+                        request["card_version"], minimum=1
+                    ),
+                    value=_reader_input(request["value"], kind="discussion"),
                 )
             )
         if operation == "execution_view":
