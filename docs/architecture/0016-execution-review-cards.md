@@ -30,10 +30,17 @@ The four card kinds have closed action sets:
 
 | Card | Allowed reader actions |
 |---|---|
-| Start | Complete, continue into planning, drop, update instructions, snooze to a calendar morning, or reassign |
-| Plan review | Investigate, discuss, execute, snooze, complete, reassign, or drop |
-| External review | Authorize the exact action, return for revision, discuss, snooze, complete, reassign, or drop |
+| Start | Complete, continue into planning, comment and continue into planning, drop, update instructions, snooze to a calendar morning, or reassign |
+| Plan review | Investigate, discuss, execute, comment and continue into execution, snooze, complete, reassign, or drop |
+| External review | Authorize the exact action, return for revision, discuss, comment and authorize, snooze, complete, reassign, or drop |
 | Result review | Discuss, snooze, complete, reassign, or drop |
+
+Comment and Go first collects one bounded private note, then atomically applies
+the listed transition. A gateway must submit that note to
+`/v1/execution-cards/comment-and-go` using the exact card id and version from
+the callback; it must not send a separate discussion response followed by a
+second action. The note targets the resulting workflow version, so the next
+agent run receives it once and the answered card is resolved.
 
 Every card renders the same four snooze choices directly: tomorrow at 09:00,
 Friday at 09:00 (the following Friday when that time has passed), next Monday

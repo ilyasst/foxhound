@@ -631,7 +631,7 @@ class ExecutionCardTests(unittest.TestCase):
         ]
         self.assertEqual(
             [parse_execution_review_callback(value)[2] for value in callbacks],
-            ["done", "start", "drop", "discuss", "snooze",
+            ["done", "start", "drop", "discuss", "comment_go", "snooze",
              "reassign", "agent", "brief"],
         )
         self.assertEqual(
@@ -640,6 +640,7 @@ class ExecutionCardTests(unittest.TestCase):
             [
                 ["✅ Done", "▶️ Continue"],
                 ["🗑 Drop", "✏️ Update"],
+                ["💬 Comment and Go"],
                 SNOOZE_LABEL_ROW,
                 ["👥 Reassign"],
                 ["🤖 Agent"],
@@ -1292,7 +1293,8 @@ class ExecutionCardTests(unittest.TestCase):
                 [parse_execution_review_callback(value)[2]
                  for value in callbacks],
                 [
-                    "revise", "discuss", "approve", "agent", "snooze",
+                    "revise", "discuss", "approve", "agent", "comment_go",
+                    "snooze",
                     "done", "reassign", "drop", "brief",
                 ],
             )
@@ -1302,6 +1304,7 @@ class ExecutionCardTests(unittest.TestCase):
                 [
                     ["🔎 Investigate further", "💬 Discuss"],
                     ["▶️ Execute plan", "🤖 Agents"],
+                    ["💬 Comment and Go"],
                     SNOOZE_LABEL_ROW,
                     ["✅ Mark as done"],
                     ["👥 Reassign", "🗑 Drop task"],
@@ -3354,6 +3357,78 @@ class ExecutionCardTests(unittest.TestCase):
             claim_token=next_run.token,
         ))
         self.assertGreater(discussed.workflow_version, before.version)
+
+    def _assert_comment_and_go(
+        self, task_id: int, expected_phase: WorkflowPhase
+    ) -> None:
+        self.cards.schedule()
+        claim = self._claim_and_deliver()
+        self.assertEqual(claim.card.task_id, task_id)
+        result = self.cards.comment_and_go(
+            claim.card.id,
+            expected_version=claim.card.version,
+            value=f"Synthetic direction for task {task_id}.",
+        )
+        self.assertTrue(result.accepted, result.refusal)
+        self.assertEqual(
+            (result.card_status, result.workflow_status, result.workflow_phase),
+            (ExecutionCardStatus.RESOLVED, WorkflowStatus.QUEUED, expected_phase),
+        )
+        self.assertEqual(self.cards.schedule().created, 0)
+        run = self.execution.claim_next()
+        self.assertEqual((run.task_id, run.phase), (task_id, expected_phase))
+        self.assertEqual(
+            self.execution.reader_instruction(
+                task_id,
+                expected_version=run.workflow_version,
+                claim_token=run.token,
+            ),
+            f"Synthetic direction for task {task_id}.",
+        )
+
+    def test_comment_and_go_starts_planning_with_the_note(self):
+        self._schedule_workflow(1)
+        self._assert_comment_and_go(1, WorkflowPhase.PLAN)
+
+    def test_comment_and_go_approves_a_plan_with_the_note(self):
+        self._plan_review(1, "comment-go-plan")
+        self._assert_comment_and_go(1, WorkflowPhase.EXECUTE)
+
+    def test_comment_and_go_authorizes_an_external_action_with_the_note(self):
+        self._external_review(1, "comment-go-external")
+        self._assert_comment_and_go(1, WorkflowPhase.EXTERNAL_ACTION)
+
+    def test_result_review_omits_comment_and_go(self):
+        _body, keyboard = render_execution_review_card(self._plan_card(
+            kind=ExecutionCardKind.RESULT_REVIEW,
+        ))
+        actions = [
+            parse_execution_review_callback(button["callback_data"])[2]
+            for row in keyboard["inline_keyboard"] for button in row
+        ]
+        self.assertNotIn("comment_go", actions)
+
+    def test_comment_and_go_rejects_stale_cards_and_missing_notes(self):
+        self._plan_review(1, "comment-go-stale")
+        self.cards.schedule()
+        claim = self._claim_and_deliver()
+
+        invalid = self.cards.comment_and_go(
+            claim.card.id, expected_version=claim.card.version, value=" "
+        )
+        self.assertEqual(invalid.refusal, ExecutionCardRefusal.INVALID_ARGUMENT)
+        accepted = self.cards.comment_and_go(
+            claim.card.id,
+            expected_version=claim.card.version,
+            value="Synthetic direction.",
+        )
+        self.assertTrue(accepted.accepted)
+        stale = self.cards.comment_and_go(
+            claim.card.id,
+            expected_version=claim.card.version,
+            value="A second synthetic direction.",
+        )
+        self.assertEqual(stale.refusal, ExecutionCardRefusal.STALE_VERSION)
 
     def test_reassignment_versions_task_and_restarts_at_start_gate(self):
         self._plan_review(1, "reassignment-plan")
