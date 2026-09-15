@@ -1,0 +1,63 @@
+#!/bin/sh
+# Pre-commit gate for this repository.
+#
+# Install with:
+#   git config core.hooksPath tools/hooks
+#
+# Two checks, both deliberate:
+#
+# 1. Refuse commits on `main`. AGENTS.md already prohibits committing
+#    directly to `main` ("issue-to-merge workflow", step 3 onward: all work
+#    happens in a dedicated worktree and branch). This repository has no CI
+#    of any kind (see CONFIDENTIALITY.md / AGENTS.md for why: Actions billing
+#    is unavailable for this account, so a workflow-based gate would never
+#    run), which means there is nothing else in the toolchain that catches an
+#    accidental commit on `main` before it is pushed. This hook is the only
+#    mechanical backstop for that rule, so it enforces it rather than only
+#    documenting it.
+#
+# 2. Run the public-diff guard (tools/check_public_diff.py) over the staged
+#    diff and refuse the commit if it finds a non-example email address, a
+#    user home path, a non-example IPv4 address, or a remote host identifier
+#    in an ssh-, scp-, or rsync-style remote copy. A clean result here is a mechanical floor,
+#    not a substitute for the publication-safety review AGENTS.md requires:
+#    the guard cannot see a client name, a project name, a knowledge-base
+#    folder, a person, a line of content, or anything inside an image.
+#
+# Both checks can be bypassed with `git commit --no-verify`. You should not
+# need to.
+
+set -eu
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+branch=$(git symbolic-ref --quiet --short HEAD 2>/dev/null || echo "")
+if [ "$branch" = "main" ]; then
+    echo "refusing to commit on main." >&2
+    echo "" >&2
+    echo "AGENTS.md's issue-to-merge workflow does not permit commits" >&2
+    echo "directly on main. Use a worktree and a short-lived branch instead:" >&2
+    echo "" >&2
+    echo "  git worktree add ~/foxhound-worktrees/<topic> -b issue-<n>-<slug> origin/main" >&2
+    echo "" >&2
+    echo "override (you should not need to): git commit --no-verify" >&2
+    exit 1
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "python3 not found; skipping the public-diff guard." >&2
+    echo "install python3, or commit with --no-verify if this is expected." >&2
+    exit 1
+fi
+
+if ! git diff --cached --unified=0 --no-color | python3 tools/check_public_diff.py; then
+    echo "" >&2
+    echo "commit blocked by the public-diff guard (tools/check_public_diff.py)." >&2
+    echo "replace the flagged values with synthetic examples (see AGENTS.md)," >&2
+    echo "or override with git commit --no-verify if you have reviewed the" >&2
+    echo "diff by hand and are certain it is safe." >&2
+    exit 1
+fi
+
+exit 0
