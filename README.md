@@ -218,6 +218,28 @@ the same role share that one token file. See
 Per ADR 0036 invariant 10, revalidate the current gateway configuration before
 ever changing the fixed `drip` claim ceiling.
 
+Execution-card routes use a separate authorization policy. A deployment that
+uses a role-mapped task policy must opt in with repeatable
+`--execution-token-file ROLE=PATH` arguments; the task token files are never
+borrowed for execution routes. For example, a console may receive only the
+`queue_view` execution role:
+
+```sh
+foxhound-task-cards \
+  --database /srv/example/private-foxhound-state/foxhound.sqlite3 \
+  --token-file drip=/srv/example/private-foxhound-state/card-gateway.token \
+  --token-file queue_view=/srv/example/private-foxhound-state/task-console.token \
+  --execution-token-file queue_view=/srv/example/private-foxhound-state/execution-console.token \
+  --bind 127.0.0.1 \
+  --port 8790
+```
+
+The execution option uses the same owner-only token-file checks, role
+allowlist, duplicate-role rejection, and duplicate-token rejection as
+`--token-file`. A single bare execution path is accepted as the legacy
+`drip` role; omitting the option with a role-mapped task policy leaves
+execution routes fail-closed.
+
 Foxhound now also owns a transport-neutral execution workflow ledger. An
 explicitly scheduled open task stops at a reader start gate, then advances
 through separately approved plan, execution, and external-action phases under

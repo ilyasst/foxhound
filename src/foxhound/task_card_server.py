@@ -1564,8 +1564,10 @@ def load_token(path: str | os.PathLike[str]) -> str:
     return token
 
 
-def load_role_tokens(specs: list[str]) -> dict[str, str]:
-    """Load one or more ``--token-file`` specs into a role-to-token map.
+def load_role_tokens(
+    specs: list[str], *, option_name: str = "--token-file"
+) -> dict[str, str]:
+    """Load one or more token-file specs into a role-to-token map.
 
     A single spec with no ``=`` is today's invocation shape: the file it
     names is loaded exactly as ``load_token`` always has, with no role
@@ -1579,14 +1581,16 @@ def load_role_tokens(specs: list[str]) -> dict[str, str]:
     single implicit default to fall back on.
     """
     if not specs:
-        raise TaskCardServerConfigError("at least one --token-file is required")
+        raise TaskCardServerConfigError(
+            f"at least one {option_name} is required"
+        )
     if len(specs) == 1 and "=" not in specs[0]:
         return {DRIP_ROLE: load_token(specs[0])}
     tokens: dict[str, str] = {}
     for spec in specs:
         if "=" not in spec:
             raise TaskCardServerConfigError(
-                "--token-file must have the form ROLE=PATH once more than "
+                f"{option_name} must have the form ROLE=PATH once more than "
                 "one is configured"
             )
         role, path = spec.split("=", 1)
@@ -1661,6 +1665,19 @@ def main(argv: list[str] | None = None) -> int:
             "explicitly as ROLE=PATH with ROLE in {drip, queue_view}"
         ),
     )
+    parser.add_argument(
+        "--execution-token-file",
+        action="append",
+        default=None,
+        metavar="PATH|ROLE=PATH",
+        help=(
+            "independent execution-card bearer token file (repeatable); "
+            "a single bare PATH defaults to role 'drip', while multiple "
+            "files must use ROLE=PATH with ROLE in {drip, queue_view}; "
+            "omitting this option keeps execution authorization disabled "
+            "for role-mapped task tokens"
+        ),
+    )
     parser.add_argument("--bind", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8790)
     parser.add_argument("--request-timeout", type=float, default=5.0)
@@ -1701,10 +1718,17 @@ def main(argv: list[str] | None = None) -> int:
             load_role_tokens(arguments.token_file),
             execution_cards=execution_cards,
             execution_tokens=(
-                load_token(arguments.token_file[0])
-                if len(arguments.token_file) == 1
-                and "=" not in arguments.token_file[0]
-                else None
+                load_role_tokens(
+                    arguments.execution_token_file,
+                    option_name="--execution-token-file",
+                )
+                if arguments.execution_token_file is not None
+                else (
+                    load_token(arguments.token_file[0])
+                    if len(arguments.token_file) == 1
+                    and "=" not in arguments.token_file[0]
+                    else None
+                )
             ),
             limits=TaskCardServerLimits(
                 request_timeout_seconds=arguments.request_timeout
