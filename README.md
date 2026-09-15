@@ -500,6 +500,17 @@ foxhound-execution-schedule \
   --limit 100
 ```
 
+Run this bounded command hourly through the local scheduler to re-present only
+still-current execution cards that have been delivered without a reader action
+for at least one hour. The replacement card has a new version, so callbacks on
+the earlier presentation are stale:
+
+```sh
+foxhound-execution-card-requeue \
+  --database /srv/example/private-foxhound-state/foxhound.sqlite3 \
+  --limit 100
+```
+
 Both options are explicit deployment policy. The command fails before
 scheduling if the installed directory is unsafe, the profile is unavailable,
 or that profile cannot plan. Omitting them retains the built-in General
