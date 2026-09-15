@@ -2733,6 +2733,7 @@ def _asked_for_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
 #: A `[label](target)` produced by `review_links`. Anything else it returns
 #: is a record identifier rather than a destination.
 _ADDRESSABLE_LINK_RE = re.compile(r"\[[^\]]*\]\([^)\s]+\)")
+_GITHUB_REPOSITORY_RE = re.compile(r"^github\.com/([^/\s]+)/([^/\s]+)$")
 
 
 def _review_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
@@ -2743,6 +2744,9 @@ def _review_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
     # from the surface they appeared on. GW's card never carried them.
     # The files still exist and the task handle still names them.
     lines: list[str] = []
+    repository = _repository_review_line(card, html=html)
+    if repository:
+        lines.extend(("", repository))
     links = review_links(
         "\n".join((
             card.summary,
@@ -2773,6 +2777,24 @@ def _review_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
             for link in addressable
         )
     return lines
+
+
+def _repository_review_line(card: ExecutionReviewCard, *, html: bool) -> str:
+    """Name a forge repository when the task origin identifies one.
+
+    A card can translate ``Issue #17`` into a destination, but the label
+    alone does not tell a reader which repository the destination belongs to.
+    Keep this deliberately narrow: an unknown record is not a repository and
+    must not become an invented or untappable context line.
+    """
+    match = _GITHUB_REPOSITORY_RE.fullmatch(card.origin_record)
+    if match is None:
+        return ""
+    name = f"{match.group(1)}/{match.group(2)}"
+    target = "https://github.com/" + urllib.parse.quote(name, safe="/")
+    if html:
+        return f'<b>Repository:</b> <a href="{target}">{_escape(name)}</a>'
+    return f"Repository: [{name}]({target})"
 
 
 def _card_lines(card: ExecutionReviewCard) -> list[str]:
@@ -3330,10 +3352,17 @@ def _markdown_lines(value: str) -> list[str]:
 
 def _markdown_inline(value: str) -> str:
     fragments: list[str] = []
+    # Telegram rejects C0 controls, including the NUL marker this renderer
+    # used originally. A transport sanitizer then left the numeric fragment
+    # indices visible as a row of unhelpful zeroes under Review links. Pick a
+    # control-free marker that cannot occur in the input instead.
+    marker_prefix = "FOXHOUNDINLINEFRAGMENT"
+    while marker_prefix in value:
+        marker_prefix += "X"
 
     def stash(fragment: str) -> str:
         fragments.append(fragment)
-        return f"\x00{len(fragments) - 1}\x00"
+        return f"{marker_prefix}{len(fragments) - 1}END"
 
     value = re.sub(
         r"`([^`\n]+)`",
@@ -3363,7 +3392,7 @@ def _markdown_inline(value: str) -> str:
         value,
     )
     return re.sub(
-        r"\x00(\d+)\x00",
+        re.escape(marker_prefix) + r"(\d+)END",
         lambda match: fragments[int(match.group(1))],
         value,
     )

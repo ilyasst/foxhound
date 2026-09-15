@@ -39,6 +39,7 @@ from foxhound.execution_cards import (
     ExecutionCardService,
     ExecutionCardStatus,
     ExecutionReviewCard,
+    _markdown_inline,
     parse_execution_agent_callback,
     parse_execution_review_callback,
     render_execution_agent_selector,
@@ -2872,6 +2873,46 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertNotIn("See https://github.com", linked)
         self.assertIn(
             'href="https://github.com/example/project-alpha/pull/12"', linked)
+
+    def test_review_links_name_the_repository_and_render_all_artifacts(self):
+        card = self._plan_card(
+            origin_kind="issue",
+            origin_record="github.com/example-org/example-repo",
+            origin_item="42",
+            work_markdown=(
+                "Validate PR #12, issue #34, and commit abcdef1234567."
+            ),
+        )
+
+        body, _ = render_execution_review_card(card)
+
+        self.assertIn("<b>Repository:</b>", body)
+        self.assertIn(
+            'href="https://github.com/example-org/example-repo"', body)
+        for destination in (
+            "/issues/42",
+            "/pull/12",
+            "/issues/34",
+            "/commit/abcdef1234567",
+        ):
+            with self.subTest(destination=destination):
+                self.assertIn(
+                    f'href="https://github.com/example-org/example-repo{destination}"',
+                    body,
+                )
+        self.assertNotIn("\x00", body)
+        self.assertNotIn("• 0", body)
+
+    def test_inline_fragments_use_no_control_markers_or_input_collisions(self):
+        rendered = _markdown_inline(
+            "FOXHOUNDINLINEFRAGMENT "
+            "[Synthetic link](https://example.com/path)"
+        )
+
+        self.assertIn("FOXHOUNDINLINEFRAGMENT", rendered)
+        self.assertIn(
+            '<a href="https://example.com/path">Synthetic link</a>', rendered)
+        self.assertFalse(any(ord(character) < 32 for character in rendered))
 
     def test_a_digest_replaces_the_excerpt_when_one_exists(self):
         """A few sentences ABOUT the plan beat the first screenful OF it.
