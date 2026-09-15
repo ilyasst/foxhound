@@ -27,6 +27,7 @@ from foxhound.execution_runner import (
     ExecutionRunnerError,
     ExecutionRunResult,
     _exclusive_lock,
+    _runner_lock_path,
     agent_prompt,
     hermes_argv,
     main,
@@ -603,7 +604,7 @@ class ExecutionRunnerTests(unittest.TestCase):
 
     def test_lock_private_paths_and_timing_fail_closed_before_claim(self):
         self._ready()
-        with _exclusive_lock(self.run_root / ".runner.lock") as acquired:
+        with _exclusive_lock(_runner_lock_path(self.run_root, "default")) as acquired:
             self.assertTrue(acquired)
             result = run_once(self._config())
         self.assertEqual(result.outcome, "already_running")

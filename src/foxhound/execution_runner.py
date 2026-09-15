@@ -56,6 +56,7 @@ from .task_archive import (
     preserve_run_files,
 )
 from .task_ledger import TaskLedger, TaskLedgerError
+from .source_policy import planning_grants as _planning_grants
 
 
 NO_PROGRESS_EXIT_CODE = 70
@@ -63,6 +64,7 @@ STARTUP_EXIT_CODE = 71
 TIMEOUT_EXIT_CODE = 124
 _COMMAND_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_RUNNER_SLOT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
 
 
 class ExecutionRunnerError(RuntimeError):
@@ -96,6 +98,8 @@ class ExecutionRunnerConfig:
     task_work_root: Path | None = field(default=None, repr=False)
     task_kb_root: Path | None = field(default=None, repr=False)
     allowed_phases: tuple[WorkflowPhase, ...] = tuple(WorkflowPhase)
+    planning_grants: tuple[str, ...] = ()
+    runner_slot: str = "default"
     poll_seconds: float = 0.1
 
     def __post_init__(self) -> None:
@@ -122,6 +126,17 @@ class ExecutionRunnerConfig:
             or len(set(self.allowed_phases)) != len(self.allowed_phases)
         ):
             raise ValueError("execution phase allowlist is invalid")
+        if (
+            not isinstance(self.runner_slot, str)
+            or not _RUNNER_SLOT_RE.fullmatch(self.runner_slot)
+        ):
+            raise ValueError("execution runner slot is invalid")
+        if not isinstance(self.planning_grants, tuple):
+            raise ValueError("execution planning grants are invalid")
+        try:
+            _planning_grants(self.planning_grants)
+        except ValueError as exc:
+            raise ValueError("execution planning grants are invalid") from exc
         if (
             isinstance(self.poll_seconds, bool)
             or not isinstance(self.poll_seconds, (int, float))
@@ -254,17 +269,24 @@ def run_once(
         config.gw_endpoint, config.gw_alias, config.gw_token_file
     )
     service = TaskExecutionService(
-        database, profile_registry=config.profile_registry
+        database,
+        profile_registry=config.profile_registry,
+        planning_grants=config.planning_grants,
     )
     terminator = terminate or _terminate_process_group
-    with _exclusive_lock(root / ".runner.lock") as acquired:
+    with _exclusive_lock(_runner_lock_path(root, config.runner_slot)) as acquired:
         if not acquired:
             return ExecutionRunResult("already_running", 0)
+        # Refill before and after the claim.  The second pass replaces the
+        # queue position the slot just consumed, keeping ten plans durable
+        # while two independent runners work.
+        service.schedule_new()
         claim = service.claim_next(
             allowed_phases=config.allowed_phases,
         )
         if claim is None:
             return ExecutionRunResult("idle", 0)
+        service.schedule_new()
         try:
             profile = config.profile_registry.resolve(
                 claim.agent_profile_id, claim.agent_profile_revision
@@ -534,6 +556,13 @@ def _terminal_result(
     if current.status is WorkflowStatus.QUEUED:
         return "released"
     return "claim_lost"
+
+
+def _runner_lock_path(root: Path, slot: str) -> Path:
+    """One lock per declared local execution slot, never per process."""
+    if not isinstance(root, Path) or not _RUNNER_SLOT_RE.fullmatch(slot):
+        raise ValueError("execution runner slot is invalid")
+    return root / f".runner-{slot}.lock"
 
 
 #: Owner-only, beside the result the agent writes, and never anywhere a
@@ -842,6 +871,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--agent-profile-directory", type=Path)
     parser.add_argument("--worker-command", default="foxhound-task-worker")
     parser.add_argument(
+        "--runner-slot", default="default",
+        help="stable local execution-slot name; distinct slots may run together",
+    )
+    parser.add_argument(
+        "--plan-without-asking", action="append", metavar="SOURCE_KIND",
+        help="refill the ready plan reserve for this source kind",
+    )
+    parser.add_argument(
         "--knowledge-root",
         type=Path,
         help=(
@@ -884,6 +921,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             agent_command=args.agent_command,
             profile_registry=load_registry(args.agent_profile_directory),
             worker_command=args.worker_command,
+            runner_slot=args.runner_slot,
+            planning_grants=tuple(args.plan_without_asking or ()),
             knowledge_root=args.knowledge_root,
             task_work_root=args.task_work_root,
             task_kb_root=args.task_kb_root,

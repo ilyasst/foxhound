@@ -76,11 +76,17 @@ MAX_WORK_DIGEST_CHARS = 800
 MAX_COLLECTION_ITEMS = 20
 MAX_QUESTION_CHARS = 1_000
 
-# Match the retired GW scheduler's two independent bounds.  Work consumes
-# fleet capacity; a workflow waiting for a reader consumes attention instead.
-# Conflating the two lets one unanswered card stop agents, while leaving work
-# unbounded lets a scheduling pass queue an arbitrary backlog.
-WORK_IN_PROGRESS_CAP = 5
+# Agent processes are scarce independently of planned work.  The runner claim
+# transaction enforces this cap, so two hosts (or two local slots) cannot both
+# observe room and start a third process.
+EXECUTION_SLOT_CAP = 2
+# Keep a durable planning reserve separate from the running slots.  A claimed
+# plan leaves this many ready plans behind, rather than making the next slot
+# wait for a periodic intake pass.
+PLAN_READY_CAP = 10
+# Compatibility name retained for callers that report the old aggregate.  It
+# now describes only active execution, not queued planning work.
+WORK_IN_PROGRESS_CAP = EXECUTION_SLOT_CAP
 AWAITING_READER_CAP = 20
 WORKING_STATUSES = frozenset({"queued", "running"})
 READER_WAITING_STATUSES = frozenset({
@@ -324,10 +330,9 @@ class TaskExecutionService:
     def schedule_new(self, *, limit: int = 100) -> ExecutionScheduleResult:
         """Create bounded workflows only for never-scheduled open tasks.
 
-        Agent work and reader-waiting decisions have separate capacities.  A
-        deployment may therefore keep planning while a card waits, without a
-        single pass filling either queue without bound.  Existing over-cap
-        rows are counted but never rewritten; capacity returns as they drain.
+        Agent work, ready plans, and reader-waiting decisions have separate
+        capacities.  Existing over-cap rows are counted but never rewritten;
+        capacity returns as they drain.
         """
         if (
             isinstance(limit, bool)
@@ -356,10 +361,11 @@ class TaskExecutionService:
                 waiting_marks = ",".join("?" for _ in waiting_statuses)
                 capacity = connection.execute(
                     "SELECT "
-                    "SUM(CASE WHEN w.status='running' OR "
-                    "(w.status='queued' AND (w.next_attempt_at IS NULL OR "
-                    "w.next_attempt_at<=?)) "
-                    "THEN 1 ELSE 0 END) AS working,"
+                    "SUM(CASE WHEN w.status='running' THEN 1 ELSE 0 END) "
+                    "AS running,"
+                    "SUM(CASE WHEN w.status='queued' AND w.phase='plan' "
+                    "AND (w.next_attempt_at IS NULL OR w.next_attempt_at<=?) "
+                    "THEN 1 ELSE 0 END) AS ready_plans,"
                     "SUM(CASE WHEN t.status='open' AND "
                     f"w.status IN ({waiting_marks}) "
                     "THEN 1 ELSE 0 END) AS waiting "
@@ -367,8 +373,8 @@ class TaskExecutionService:
                     "ON t.id=w.task_id",
                     (now, *waiting_statuses),
                 ).fetchone()
-                working_room = max(
-                    0, WORK_IN_PROGRESS_CAP - int(capacity["working"] or 0)
+                plan_room = max(
+                    0, PLAN_READY_CAP - int(capacity["ready_plans"] or 0)
                 )
                 waiting_room = max(
                     0, AWAITING_READER_CAP - int(capacity["waiting"] or 0)
@@ -399,9 +405,9 @@ class TaskExecutionService:
                     status = _initial_status(
                         row["origin_kind"], self._planning_grants)
                     if status.value in WORKING_STATUSES:
-                        if working_room == 0:
+                        if plan_room == 0:
                             continue
-                        working_room -= 1
+                        plan_room -= 1
                     else:
                         if waiting_room == 0:
                             continue
@@ -637,6 +643,15 @@ class TaskExecutionService:
             try:
                 self._cancel_stale(connection, now)
                 self._recover_expired(connection, stamp)
+                running = int(connection.execute(
+                    "SELECT COUNT(*) FROM task_execution_workflows AS w "
+                    "JOIN tasks AS t ON t.id=w.task_id "
+                    "WHERE w.status='running' AND t.status='open' "
+                    "AND t.version=w.task_version"
+                ).fetchone()[0])
+                if running >= EXECUTION_SLOT_CAP:
+                    connection.commit()
+                    return None
                 row = connection.execute(
                     "SELECT w.*,t.text,t.owner,t.due,t.status AS task_status,"
                     "t.version AS current_task_version "
