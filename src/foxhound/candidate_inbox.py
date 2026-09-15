@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -243,6 +243,7 @@ _SCHEMA_COLUMNS = {
         "created_at",
         "updated_at",
         "resolved_at",
+        "consumer_digest",
     ),
     "task_review_card_events": (
         "sequence",
@@ -413,13 +414,20 @@ _SCHEMA_COLUMNS = {
 
 # Every historical map is derived from the current one by subtraction, so
 # anything added now has to be taken back out of the version before it
-# existed -- otherwise a migration step verifies its own future. Two
-# subtractions, applied in version order: `work_digest` arrives at v22 and
-# `task_relations` at v21, so the v21 state has the table and not the
-# column, and the v20 state has neither.
+# existed -- otherwise a migration step verifies its own future. Three
+# subtractions, applied in version order: `consumer_digest` (task review
+# cards, ADR 0036 decision 2) arrives at v23, `work_digest` at v22, and
+# `task_relations` at v21, so the v22 state has the first table's extra
+# column removed but keeps `work_digest`, the v21 state has neither new
+# column but keeps `task_relations`, and the v20 state has none of the three.
+_SCHEMA_V22_COLUMNS = {
+    name: tuple(column for column in columns if column != "consumer_digest")
+    for name, columns in _SCHEMA_COLUMNS.items()
+}
+
 _SCHEMA_V21_COLUMNS = {
     name: tuple(column for column in columns if column != "work_digest")
-    for name, columns in _SCHEMA_COLUMNS.items()
+    for name, columns in _SCHEMA_V22_COLUMNS.items()
 }
 
 _SCHEMA_V20_COLUMNS = {
@@ -1744,6 +1752,22 @@ _SCHEMA_V22 = (
     "CHECK(work_digest IS NULL OR length(work_digest) BETWEEN 1 AND 800);",
 )
 
+# ADR 0036 decision 2: a card belongs to exactly one consumer for as long as
+# it is claimed. `claim_next()` will record the resolved consumer identity
+# here -- the digest of the accepting bearer token, the same digest function
+# already used for `claim_token_digest` -- at the moment of claim, one step
+# earlier than `transport`, which is only ever populated at delivery. This
+# migration adds only the column. Nothing yet writes or reads it: every
+# existing row is left NULL, exactly like `claim_token_digest` and
+# `transport` already are for a card that has never been claimed, so a
+# database with no second consumer configured is unaffected. Matches
+# `claim_token_digest`'s shape -- plain nullable TEXT holding a fixed-length
+# sha256 hex digest, no CHECK -- rather than `work_digest`'s bounded free
+# text, because a digest's length is already fixed by the hash function.
+_SCHEMA_V23 = (
+    "ALTER TABLE task_review_cards ADD COLUMN consumer_digest TEXT;",
+)
+
 _SCHEMA_V20 = (
     # SQLite cannot alter a CHECK in place, and three tables carry a foreign
     # key to this one. Renaming the card table would rewrite all three to
@@ -2475,6 +2499,17 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 22
+            if version == 22:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V23:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 23")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 23
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:
