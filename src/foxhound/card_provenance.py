@@ -49,10 +49,13 @@ def origin_lines(
 ) -> list[str]:
     """Render the same origin and literal evidence on every task surface."""
     if sources:
-        shown_kind = kind.replace("_", " ").title() or "Source"
         lines = [
-            f"<b>From:</b> {_escape(shown_kind)}"
-            if html_output else f"From: {shown_kind}",
+            *_source_identity_lines(
+                kind=kind,
+                record=record,
+                item=item,
+                html_output=html_output,
+            ),
             "<b>Source files and evidence:</b>"
             if html_output else "Source files and evidence:",
         ]
@@ -80,6 +83,40 @@ def origin_lines(
     return lines
 
 
+def origin_url(*, kind: str, record: str, item: str) -> str | None:
+    """Return the verified public URL for an addressable task origin."""
+    host = record.split("/", 1)[0]
+    if (
+        kind not in ADDRESSABLE_ORIGINS
+        or "/" not in record
+        or host not in _LINKABLE_HOSTS
+        or not item
+    ):
+        return None
+    number = item.split("/", 1)[0]
+    return f"https://{record}/{_ORIGIN_PATHS.get(kind, 'issues')}/{number}"
+
+
+def _source_identity_lines(
+    *, kind: str, record: str, item: str, html_output: bool
+) -> list[str]:
+    """Prefer a useful forge link, otherwise name the source kind.
+
+    Opaque record ids are storage keys, not reader context. Once literal
+    evidence is available its filenames and extracts identify an
+    unaddressable source more usefully than repeating such a key.
+    """
+    if origin_url(kind=kind, record=record, item=item):
+        return _origin_identity_lines(
+            kind=kind, record=record, item=item, html_output=html_output
+        )
+    shown_kind = kind.replace("_", " ").title() or "Source"
+    return [
+        f"<b>From:</b> {_escape(shown_kind)}"
+        if html_output else f"From: {shown_kind}"
+    ]
+
+
 def _origin_identity_lines(
     *, kind: str, record: str, item: str, html_output: bool
 ) -> list[str]:
@@ -95,7 +132,9 @@ def _origin_identity_lines(
     if not html_output or not record.startswith(_LINKABLE_HOSTS):
         return [f"<b>From:</b> {_escape(shown)}" if html_output
                 else f"From: {shown}"]
-    url = f"https://{record}/{_ORIGIN_PATHS.get(kind, 'issues')}/{number}"
+    url = origin_url(kind=kind, record=record, item=item)
+    if url is None:
+        return [f"<b>From:</b> {_escape(shown)}"]
     return [f'<b>From:</b> <a href="{_escape(url)}">{_escape(shown)}</a>']
 
 
