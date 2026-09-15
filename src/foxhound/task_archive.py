@@ -26,6 +26,7 @@ RESULT_INPUT_NAMES = (
     "result-questions.json",
     "result-external-actions.json",
     "result-deliverables.json",
+    "repository-action-receipts.json",
 )
 MAX_ARTIFACTS = 100
 MAX_ARTIFACT_BYTES = 2 * 1024 * 1024

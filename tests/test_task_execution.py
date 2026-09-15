@@ -147,6 +147,10 @@ class TaskExecutionTests(unittest.TestCase):
             clock=self.clock,
             token_factory=lambda: TOKEN,
             max_attempts=3,
+            profile_registry=AgentProfileRegistry((
+                general_profile(),
+                _profile("sigint", phases=("plan", "execute", "external_action")),
+            )),
         )
 
     def _now(self) -> str:
@@ -630,9 +634,8 @@ class TaskExecutionTests(unittest.TestCase):
         pull-request review went to the compatibility profile, produced
         nothing recordable three times, and parked with the review written.
 
-        A preference, not a rule: the reader may still change it at the
-        gate, and a machine without the profile falls back rather than
-        refusing the task.
+        A compatibility-only library instance may still fall back while the
+        production scheduler is responsible for installing SigInt.
         """
         from foxhound.agent_profiles import AgentProfile, AgentProfileRegistry
         from foxhound.task_execution import SOURCE_KIND_PROFILES
@@ -646,7 +649,6 @@ class TaskExecutionTests(unittest.TestCase):
         service = TaskExecutionService(
             self.database, clock=self.clock,
             profile_registry=AgentProfileRegistry([general]))
-        # `sigint` is not installed here, so the task still gets an agent.
         self.assertEqual(
             service._profile_for("review_request").profile_id, "general")
 
@@ -689,6 +691,7 @@ class TaskExecutionTests(unittest.TestCase):
             self.database,
             clock=self.clock,
             planning_grants=["issue", "review_request"],
+            profile_registry=self.service._profile_registry,
         ).schedule_new(limit=10)
 
         def status(task_id):
@@ -720,6 +723,7 @@ class TaskExecutionTests(unittest.TestCase):
         self._bind_origin(1, "issue")
         service = TaskExecutionService(
             self.database, clock=self.clock, planning_grants=["issue"],
+            profile_registry=self.service._profile_registry,
         )
 
         scheduled = service.schedule(1, expected_task_version=1)
@@ -737,6 +741,7 @@ class TaskExecutionTests(unittest.TestCase):
         service = TaskExecutionService(
             self.database, clock=self.clock,
             planning_grants=["review_request"],
+            profile_registry=self.service._profile_registry,
         )
 
         result = service.schedule_new()
@@ -842,6 +847,7 @@ class TaskExecutionTests(unittest.TestCase):
             self.database,
             clock=self.clock,
             planning_grants=["issue"],
+            profile_registry=self.service._profile_registry,
         ).schedule_new(limit=100)
         self.assertEqual(
             (EXECUTION_SLOT_CAP, PLAN_READY_CAP, AWAITING_READER_CAP),
@@ -864,6 +870,7 @@ class TaskExecutionTests(unittest.TestCase):
             self.database,
             clock=self.clock,
             planning_grants=["issue"],
+            profile_registry=self.service._profile_registry,
         ).schedule_new(limit=100)
         self.assertEqual((replay.scheduled, replay.remaining), (0, 5))
         with closing(sqlite3.connect(self.database)) as connection:
