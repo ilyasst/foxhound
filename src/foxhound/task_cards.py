@@ -1082,6 +1082,13 @@ class TaskCardService:
                 or int(tasks[0]["version"]) != int(proposal["left_task_version"])
                 or int(tasks[1]["version"]) != int(proposal["right_task_version"])):
             return None
+        active_execution = connection.execute(
+            "SELECT 1 FROM task_execution_workflows WHERE task_id IN (?,?) "
+            "AND status IN ('running','awaiting_review') LIMIT 1",
+            (int(proposal["left_task_id"]), int(proposal["right_task_id"])),
+        ).fetchone()
+        if active_execution is not None:
+            return None
         proposal_id = int(proposal["id"])
         if action == "duplicate_confirm":
             try:
@@ -1235,12 +1242,15 @@ class TaskCardService:
             " JOIN candidate_inbox AS o ON o.candidate_id=b.candidate_id "
             " WHERE b.task_id=c.task_id AND b.relation='accepted') "
             " AS origin_item,"
-            "(SELECT h.payload_json FROM task_candidate_bindings AS b "
-            " JOIN candidate_revision_history AS h "
-            " ON h.candidate_id=b.candidate_id "
+            "(SELECT group_concat(payload_json, char(30)) FROM ("
+            " SELECT h.payload_json AS payload_json FROM task_candidate_bindings AS b "
+            " JOIN candidate_revision_history AS h ON h.candidate_id=b.candidate_id "
             " AND h.source_revision=b.source_revision "
-            " WHERE b.task_id=c.task_id AND b.relation='accepted') "
-            " AS origin_payload,"
+            " WHERE b.relation='accepted' AND (b.task_id=c.task_id OR b.task_id IN ("
+            "  SELECT relation.subject_id FROM task_relations AS relation "
+            "  WHERE relation.object_id=c.task_id AND relation.kind='duplicate_of' "
+            "  AND relation.withdrawn_at IS NULL)) ORDER BY h.created_at)) "
+            " AS origin_payloads,"
             "EXISTS(SELECT 1 FROM task_review_cards AS seen "
             " WHERE seen.task_id=c.task_id "
             " AND seen.source_revision<>c.source_revision "
@@ -1531,7 +1541,7 @@ def _card(row) -> TaskReviewCard:
         origin_kind=str(row["origin_kind"] or ""),
         origin_record=str(row["origin_record"] or ""),
         origin_item=str(row["origin_item"] or ""),
-        origin_sources=stored_origin_sources(row["origin_payload"]),
+        origin_sources=_stored_origin_sources(row["origin_payloads"]),
         completion=_question(row),
         duplicate=_duplicate(row),
         source_revision=row["source_revision"],
@@ -1564,6 +1574,15 @@ def _question(row) -> CardCompletionQuestion | None:
         quotation=str(row["completion_quotation"] or ""),
         reason=str(row["completion_reason"] or ""),
         confidence=str(row["completion_confidence"] or ""),
+    )
+
+
+def _stored_origin_sources(value: object) -> tuple[CardSourceEvidence, ...]:
+    if not isinstance(value, str) or not value:
+        return ()
+    return tuple(
+        source for payload in value.split("\x1e")
+        for source in stored_origin_sources(payload)
     )
 
 

@@ -147,6 +147,24 @@ class DuplicateReviewCardTests(unittest.TestCase):
             self.connection.execute("SELECT count(*) FROM task_relations").fetchone()[0], 0
         )
 
+    def test_active_execution_refuses_confirmation(self) -> None:
+        claim = self._deliver()
+        self.connection.execute(
+            "INSERT INTO task_execution_workflows("
+            "task_id,task_version,status,phase,version,failure_count,"
+            "created_at,updated_at) VALUES(1,1,'awaiting_review','plan',1,0,?,?)",
+            (NOW.isoformat(), NOW.isoformat()),
+        )
+        self.connection.commit()
+        result = self.cards.act(
+            claim.card.id, expected_version=claim.card.version,
+            action="duplicate_confirm",
+        )
+        self.assertIs(result.disposition, CardDisposition.REFUSED)
+        self.assertEqual(
+            self.connection.execute("SELECT count(*) FROM task_relations").fetchone()[0], 0
+        )
+
     def test_reader_can_reverse_a_confirmation_without_losing_history(self) -> None:
         claim = self._deliver()
         self.assertTrue(self.cards.act(
