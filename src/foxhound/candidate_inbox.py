@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -216,6 +216,23 @@ _SCHEMA_COLUMNS = {
         "created_at",
         "withdrawn_at",
         "withdrawn_by",
+    ),
+    "task_completion_evidence": (
+        "id",
+        "task_id",
+        "evidence_digest",
+        "source_kind",
+        "source_record_id",
+        "source_item_id",
+        "observed_at",
+        "quotation",
+        "reason",
+        "detector",
+        "confidence",
+        "state",
+        "card_id",
+        "created_at",
+        "settled_at",
     ),
     "task_owner_equivalences": (
         "candidate_id",
@@ -414,15 +431,22 @@ _SCHEMA_COLUMNS = {
 
 # Every historical map is derived from the current one by subtraction, so
 # anything added now has to be taken back out of the version before it
-# existed -- otherwise a migration step verifies its own future. Three
-# subtractions, applied in version order: `consumer_digest` (task review
-# cards, ADR 0036 decision 2) arrives at v23, `work_digest` at v22, and
-# `task_relations` at v21, so the v22 state has the first table's extra
-# column removed but keeps `work_digest`, the v21 state has neither new
-# column but keeps `task_relations`, and the v20 state has none of the three.
+# existed -- otherwise a migration step verifies its own future. Four
+# subtractions, applied in version order: `task_completion_evidence` arrives
+# at v25, `consumer_digest` (task review cards, ADR 0036 decision 2) at v23,
+# `work_digest` at v22, and `task_relations` at v21 -- so the v24 state has
+# the new table removed, the v22 state also has the card column removed but
+# keeps `work_digest`, the v21 state has neither column but keeps
+# `task_relations`, and the v20 state has none of the four.
+_SCHEMA_V24_COLUMNS = {
+    name: columns
+    for name, columns in _SCHEMA_COLUMNS.items()
+    if name != "task_completion_evidence"
+}
+
 _SCHEMA_V22_COLUMNS = {
     name: tuple(column for column in columns if column != "consumer_digest")
-    for name, columns in _SCHEMA_COLUMNS.items()
+    for name, columns in _SCHEMA_V24_COLUMNS.items()
 }
 
 _SCHEMA_V21_COLUMNS = {
@@ -500,6 +524,10 @@ _SCHEMA_OBJECTS = {
     "task_relations_only_withdraw": "trigger",
     "task_relations_live": "index",
     "task_relations_object": "index",
+    "task_completion_evidence_identity": "index",
+    "task_completion_evidence_open": "index",
+    "task_completion_evidence_no_delete": "trigger",
+    "task_completion_evidence_settle_only": "trigger",
     "task_owner_equivalences_no_update": "trigger",
     "task_owner_equivalences_no_delete": "trigger",
     "task_review_cards_one_active": "index",
@@ -1832,6 +1860,106 @@ END;
 """,
 )
 
+#: One reason to believe an open task is finished, and what the reader said.
+#:
+#: Nothing here closes anything. A row is a question waiting to be asked, and
+#: the answer to it -- the closure itself goes through the ordinary ledger
+#: transition, exactly as it does when a reader closes a task unprompted.
+#:
+#: The identity is the EVIDENCE, not the judgement about it. Two runs of a
+#: detector that quote the same sentence from the same source are one question,
+#: however differently they word their reasoning, because the reader is being
+#: asked to look at that sentence. That is what makes re-detection idempotent,
+#: and it is also what makes a rejection durable: a refused row still occupies
+#: the pair, so the same sentence can never raise the question twice.
+#:
+#: Append-only. A settled row keeps the quotation it was settled on, so the
+#: share of detections a reader accepted stays recoverable afterwards and a
+#: detector that is usually wrong is visible rather than merely irritating.
+_SCHEMA_V25 = (
+    """
+CREATE TABLE IF NOT EXISTS task_completion_evidence (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id          INTEGER NOT NULL,
+    -- Identity of the quoted evidence, not of this row: see above.
+    evidence_digest  TEXT NOT NULL CHECK(length(evidence_digest) = 64),
+    source_kind      TEXT NOT NULL
+                     CHECK(length(source_kind) BETWEEN 1 AND 64),
+    source_record_id TEXT NOT NULL
+                     CHECK(length(source_record_id) BETWEEN 1 AND 200),
+    source_item_id   TEXT NOT NULL CHECK(length(source_item_id) <= 200),
+    -- When the source is dated, which is what the card shows. Not when this
+    -- row was written: a meeting held in March read in April closes the task
+    -- as of March, and the reader needs the earlier date to recognise it.
+    observed_at      TEXT NOT NULL
+                     CHECK(length(observed_at) BETWEEN 4 AND 40),
+    -- Verbatim, and never empty. A done-check with nothing to quote is the
+    -- card this table exists to stop us sending.
+    quotation        TEXT NOT NULL
+                     CHECK(length(quotation) BETWEEN 1 AND 1200),
+    -- Why this evidence was read as closing THIS task rather than a similar
+    -- one. The reader cannot check a match they were never shown.
+    reason           TEXT NOT NULL CHECK(length(reason) BETWEEN 1 AND 500),
+    detector         TEXT NOT NULL CHECK(length(detector) BETWEEN 1 AND 64),
+    confidence       TEXT NOT NULL
+                     CHECK(confidence IN ('high','medium','low')),
+    state            TEXT NOT NULL DEFAULT 'proposed' CHECK(
+                         state IN ('proposed','accepted','rejected','superseded')),
+    -- The card carrying the question, once one does. Null while unasked, and
+    -- null again if that card is cancelled before anyone answers it.
+    card_id          INTEGER,
+    created_at       TEXT NOT NULL,
+    settled_at       TEXT,
+    CHECK((state = 'proposed') = (settled_at IS NULL)),
+    FOREIGN KEY(task_id) REFERENCES tasks(id),
+    FOREIGN KEY(card_id) REFERENCES task_review_cards(id)
+);
+""",
+    # One question per piece of evidence, for the life of the task. Unlike the
+    # live-relation index this one has no WHERE clause, and that is the point:
+    # a settled row keeps occupying the pair, so an answered question is never
+    # asked again.
+    """
+CREATE UNIQUE INDEX IF NOT EXISTS task_completion_evidence_identity
+    ON task_completion_evidence(task_id, evidence_digest);
+""",
+    """
+CREATE INDEX IF NOT EXISTS task_completion_evidence_open
+    ON task_completion_evidence(task_id) WHERE state = 'proposed';
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS task_completion_evidence_no_delete
+BEFORE DELETE ON task_completion_evidence
+BEGIN
+    SELECT RAISE(ABORT, 'task completion evidence is append-only');
+END;
+""",
+    # Binding and settling are the only changes. Everything the reader was
+    # shown is frozen at insert, and a settled row never moves again -- an
+    # accepted detection that could later be rewritten as rejected would make
+    # the accept ratio a measure of the last pass rather than of the detector.
+    """
+CREATE TRIGGER IF NOT EXISTS task_completion_evidence_settle_only
+BEFORE UPDATE ON task_completion_evidence
+BEGIN
+    SELECT RAISE(ABORT, 'task completion evidence may only be bound or settled')
+    WHERE OLD.task_id          <> NEW.task_id
+       OR OLD.evidence_digest  <> NEW.evidence_digest
+       OR OLD.source_kind      <> NEW.source_kind
+       OR OLD.source_record_id <> NEW.source_record_id
+       OR OLD.source_item_id   <> NEW.source_item_id
+       OR OLD.observed_at      <> NEW.observed_at
+       OR OLD.quotation        <> NEW.quotation
+       OR OLD.reason           <> NEW.reason
+       OR OLD.detector         <> NEW.detector
+       OR OLD.confidence       <> NEW.confidence
+       OR OLD.created_at       <> NEW.created_at
+       OR OLD.state            <> 'proposed';
+END;
+""",
+)
+
+
 _SCHEMA_V20 = (
     # SQLite cannot alter a CHECK in place, and three tables carry a foreign
     # key to this one. Renaming the card table would rewrite all three to
@@ -2585,6 +2713,25 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 24
+            if version == 24:
+                # The default expectation is the version-14 map, and this step
+                # reads the card table it points a foreign key at.
+                self._require_tables(
+                    connection,
+                    ("tasks", "task_review_cards"),
+                    columns=_SCHEMA_V24_COLUMNS,
+                )
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V25:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 25")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 25
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:

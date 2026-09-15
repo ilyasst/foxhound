@@ -17,8 +17,12 @@ from typing import Callable
 from .card_provenance import (
     CardSourceEvidence,
     origin_lines,
+    origin_url,
+    quotable,
     stored_origin_sources,
 )
+
+from . import task_completion as completion
 from .candidate_inbox import CandidateInbox, InboxError, SCHEMA_VERSION
 from .task_ledger import (
     TaskLedgerError,
@@ -28,6 +32,15 @@ from .task_ledger import (
 )
 from .task_owner import canonical_owner_display
 
+
+#: What each answer says about the evidence that prompted the question.
+#: `drop` is neither an acceptance nor a refusal of the detection: the reader
+#: discarded the task itself, and never reached the question.
+_ANSWERS = {
+    "done": completion.Outcome.ACCEPTED,
+    "keep_open": completion.Outcome.REJECTED,
+    "drop": completion.Outcome.SUPERSEDED,
+}
 
 SNOOZE_INTERVAL = timedelta(days=3)
 OPEN_REVIEW_INTERVAL = timedelta(days=7)
@@ -66,6 +79,10 @@ class ScheduleResult:
     disposition: CardDisposition
     created: int = 0
     cancelled: int = 0
+    #: Cards now carrying a completion question, whether they were created for
+    #: it or already waiting. Counted apart from `created` because asking is
+    #: not scheduling: a question can reach a reader without a new card.
+    asked: int = 0
     refusal: CardRefusal | None = None
 
 
@@ -78,6 +95,20 @@ class CardStats:
     delivered: int
     snoozed: int
     active: int
+
+
+@dataclass(frozen=True)
+class CardCompletionQuestion:
+    """The one detection a card is asking about; private card content."""
+
+    id: int
+    source_kind: str = field(repr=False)
+    source_record_id: str = field(repr=False)
+    source_item_id: str = field(repr=False)
+    observed_at: str = field(repr=False)
+    quotation: str = field(repr=False)
+    reason: str = field(repr=False)
+    confidence: str = field(repr=False)
 
 
 @dataclass(frozen=True)
@@ -100,6 +131,12 @@ class TaskReviewCard:
     origin_item: str = field(default="", repr=False)
     origin_sources: tuple[CardSourceEvidence, ...] = field(
         default=(), repr=False
+    )
+    #: Set only when this card is a done-check. An ordinary review card asks
+    #: whether a task is finished and shows nothing about why it is asking;
+    #: this one has an answer to that.
+    completion: CardCompletionQuestion | None = field(
+        default=None, repr=False
     )
 
 
@@ -195,13 +232,19 @@ class TaskCardService:
                         task_version=int(row["version"]),
                         now=now,
                     )
-                connection.commit()
                 created = len(rows)
+                asked, raised = self._ask_completion_questions(
+                    connection, now, limit=limit
+                )
+                created += raised
+                connection.commit()
                 return ScheduleResult(
                     CardDisposition.APPLIED
-                    if created or cancelled else CardDisposition.UNCHANGED,
+                    if created or cancelled or asked
+                    else CardDisposition.UNCHANGED,
                     created=created,
                     cancelled=cancelled,
+                    asked=asked,
                 )
             except Exception:
                 connection.rollback()
@@ -521,6 +564,20 @@ class TaskCardService:
                     )
                     kind = "resolved"
                     status = CardStatus.RESOLVED
+                # The answer to the question, if this card was carrying one.
+                # `keep_open` on a done-check is Reopen: the suggestion is
+                # refused, and refusing it durably is what stops the next pass
+                # asking again from the same evidence -- the exact failure the
+                # removed engine had, where reopening cleared the record of
+                # why the task had been closed and the following run closed it
+                # again on the same sentence.
+                if action != "snooze":
+                    completion.settle_for_card(
+                        connection,
+                        card_id=card_id,
+                        outcome=_ANSWERS[action],
+                        now=now,
+                    )
                 self._event(
                     connection,
                     card_id=card_id,
@@ -544,6 +601,11 @@ class TaskCardService:
             except Exception:
                 connection.rollback()
                 raise
+
+    def completion_counts(self) -> tuple[completion.DetectorCounts, ...]:
+        """Per-detector accept/reject totals, so a bad matcher is visible."""
+        with closing(self._connect()) as connection:
+            return completion.counts(connection)
 
     def count(self) -> int:
         with closing(self._connect()) as connection:
@@ -575,6 +637,98 @@ class TaskCardService:
                 "SELECT count(*) FROM task_review_card_events"
             ).fetchone()[0])
 
+    def _ask_completion_questions(
+        self, connection: sqlite3.Connection, now: str, *, limit: int
+    ) -> tuple[int, int]:
+        """Put unanswered completion questions in front of a reader.
+
+        A done-check is not a new card kind. It is the task's own review card,
+        carrying the evidence that says the work is finished — so a task with
+        a card already waiting gets its question attached to that card, and
+        only a task with no card at all gets one made for it.
+
+        This is the one path that ignores `review_after`. The weekly rhythm
+        exists so an untouched task is not asked about repeatedly; evidence
+        that the task is finished is exactly the event that rhythm should not
+        delay, and a reader who has just been told why we think it is done is
+        not being asked the same question again.
+
+        A card already claimed, delivered or snoozed is left alone. Binding to
+        it would change nothing a reader has been shown, and a question that
+        looks asked but was never displayed is worse than one still waiting.
+        """
+        rows = connection.execute(
+            "SELECT e.id AS evidence_id,e.task_id AS task_id,"
+            "(SELECT c.id FROM task_review_cards AS c "
+            " WHERE c.task_id=e.task_id AND c.status IN "
+            " ('pending','delivering','delivered','snoozed')) AS active_id,"
+            "(SELECT c.status FROM task_review_cards AS c "
+            " WHERE c.task_id=e.task_id AND c.status IN "
+            " ('pending','delivering','delivered','snoozed')) AS active_status,"
+            "t.version AS task_version "
+            "FROM task_completion_evidence AS e "
+            "JOIN tasks AS t ON t.id=e.task_id "
+            "WHERE e.state='proposed' AND e.card_id IS NULL "
+            "AND t.status='open' "
+            "AND NOT EXISTS("
+            " SELECT 1 FROM task_candidate_bindings AS b JOIN "
+            " task_candidate_lifecycle AS l ON l.candidate_id=b.candidate_id "
+            " WHERE b.task_id=t.id AND b.relation='accepted' "
+            " AND l.state='withdrawn' AND l.resolution='preserved_open'"
+            ") "
+            "ORDER BY e.id LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+        asked = raised = 0
+        seen: set[int] = set()
+        for row in rows:
+            task_id = int(row["task_id"])
+            # One question per task per pass. The next one waits for this
+            # one's answer, which is what stops a detector from turning a
+            # single task into a queue of cards.
+            if task_id in seen:
+                continue
+            status = row["active_status"]
+            if status is not None and status != CardStatus.PENDING:
+                continue
+            if status == CardStatus.PENDING:
+                card_id = int(row["active_id"])
+                # Due now: the card was waiting on its own schedule, and it
+                # has just acquired something to say.
+                connection.execute(
+                    "UPDATE task_review_cards SET due_at=?,updated_at=? "
+                    "WHERE id=? AND status='pending'",
+                    (now, now, card_id),
+                )
+            else:
+                cursor = connection.execute(
+                    "INSERT INTO task_review_cards("
+                    "task_id,task_version,status,version,due_at,created_at,"
+                    "updated_at) VALUES(?,?,'pending',1,?,?,?)",
+                    (task_id, int(row["task_version"]), now, now, now),
+                )
+                card_id = int(cursor.lastrowid)
+                self._event(
+                    connection,
+                    card_id=card_id,
+                    task_id=task_id,
+                    kind="scheduled",
+                    card_version=1,
+                    task_version=int(row["task_version"]),
+                    now=now,
+                )
+                raised += 1
+            if not completion.bind(
+                connection,
+                evidence_id=int(row["evidence_id"]),
+                card_id=card_id,
+            ):
+                continue
+            seen.add(task_id)
+            asked += 1
+        return asked, raised
+
     def _cancel_stale(self, connection: sqlite3.Connection, now: str) -> int:
         rows = connection.execute(
             "SELECT c.id,c.task_id,c.task_version,c.version "
@@ -596,6 +750,11 @@ class TaskCardService:
                 "updated_at=? WHERE id=? AND version=?",
                 (next_version, now, now, int(row["id"]), int(row["version"])),
             )
+            # The question goes back in the queue rather than down with the
+            # card: bound to a card nobody will see, it could never be asked
+            # again, because the identity index refuses a second row for the
+            # same evidence.
+            completion.release(connection, int(row["id"]))
             self._event(
                 connection,
                 card_id=int(row["id"]),
@@ -656,8 +815,20 @@ class TaskCardService:
             " ON h.candidate_id=b.candidate_id "
             " AND h.source_revision=b.source_revision "
             " WHERE b.task_id=c.task_id AND b.relation='accepted') "
-            " AS origin_payload FROM task_review_cards AS c "
-            "JOIN tasks AS t ON t.id=c.task_id"
+            " AS origin_payload,"
+            # A card carries at most one unanswered question -- scheduling
+            # binds one at a time -- so this join never multiplies rows.
+            "e.id AS completion_id,e.source_kind AS completion_kind,"
+            "e.source_record_id AS completion_record,"
+            "e.source_item_id AS completion_item,"
+            "e.observed_at AS completion_observed,"
+            "e.quotation AS completion_quotation,"
+            "e.reason AS completion_reason,"
+            "e.confidence AS completion_confidence "
+            "FROM task_review_cards AS c "
+            "JOIN tasks AS t ON t.id=c.task_id "
+            "LEFT JOIN task_completion_evidence AS e "
+            "ON e.card_id=c.id AND e.state='proposed'"
         )
 
     def _connect(self) -> sqlite3.Connection:
@@ -692,6 +863,8 @@ def render_task_review_card(card: TaskReviewCard) -> tuple[str, dict]:
     if card.status is not CardStatus.DELIVERING:
         raise ValueError("task review card is not claimed for delivery")
     text = html.escape(card.text, quote=False)
+    if card.completion is not None:
+        return _render_done_check(card, text)
     lines = [f"☑️ <b>Task done?</b>  <code>T{card.task_id}</code>", "", f"<b>{text}</b>"]
     if card.owner:
         lines.extend(("", f"👤 <b>Owner:</b> {html.escape(card.owner, quote=False)}"))
@@ -732,6 +905,93 @@ def render_task_review_card(card: TaskReviewCard) -> tuple[str, dict]:
     return "\n".join(lines), keyboard
 
 
+def _render_done_check(card: TaskReviewCard, text: str) -> tuple[str, dict]:
+    """The same card, asking a question it can justify.
+
+    An ordinary review card asks whether a task is done and shows the reader
+    nothing about why it is asking now. This one is only ever raised because
+    something said the work is finished, so it shows that something: the
+    source, its date, the sentence itself, and why that sentence was read as
+    closing this task rather than a similar one. A reader can check all four
+    without leaving the chat, which is the whole difference between a
+    suggestion and a nag.
+
+    Two controls, and no third. Snooze and Drop belong to the open question
+    "is this still live?"; this card asks "is this finished?", and the only
+    honest answers to it are yes and no.
+    """
+    question = card.completion
+    quotation = quotable(question.quotation)
+    lines = [
+        f"✅ <b>Looks done</b>  <code>T{card.task_id}</code>",
+        "",
+        f"<b>{text}</b>",
+    ]
+    if card.owner:
+        lines.extend(("", f"👤 <b>Owner:</b> {_escape(card.owner)}"))
+    origin = _source_line(question)
+    when = str(question.observed_at)[:10]
+    lines.extend((
+        "",
+        f"🔎 <b>Why we think so</b> — {origin}"
+        + (f", {_escape(when)}" if when else ""),
+        f"<blockquote>{_escape(quotation)}</blockquote>",
+        _escape(question.reason),
+    ))
+    # The task's own justifying extract, so the reader can see both halves of
+    # the match: what the task asked for, and what is said to have answered
+    # it. Without it "why this task" is a claim they have to take on trust.
+    #
+    # Only when there is an extract. The missing-evidence warning that block
+    # otherwise carries is written for the card that asks "is this still
+    # live?"; here it would sit under a heading promising the task's own words
+    # and deliver a second "From:" naming an unknown source, which reads as a
+    # doubt about the quotation immediately above it.
+    if card.origin_sources:
+        lines.extend((
+            "",
+            "📌 <b>What this task asked for</b>",
+            *origin_lines(
+                kind=card.origin_kind,
+                record=card.origin_record,
+                item=card.origin_item,
+                sources=card.origin_sources,
+                html_output=True,
+            ),
+        ))
+
+    def callback(action: str) -> str:
+        value = f"{CALLBACK_PREFIX}|{card.id}|{card.version}|{action}"
+        if len(value.encode("utf-8")) > CALLBACK_DATA_LIMIT:
+            raise ValueError("task review callback exceeds transport limit")
+        return value
+
+    keyboard = {"inline_keyboard": [[
+        {"text": "✅ Mark as done", "callback_data": callback("done")},
+        {"text": "↩️ Reopen", "callback_data": callback("keep_open")},
+    ]]}
+    return "\n".join(lines), keyboard
+
+
+def _source_line(question: CardCompletionQuestion) -> str:
+    """Name the completing source the way the reader would name it."""
+    url = origin_url(
+        kind=question.source_kind,
+        record=question.source_record_id,
+        item=question.source_item_id,
+    )
+    if url is not None:
+        name = question.source_record_id.rsplit("/", 1)[-1]
+        number = question.source_item_id.split("/", 1)[0]
+        return f'<a href="{_escape(url)}">{_escape(name)} #{_escape(number)}</a>'
+    kind = question.source_kind.replace("_", " ").title() or "Source"
+    return _escape(kind)
+
+
+def _escape(value: str) -> str:
+    return html.escape(value, quote=False)
+
+
 def parse_task_review_callback(value: object) -> tuple[int, int, str] | None:
     if not isinstance(value, str) or len(value.encode("utf-8")) > CALLBACK_DATA_LIMIT:
         return None
@@ -767,6 +1027,22 @@ def _card(row) -> TaskReviewCard:
         origin_record=str(row["origin_record"] or ""),
         origin_item=str(row["origin_item"] or ""),
         origin_sources=stored_origin_sources(row["origin_payload"]),
+        completion=_question(row),
+    )
+
+
+def _question(row) -> CardCompletionQuestion | None:
+    if row["completion_id"] is None:
+        return None
+    return CardCompletionQuestion(
+        id=int(row["completion_id"]),
+        source_kind=str(row["completion_kind"] or ""),
+        source_record_id=str(row["completion_record"] or ""),
+        source_item_id=str(row["completion_item"] or ""),
+        observed_at=str(row["completion_observed"] or ""),
+        quotation=str(row["completion_quotation"] or ""),
+        reason=str(row["completion_reason"] or ""),
+        confidence=str(row["completion_confidence"] or ""),
     )
 
 
