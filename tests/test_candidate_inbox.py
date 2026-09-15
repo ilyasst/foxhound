@@ -73,6 +73,9 @@ class CandidateInboxTests(unittest.TestCase):
             connection.execute(
                 "ALTER TABLE task_review_cards DROP COLUMN consumer_digest"
             )
+            connection.execute(
+                "ALTER TABLE task_review_cards DROP COLUMN source_revision"
+            )
             connection.execute("PRAGMA user_version = 17")
             connection.commit()
 
@@ -113,6 +116,9 @@ class CandidateInboxTests(unittest.TestCase):
             )
             connection.execute(
                 "ALTER TABLE task_review_cards DROP COLUMN consumer_digest"
+            )
+            connection.execute(
+                "ALTER TABLE task_review_cards DROP COLUMN source_revision"
             )
             connection.execute(
                 "INSERT INTO task_review_cards(task_id,task_version,status,"

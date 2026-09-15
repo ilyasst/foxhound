@@ -138,6 +138,12 @@ class TaskReviewCard:
     completion: CardCompletionQuestion | None = field(
         default=None, repr=False
     )
+    #: The source revision displayed by this card. It is the stale-action
+    #: fence, not reader content.
+    source_revision: str | None = field(default=None, repr=False)
+    #: A previous card was delivered for this task, but this one carries a
+    #: later source revision. No semantic diff is inferred from digests.
+    source_changed: bool = field(default=False, repr=False)
 
 
 @dataclass(frozen=True)
@@ -195,7 +201,9 @@ class TaskCardService:
             try:
                 cancelled = self._cancel_stale(connection, now)
                 rows = connection.execute(
-                    "SELECT t.id,t.version FROM tasks AS t "
+                    "SELECT t.id,t.version,"
+                    + _bound_source_revision("t.id") + " AS source_revision "
+                    "FROM tasks AS t "
                     "WHERE t.status='open' "
                     "AND NOT EXISTS("
                     " SELECT 1 FROM task_candidate_bindings AS b JOIN "
@@ -209,19 +217,30 @@ class TaskCardService:
                     " WHERE active.task_id=t.id AND active.status IN "
                     " ('pending','delivering','delivered','snoozed')"
                     ") "
-                    "AND COALESCE(("
+                    "AND (COALESCE(("
                     " SELECT prior.review_after FROM task_review_cards AS prior "
                     " WHERE prior.task_id=t.id ORDER BY prior.id DESC LIMIT 1"
-                    "),'')<=? "
+                    "),'')<=? OR EXISTS("
+                    " SELECT 1 FROM task_candidate_bindings AS b "
+                    " WHERE b.task_id=t.id AND b.relation='accepted' "
+                    " AND NOT EXISTS("
+                    "  SELECT 1 FROM task_review_cards AS seen "
+                    "  WHERE seen.task_id=t.id "
+                    "  AND seen.source_revision=b.source_revision "
+                    "  AND EXISTS(SELECT 1 FROM task_review_card_events AS event "
+                    "             WHERE event.card_id=seen.id "
+                    "             AND event.kind='delivered')"
+                    " )) ) "
                     "ORDER BY t.created_at,t.id LIMIT ?",
                     (now, limit),
                 ).fetchall()
                 for row in rows:
                     cursor = connection.execute(
                         "INSERT INTO task_review_cards("
-                        "task_id,task_version,status,version,due_at,created_at,"
-                        "updated_at) VALUES(?,?,'pending',1,?,?,?)",
-                        (int(row["id"]), int(row["version"]), now, now, now),
+                        "task_id,task_version,source_revision,status,version,"
+                        "due_at,created_at,updated_at) VALUES(?,?,?,'pending',1,?,?,?)",
+                        (int(row["id"]), int(row["version"]),
+                         row["source_revision"], now, now, now),
                     )
                     self._event(
                         connection,
@@ -258,7 +277,9 @@ class TaskCardService:
             rows = connection.execute(
                 self._card_select()
                 + " WHERE c.status IN ('pending','snoozed') AND c.due_at<=? "
-                "AND t.status='open' AND t.version=c.task_version "
+                    "AND t.status='open' AND t.version=c.task_version "
+                    "AND COALESCE(c.source_revision,'')=COALESCE("
+                    + _bound_source_revision("t.id") + ",'') "
                 "ORDER BY c.due_at,c.id LIMIT ?",
                 (now, limit),
             ).fetchall()
@@ -316,6 +337,8 @@ class TaskCardService:
                     + " WHERE c.status IN ('pending','snoozed') "
                     "AND c.due_at<=? AND t.status='open' "
                     "AND t.version=c.task_version "
+                    "AND COALESCE(c.source_revision,'')=COALESCE("
+                    + _bound_source_revision("t.id") + ",'') "
                     "ORDER BY c.due_at,c.id LIMIT 1",
                     (now,),
                 ).fetchone()
@@ -402,6 +425,16 @@ class TaskCardService:
                 if row["status"] != CardStatus.DELIVERING:
                     connection.rollback()
                     return _refused_row(card_id, row, CardRefusal.INVALID_STATE)
+                current_revision = connection.execute(
+                    "SELECT b.source_revision FROM task_candidate_bindings AS b "
+                    "WHERE b.task_id=? AND b.relation='accepted'",
+                    (int(row["task_id"]),),
+                ).fetchone()
+                if (row["source_revision"] or None) != (
+                    None if current_revision is None else current_revision[0]
+                ):
+                    connection.rollback()
+                    return _refused_row(card_id, row, CardRefusal.STALE_VERSION)
                 connection.execute(
                     "UPDATE task_review_cards SET status='delivered',"
                     "claim_expires_at=NULL,transport=?,delivery_ref=?,"
@@ -490,7 +523,8 @@ class TaskCardService:
             try:
                 row = connection.execute(
                     "SELECT c.*,t.status AS task_status_current,"
-                    "t.version AS task_version_current "
+                    "t.version AS task_version_current,"
+                    + _bound_source_revision("t.id") + " AS source_revision_current "
                     "FROM task_review_cards AS c JOIN tasks AS t "
                     "ON t.id=c.task_id WHERE c.id=?",
                     (card_id,),
@@ -504,7 +538,9 @@ class TaskCardService:
                     return _refused_row(card_id, row, CardRefusal.INVALID_STATE)
                 if (row["task_status_current"] != TaskStatus.OPEN
                         or int(row["task_version_current"])
-                        != int(row["task_version"])):
+                        != int(row["task_version"])
+                        or (row["source_revision"] or None)
+                        != (row["source_revision_current"] or None)):
                     connection.rollback()
                     return _refused_row(card_id, row, CardRefusal.STALE_VERSION)
 
@@ -665,7 +701,8 @@ class TaskCardService:
             "(SELECT c.status FROM task_review_cards AS c "
             " WHERE c.task_id=e.task_id AND c.status IN "
             " ('pending','delivering','delivered','snoozed')) AS active_status,"
-            "t.version AS task_version "
+            "t.version AS task_version,"
+            + _bound_source_revision("t.id") + " AS source_revision "
             "FROM task_completion_evidence AS e "
             "JOIN tasks AS t ON t.id=e.task_id "
             "WHERE e.state='proposed' AND e.card_id IS NULL "
@@ -704,9 +741,10 @@ class TaskCardService:
             else:
                 cursor = connection.execute(
                     "INSERT INTO task_review_cards("
-                    "task_id,task_version,status,version,due_at,created_at,"
-                    "updated_at) VALUES(?,?,'pending',1,?,?,?)",
-                    (task_id, int(row["task_version"]), now, now, now),
+                    "task_id,task_version,source_revision,status,version,"
+                    "due_at,created_at,updated_at) VALUES(?,?,?,'pending',1,?,?,?)",
+                    (task_id, int(row["task_version"]),
+                     row["source_revision"], now, now, now),
                 )
                 card_id = int(cursor.lastrowid)
                 self._event(
@@ -731,10 +769,12 @@ class TaskCardService:
 
     def _cancel_stale(self, connection: sqlite3.Connection, now: str) -> int:
         rows = connection.execute(
-            "SELECT c.id,c.task_id,c.task_version,c.version "
+            "SELECT c.id,c.task_id,c.task_version,c.version,c.source_revision "
             "FROM task_review_cards AS c JOIN tasks AS t ON t.id=c.task_id "
             "WHERE c.status IN ('pending','delivering','delivered','snoozed') "
-            "AND (t.status!='open' OR t.version!=c.task_version OR EXISTS("
+            "AND (t.status!='open' OR t.version!=c.task_version "
+            "OR COALESCE(c.source_revision,'')!=COALESCE("
+            + _bound_source_revision("t.id") + ",'') OR EXISTS("
             " SELECT 1 FROM task_candidate_bindings AS b JOIN "
             " task_candidate_lifecycle AS l ON l.candidate_id=b.candidate_id "
             " WHERE b.task_id=t.id AND b.relation='accepted' "
@@ -789,6 +829,7 @@ class TaskCardService:
     def _card_select() -> str:
         return (
             "SELECT c.id,c.task_id,c.task_version,c.status,c.version,c.due_at,"
+            "c.source_revision,"
             "t.text,t.owner,t.owner_kind,t.due,"
             "(SELECT min(h.created_at) FROM task_candidate_bindings AS b "
             " JOIN candidate_revision_history AS h "
@@ -816,6 +857,12 @@ class TaskCardService:
             " AND h.source_revision=b.source_revision "
             " WHERE b.task_id=c.task_id AND b.relation='accepted') "
             " AS origin_payload,"
+            "EXISTS(SELECT 1 FROM task_review_cards AS seen "
+            " WHERE seen.task_id=c.task_id "
+            " AND seen.source_revision<>c.source_revision "
+            " AND EXISTS(SELECT 1 FROM task_review_card_events AS event "
+            "            WHERE event.card_id=seen.id AND event.kind='delivered')) "
+            " AS source_changed,"
             # A card carries at most one unanswered question -- scheduling
             # binds one at a time -- so this join never multiplies rows.
             "e.id AS completion_id,e.source_kind AS completion_kind,"
@@ -866,6 +913,11 @@ def render_task_review_card(card: TaskReviewCard) -> tuple[str, dict]:
     if card.completion is not None:
         return _render_done_check(card, text)
     lines = [f"☑️ <b>Task done?</b>  <code>T{card.task_id}</code>", "", f"<b>{text}</b>"]
+    if card.source_changed:
+        lines.extend((
+            "",
+            "🔄 <b>Source updated since you last saw this task</b>",
+        ))
     if card.owner:
         lines.extend(("", f"👤 <b>Owner:</b> {html.escape(card.owner, quote=False)}"))
     if card.due:
@@ -1028,6 +1080,21 @@ def _card(row) -> TaskReviewCard:
         origin_item=str(row["origin_item"] or ""),
         origin_sources=stored_origin_sources(row["origin_payload"]),
         completion=_question(row),
+        source_revision=row["source_revision"],
+        source_changed=bool(row["source_changed"]),
+    )
+
+
+def _bound_source_revision(task_id: str) -> str:
+    """SQL scalar for the accepted candidate revision of one task.
+
+    A task can be created without a producer candidate, so callers compare the
+    result with ``COALESCE`` rather than treating NULL as a stale revision.
+    The accepted-binding invariant makes this scalar unambiguous.
+    """
+    return (
+        "(SELECT b.source_revision FROM task_candidate_bindings AS b "
+        f"WHERE b.task_id={task_id} AND b.relation='accepted')"
     )
 
 

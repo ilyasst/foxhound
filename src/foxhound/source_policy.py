@@ -49,7 +49,11 @@ SOURCE_POLICIES = {
     ),
     "issue": SourcePolicy(
         True, True, True, addressable_origin=True,
-        provenance_roles=frozenset({"title", "body"}),
+        # A comment that changed an issue after a reader saw its task is
+        # evidence in its own right. Keeping it distinct from the body lets
+        # the card say why it has been raised again without pretending the
+        # issue description itself changed.
+        provenance_roles=frozenset({"title", "body", "comment"}),
     ),
     "legacy": SourcePolicy(
         True, True, True, provenance_roles=frozenset({"record"}),

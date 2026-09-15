@@ -20,6 +20,12 @@ class SourcePolicyTests(unittest.TestCase):
         self.assertTrue(policy.accepts_shadow_observations)
         self.assertTrue(policy.accepts_native_intake)
 
+    def test_issue_can_carry_the_comment_that_triggered_a_resurface(self):
+        self.assertEqual(
+            provenance_roles_for("issue"),
+            frozenset({"title", "body", "comment"}),
+        )
+
     def test_a_machine_that_declares_nothing_asks_about_everything(self):
         """Planning authority is no longer decided in this registry. It is
         a judgement about one machine and its operator, so a machine that
