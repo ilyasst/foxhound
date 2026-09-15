@@ -267,11 +267,11 @@ class TaskCardTests(unittest.TestCase):
         self.assertEqual(self.cards.count(), 4)
 
     def test_stats_are_aggregate_and_from_one_queue_snapshot(self):
-        empty = self.cards.stats()
+        empty = self.cards.stats(consumer_digest=CONSUMER_A)
         self.assertEqual(
             (empty.pending, empty.delivering, empty.delivered,
-             empty.snoozed, empty.active),
-            (0, 0, 0, 0, 0),
+             empty.snoozed, empty.elsewhere, empty.active),
+            (0, 0, 0, 0, 0, 0),
         )
         self.cards.schedule()
         first = self.claim_and_deliver()
@@ -282,13 +282,42 @@ class TaskCardTests(unittest.TestCase):
         )
         self.cards.claim_next(consumer_digest=CONSUMER_A)
 
-        stats = self.cards.stats()
+        stats = self.cards.stats(consumer_digest=CONSUMER_A)
 
         self.assertEqual(
             (stats.pending, stats.delivering, stats.delivered,
-             stats.snoozed, stats.active),
-            (2, 1, 0, 1, 4),
+             stats.snoozed, stats.elsewhere, stats.active),
+            (2, 1, 0, 1, 0, 4),
         )
+
+    def test_stats_scope_claimed_cards_and_hide_legacy_consumer_rows(self):
+        self.cards.schedule()
+        mine = self.claim_and_deliver(consumer_digest=CONSUMER_A)
+        other = self.cards.claim_next(consumer_digest=CONSUMER_B)
+        self.assertIsNotNone(other)
+
+        a = self.cards.stats(consumer_digest=CONSUMER_A)
+        b = self.cards.stats(consumer_digest=CONSUMER_B)
+        self.assertEqual(
+            (a.pending, a.snoozed, a.delivering, a.delivered,
+             a.elsewhere, a.active),
+            (2, 0, 0, 1, 1, 4),
+        )
+        self.assertEqual(
+            (b.pending, b.snoozed, b.delivering, b.delivered,
+             b.elsewhere, b.active),
+            (2, 0, 1, 0, 1, 4),
+        )
+
+        # A row left by a pre-migration binary has no attributable owner.
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "UPDATE task_review_cards SET consumer_digest=NULL WHERE id=?",
+                (mine.card.id,),
+            )
+            connection.commit()
+        a = self.cards.stats(consumer_digest=CONSUMER_A)
+        self.assertEqual((a.delivered, a.elsewhere, a.active), (0, 1, 4))
 
     def test_delivery_claim_render_ack_and_replay_are_fenced(self):
         self.cards.schedule()
