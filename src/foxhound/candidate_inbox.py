@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -295,6 +295,7 @@ _SCHEMA_COLUMNS = {
         "agent_profile_revision",
         "task_work_directory",
         "task_kb_file",
+        "work_digest",
     ),
     "task_execution_events": (
         "sequence",
@@ -410,12 +411,20 @@ _SCHEMA_COLUMNS = {
     ),
 }
 
-# Every historical map is derived from the current one by subtraction, so a
-# table added now has to be taken back out of the version before it existed —
-# otherwise a migration step verifies its own future.
+# Every historical map is derived from the current one by subtraction, so
+# anything added now has to be taken back out of the version before it
+# existed -- otherwise a migration step verifies its own future. Two
+# subtractions, applied in version order: `work_digest` arrives at v22 and
+# `task_relations` at v21, so the v21 state has the table and not the
+# column, and the v20 state has neither.
+_SCHEMA_V21_COLUMNS = {
+    name: tuple(column for column in columns if column != "work_digest")
+    for name, columns in _SCHEMA_COLUMNS.items()
+}
+
 _SCHEMA_V20_COLUMNS = {
     name: columns
-    for name, columns in _SCHEMA_COLUMNS.items()
+    for name, columns in _SCHEMA_V21_COLUMNS.items()
     if name != "task_relations"
 }
 
@@ -1724,6 +1733,17 @@ _SCHEMA_V20_CARD_TABLE = _SCHEMA_V11_CARD_TABLE.replace(
     "(kind = 'start' AND result_id IS NULL)",
 )
 
+_SCHEMA_V22 = (
+    # Derived, not reported. The agent writes `work_markdown`; this is a
+    # few sentences of it produced afterwards by a small model so the card
+    # can show what the plan SAYS instead of its first screenful. Nullable
+    # because it is allowed to be missing: the model is remote, the card
+    # must render without it, and every result written before this column
+    # existed has none.
+    "ALTER TABLE task_execution_results ADD COLUMN work_digest TEXT "
+    "CHECK(work_digest IS NULL OR length(work_digest) BETWEEN 1 AND 800);",
+)
+
 _SCHEMA_V20 = (
     # SQLite cannot alter a CHECK in place, and three tables carry a foreign
     # key to this one. Renaming the card table would rewrite all three to
@@ -2443,6 +2463,18 @@ class CandidateInbox:
                 except Exception:
                     connection.rollback()
                     raise
+                version = 21
+            if version == 21:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V22:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 22")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 22
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:
