@@ -32,7 +32,10 @@ requested explicitly.
 The complete response is validated before use. Schema and version, echoed
 query and parameters, layer order, aggregate counts, document identifiers,
 relative paths, excerpts, optional KB paths and sections, and optional ranking
-metadata all have closed shapes. Absolute paths, parent traversal, duplicate
+metadata all have closed shapes. The optional `excluded` object is accepted
+only as the three non-negative aggregate counts emitted when GW omits
+unrequested search scopes; no excluded path or record content crosses the
+boundary. Absolute paths, parent traversal, duplicate
 JSON fields, additional fields, inconsistent counts, unexpected media types,
 and oversized bodies fail closed.
 

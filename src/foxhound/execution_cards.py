@@ -36,7 +36,7 @@ from .card_provenance import (
 from .knowledge_client import KnowledgeClientError, OwnerUpcomingMeeting
 from .task_execution import (
     ExecutionOutcome,
-    REVIEW_SNOOZE_INTERVALS,
+    REVIEW_SNOOZE_ACTIONS,
     TaskExecutionService,
     WorkflowDisposition,
     WorkflowOperationResult,
@@ -68,8 +68,14 @@ MAX_TRUNCATED_CARD_BODY_BYTES = 3_500
 ACTIVE_STATUSES = ("pending", "delivering", "delivered")
 REVIEW_DIRECT_ACTIONS = {
     "approve", "revise", "cancel", "done", "drop",
-    *REVIEW_SNOOZE_INTERVALS,
+    *REVIEW_SNOOZE_ACTIONS,
 }
+SNOOZE_BUTTON_ROWS = (
+    (("🕓 Tomorrow · 9 AM", "snooze_1d"),
+     ("Friday · 9 AM", "snooze_7d")),
+    (("Next Monday · 9 AM", "snooze_14d"),
+     ("In 2 weeks · 9 AM", "snooze_30d")),
+)
 READER_INPUT_KINDS = {"discussion", "reassignment"}
 MAX_DISCUSSION_CHARS = 16_000
 MAX_OWNER_CHARS = 200
@@ -1728,7 +1734,7 @@ def parse_execution_review_callback(
     if parts[3] not in {
         "start", "snooze", "cancel", "approve", "revise", "discuss",
         "done", "reassign", "drop", "agent", "brief", OWNER_HOLD_ACTION,
-        *REVIEW_SNOOZE_INTERVALS,
+        *REVIEW_SNOOZE_ACTIONS,
     }:
         return None
     return card_id, version, parts[3]
@@ -3067,7 +3073,8 @@ def _button_rows(
         rows: tuple[tuple[tuple[str, str], ...], ...] = (
             (("✅ Done", "done"), ("▶️ Continue", "start")),
             (("🗑 Drop", "drop"), ("✏️ Update", "discuss")),
-            (("🕓 Snooze", "snooze"), ("👥 Reassign", "reassign")),
+            *SNOOZE_BUTTON_ROWS,
+            (("👥 Reassign", "reassign"),),
         )
         if card.owner_hold_eligible and card.owner:
             rows += ((
@@ -3083,20 +3090,22 @@ def _button_rows(
     if kind is ExecutionCardKind.EXTERNAL_REVIEW:
         rows = (
             (("✅ Authorize action", "approve"), ("⛔ Not now", "revise")),
-            (("🕒 Snooze", "snooze"),),
+            *SNOOZE_BUTTON_ROWS,
             (("💬 Discuss", "discuss"), ("✅ Mark as done", "done")),
             stop_row,
         )
     elif kind is ExecutionCardKind.RESULT_REVIEW:
         rows = (
             (("✅ Mark as done", "done"),),
-            (("💬 Discuss", "discuss"), ("🕒 Snooze", "snooze")),
+            (("💬 Discuss", "discuss"),),
+            *SNOOZE_BUTTON_ROWS,
             stop_row,
         )
     else:
         rows = (
             (("🔎 Investigate further", "revise"), ("💬 Discuss", "discuss")),
-            (("▶️ Execute plan", "approve"), ("🕒 Snooze", "snooze")),
+            (("▶️ Execute plan", "approve"),),
+            *SNOOZE_BUTTON_ROWS,
             (("✅ Mark as done", "done"),),
             stop_row,
         )
@@ -3138,20 +3147,20 @@ def _direct_actions_for_kind(kind: ExecutionCardKind) -> set[str]:
         return {
             "start", "snooze", "cancel", "done", "drop",
             OWNER_HOLD_ACTION,
-            *REVIEW_SNOOZE_INTERVALS,
+            *REVIEW_SNOOZE_ACTIONS,
         }
     if kind is ExecutionCardKind.RESULT_REVIEW:
-        return {"done", "drop", *REVIEW_SNOOZE_INTERVALS}
+        return {"done", "drop", *REVIEW_SNOOZE_ACTIONS}
     return {
         "approve", "revise", "cancel", "done", "drop",
-        *REVIEW_SNOOZE_INTERVALS,
+        *REVIEW_SNOOZE_ACTIONS,
     }
 
 
 def _stored_action(action: str) -> str:
     return (
         "snooze"
-        if action in {*REVIEW_SNOOZE_INTERVALS, OWNER_HOLD_ACTION}
+        if action in {*REVIEW_SNOOZE_ACTIONS, OWNER_HOLD_ACTION}
         else action
     )
 

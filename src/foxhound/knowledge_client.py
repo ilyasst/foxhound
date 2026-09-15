@@ -361,10 +361,15 @@ def _parse_search_response(
     value: object, request: Mapping[str, Any]
 ) -> KnowledgeSearchResult:
     root = _object(value, "search response")
+    allowed_fields = {
+        "schema", "schema_version", "ok", "query", "parameters", "layers",
+    }
+    if "excluded" in root:
+        allowed_fields.add("excluded")
     _exact_fields(
         root,
         "search response",
-        {"schema", "schema_version", "ok", "query", "parameters", "layers"},
+        allowed_fields,
     )
     version = root["schema_version"]
     if (root["schema"] != SEARCH_SCHEMA
@@ -391,6 +396,15 @@ def _parse_search_response(
             )
     if "ranking" in parameters and parameters["ranking"] != "hybrid_rrf":
         raise KnowledgeResponseError("GW knowledge ranking is unsupported")
+    if "excluded" in root:
+        excluded = _object(root["excluded"], "search exclusions")
+        _exact_fields(
+            excluded,
+            "search exclusions",
+            {"hits", "directories", "declined"},
+        )
+        for name in ("hits", "directories", "declined"):
+            _response_int(excluded[name], "search exclusion count")
 
     raw_layers = root["layers"]
     if not isinstance(raw_layers, list):
