@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 27
+SCHEMA_VERSION = 28
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -246,6 +246,7 @@ _SCHEMA_COLUMNS = {
         "created_at",
         "updated_at",
         "settled_at",
+        "card_id",
     ),
     "task_duplicate_proposal_events": (
         "sequence",
@@ -454,7 +455,8 @@ _SCHEMA_COLUMNS = {
 # anything added now has to be taken back out of the version before it
 # existed -- otherwise a migration step verifies its own future. Five
 # subtractions, applied in version order: `source_revision` (task review
-# cards) arrives at v26, duplicate proposals arrive at v27,
+# cards) arrives at v26, duplicate proposals arrive at v27, and their card
+# binding arrives at v28,
 # `task_completion_evidence` arrives at v25,
 # `consumer_digest` (task review cards, ADR 0036 decision 2) at v23,
 # `work_digest` at v22, and `task_relations` at v21 -- so the v24 state has
@@ -465,6 +467,13 @@ _SCHEMA_V26_COLUMNS = {
     name: columns
     for name, columns in _SCHEMA_COLUMNS.items()
     if name not in {"task_duplicate_proposals", "task_duplicate_proposal_events"}
+}
+
+_SCHEMA_V27_COLUMNS = {
+    name: tuple(column for column in columns if not (
+        name == "task_duplicate_proposals" and column == "card_id"
+    ))
+    for name, columns in _SCHEMA_COLUMNS.items()
 }
 
 _SCHEMA_V24_COLUMNS = {
@@ -2121,6 +2130,42 @@ END;
 )
 
 
+# A duplicate proposal is presented by one ordinary task-review card.  The
+# binding is private and may be released when that card becomes stale, so an
+# unanswered proposal can be offered again without duplicating its decision
+# record.
+_SCHEMA_V28 = (
+    "DROP TRIGGER task_duplicate_proposals_settle_only;",
+    """
+CREATE TRIGGER task_duplicate_proposals_settle_only
+BEFORE UPDATE ON task_duplicate_proposals
+BEGIN
+    SELECT RAISE(ABORT, 'task duplicate proposal may only be settled, reopened, or rebound')
+    WHERE OLD.left_task_id       <> NEW.left_task_id
+       OR OLD.right_task_id      <> NEW.right_task_id
+       OR OLD.left_task_version  <> NEW.left_task_version
+       OR OLD.right_task_version <> NEW.right_task_version
+       OR OLD.basis              <> NEW.basis
+       OR OLD.detector           <> NEW.detector
+       OR OLD.created_at         <> NEW.created_at
+       OR NOT (
+           (OLD.state = 'proposed' AND NEW.state IN ('confirmed','rejected')
+            AND NEW.settled_at IS NOT NULL AND OLD.card_id IS NEW.card_id)
+           OR
+           (OLD.state IN ('rejected','confirmed') AND NEW.state = 'proposed'
+            AND NEW.settled_at IS NULL
+            AND (OLD.card_id IS NEW.card_id OR NEW.card_id IS NULL))
+           OR
+           (OLD.state = 'proposed' AND NEW.state = 'proposed'
+            AND OLD.settled_at IS NULL AND NEW.settled_at IS NULL
+            AND ((OLD.card_id IS NULL AND NEW.card_id IS NOT NULL)
+                 OR (OLD.card_id IS NOT NULL AND NEW.card_id IS NULL)))
+       );
+END;
+""",
+)
+
+
 _SCHEMA_V20 = (
     # SQLite cannot alter a CHECK in place, and three tables carry a foreign
     # key to this one. Renaming the card table would rewrite all three to
@@ -2926,6 +2971,26 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 27
+            if version == 27:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    columns = tuple(item["name"] for item in connection.execute(
+                        "PRAGMA table_info(task_duplicate_proposals)"
+                    ))
+                    if "card_id" not in columns:
+                        connection.execute(
+                            "ALTER TABLE task_duplicate_proposals ADD COLUMN "
+                            "card_id INTEGER REFERENCES task_review_cards(id);"
+                        )
+                    for statement in _SCHEMA_V28:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 28")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 28
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:
