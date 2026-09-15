@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -203,6 +203,19 @@ _SCHEMA_COLUMNS = {
         "comparison_divergent",
         "comparison_refused",
         "comparison_unmapped",
+    ),
+    "task_relations": (
+        "id",
+        "subject_id",
+        "object_id",
+        "kind",
+        "basis",
+        "asserted_by",
+        "actor",
+        "note",
+        "created_at",
+        "withdrawn_at",
+        "withdrawn_by",
     ),
     "task_owner_equivalences": (
         "candidate_id",
@@ -397,9 +410,18 @@ _SCHEMA_COLUMNS = {
     ),
 }
 
-_SCHEMA_V18_COLUMNS = {
+# Every historical map is derived from the current one by subtraction, so a
+# table added now has to be taken back out of the version before it existed —
+# otherwise a migration step verifies its own future.
+_SCHEMA_V20_COLUMNS = {
     name: columns
     for name, columns in _SCHEMA_COLUMNS.items()
+    if name != "task_relations"
+}
+
+_SCHEMA_V18_COLUMNS = {
+    name: columns
+    for name, columns in _SCHEMA_V20_COLUMNS.items()
     if name not in {
         "task_execution_owner_holds",
         "task_execution_owner_hold_events",
@@ -457,6 +479,10 @@ _SCHEMA_OBJECTS = {
     "task_events_no_delete": "trigger",
     "shadow_import_cycles_no_update": "trigger",
     "shadow_import_cycles_no_delete": "trigger",
+    "task_relations_no_delete": "trigger",
+    "task_relations_only_withdraw": "trigger",
+    "task_relations_live": "index",
+    "task_relations_object": "index",
     "task_owner_equivalences_no_update": "trigger",
     "task_owner_equivalences_no_delete": "trigger",
     "task_review_cards_one_active": "index",
@@ -1726,6 +1752,81 @@ _SCHEMA_V20 = (
 )
 
 
+#: A durable, attributed, reversible statement that two tasks are related.
+#:
+#: The card surface already answers "what came before this task" by joining on
+#: source identity: two review tasks for the same pull request share a stem, so
+#: one can be named as the other's predecessor without storing anything. That
+#: works, costs nothing to keep in sync, and cannot express any of what this
+#: table is for — a relation between tasks from different sources, a basis, an
+#: actor, or a decision a reader made and can take back.
+#:
+#: Append-only, like every other attributed record here. A relation is
+#: withdrawn by recording a withdrawal, never by deleting the assertion: "we
+#: decided these were the same and then decided they were not" is the history
+#: worth keeping, and a deleted row keeps none of it.
+_SCHEMA_V21 = (
+    """
+CREATE TABLE IF NOT EXISTS task_relations (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    subject_id    INTEGER NOT NULL,
+    object_id     INTEGER NOT NULL,
+    kind          TEXT NOT NULL CHECK(kind IN ('supersedes','duplicate_of')),
+    -- What the assertion rests on, in the asserter's own terms. Bounded, and
+    -- never empty: a relation nobody can justify is one nobody can review.
+    basis         TEXT NOT NULL CHECK(length(basis) BETWEEN 1 AND 500),
+    -- Who said so. A machine's inference and a reader's confirmation are the
+    -- same shape and must not be the same fact.
+    asserted_by   TEXT NOT NULL CHECK(asserted_by IN ('machine','reader')),
+    actor         TEXT CHECK(actor IS NULL OR length(actor) BETWEEN 1 AND 200),
+    note          TEXT CHECK(note IS NULL OR length(note) BETWEEN 1 AND 500),
+    created_at    TEXT NOT NULL,
+    withdrawn_at  TEXT,
+    withdrawn_by  TEXT CHECK(
+        withdrawn_by IS NULL OR withdrawn_by IN ('machine','reader')),
+    CHECK(subject_id <> object_id),
+    CHECK((withdrawn_at IS NULL) = (withdrawn_by IS NULL)),
+    FOREIGN KEY(subject_id) REFERENCES tasks(id),
+    FOREIGN KEY(object_id) REFERENCES tasks(id)
+);
+""",
+    # One live relation of a kind between an ordered pair. A withdrawn one
+    # does not occupy the slot, so the same pair can be asserted again later
+    # — a reader who changes their mind twice is not a constraint violation.
+    """
+CREATE UNIQUE INDEX IF NOT EXISTS task_relations_live
+    ON task_relations(subject_id, object_id, kind)
+    WHERE withdrawn_at IS NULL;
+""",
+    """
+CREATE INDEX IF NOT EXISTS task_relations_object ON task_relations(object_id);
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS task_relations_no_delete
+BEFORE DELETE ON task_relations
+BEGIN
+    SELECT RAISE(ABORT, 'task relations are append-only');
+END;
+""",
+    # Only the withdrawal columns may ever change, and only once: withdrawing
+    # a withdrawn relation would overwrite when it happened.
+    """
+CREATE TRIGGER IF NOT EXISTS task_relations_only_withdraw
+BEFORE UPDATE ON task_relations
+BEGIN
+    SELECT RAISE(ABORT, 'task relations may only be withdrawn')
+    WHERE OLD.subject_id  <> NEW.subject_id
+       OR OLD.object_id   <> NEW.object_id
+       OR OLD.kind        <> NEW.kind
+       OR OLD.basis       <> NEW.basis
+       OR OLD.asserted_by <> NEW.asserted_by
+       OR OLD.created_at  <> NEW.created_at
+       OR OLD.withdrawn_at IS NOT NULL;
+END;
+""",
+)
+
+
 class InboxError(RuntimeError):
     """The inbox cannot safely initialize or read its state."""
 
@@ -2326,6 +2427,22 @@ class CandidateInbox:
                     raise InboxError(
                         "candidate inbox schema is incomplete"
                     )
+                version = 20
+            if version == 20:
+                # The default expectation is the version-14 map, which is
+                # several tables and seven owner columns behind this point.
+                self._require_tables(
+                    connection, ("tasks",), columns=_SCHEMA_V20_COLUMNS)
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V21:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 21")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:

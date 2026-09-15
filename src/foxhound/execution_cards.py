@@ -18,6 +18,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
+from . import task_relations
 from .agent_profiles import (
     AgentProfile,
     AgentProfileError,
@@ -174,6 +175,9 @@ class ExecutionReviewCard:
     origin_record: str = field(default="", repr=False)
     origin_item: str = field(default="", repr=False)
     prior_task_id: int | None = None
+    #: Recorded relations to other tasks, live ones only.
+    relations: tuple["CardRelation", ...] = field(
+        default_factory=tuple)
     #: How a parked workflow got there. A reader told only that nothing
     #: happened cannot tell a task nobody reached from one that was
     #: abandoned.
@@ -1532,6 +1536,22 @@ class ExecutionCardService:
             " AND " + _ITEM_STEM.format(column="o2.source_item_id") + "="
             + _ITEM_STEM.format(column="o1.source_item_id") +
             " ORDER BY b2.task_id DESC LIMIT 1) AS prior_task_id,"
+            # Recorded relations, as distinct from the derived predecessor
+            # above: that one is inferred from source identity and cannot
+            # reach across sources, carries no basis and cannot be taken
+            # back. Both render through one path, so a reader is never shown
+            # two answers to "what came before this".
+            "(SELECT group_concat("
+            " r.kind || char(31) ||"
+            " (CASE WHEN r.subject_id=c.task_id THEN 'out' ELSE 'in' END)"
+            " || char(31) ||"
+            " (CASE WHEN r.subject_id=c.task_id THEN r.object_id"
+            "       ELSE r.subject_id END) || char(31) ||"
+            " COALESCE(r.note,''), char(30)) "
+            " FROM task_relations AS r "
+            " WHERE r.withdrawn_at IS NULL "
+            "   AND (r.subject_id=c.task_id OR r.object_id=c.task_id)) "
+            " AS task_relations,"
             "(SELECT h.payload_json FROM task_candidate_bindings AS b "
             " JOIN candidate_revision_history AS h "
             " ON h.candidate_id=b.candidate_id "
@@ -1838,6 +1858,43 @@ def _current_card(row: Mapping[str, object]) -> bool:
         return False
 
 
+@dataclass(frozen=True)
+class CardRelation:
+    """One recorded relation, from the point of view of the card's task."""
+
+    kind: str
+    other_task_id: int
+    #: True when this card's task is the subject — the one doing the
+    #: superseding. The direction decides which sentence a reader is shown.
+    outgoing: bool
+    note: str | None
+
+
+#: `kind`, direction, other task, and an optional note, one relation per row.
+_RELATION_FIELDS = 4
+
+
+def _stored_relations(value: object) -> tuple[CardRelation, ...]:
+    """Parse the relations the card query collected for this task."""
+    if not isinstance(value, str) or not value:
+        return ()
+    out: list[CardRelation] = []
+    for record in value.split("\x1e"):
+        parts = record.split("\x1f")
+        if len(parts) != _RELATION_FIELDS:
+            continue
+        kind, direction, other, note = parts
+        if kind not in task_relations.KINDS or direction not in ("out", "in"):
+            continue
+        try:
+            other_id = int(other)
+        except ValueError:
+            continue
+        out.append(CardRelation(kind, other_id, direction == "out",
+                                note or None))
+    return tuple(out)
+
+
 def _card(
     row: Mapping[str, object],
     registry: AgentProfileRegistry,
@@ -1908,6 +1965,7 @@ def _card(
                 None if row["prior_task_id"] is None
                 else int(row["prior_task_id"])
             ),
+            relations=_stored_relations(row["task_relations"]),
             task_work_directory=str(row["task_work_directory"] or ""),
             task_kb_file=str(row["task_kb_file"] or ""),
             origin_sources=stored_origin_sources(row["origin_payload"]),
@@ -2264,10 +2322,27 @@ def _continues_lines(
     There are two heading builders, so this lives in one place rather than
     being written twice and drifting.
     """
-    if card.prior_task_id is None:
-        return []
-    shown = f"Continues T{card.prior_task_id}"
-    return [f"↩ <b>{shown}</b>" if html else f"↩ {shown}"]
+    lines: list[str] = []
+    named: set[int] = set()
+    for relation in card.relations:
+        other = relation.other_task_id
+        if relation.kind == "duplicate_of":
+            shown = f"Same task as T{other}"
+        elif relation.outgoing:
+            shown = f"Continues T{other}"
+        else:
+            shown = f"Continued by T{other}"
+        if relation.note:
+            note = _escape(relation.note) if html else relation.note
+            shown = f"{shown} — {note}"
+        named.add(other)
+        lines.append(f"↩ <b>{shown}</b>" if html else f"↩ {shown}")
+    # The derived predecessor, unless a recorded relation already names it.
+    # Two sentences about the same pair is worse than either alone.
+    if card.prior_task_id is not None and card.prior_task_id not in named:
+        shown = f"Continues T{card.prior_task_id}"
+        lines.append(f"↩ <b>{shown}</b>" if html else f"↩ {shown}")
+    return lines
 
 
 def _origin_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
