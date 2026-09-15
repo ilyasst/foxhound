@@ -152,6 +152,12 @@ class NativeIntakeResult:
     tasks_revised: int = 0
     candidates_unchanged: int = 0
     candidates_withdrawn: int = 0
+    #: Revisions the reader's own decision overtook. Counted apart from
+    #: `candidates_unchanged` because they are not nothing happening: the
+    #: producer changed a task and the change was deliberately not applied.
+    #: Folded into "unchanged" it would be a stream dropping work on the
+    #: floor and reporting a quiet pass.
+    candidates_after_close: int = 0
     remaining: int = 0
     refusal: NativeIntakeRefusal | None = None
 
@@ -546,7 +552,7 @@ class TaskLedger:
 
                 expected_sequence = previous_cursor + 1
                 tasks_created = tasks_revised = candidates_unchanged = 0
-                candidates_withdrawn = 0
+                candidates_withdrawn = candidates_after_close = 0
                 for row in rows:
                     if int(row["sequence"]) != expected_sequence:
                         raise _NativeIntakeConflict
@@ -655,8 +661,33 @@ class TaskLedger:
                         "SELECT * FROM tasks WHERE id=?",
                         (int(binding["task_id"]),),
                     ).fetchone()
-                    if task is None or task["status"] != TaskStatus.OPEN:
+                    if task is None:
+                        # A binding pointing at a task that does not exist is
+                        # corruption, not a race, and must still stop the pass.
                         raise _NativeIntakeConflict
+                    if task["status"] != TaskStatus.OPEN:
+                        # The reader got there first. That is the ordinary end
+                        # of a task's life, and a producer that still holds it
+                        # open will keep re-emitting it -- so refusing here
+                        # stopped the stream permanently, and every later
+                        # candidate, for open tasks too, was blocked behind a
+                        # decision the reader had already made correctly.
+                        #
+                        # Acknowledged, not applied: the binding advances so
+                        # the producer is not asked about this revision again,
+                        # and the task is left exactly as the reader left it.
+                        # This is what `_apply_candidate_withdrawal` already
+                        # does when a withdrawal meets a task the reader has
+                        # changed; the revision path was the one that raised.
+                        TaskLedger._acknowledge_revision_after_close(
+                            connection,
+                            candidate=candidate,
+                            binding=binding,
+                            task=task,
+                            now=now,
+                        )
+                        candidates_after_close += 1
+                        continue
                     desired_owner = (
                         _row_owner_values(task)
                         if bool(task["owner_pinned"])
@@ -801,6 +832,7 @@ class TaskLedger:
                     tasks_revised=tasks_revised,
                     candidates_unchanged=candidates_unchanged,
                     candidates_withdrawn=candidates_withdrawn,
+                    candidates_after_close=candidates_after_close,
                     remaining=remaining,
                 )
             except _NativeIntakeConflict:
@@ -1334,6 +1366,59 @@ class TaskLedger:
                 task_version,
                 candidate.lifecycle.state,
                 candidate.lifecycle.changed_at,
+                now,
+            ),
+        )
+
+    @staticmethod
+    def _acknowledge_revision_after_close(
+        connection: sqlite3.Connection,
+        *,
+        candidate: TaskCandidate,
+        binding: sqlite3.Row,
+        task: sqlite3.Row,
+        now: str,
+    ) -> None:
+        """Record a revision for a task the reader has already closed.
+
+        The binding and lifecycle move to the new revision so the producer is
+        not asked about it again; the task keeps its row, its status and its
+        version, because the reader's decision is the one that stands.
+
+        The event is `candidate_revision_conflict` rather than
+        `candidate_revised`: the ledger must not claim a revision was folded
+        into a task when it was not. `reader_conflict` is the same resolution
+        the withdrawal path records for the same reason.
+        """
+        version = int(task["version"])
+        connection.execute(
+            "UPDATE task_candidate_bindings SET source_revision=?,decided_at=? "
+            "WHERE candidate_id=?",
+            (candidate.source.revision, now, candidate.candidate_id),
+        )
+        connection.execute(
+            "UPDATE task_candidate_lifecycle SET source_revision=?,"
+            "task_version=?,resolution='reader_conflict',changed_at=?,"
+            "decided_at=? WHERE candidate_id=?",
+            (
+                candidate.source.revision,
+                version,
+                candidate.lifecycle.changed_at,
+                now,
+                candidate.candidate_id,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO task_events(task_id,kind,task_version,candidate_id,"
+            "source_revision,from_status,to_status,occurred_at) "
+            "VALUES(?,'candidate_revision_conflict',?,?,?,?,?,?)",
+            (
+                int(binding["task_id"]),
+                version,
+                candidate.candidate_id,
+                candidate.source.revision,
+                task["status"],
+                task["status"],
                 now,
             ),
         )
