@@ -15,7 +15,7 @@ import secrets
 import sqlite3
 from contextlib import closing
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
 from typing import Callable, Sequence
@@ -35,12 +35,12 @@ from .task_ledger import TaskLedgerError, TaskStatus
 
 
 START_SNOOZE_INTERVAL = timedelta(days=1)
-REVIEW_SNOOZE_INTERVALS = {
-    "snooze_1d": timedelta(days=1),
-    "snooze_7d": timedelta(days=7),
-    "snooze_14d": timedelta(days=14),
-    "snooze_30d": timedelta(days=30),
-}
+# Stable callback tokens shared with GW. Their presentation and behavior are
+# calendar choices, rather than durations: changing the vocabulary would make
+# a new Foxhound card fail closed in an older gateway deployment.
+REVIEW_SNOOZE_ACTIONS = frozenset({
+    "snooze_1d", "snooze_7d", "snooze_14d", "snooze_30d",
+})
 #: The agent a kind of work starts on, when that machine has it installed.
 #: A preference, not a rule: the reader may change it at the gate, and a
 #: machine without the profile falls back to its default rather than
@@ -584,7 +584,7 @@ class TaskExecutionService:
         if not _valid_identity(task_id, expected_version):
             return _refused(task_id, WorkflowRefusal.INVALID_ARGUMENT)
         if action not in {
-            "approve", "revise", "cancel", *REVIEW_SNOOZE_INTERVALS,
+            "approve", "revise", "cancel", *REVIEW_SNOOZE_ACTIONS,
         }:
             return _refused(task_id, WorkflowRefusal.INVALID_ACTION)
         stamp = self._clock_value()
@@ -1413,6 +1413,32 @@ def _apply_agent_selection(
     )
 
 
+def _calendar_snooze_until(action: str, stamp: datetime) -> str:
+    """Resolve one review choice to 09:00 in the service host timezone."""
+    if action not in REVIEW_SNOOZE_ACTIONS:
+        raise TaskLedgerError("task execution snooze action is invalid")
+    if stamp.tzinfo is None or stamp.utcoffset() is None:
+        raise TaskLedgerError("task execution clock must include a timezone")
+    current = stamp.astimezone()
+    today = current.date()
+    if action == "snooze_1d":
+        target = today + timedelta(days=1)
+    elif action == "snooze_7d":
+        target = today + timedelta(days=(4 - today.weekday()) % 7)
+        if target == today and current.timetz() >= time(
+            9, tzinfo=current.tzinfo
+        ):
+            target += timedelta(days=7)
+    elif action == "snooze_14d":
+        target = today + timedelta(days=7 - today.weekday())
+    else:
+        target = today + timedelta(days=14)
+    # Calling astimezone on the naive target applies the host's timezone rules
+    # for the target date, including a daylight-saving transition meanwhile.
+    local_target = datetime.combine(target, time(9)).astimezone()
+    return local_target.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
 def _apply_start_action(
     connection: sqlite3.Connection,
     task_id: int,
@@ -1424,7 +1450,7 @@ def _apply_start_action(
     """Apply one start gate inside the caller transaction."""
     if not _valid_identity(task_id, expected_version):
         return _refused(task_id, WorkflowRefusal.INVALID_ARGUMENT)
-    if action not in {"start", "snooze", "cancel", *REVIEW_SNOOZE_INTERVALS}:
+    if action not in {"start", "snooze", "cancel", *REVIEW_SNOOZE_ACTIONS}:
         return _refused(task_id, WorkflowRefusal.INVALID_ACTION)
     if stamp.tzinfo is None or stamp.utcoffset() is None:
         raise TaskLedgerError("task execution clock must include a timezone")
@@ -1460,13 +1486,15 @@ def _apply_start_action(
         wake = None
         completed = None
         kind = "start_approved"
-    elif action == "snooze" or action in REVIEW_SNOOZE_INTERVALS:
-        # A bare `snooze` keeps the gate's own default, because that is what
-        # the control sends before the reader has chosen. An interval comes
-        # from the picker, and means they did choose.
+    elif action == "snooze" or action in REVIEW_SNOOZE_ACTIONS:
+        # A bare `snooze` survives for already-delivered cards. New cards
+        # carry one of the explicit calendar choices instead.
         status = WorkflowStatus.SNOOZED
-        interval = REVIEW_SNOOZE_INTERVALS.get(action, START_SNOOZE_INTERVAL)
-        wake = (stamp + interval).isoformat(timespec="seconds")
+        wake = (
+            (stamp + START_SNOOZE_INTERVAL).isoformat(timespec="seconds")
+            if action == "snooze"
+            else _calendar_snooze_until(action, stamp)
+        )
         completed = None
         kind = "snoozed"
     else:
@@ -1535,7 +1563,7 @@ def _apply_review_action(
     if not _valid_identity(task_id, expected_version):
         return _refused(task_id, WorkflowRefusal.INVALID_ARGUMENT)
     if action not in {
-        "approve", "revise", "cancel", *REVIEW_SNOOZE_INTERVALS,
+        "approve", "revise", "cancel", *REVIEW_SNOOZE_ACTIONS,
     }:
         return _refused(task_id, WorkflowRefusal.INVALID_ACTION)
     if stamp.tzinfo is None or stamp.utcoffset() is None:
@@ -1547,7 +1575,7 @@ def _apply_review_action(
         WorkflowStatus.AWAITING_REVIEW,
         WorkflowStatus.SNOOZED,
     }
-    if action in REVIEW_SNOOZE_INTERVALS:
+    if action in REVIEW_SNOOZE_ACTIONS:
         allowed_statuses.add(WorkflowStatus.COMPLETED)
     refusal = _workflow_guard(
         row,
@@ -1585,14 +1613,12 @@ def _apply_review_action(
         completed = None
         kind = "revision_requested"
         wake = None
-    elif action in REVIEW_SNOOZE_INTERVALS:
+    elif action in REVIEW_SNOOZE_ACTIONS:
         phase = WorkflowPhase(row["phase"])
         status = WorkflowStatus.SNOOZED
         completed = None
         kind = "snoozed"
-        wake = (stamp + REVIEW_SNOOZE_INTERVALS[action]).isoformat(
-            timespec="seconds"
-        )
+        wake = _calendar_snooze_until(action, stamp)
     else:
         targets = {
             ExecutionOutcome.AWAITING_PLAN: WorkflowPhase.EXECUTE,

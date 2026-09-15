@@ -347,6 +347,40 @@ class KnowledgeClientTests(unittest.TestCase):
             "max_results_per_layer": 4,
         })
 
+    def test_search_accepts_bounded_aggregate_exclusion_counts(self):
+        def add_exclusions(document):
+            document["excluded"] = {
+                "hits": 3,
+                "directories": 2,
+                "declined": 1,
+            }
+            return document
+
+        with server(transform=add_exclusions) as (endpoint, _requests):
+            result = client(endpoint).search(
+                "synthetic query", layers=("emails",)
+            )
+
+        self.assertEqual([layer.name for layer in result.layers], ["emails"])
+
+    def test_search_exclusion_metadata_remains_strict_and_content_free(self):
+        invalid = (
+            {"hits": -1, "directories": 0, "declined": 0},
+            {"hits": 0, "directories": False, "declined": 0},
+            {"hits": 0, "directories": 0, "declined": 0,
+             "records": ["private"]},
+        )
+        for excluded in invalid:
+            with self.subTest(excluded=excluded):
+                def add_exclusions(document):
+                    document["excluded"] = excluded
+                    return document
+
+                with server(transform=add_exclusions) as (endpoint, _requests):
+                    with self.assertRaises(KnowledgeResponseError) as raised:
+                        client(endpoint).search("synthetic query")
+                self.assertNotIn("private", str(raised.exception))
+
     def test_owner_equivalence_is_identity_bound_and_strictly_parsed(self):
         request = {
             "candidate_id": "tc_" + "a" * 64,

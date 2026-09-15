@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import tempfile
+import time
 import unittest
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -57,6 +59,28 @@ from foxhound.task_lifecycle_outcome_export import export_outcomes
 
 
 NOW = datetime(2030, 4, 5, 12, 0, tzinfo=timezone.utc)
+SNOOZE_ACTIONS = [
+    "snooze_1d", "snooze_7d", "snooze_14d", "snooze_30d",
+]
+SNOOZE_LABEL_ROWS = [
+    ["🕓 Tomorrow · 9 AM", "Friday · 9 AM"],
+    ["Next Monday · 9 AM", "In 2 weeks · 9 AM"],
+]
+
+
+@contextmanager
+def host_timezone(name: str):
+    previous = os.environ.get("TZ")
+    os.environ["TZ"] = name
+    time.tzset()
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous
+        time.tzset()
 
 
 def _drop_native_intake_schema(connection: sqlite3.Connection) -> None:
@@ -501,8 +525,8 @@ class ExecutionCardTests(unittest.TestCase):
         ]
         self.assertEqual(
             [parse_execution_review_callback(value)[2] for value in callbacks],
-            ["done", "start", "drop", "discuss", "snooze", "reassign",
-             "agent", "brief"],
+            ["done", "start", "drop", "discuss", *SNOOZE_ACTIONS,
+             "reassign", "agent", "brief"],
         )
         self.assertEqual(
             [[button["text"] for button in row]
@@ -510,7 +534,8 @@ class ExecutionCardTests(unittest.TestCase):
             [
                 ["✅ Done", "▶️ Continue"],
                 ["🗑 Drop", "✏️ Update"],
-                ["🕓 Snooze", "👥 Reassign"],
+                *SNOOZE_LABEL_ROWS,
+                ["👥 Reassign"],
                 ["🤖 Agent"],
                 ["📋 Task brief"],
             ],
@@ -1119,7 +1144,7 @@ class ExecutionCardTests(unittest.TestCase):
                 [parse_execution_review_callback(value)[2]
                  for value in callbacks],
                 [
-                    "revise", "discuss", "approve", "snooze", "done",
+                    "revise", "discuss", "approve", *SNOOZE_ACTIONS, "done",
                     "reassign", "drop", "brief",
                 ],
             )
@@ -1128,7 +1153,8 @@ class ExecutionCardTests(unittest.TestCase):
                  for row in keyboard["inline_keyboard"]],
                 [
                     ["🔎 Investigate further", "💬 Discuss"],
-                    ["▶️ Execute plan", "🕒 Snooze"],
+                    ["▶️ Execute plan"],
+                    *SNOOZE_LABEL_ROWS,
                     ["✅ Mark as done"],
                     ["👥 Reassign", "🗑 Drop task"],
                     ["📋 Task brief"],
@@ -1161,7 +1187,8 @@ class ExecutionCardTests(unittest.TestCase):
         ]
         self.assertEqual(
             actions,
-            ["revise", "discuss", "snooze", "reassign", "drop", "brief"],
+            ["revise", "discuss", *SNOOZE_ACTIONS,
+             "reassign", "drop", "brief"],
         )
         before = self.execution.get(1)
         refused = self.cards.act(
@@ -2348,7 +2375,8 @@ class ExecutionCardTests(unittest.TestCase):
                 for row in keyboard["inline_keyboard"]
                 for button in row
             ],
-            ["done", "discuss", "snooze", "reassign", "drop", "brief"],
+            ["done", "discuss", *SNOOZE_ACTIONS,
+             "reassign", "drop", "brief"],
         )
         self.cards.complete_delivery(
             claim.card.id,
@@ -2378,40 +2406,56 @@ class ExecutionCardTests(unittest.TestCase):
                 connection.execute("DELETE FROM execution_review_card_events")
         self.assertEqual(self.cards.event_count(), before)
 
-    def test_a_gate_can_be_snoozed_for_a_chosen_interval(self):
-        """A gate is asked before any work has been done, which makes it the
-        card most likely to be deferred — and "tomorrow" is rarely the right
-        answer for something waiting on another person, a release, or a
-        month end. The review cards already accept these intervals; only
-        the gate did not, so the reader could defer it one day at a time.
-        """
-        for task_id, action, days in (
-            (2, "snooze_7d", 7), (3, "snooze_30d", 30),
-        ):
-            with self.subTest(action=action):
-                self._schedule_workflow(task_id)
-                self.cards.schedule()
-                claim = self._claim_and_deliver()
-                self.assertEqual(claim.card.kind, ExecutionCardKind.START)
+    def test_gate_snooze_choices_resolve_to_local_calendar_mornings(self):
+        choices = (
+            (1, "snooze_1d", "2030-03-09T14:00:00+00:00"),
+            (2, "snooze_7d", "2030-03-08T14:00:00+00:00"),
+            (3, "snooze_14d", "2030-03-11T13:00:00+00:00"),
+            (4, "snooze_30d", "2030-03-22T13:00:00+00:00"),
+        )
+        with host_timezone("America/Toronto"):
+            self.clock.value = datetime(
+                2030, 3, 8, 12, 0, tzinfo=timezone.utc
+            )
+            for task_id, action, expected in choices:
+                with self.subTest(action=action):
+                    self._schedule_workflow(task_id)
+                    self.cards.schedule()
+                    claim = self._claim_and_deliver()
+                    self.assertEqual(claim.card.kind, ExecutionCardKind.START)
 
-                snoozed = self.cards.act(
-                    claim.card.id,
-                    expected_version=claim.card.version,
-                    action=action,
-                )
+                    snoozed = self.cards.act(
+                        claim.card.id,
+                        expected_version=claim.card.version,
+                        action=action,
+                    )
 
-                self.assertTrue(snoozed.accepted, snoozed.refusal)
-                self.assertEqual(
-                    snoozed.workflow_status, WorkflowStatus.SNOOZED)
-                self.assertEqual(
-                    snoozed.wake_at,
-                    (NOW + timedelta(days=days)).isoformat(
-                        timespec="seconds"),
-                )
+                    self.assertTrue(snoozed.accepted, snoozed.refusal)
+                    self.assertEqual(
+                        snoozed.workflow_status, WorkflowStatus.SNOOZED)
+                    self.assertEqual(snoozed.wake_at, expected)
+
+    def test_end_of_week_rolls_to_next_friday_after_nine(self):
+        with host_timezone("America/Toronto"):
+            self.clock.value = datetime(
+                2030, 3, 8, 15, 0, tzinfo=timezone.utc
+            )
+            self._schedule_workflow(5)
+            self.cards.schedule()
+            claim = self._claim_and_deliver()
+
+            snoozed = self.cards.act(
+                claim.card.id,
+                expected_version=claim.card.version,
+                action="snooze_7d",
+            )
+
+            self.assertEqual(
+                snoozed.wake_at, "2030-03-15T13:00:00+00:00"
+            )
 
     def test_a_gate_still_takes_the_plain_snooze(self):
-        # The control the reader taps sends `snooze`; the interval arrives
-        # from the picker that opens. Both have to keep working.
+        # Already-delivered cards can still carry the retired generic action.
         self._schedule_workflow(4)
         self.cards.schedule()
         claim = self._claim_and_deliver()
@@ -2424,35 +2468,35 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertEqual(snoozed.workflow_status, WorkflowStatus.SNOOZED)
 
     def test_review_snooze_is_durable_and_resumes_the_same_gate(self):
-        self._plan_review(1, "snooze-plan")
-        self.cards.schedule()
-        claim = self._claim_and_deliver()
+        with host_timezone("UTC"):
+            self._plan_review(1, "snooze-plan")
+            self.cards.schedule()
+            claim = self._claim_and_deliver()
 
-        snoozed = self.cards.act(
-            claim.card.id,
-            expected_version=claim.card.version,
-            action="snooze_7d",
-        )
+            snoozed = self.cards.act(
+                claim.card.id,
+                expected_version=claim.card.version,
+                action="snooze_14d",
+            )
 
-        self.assertEqual(snoozed.workflow_status, WorkflowStatus.SNOOZED)
-        self.assertEqual(
-            snoozed.wake_at,
-            (NOW + timedelta(days=7)).isoformat(timespec="seconds"),
-        )
-        self.assertEqual(self.cards.schedule().created, 0)
-        self.clock.advance(timedelta(days=7))
-        self.assertEqual(self.cards.schedule().created, 1)
-        resumed = self._claim_and_deliver()
-        self.assertEqual(resumed.card.kind, ExecutionCardKind.PLAN_REVIEW)
-        approved = self.cards.act(
-            resumed.card.id,
-            expected_version=resumed.card.version,
-            action="approve",
-        )
-        self.assertEqual(
-            (approved.workflow_status, approved.workflow_phase),
-            (WorkflowStatus.QUEUED, WorkflowPhase.EXECUTE),
-        )
+            self.assertEqual(snoozed.workflow_status, WorkflowStatus.SNOOZED)
+            self.assertEqual(
+                snoozed.wake_at, "2030-04-08T09:00:00+00:00"
+            )
+            self.assertEqual(self.cards.schedule().created, 0)
+            self.clock.advance(timedelta(days=3))
+            self.assertEqual(self.cards.schedule().created, 1)
+            resumed = self._claim_and_deliver()
+            self.assertEqual(resumed.card.kind, ExecutionCardKind.PLAN_REVIEW)
+            approved = self.cards.act(
+                resumed.card.id,
+                expected_version=resumed.card.version,
+                action="approve",
+            )
+            self.assertEqual(
+                (approved.workflow_status, approved.workflow_phase),
+                (WorkflowStatus.QUEUED, WorkflowPhase.EXECUTE),
+            )
 
     def test_pre_migration_completed_result_can_be_snoozed_for_review(self):
         scheduled = self._schedule_workflow(1)

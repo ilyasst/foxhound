@@ -30,10 +30,17 @@ The four card kinds have closed action sets:
 
 | Card | Allowed reader actions |
 |---|---|
-| Start | Complete, continue into planning, drop, update instructions, snooze one day, or reassign |
+| Start | Complete, continue into planning, drop, update instructions, snooze to a calendar morning, or reassign |
 | Plan review | Investigate, discuss, execute, snooze, complete, reassign, or drop |
 | External review | Authorize the exact action, return for revision, discuss, snooze, complete, reassign, or drop |
 | Result review | Discuss, snooze, complete, reassign, or drop |
+
+Every card renders the same four snooze choices directly: tomorrow at 09:00,
+Friday at 09:00 (the following Friday when that time has passed), next Monday
+at 09:00, and the date two weeks from today at 09:00. These are resolved in the
+card-service host's local timezone and stored as UTC. The callback tokens remain
+the bounded vocabulary already shared with GW; their meaning is defined by the
+visible calendar label, not by the historical duration-like token name.
 
 A delivered action and every affected execution workflow or task-lifecycle
 transition occur in one `BEGIN IMMEDIATE` transaction. The card, task, and
