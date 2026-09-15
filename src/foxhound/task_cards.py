@@ -692,13 +692,17 @@ def render_task_review_card(card: TaskReviewCard) -> tuple[str, dict]:
     last = "" if not card.last_mentioned else str(card.last_mentioned)[:10]
     if last and last != first:
         lines.append(f"🕑 <b>Last mentioned:</b> {html.escape(last, quote=False)}")
-    lines.extend(("", *origin_lines(
+    # Conditional because the provenance block is now allowed to be empty:
+    # an unconditional blank separator would end the card on a stray line.
+    origin = origin_lines(
         kind=card.origin_kind,
         record=card.origin_record,
         item=card.origin_item,
         sources=card.origin_sources,
         html_output=True,
-    )))
+    )
+    if origin:
+        lines.extend(("", *origin))
 
     def callback(action: str) -> str:
         value = f"{CALLBACK_PREFIX}|{card.id}|{card.version}|{action}"

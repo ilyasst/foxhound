@@ -62,6 +62,33 @@ AGENT_CALLBACK_PREFIX = "fha"
 CALLBACK_DATA_LIMIT = 64
 AGENT_SELECTION_TOKEN_CHARS = 20
 MAX_REVISION_NOTE_CHARS = 400
+
+#: How much of an agent's plan or work a card may carry.
+#:
+#: A card is a glance with buttons under it. The whole text already lives in
+#: `result-work.md` in the task working folder and in the KB task file, both
+#: of which the card names a few lines above this block, so putting it on the
+#: card a second time buys nothing and costs the only thing the card has --
+#: the reader reaching the buttons. One real plan-review card ran to 12,057
+#: characters over 224 lines, of which the plan was 79%.
+#:
+#: Bounded rather than dropped: the card asks the reader to approve a plan,
+#: and a plan nobody can see is not one anybody can approve. The opening is
+#: what states the approach; the rest is the working.
+MAX_WORK_EXCERPT_CHARS = 1_200
+
+#: How much of one prepared draft a card may carry. A deliverable is shown
+#: so it can be judged rather than named, so this is generous; it exists to
+#: stop a single attached document from becoming the card.
+MAX_DELIVERABLE_BODY_CHARS = 3_000
+
+#: How many records an ADVISORY list may show. "Potential external actions"
+#: and the deliverables of a plan or a result describe work, and the fourth
+#: one rarely changes the answer. Never applied to the list on an external
+#: review: that card asks the reader to authorise those exact effects, and
+#: hiding one would make the sentence above it false.
+MAX_ADVISORY_RECORDS = 3
+
 MAX_CARD_BODY_BYTES = 24 * 1024
 MAX_RENDER_SOURCE_LINE_CHARS = 500
 MAX_TRUNCATED_CARD_BODY_BYTES = 3_500
@@ -172,6 +199,9 @@ class ExecutionReviewCard:
     owner_hold_eligible: bool = field(default=False, repr=False)
     summary: str = field(default="", repr=False)
     work_markdown: str = field(default="", repr=False)
+    #: A few sentences derived from `work_markdown`; empty when the
+    #: worker could not produce one, which the card must survive.
+    work_digest: str = field(default="", repr=False)
     questions: tuple[str, ...] = field(default=(), repr=False)
     external_actions: tuple[CardRecord, ...] = field(default=(), repr=False)
     deliverables: tuple[CardRecord, ...] = field(default=(), repr=False)
@@ -1293,8 +1323,18 @@ class ExecutionCardService:
             if self._owner_condition is None:
                 continue
             try:
+                # By keyword. The one implementation of this hook takes
+                # its arguments keyword-only, so calling it positionally
+                # raised TypeError rather than answering -- and TypeError
+                # is not what the `except` below catches, so it escaped
+                # `schedule` and returned 500 for the whole call. Nothing
+                # noticed until an owner hold went active, because the
+                # loop this sits in has no rows to walk until then: the
+                # card surface then stopped topping up entirely, on a
+                # path whose only job is to keep it filled.
                 result = self._owner_condition(
-                    str(row["owner_display"]), _owner_ref(row)
+                    owner=str(row["owner_display"]),
+                    owner_ref=_owner_ref(row),
                 )
             except KnowledgeClientError:
                 continue
@@ -1488,6 +1528,7 @@ class ExecutionCardService:
             "r.task_id AS result_task_id,r.workflow_version AS result_version,"
             "r.task_version AS result_task_version,r.phase AS result_phase,"
             "r.outcome AS result_outcome,r.summary,r.work_markdown,"
+            "r.work_digest,"
             "r.questions_json,r.external_actions_json,r.deliverables_json,"
             "r.task_work_directory,r.task_kb_file,"
             "(SELECT min(h.created_at) "
@@ -1953,6 +1994,10 @@ def _card(
                 ""
                 if row["work_markdown"] is None
                 else str(row["work_markdown"])
+            ),
+            work_digest=(
+                "" if row["work_digest"] is None
+                else str(row["work_digest"])
             ),
             questions=_stored_lines(row["questions_json"]),
             external_actions=_stored_collection(row["external_actions_json"]),
@@ -2458,21 +2503,44 @@ def _heading_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
             phase = "not started"
     elif card.outcome is ExecutionOutcome.COMPLETED:
         # Marked rather than renamed: the same card carrying its last
-        # update, recognisable at a glance as finished.
-        done = "✅ done — close it with Mark as done"
-        phase = f"{phase} {done}" if not html else f"{phase} <b>{done}</b>"
-    lines.append(f"<b>Phase:</b> {phase}" if html else f"Phase: {phase}")
+        # update, recognisable at a glance as finished. The prose that
+        # used to follow -- "close it with Mark as done" -- is now the
+        # label on the button directly below, so it was the card saying
+        # the same thing twice.
+        phase = f"{phase} ✅ done"
+    # One chip line rather than four labelled ones. Phase, agent,
+    # revision and owner are all answers to "which run of what is this",
+    # and none of them is the question the card asks; four stacked labels
+    # made them look like four things to read before reaching one.
+    chips = [phase]
     if card.kind is not ExecutionCardKind.START:
-        agent = (
-            _escape(card.agent_display_name)
-            if html
-            else card.agent_display_name
-        )
-        lines.append(f"<b>Agent:</b> {agent}" if html else f"Agent: {agent}")
+        chips.append(card.agent_display_name)
     if card.revisions:
-        revised = f"Revision {card.revisions}"
-        lines.append(f"<b>{revised}</b>" if html else revised)
-    lines.extend(_origin_lines(card, html=html))
+        chips.append(f"rev {card.revisions}")
+    if card.owner:
+        chips.append(card.owner)
+    if card.due:
+        chips.append(f"due {card.due}")
+    chip = " · ".join(chip for chip in chips if chip)
+    lines.append(f"<i>{_escape(chip)}</i>" if html else chip)
+    if card.kind is ExecutionCardKind.START:
+        # Provenance belongs to the card that FIRST asks. A start gate is
+        # that card here -- it proposes work on something the reader may
+        # not have seen -- and the task card is that card on the other
+        # surface. By the time a plan, a result or an external effect comes
+        # back, the reader has already been shown where the task came from
+        # and has answered about it once, so quoting the sources again is
+        # a third telling: on one card in use the handoff quoted the task
+        # text that was already the card's second line, and the transcript
+        # said the same thing a third time in speech. Roughly 1,400
+        # characters of it sat between the task title and "External action
+        # awaiting your approval", which is the line the card exists to
+        # put in front of someone.
+        #
+        # The evidence is not lost: it is on the task card, in the
+        # candidate payload, and in the KB task file this card names under
+        # Review files.
+        lines.extend(_origin_lines(card, html=html))
     lines.extend(_continues_lines(card, html=html))
     return lines
 
@@ -2494,23 +2562,19 @@ def _asked_for_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
     return ["", "You asked for:", shown]
 
 
+#: A `[label](target)` produced by `review_links`. Anything else it returns
+#: is a record identifier rather than a destination.
+_ADDRESSABLE_LINK_RE = re.compile(r"\[[^\]]*\]\([^)\s]+\)")
+
+
 def _review_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
     """Put the durable evidence and forge references before the long work."""
+    # No working folder and no KB path. Two absolute filesystem paths,
+    # each long enough to wrap twice, neither of them tappable on the
+    # phone this card is read on: three lines that could not be acted on
+    # from the surface they appeared on. GW's card never carried them.
+    # The files still exist and the task handle still names them.
     lines: list[str] = []
-    if card.task_work_directory or card.task_kb_file:
-        lines.extend(("", "<b>Review files:</b>" if html else "Review files:"))
-        if card.task_work_directory:
-            shown = _escape(card.task_work_directory)
-            lines.append(
-                f"• Working folder: <code>{shown}</code>"
-                if html else f"- Working folder: {card.task_work_directory}"
-            )
-        if card.task_kb_file:
-            shown = _escape(card.task_kb_file)
-            lines.append(
-                f"• KB task file: <code>{shown}</code>"
-                if html else f"- KB task file: {card.task_kb_file}"
-            )
     links = review_links(
         "\n".join((
             card.summary,
@@ -2523,11 +2587,22 @@ def _review_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
         origin_record=card.origin_record,
         origin_item=card.origin_item,
     )
-    if links:
+    # Only the ones that are links. `review_links` also yields a plain
+    # `<record> #<item>` for an origin it cannot address, which is right for
+    # the archive file -- a durable record should name its source however it
+    # can -- and wrong here: on the card it renders as a bare digest under a
+    # heading promising somewhere to go, duplicating the `From:` line a few
+    # lines above and going nowhere. One card in use carried a bare record
+    # digest and an action anchor as its only "link" -- nothing a reader
+    # could open, search for, or recognise.
+    addressable = [
+        link for link in links if _ADDRESSABLE_LINK_RE.fullmatch(link)
+    ]
+    if addressable:
         lines.extend(("", "<b>Review links:</b>" if html else "Review links:"))
         lines.extend(
             f"• {_markdown_inline(link)}" if html else f"- {link}"
-            for link in links
+            for link in addressable
         )
     return lines
 
@@ -2535,15 +2610,9 @@ def _review_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
 def _card_lines(card: ExecutionReviewCard) -> list[str]:
     if card.kind is ExecutionCardKind.START:
         return _start_card_lines(card, html=False)
-    details = []
-    if card.owner:
-        details.append(f"Owner: {card.owner}")
-    if card.due:
-        details.append(f"Due: {card.due}")
     if card.kind is ExecutionCardKind.EXTERNAL_REVIEW:
         lines = [
             *_heading_lines(card, html=False),
-            *details,
             "",
             "External action awaiting your approval:",
             *_listed(card.external_actions, empty="None supplied."),
@@ -2565,7 +2634,6 @@ def _card_lines(card: ExecutionReviewCard) -> list[str]:
     if card.kind is ExecutionCardKind.RESULT_REVIEW:
         lines = [
             *_heading_lines(card, html=False),
-            *details,
             "",
             f"Outcome: {card.outcome}",
             f"Summary: {card.summary}",
@@ -2576,13 +2644,13 @@ def _card_lines(card: ExecutionReviewCard) -> list[str]:
             lines.extend(("", "Needs your input:",
                       *[f"- {q}" for q in card.questions]))
         if card.deliverables:
-            lines.extend(("", "Deliverables:", *_drafted(card.deliverables)))
-        if card.work_markdown:
-            lines.extend(("", "Work:", card.work_markdown))
+            lines.extend(_advisory(
+                card.deliverables, heading="Deliverables", html=False,
+                render=_drafted))
+        lines.extend(_work_lines(card, label="Work", html=False))
         return lines
     lines = [
         *_heading_lines(card, html=False),
-        *details,
         "",
         f"Summary: {card.summary}",
         *_review_lines(card, html=False),
@@ -2591,16 +2659,11 @@ def _card_lines(card: ExecutionReviewCard) -> list[str]:
     if card.questions:
         lines.extend(("", "Needs your input:",
                       *[f"- {q}" for q in card.questions]))
-    if card.external_actions:
-        lines.extend((
-            "",
-            "Potential external actions (not yet authorized):",
-            *_listed(card.external_actions),
-        ))
     if card.deliverables:
-        lines.extend(("", "Deliverables:", *_drafted(card.deliverables)))
-    if card.work_markdown:
-        lines.extend(("", "Plan:", card.work_markdown))
+        lines.extend(_advisory(
+            card.deliverables, heading="Deliverables", html=False,
+            render=_drafted))
+    lines.extend(_work_lines(card, label="Plan", html=False))
     return lines
 
 
@@ -2625,6 +2688,115 @@ def _record_detail_lines(record: CardRecord) -> list[str]:
     if record.channel and record.channel.casefold() not in record.text.casefold():
         details.append("Channel: " + record.channel)
     return details
+
+
+def _work_excerpt(value: str) -> tuple[str, int]:
+    """The opening of the work, cut on a line boundary, and what is left.
+
+    Whole lines, because the renderer reads a line at a time: a cut in the
+    middle of one turns a heading into body text or a table row into a
+    stray pipe, which misrepresents the plan rather than shortening it. The
+    first line is kept even when it alone exceeds the budget -- a plan whose
+    opening line is 4,000 characters still has to show the reader something
+    -- and only that case is cut mid-line.
+    """
+    if len(value) <= MAX_WORK_EXCERPT_CHARS:
+        return value, 0
+    kept: list[str] = []
+    used = 0
+    for line in value.split("\n"):
+        if kept and used + len(line) + 1 > MAX_WORK_EXCERPT_CHARS:
+            break
+        used += len(line) + 1
+        kept.append(line)
+    while kept and not kept[-1].strip():
+        kept.pop()
+    excerpt = "\n".join(kept)
+    if len(excerpt) > MAX_WORK_EXCERPT_CHARS:
+        excerpt = excerpt[:MAX_WORK_EXCERPT_CHARS].rstrip()
+    return excerpt, len(value) - len(excerpt)
+
+
+def _work_lines(
+    card: ExecutionReviewCard, *, label: str, html: bool
+) -> list[str]:
+    """The bounded plan or work, and where the rest of it is.
+
+    The pointer is not decoration. A reader who cannot tell that the text
+    stopped early will read a truncated plan as the whole plan and approve
+    it, which is the one failure a length limit could introduce.
+    """
+    if card.work_digest:
+        # A few sentences ABOUT the whole plan beat the first screenful OF
+        # it. The excerpt below can only ever show the opening, and an
+        # agent's opening is its framing -- "Task", "Current state",
+        # "Evidence consulted" -- while the thing the reader has to agree
+        # with is usually somewhere in the middle. On one real plan the
+        # excerpt reached none of the eight thousand characters that held
+        # the actual recommendation; the digest led with it.
+        subject = label.lower()
+        pointer = (
+            f"<i>Condensed — the full {subject} is in "
+            f"<code>result-work.md</code> in the task working folder.</i>"
+            if html else
+            f"Condensed — the full {subject} is in result-work.md in the "
+            f"task working folder."
+        )
+        body = (_markdown_lines(card.work_digest) if html
+                else [card.work_digest])
+        return ["", f"<b>{label}:</b>" if html else f"{label}:", *body,
+                pointer]
+    if not card.work_markdown:
+        return []
+    excerpt, remaining = _work_excerpt(card.work_markdown)
+    if html:
+        lines = ["", f"<b>{label}:</b>", *_markdown_lines(excerpt)]
+    else:
+        lines = ["", f"{label}:", excerpt]
+    if not remaining:
+        return lines
+    where = "in the task working folder"
+    subject = label.lower()
+    if html:
+        lines.append(
+            f"<i>… {remaining} more characters — the full {subject} is in "
+            f"<code>result-work.md</code> {where}.</i>"
+        )
+    else:
+        lines.append(
+            f"... {remaining} more characters — the full {subject} is in "
+            f"result-work.md {where}."
+        )
+    return lines
+
+
+def _bounded_draft_body(value: str) -> str:
+    """One draft, bounded, and honest about having been bounded."""
+    if len(value) <= MAX_DELIVERABLE_BODY_CHARS:
+        return value
+    return (value[:MAX_DELIVERABLE_BODY_CHARS].rstrip()
+            + "\n… (truncated — full text in result-work.md)")
+
+
+def _advisory(
+    values: Sequence[CardRecord],
+    *,
+    heading: str,
+    html: bool,
+    render,
+) -> list[str]:
+    """A capped list of records that DESCRIBE work, with the count of any
+    it did not show. Nothing is hidden silently: a list that says three of
+    seven reads as a summary, and one that says three reads as all of them.
+    """
+    shown = tuple(values)[:MAX_ADVISORY_RECORDS]
+    hidden = len(values) - len(shown)
+    head = f"<b>{heading}:</b>" if html else f"{heading}:"
+    lines = ["", head, *render(shown)]
+    if hidden:
+        more = f"and {hidden} more — see result-work.md"
+        lines.append(f"• <i>{_escape(more)}</i>" if html else f"- {more}")
+    return lines
 
 
 def _listed(values: Sequence[CardRecord], *, empty: str = "None.") -> list[str]:
@@ -2655,22 +2827,16 @@ def _drafted(values: Sequence[CardRecord]) -> list[str]:
             lines.append("To: " + record.recipient)
         if record.subject:
             lines.append("Subject: " + record.subject)
-        lines.append(record.text)
+        lines.append(_bounded_draft_body(record.text))
     return lines
 
 
 def _html_card_lines(card: ExecutionReviewCard) -> list[str]:
     if card.kind is ExecutionCardKind.START:
         return _start_card_lines(card, html=True)
-    details = []
-    if card.owner:
-        details.extend(_labelled_html_lines("Owner", card.owner))
-    if card.due:
-        details.extend(_labelled_html_lines("Due", card.due))
     if card.kind is ExecutionCardKind.EXTERNAL_REVIEW:
         lines = [
             *_heading_lines(card, html=True),
-            *details,
             "",
             "<b>External action awaiting your approval:</b>",
             *_html_listed(card.external_actions, empty="None supplied."),
@@ -2699,7 +2865,6 @@ def _html_card_lines(card: ExecutionReviewCard) -> list[str]:
     if card.kind is ExecutionCardKind.RESULT_REVIEW:
         lines = [
             *_heading_lines(card, html=True),
-            *details,
             "",
             *_labelled_html_lines("Outcome", str(card.outcome)),
             *_labelled_html_lines("Summary", card.summary),
@@ -2710,14 +2875,13 @@ def _html_card_lines(card: ExecutionReviewCard) -> list[str]:
             lines.extend(("", "<b>Needs your input:</b>",
                           *_html_question_lines(card.questions)))
         if card.deliverables:
-            lines.extend(("", "<b>Deliverables:</b>",
-                          *_html_drafted(card.deliverables)))
-        if card.work_markdown:
-            lines.extend(("", "<b>Work:</b>", *_markdown_lines(card.work_markdown)))
+            lines.extend(_advisory(
+                card.deliverables, heading="Deliverables", html=True,
+                render=_html_drafted))
+        lines.extend(_work_lines(card, label="Work", html=True))
         return lines
     lines = [
         *_heading_lines(card, html=True),
-        *details,
         "",
         *_labelled_html_lines("Summary", card.summary),
         *_review_lines(card, html=True),
@@ -2729,20 +2893,16 @@ def _html_card_lines(card: ExecutionReviewCard) -> list[str]:
             "<b>Needs your input:</b>",
             *_html_question_lines(card.questions),
         ))
-    if card.external_actions:
-        lines.extend((
-            "",
-            "<b>Potential external actions (not yet authorized):</b>",
-            *_html_listed(card.external_actions),
-        ))
     if card.deliverables:
-        lines.extend((
-            "",
-            "<b>Deliverables:</b>",
-            *_html_drafted(card.deliverables),
-        ))
-    if card.work_markdown:
-        lines.extend(("", "<b>Plan:</b>", *_markdown_lines(card.work_markdown)))
+        lines.extend(_advisory(
+            card.deliverables, heading="Deliverables", html=True,
+            render=_html_drafted))
+    # No "potential external actions" here. Nothing is authorised at this
+    # phase, the plan below already says what the agent means to do, and
+    # the card that actually asks -- the external review -- lists the
+    # effects in full under a sentence that is the whole point of it.
+    # Listing them twice taught the reader to skim the list that matters.
+    lines.extend(_work_lines(card, label="Plan", html=True))
     return lines
 
 
@@ -2792,7 +2952,8 @@ def _html_drafted(values: Sequence[CardRecord]) -> list[str]:
             lines.append("To: " + _escape(record.recipient))
         if record.subject:
             lines.append("Subject: " + _escape(record.subject))
-        lines.append("<pre>" + _escape(record.text) + "</pre>")
+        lines.append(
+            "<pre>" + _escape(_bounded_draft_body(record.text)) + "</pre>")
     return lines
 
 

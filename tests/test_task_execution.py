@@ -238,6 +238,11 @@ class TaskExecutionTests(unittest.TestCase):
         with closing(sqlite3.connect(self.database)) as connection:
             _drop_owner_schema(connection)
             _drop_agent_profile_schema(connection)
+            # v21 added this; a database at an older version has
+            # not got it yet.
+            connection.execute(
+                "ALTER TABLE task_execution_results DROP COLUMN work_digest"
+            )
             connection.execute("PRAGMA user_version = 11")
             connection.commit()
 

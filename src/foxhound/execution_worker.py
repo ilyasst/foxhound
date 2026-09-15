@@ -24,6 +24,7 @@ from .knowledge_client import (
     KnowledgeClientError,
     KnowledgeSearchResult,
 )
+from . import work_digest
 from .task_execution import (
     ExecutionResultEnvelope,
     TaskExecutionService,
@@ -464,6 +465,12 @@ class ExecutionWorker:
             outcome=draft["outcome"],
             summary=draft["summary"],
             work_markdown=draft["work_markdown"],
+            # Here rather than in `draft`, so the draft file keeps the
+            # exact field set older drafts were written with, and rather
+            # than at render time, where a remote call would sit inside
+            # the transaction a card claim is waiting on. Returns "" on
+            # any failure; the card then shows an excerpt instead.
+            work_digest=work_digest.digest(draft["work_markdown"]),
             questions=draft["questions"],
             external_actions=draft["external_actions"],
             deliverables=draft["deliverables"],

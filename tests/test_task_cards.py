@@ -12,7 +12,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from foxhound import CandidateInbox
-from foxhound.card_provenance import CardSourceEvidence
+from foxhound.card_provenance import (
+    MAX_CARD_EXTRACT_CHARS,
+    CardSourceEvidence,
+)
 from foxhound.candidate_inbox import SCHEMA_VERSION
 from foxhound.contracts import candidate_id_for, comparable_task_digest
 from foxhound.task_cards import (
@@ -295,6 +298,18 @@ class TaskCardTests(unittest.TestCase):
         missing_body, _ = render_task_review_card(no_evidence)
         self.assertIn("Source extract not provided", missing_body)
 
+        # A record identified only by digest is not a source the reader can
+        # reach, so neither it nor a warning about it earns a line. The
+        # card must not end on the blank separator that block used to sit
+        # under, either.
+        opaque = replace(
+            no_evidence, origin_record="0123456789abcdef", origin_sources=())
+        opaque_body, _ = render_task_review_card(opaque)
+        self.assertNotIn("0123456789abcdef", opaque_body)
+        self.assertNotIn("Source extract not provided", opaque_body)
+        self.assertEqual(opaque_body, opaque_body.rstrip())
+        self.assertIn("☑️ <b>Task done?</b>", opaque_body)
+
         bounded = replace(
             claim.card,
             origin_sources=tuple(
@@ -309,6 +324,16 @@ class TaskCardTests(unittest.TestCase):
         bounded_body, _ = render_task_review_card(bounded)
         self.assertLess(len(bounded_body.encode("utf-8")), 24 * 1024)
         self.assertEqual(bounded_body.count("<blockquote>"), 3)
+        # Every source still gets a quote, and no quote gets the card. The
+        # contract allows 1,200 characters each and a card may carry three;
+        # what the reader needs from an extract is recognition, which the
+        # opening gives them.
+        self.assertEqual(bounded_body.count("…"), 3)
+        for quote in bounded_body.split("<blockquote>")[1:]:
+            self.assertLess(
+                len(quote.split("</blockquote>")[0]),
+                MAX_CARD_EXTRACT_CHARS * 6,
+            )
 
         refused = self.cards.complete_delivery(
             claim.card.id,

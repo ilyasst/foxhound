@@ -63,6 +63,11 @@ class CandidateInboxTests(unittest.TestCase):
                 "'Person A',NULL,1,?,?,NULL)",
                 (now, now),
             )
+            # v21 added this; a database at an older version has
+            # not got it yet.
+            connection.execute(
+                "ALTER TABLE task_execution_results DROP COLUMN work_digest"
+            )
             connection.execute("PRAGMA user_version = 17")
             connection.commit()
 

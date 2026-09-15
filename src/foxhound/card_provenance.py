@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import json
+import re
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -14,6 +15,30 @@ from .source_policy import source_kinds_accepting
 _LINKABLE_HOSTS = ("github.com",)
 _ORIGIN_PATHS = {"issue": "issues", "review_request": "pull"}
 ADDRESSABLE_ORIGINS = source_kinds_accepting("addressable_origin")
+
+#: A record identifier that says nothing to the person reading the card.
+#: Some producers key a record by digest rather than by name, and a digest
+#: is not a source: it cannot be searched for, opened, or recognised. When
+#: one of those arrives without evidence, the two lines this module would
+#: otherwise emit -- the digest, and a warning that no extract came with it
+#: -- spend two of a card's few readable lines telling the reader nothing
+#: they can act on. The warning is worth keeping where the record IS
+#: nameable, because there it says "this source exists and you were not
+#: shown it"; against a digest it only says the pipeline is a pipeline.
+_OPAQUE_RECORD_RE = re.compile(r"[0-9a-f]{8,}")
+
+#: How much of one source extract a card may quote.
+#:
+#: The candidate contract lets an extract run to 1,200 characters, and a
+#: card may carry three of them, so the evidence block alone could reach
+#: 3,600 -- ahead of the summary, and on an execution card ahead of the
+#: plan the reader is there to approve. One real card spent 2,400 on a raw
+#: handoff JSON blob and a transcript with one word repeated fifty times.
+#:
+#: The extract exists to let the reader recognise where the task came
+#: from, and recognition happens in the first sentence or two. The whole
+#: extract stays in the candidate payload and in the KB task file.
+MAX_CARD_EXTRACT_CHARS = 400
 
 
 @dataclass(frozen=True)
@@ -47,7 +72,11 @@ def origin_lines(
     sources: Sequence[CardSourceEvidence],
     html_output: bool,
 ) -> list[str]:
-    """Render the same origin and literal evidence on every task surface."""
+    """Render the same origin and literal evidence on every task surface.
+
+    Empty when there is nothing a reader can use: no evidence, and a
+    record identified only by digest. Callers must not assume a block.
+    """
     if sources:
         lines = [
             *_source_identity_lines(
@@ -61,17 +90,21 @@ def origin_lines(
         ]
         for source in sources:
             role = source.role.replace("_", " ").title()
+            extract = _quotable(source.extract)
             if html_output:
                 lines.extend((
                     f"• <code>{_escape(source.name)}</code> — {_escape(role)}",
-                    f"<blockquote>{_escape(source.extract)}</blockquote>",
+                    f"<blockquote>{_escape(extract)}</blockquote>",
                 ))
             else:
                 lines.extend((
                     f"- {source.name} — {role}",
-                    *(f"> {line}" for line in source.extract.splitlines()),
+                    *(f"> {line}" for line in extract.splitlines()),
                 ))
         return lines
+
+    if _OPAQUE_RECORD_RE.fullmatch(record or ""):
+        return []
 
     lines = _origin_identity_lines(
         kind=kind, record=record, item=item, html_output=html_output
@@ -136,6 +169,22 @@ def _origin_identity_lines(
     if url is None:
         return [f"<b>From:</b> {_escape(shown)}"]
     return [f'<b>From:</b> <a href="{_escape(url)}">{_escape(shown)}</a>']
+
+
+def _quotable(value: str) -> str:
+    """As much of one extract as recognising a source takes.
+
+    Cut on a word boundary where there is one near the end, so the quote
+    stops mid-sentence rather than mid-word: a reader can tell a sentence
+    was interrupted, and cannot tell a mangled word from the source's own.
+    """
+    if len(value) <= MAX_CARD_EXTRACT_CHARS:
+        return value
+    head = value[:MAX_CARD_EXTRACT_CHARS]
+    space = head.rfind(" ")
+    if space >= MAX_CARD_EXTRACT_CHARS - 80:
+        head = head[:space]
+    return head.rstrip() + " …"
 
 
 def _escape(value: str) -> str:

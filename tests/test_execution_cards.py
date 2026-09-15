@@ -22,13 +22,17 @@ from foxhound.agent_profiles import (
 )
 from foxhound import task_relations
 from foxhound.candidate_inbox import CandidateInbox, SCHEMA_VERSION
+from foxhound.card_provenance import CardSourceEvidence
 from foxhound.contracts import candidate_id_for
 from foxhound.execution_cards import (
     CALLBACK_DATA_LIMIT,
     MAX_BRIEF_BYTES,
     MAX_BRIEF_CHARS,
+    MAX_ADVISORY_RECORDS,
     MAX_CARD_BODY_BYTES,
     MAX_TRUNCATED_CARD_BODY_BYTES,
+    MAX_WORK_EXCERPT_CHARS,
+    CardRecord,
     ExecutionCardDisposition,
     ExecutionCardKind,
     ExecutionCardRefusal,
@@ -41,7 +45,6 @@ from foxhound.execution_cards import (
     render_execution_review_card,
     task_brief,
 )
-from foxhound.card_provenance import CardSourceEvidence
 from foxhound.task_execution import (
     PARK_RETRY_INTERVAL,
     ExecutionOutcome,
@@ -234,6 +237,8 @@ class ExecutionCardTests(unittest.TestCase):
         result_id: str,
         long_work: bool = False,
         work_markdown: str | None = None,
+        oversized: bool = False,
+        external_actions: tuple[str, ...] | None = None,
     ):
         claim = self.execution.claim_next()
         self.assertIsNotNone(claim)
@@ -257,7 +262,25 @@ class ExecutionCardTests(unittest.TestCase):
                 )
             ),
             questions=("Proceed with Example A?",),
-            external_actions=("Publish synthetic draft <alpha>.",),
+            # Oversize has to come from a field the card renderer does NOT
+            # cap, or the fixture tests itself rather than the mechanism.
+            # The plan is bounded now, and so are the advisory lists; the
+            # list of effects an external review asks the reader to
+            # AUTHORISE is deliberately not, because hiding one would make
+            # "approve only if these exact effects are intended" a lie.
+            # That is where an unanswerably long card can still come from,
+            # so that is what these fixtures build.
+            external_actions=(
+                external_actions
+                if external_actions is not None
+                else tuple(
+                    (f"Publish synthetic draft <{index}>. "
+                     + "Synthetic effect detail. " * 70).strip()
+                    for index in range(20)
+                )
+                if oversized
+                else ("Publish synthetic draft <alpha>.",)
+            ),
             deliverables=("Synthetic deliverable",),
         ))
         self.assertTrue(result.accepted)
@@ -285,7 +308,9 @@ class ExecutionCardTests(unittest.TestCase):
             work_markdown=work_markdown,
         )
 
-    def _external_review(self, task_id: int, prefix: str):
+    def _external_review(self, task_id: int, prefix: str, *,
+                         oversized: bool = False,
+                         external_actions: tuple[str, ...] | None = None):
         self._plan_review(task_id, f"{prefix}-plan")
         approved = self.execution.review_action(
             task_id,
@@ -301,6 +326,8 @@ class ExecutionCardTests(unittest.TestCase):
             phase=WorkflowPhase.EXECUTE,
             outcome=ExecutionOutcome.AWAITING_EXTERNAL,
             result_id=f"{prefix}-execute",
+            oversized=oversized,
+            external_actions=external_actions,
         )
 
     def test_schema_eight_migration_is_passive_and_preserves_execution(self):
@@ -317,6 +344,11 @@ class ExecutionCardTests(unittest.TestCase):
             connection.execute("DROP INDEX execution_review_cards_one_active")
             connection.execute("DROP TABLE execution_review_card_events")
             connection.execute("DROP TABLE execution_review_cards")
+            # v21 added this; a database at an older version has
+            # not got it yet.
+            connection.execute(
+                "ALTER TABLE task_execution_results DROP COLUMN work_digest"
+            )
             connection.execute("PRAGMA user_version = 8")
             connection.commit()
 
@@ -596,7 +628,10 @@ class ExecutionCardTests(unittest.TestCase):
         matches = [False]
         requests = []
 
-        def condition(owner, owner_ref):
+        # Keyword-only, exactly like GwKnowledgeClient's method. A
+        # looser double let a positional call site pass here and
+        # raise TypeError in production.
+        def condition(*, owner, owner_ref):
             requests.append((owner, owner_ref))
             return OwnerUpcomingMeeting(
                 matches[0],
@@ -716,7 +751,7 @@ class ExecutionCardTests(unittest.TestCase):
             )
             self._schedule_workflow(task_id)
 
-        def unavailable(_owner, _owner_ref):
+        def unavailable(*, owner, owner_ref):
             raise KnowledgeTransportError("synthetic unavailable")
 
         cards = ExecutionCardService(
@@ -1172,7 +1207,14 @@ class ExecutionCardTests(unittest.TestCase):
             self.assertEqual(self.ledger.get(task_id).status, TaskStatus.OPEN)
 
     def test_truncated_private_content_cannot_be_approved(self):
-        self._plan_review(1, "long-plan", long_work=True)
+        """A card too long to read is a card too long to authorise.
+
+        Driven from an external review's list of effects rather than from a
+        long plan: the plan is excerpted now, so it can no longer push a
+        card past the limit, and testing this through it would only be
+        testing the excerpt.
+        """
+        self._external_review(1, "long-external", oversized=True)
         self.cards.schedule()
         claim = self._claim_and_deliver()
         body, keyboard = render_execution_review_card(claim.card)
@@ -1185,9 +1227,10 @@ class ExecutionCardTests(unittest.TestCase):
             for row in keyboard["inline_keyboard"]
             for button in row
         ]
+        # An external review, not a plan: same buttons, different order.
         self.assertEqual(
             actions,
-            ["revise", "discuss", *SNOOZE_ACTIONS,
+            ["revise", *SNOOZE_ACTIONS, "discuss",
              "reassign", "drop", "brief"],
         )
         before = self.execution.get(1)
@@ -1396,17 +1439,27 @@ class ExecutionCardTests(unittest.TestCase):
         body, _keyboard = render_execution_review_card(card)
 
         self.assertIn(f"<code>T{task_id}</code>", body)
-        self.assertIn("<b>Phase:</b> plan refinement", body)
-        self.assertIn("<b>Agent:</b> General", body)
-        self.assertIn("<b>Review files:</b>", body)
-        self.assertIn("/srv/example/Tasks/T3-synthetic-task", body)
-        self.assertIn("/srv/example/KB/Tasks/T3-synthetic-task.md", body)
+        # Phase, agent, revision and owner ride one chip line: they say
+        # which run of what this is, not what is being asked.
+        self.assertIn("<i>plan refinement · General · Person 3</i>", body)
+        # No working folder, no KB path: two unwrappable, untappable
+        # absolute paths on a surface read from a phone.
+        self.assertNotIn("Review files", body)
+        self.assertNotIn("/srv/example/", body)
         self.assertIn(
             'href="https://github.com/example/project-alpha/pull/12"', body
         )
         self.assertIn("<b>Needs your input:</b>", body)
-        # The action says what is still missing, not just what it is.
-        self.assertIn("Needs: Their handle", body)
+        # The action, and what it is still missing, belong to the card
+        # that asks for authorisation -- not to the plan that proposes it.
+        self.assertNotIn("Add them as a collaborator", body)
+        asking = ExecutionReviewCard(**{
+            **card.__dict__,
+            "kind": ExecutionCardKind.EXTERNAL_REVIEW,
+        })
+        asking_body, _ = render_execution_review_card(asking)
+        self.assertIn("Add them as a collaborator", asking_body)
+        self.assertIn("Needs: Their handle", asking_body)
         # The draft is readable on the card, headed and addressed.
         self.assertIn("<b>email</b>", body)
         self.assertIn("To: Someone", body)
@@ -1719,7 +1772,18 @@ class ExecutionCardTests(unittest.TestCase):
             '<a href="https://github.com/example-org/example-repo/issues/42">',
             enriched_body,
         )
-        self.assertIn("issue-42.md", enriched_body)
+        # The card keeps the destination -- a reader can still open the
+        # issue -- and not the quoted source. Provenance belongs to the
+        # card that FIRST asks, which on this surface is the start gate
+        # and on the other surface is the task card. A plan comes back to
+        # someone who has already been shown where the task came from and
+        # has answered about it once.
+        #
+        # The brief is the opposite case and keeps both, which is what the
+        # assertions above demand: it is pasted into an agent that has
+        # seen nothing at all.
+        self.assertNotIn("issue-42.md", enriched_body)
+        self.assertNotIn("Synthetic acceptance criterion", enriched_body)
 
         long_brief = task_brief(replace(
             enriched,
@@ -2130,13 +2194,13 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertEqual(self.cards.schedule().created, 1)
         plan = self.cards.claim_next().card
         plan_body, _ = render_execution_review_card(plan)
-        self.assertIn("<b>Agent:</b> General", plan_body)
+        self.assertIn("· General ·", plan_body)
 
         self._external_review(2, "agent-external")
         self.assertEqual(self.cards.schedule().created, 1)
         external = self.cards.claim_next().card
         external_body, _ = render_execution_review_card(external)
-        self.assertIn("<b>Agent:</b> General", external_body)
+        self.assertIn("· General ·", external_body)
 
         self._plan_review(3, "agent-result-plan")
         approved = self.execution.review_action(
@@ -2155,17 +2219,20 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertEqual(self.cards.schedule().created, 1)
         completed = self.cards.claim_next().card
         completed_body, _ = render_execution_review_card(completed)
-        self.assertIn("<b>Agent:</b> General", completed_body)
+        self.assertIn("· General ·", completed_body)
 
         oversized = ExecutionReviewCard(
             **{
-                **plan.__dict__,
-                "work_markdown": "Synthetic plan. " * 4_000,
+                **external.__dict__,
+                "external_actions": tuple(
+                    CardRecord("Synthetic effect. " * 400)
+                    for _ in range(20)
+                ),
             }
         )
         oversized_body, _ = render_execution_review_card(oversized)
-        self.assertIn("Agent: General", oversized_body)
-        self.assertNotIn("<b>Agent:</b>", oversized_body)
+        self.assertIn("· General ·", oversized_body)
+        self.assertNotIn("<i>", oversized_body)
 
     def test_project_metadata_is_absent_from_start_and_review_headers(self):
         payload = json.dumps({"task": {"project": "Project Alpha"}})
@@ -2226,10 +2293,13 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertEqual(self.cards.schedule().created, 1)
         body, _keyboard = render_execution_review_card(
             self.cards.claim_next().card)
-        self.assertIn("• Publish synthetic draft &lt;alpha&gt;.", body)
+        self.assertIn("• Synthetic deliverable", body)
         self.assertIn("• Proceed with Example A?", body)
         self.assertNotIn("Needs:", body)
         self.assertNotIn("<pre>Synthetic deliverable</pre>", body)
+        # Not on a plan card: nothing is authorised at this phase, and
+        # the external review lists the effects in full when it asks.
+        self.assertNotIn("Publish synthetic draft", body)
 
     def test_unbounded_table_like_markdown_remains_ordinary_text(self):
         header = " | ".join(f"Column {number}" for number in range(13))
@@ -2248,7 +2318,16 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertIn("Column 12", body)
         self.assertIn("--- | ---", body)
 
-    def test_complete_multi_message_review_retains_approval(self):
+    def test_a_long_plan_is_excerpted_and_stays_approvable(self):
+        """The plan opens the card; it does not become the card.
+
+        This used to assert the opposite -- that the 220th line of a plan
+        reached the reader. It did, along with the 219 before it, and the
+        buttons ended up somewhere past the end of a phone screen. The full
+        text has always been in `result-work.md` and in the KB task file,
+        both named a few lines higher on this same card, so the excerpt
+        costs the reader nothing it does not tell them how to get back.
+        """
         markdown = "\n".join(
             f"- Synthetic review line {index} with **detail**."
             for index in range(220)
@@ -2264,9 +2343,287 @@ class ExecutionCardTests(unittest.TestCase):
             for button in row
         ]
 
+        self.assertIn("Synthetic review line 0", body)
+        self.assertNotIn("Synthetic review line 219", body)
+        # Cut on a line boundary: a half-rendered bullet misrepresents the
+        # plan rather than shortening it.
+        self.assertNotIn("Synthetic review line 2 with <b>deta\n", body)
+        # And it says so, naming where the rest is. A reader who cannot
+        # tell the text stopped early approves a plan they have not read.
+        self.assertIn("more characters", body)
+        self.assertIn("<code>result-work.md</code>", body)
+        self.assertLess(len(body), 4_096)
+        self.assertLessEqual(len(body.encode("utf-8")), MAX_CARD_BODY_BYTES)
+        self.assertIn("approve", actions)
+        self.assertNotIn("Approval is disabled", body)
+
+    def _plan_card(self, **overrides) -> ExecutionReviewCard:
+        """One delivered plan-review card, with fields swapped in.
+
+        Built through the renderer's own dataclass rather than through the
+        database, because what is under test is what the reader sees, and
+        every field being varied is one the card only reads.
+        """
+        card = getattr(self, "_rendered_plan_card", None)
+        if card is None:
+            self._plan_review(1, "render-plan")
+            self.assertEqual(self.cards.schedule().created, 1)
+            card = self.cards.claim_next().card
+            self._rendered_plan_card = card
+        return ExecutionReviewCard(**{**card.__dict__, **overrides})
+
+    def test_advisory_lists_are_capped_and_say_what_they_did_not_show(self):
+        """Lists that DESCRIBE work are capped; the count is not hidden.
+
+        A list that shows three of seven and says so reads as a summary. One
+        that shows three and says nothing reads as all of them, which is how
+        a reader ends up believing an agent proposed less than it did.
+        """
+        card = self._plan_card(deliverables=tuple(
+            CardRecord(f"Synthetic deliverable {index}.")
+            for index in range(5)
+        ))
+        body, _ = render_execution_review_card(card)
+
+        self.assertIn("Synthetic deliverable 0.", body)
+        self.assertIn(
+            f"Synthetic deliverable {MAX_ADVISORY_RECORDS - 1}.", body)
+        self.assertNotIn(
+            f"Synthetic deliverable {MAX_ADVISORY_RECORDS}.", body)
+        self.assertIn("and 2 more", body)
+
+    def test_the_authorising_list_is_never_capped(self):
+        """The cap must not reach the card that asks for authorisation.
+
+        An external review tells the reader to approve "these exact external
+        effects". Showing three of seven under that sentence would make it
+        false, which is worse than a long card.
+        """
+        self._external_review(1, "uncapped", external_actions=tuple(
+            f"Publish synthetic draft {index}." for index in range(7)
+        ))
+        self.assertEqual(self.cards.schedule().created, 1)
+        body, _ = render_execution_review_card(self.cards.claim_next().card)
+
+        for index in range(7):
+            self.assertIn(f"Publish synthetic draft {index}.", body)
+        self.assertNotIn("more — see result-work.md", body)
+
+    def test_a_long_deliverable_body_is_bounded_and_marked(self):
+        card = self._plan_card(deliverables=(
+            CardRecord("x" * 9_000, label="email", recipient="Someone"),
+        ))
+        body, _ = render_execution_review_card(card)
+
+        self.assertIn("<b>email</b>", body)
+        self.assertIn("truncated", body)
+        self.assertLess(body.count("x"), 9_000)
+
+    def _start_card(self, **overrides) -> ExecutionReviewCard:
+        card = getattr(self, "_rendered_start_card", None)
+        if card is None:
+            self._schedule_workflow(2)
+            self.assertEqual(self.cards.schedule().created, 1)
+            card = self.cards.claim_next().card
+            self.assertEqual(card.kind, ExecutionCardKind.START)
+            self._rendered_start_card = card
+        return ExecutionReviewCard(**{**card.__dict__, **overrides})
+
+    def test_an_opaque_origin_costs_the_card_no_lines(self):
+        """A digest is not a source.
+
+        It cannot be searched for, opened or recognised, so naming it --
+        and then warning that it came without an extract -- spends two of
+        the card's few readable lines on nothing the reader can act on.
+        Where the record IS nameable the warning stays, because there it
+        says "this source exists and you were not shown it".
+        """
+        opaque, _ = render_execution_review_card(self._start_card(
+            origin_kind="meeting",
+            origin_record="0123456789abcdef",
+            origin_item="action-002",
+            origin_sources=(),
+        ))
+        self.assertNotIn("0123456789abcdef", opaque)
+        self.assertNotIn("Source extract not provided", opaque)
+        # The card still identifies itself.
+        self.assertIn("<code>T2</code>", opaque)
+
+        nameable, _ = render_execution_review_card(self._start_card(
+            origin_kind="meeting",
+            origin_record="record-alpha",
+            origin_item="action-002",
+            origin_sources=(),
+        ))
+        self.assertIn("<b>From:</b> record-alpha", nameable)
+        self.assertIn("Source extract not provided", nameable)
+
+    def test_only_the_first_card_to_ask_carries_the_provenance(self):
+        """The start gate quotes the sources; what comes back does not.
+
+        A reader reaches a plan, a result or an external effect having
+        already been shown where the task came from and having answered
+        about it once. Quoting the sources again is a third telling, and
+        it lands between the task and the decision the card exists to put
+        in front of them.
+        """
+        sources = (CardSourceEvidence(
+            name="meeting-001.md",
+            role="transcript",
+            extract="Person A: Please prepare the synthetic item.",
+        ),)
+        start, _ = render_execution_review_card(self._start_card(
+            origin_kind="meeting",
+            origin_record="record-alpha",
+            origin_item="action-002",
+            origin_sources=sources,
+        ))
+        self.assertIn("<b>Source files and evidence:</b>", start)
+        self.assertIn("Person A: Please prepare the synthetic item.", start)
+
+        for kind in (ExecutionCardKind.PLAN_REVIEW,
+                     ExecutionCardKind.RESULT_REVIEW,
+                     ExecutionCardKind.EXTERNAL_REVIEW):
+            body, _ = render_execution_review_card(self._plan_card(
+                kind=kind,
+                origin_kind="meeting",
+                origin_record="record-alpha",
+                origin_item="action-002",
+                origin_sources=sources,
+                task_work_directory="/srv/example/Tasks/T1-synthetic-task",
+                task_kb_file="/srv/example/KB/Tasks/T1-synthetic-task.md",
+            ))
+            self.assertNotIn("Source files and evidence", body)
+            self.assertNotIn("<b>From:</b>", body)
+            self.assertNotIn("Please prepare the synthetic item", body)
+            # The task handle is what ties the card back to the files.
+            self.assertIn("<code>T1</code>", body)
+
+    def test_review_links_carry_only_destinations(self):
+        """A heading promising somewhere to go must lead somewhere.
+
+        `review_links` also yields a plain `<record> #<item>` for an origin
+        it cannot address. That is right for the archive file, which should
+        name its source however it can, and wrong on a card, where it
+        rendered as a bare digest duplicating the `From:` line above it.
+        """
+        bare, _ = render_execution_review_card(self._plan_card(
+            origin_kind="meeting",
+            origin_record="0123456789abcdef",
+            origin_item="action-002",
+            work_markdown="Synthetic plan with no destinations in it.",
+        ))
+        self.assertNotIn("Review links:", bare)
+
+        linked, _ = render_execution_review_card(self._plan_card(
+            origin_kind="meeting",
+            origin_record="0123456789abcdef",
+            origin_item="action-002",
+            work_markdown=(
+                "Synthetic plan.\n"
+                + "Filler line.\n" * 200
+                + "See https://github.com/example/project-alpha/pull/12."
+            ),
+        ))
+        self.assertIn("Review links:", linked)
+        # Found in the part of the plan the excerpt did not show: the links
+        # are read off the whole work, which is what keeps the excerpt from
+        # costing the reader a destination.
+        self.assertNotIn("See https://github.com", linked)
+        self.assertIn(
+            'href="https://github.com/example/project-alpha/pull/12"', linked)
+
+    def test_a_digest_replaces_the_excerpt_when_one_exists(self):
+        """A few sentences ABOUT the plan beat the first screenful OF it.
+
+        The excerpt can only ever show the opening, and an agent's opening
+        is its framing -- what the task is, what it read. The sentence the
+        reader has to agree with is usually further down, which is the
+        case this fixture reproduces: the recommendation is past the
+        excerpt's reach, and only the digest carries it.
+        """
+        plan = (
+            "\n".join(f"- Framing line {index}." for index in range(400))
+            + "\nRecommendation: target Journal Beta."
+        )
+        excerpted, _ = render_execution_review_card(
+            self._plan_card(work_markdown=plan))
+        self.assertIn("Framing line 0.", excerpted)
+        self.assertNotIn("target Journal Beta", excerpted)
+        self.assertIn("more characters", excerpted)
+
+        condensed, _ = render_execution_review_card(self._plan_card(
+            work_markdown=plan,
+            work_digest=(
+                "The agent will review the paper and draft the email. "
+                "Approval turns on targeting Journal Beta."
+            ),
+        ))
+        self.assertIn("target", condensed)
+        self.assertIn("Journal Beta", condensed)
+        self.assertNotIn("Framing line 0.", condensed)
+        # Condensed, not truncated -- and it still says where the whole
+        # thing is, because a reader who cannot tell will read a blurb as
+        # the plan and approve it.
+        self.assertNotIn("more characters", condensed)
+        self.assertIn("Condensed", condensed)
+        self.assertIn("<code>result-work.md</code>", condensed)
+        self.assertLess(len(condensed), len(excerpted))
+
+    def test_a_result_card_condenses_its_work_the_same_way(self):
+        body, _ = render_execution_review_card(self._plan_card(
+            kind=ExecutionCardKind.RESULT_REVIEW,
+            work_markdown="Synthetic working. " * 400,
+            work_digest="The agent sent the message and filed the note.",
+        ))
+        self.assertIn("<b>Work:</b>", body)
+        self.assertIn("The agent sent the message and filed the note.", body)
+        self.assertIn("the full work is in", body)
+        self.assertNotIn("Synthetic working.", body)
+
+    def test_the_work_excerpt_cuts_on_a_line_boundary(self):
+        long_line = "Synthetic sentence. " * 400
+        card = self._plan_card(work_markdown=long_line.strip())
+        body, _ = render_execution_review_card(card)
+        self.assertIn("more characters", body)
+
+        lines = [f"- Line {index}." for index in range(400)]
+        card = self._plan_card(work_markdown="\n".join(lines))
+        body, _ = render_execution_review_card(card)
+        shown = [line for line in body.split("\n")
+                 if line.startswith("• Line ")]
+        self.assertTrue(shown)
+        self.assertLessEqual(
+            sum(len(line) for line in shown), MAX_WORK_EXCERPT_CHARS + 100)
+        # Whole bullets only -- never "• Line 3" with the period missing.
+        self.assertTrue(all(line.endswith(".") for line in shown))
+
+    def test_complete_multi_message_review_retains_approval(self):
+        """A card can still outgrow one transport message and be approved.
+
+        Through the authorising list, which is uncapped on purpose, rather
+        than through a plan, which is not.
+        """
+        self._external_review(1, "multi-message", external_actions=tuple(
+            (f"Publish synthetic draft <{index}>. "
+             + "Synthetic effect detail. " * 40).strip()
+            for index in range(6)
+        ))
+        self.cards.schedule()
+        claim = self._claim_and_deliver()
+
+        body, keyboard = render_execution_review_card(claim.card)
+        actions = [
+            parse_execution_review_callback(button["callback_data"])[2]
+            for row in keyboard["inline_keyboard"]
+            for button in row
+        ]
+
         self.assertGreater(len(body), 4_096)
         self.assertLessEqual(len(body.encode("utf-8")), MAX_CARD_BODY_BYTES)
-        self.assertIn("Synthetic review line 219", body)
+        # Every effect, not the first three: this is the list being
+        # authorised, so the advisory cap must not reach it.
+        self.assertIn("Publish synthetic draft &lt;5&gt;.", body)
         self.assertIn("approve", actions)
         self.assertNotIn("Approval is disabled", body)
 
