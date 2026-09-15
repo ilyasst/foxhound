@@ -976,17 +976,21 @@ _GENERAL_PROMPT_TEMPLATE_V9 = _GENERAL_PROMPT_TEMPLATE_V8.replace(
 )
 
 
-_GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V9.replace(
+_GENERAL_PROMPT_TEMPLATE_V10 = _GENERAL_PROMPT_TEMPLATE_V9.replace(
     "Task lifecycle is separate. A completed execution result does not authorize you to close or drop the task.",
     "\n".join((
         "Task lifecycle is separate. A completed execution result does not authorize you to close or drop the task.",
         "# Repository follow-through",
         "When `task.origin` identifies a GitHub issue or review request, that exact origin is the repository artifact for this task: an `issue` is updated on its issue, and a `review_request` on its pull request. Never substitute a similarly named repository, issue, or pull request.",
-        "Before recording repository work as completed, partial, or blocked, prepare a concise, sanitized update for that artifact. State the outcome, verification performed, any linked pull request, commit, or check, and one clear next step. Do not claim completion while material repository work is unfinished or its truthful follow-through has not been prepared.",
-        f"In `plan` or `execute`, do not post the update. Put its complete draft in the reviewable result and list posting it as an external action, so the reader can approve the exact external write. In `external_action`, use `{WORKER_COMMAND_TOKEN} act comment --body-file FILE` for an issue update and `{WORKER_COMMAND_TOKEN} act review --body-file FILE` for a pull-request update, but only when that matching operation is listed by `context`; record the receipt link in `result-work.md`. If the run cannot complete it, record the precise blocker and the bounded continuation needed; do not silently release or claim success.",
+        "Repository follow-through is required only when execution changes or advances repository work. Planning, research, and an honest non-repository result remain valid without a forge update; for such a repository-origin execution, write JSON `false` to owner-only `result-repository-impact.json` and explain the bounded result in the deliverables. Omit the file for repository-impacting work: its safe default is `true`.",
+        "Before recording repository-impacting work as completed, partial, or blocked, prepare a concise, sanitized update for that artifact. State the outcome, verification performed, any linked pull request, commit, or check, and one clear next step. Do not claim completion while material repository work is unfinished or its truthful follow-through has not been prepared.",
+        f"In `execute`, do not post the update. Put its complete draft in the reviewable result and list posting it as a structured external action with an exact `target` URL for `task.origin`, so the reader can approve the exact external write. In `external_action`, use `{WORKER_COMMAND_TOKEN} act comment --body-file FILE` for an issue update and `{WORKER_COMMAND_TOKEN} act review --body-file FILE` for a pull-request update, but only when that matching operation is listed by `context`; record the receipt link in `result-work.md`. If the run cannot complete it, record the precise blocker and the bounded continuation needed; do not silently release or claim success.",
         "When time or turns are becoming insufficient, stop lower-priority exploration, preserve the verified partial result, and record the smallest bounded continuation that can finish it. Do not discard useful work merely because the first pass is incomplete.",
     )),
 )
+
+
+_GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V10
 
 
 if __name__ == "__main__":

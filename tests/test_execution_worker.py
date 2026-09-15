@@ -205,6 +205,7 @@ class ExecutionWorkerTests(unittest.TestCase):
             "external_actions": ["Prepare a synthetic draft."],
             "deliverables": ["Synthetic deliverable"],
             "repository_references": [],
+            "repository_impact": True,
         }
         document.update(changes)
         path = self.run_directory / f"result-{RESULT_ID}.json"
@@ -581,6 +582,7 @@ class ExecutionWorkerTests(unittest.TestCase):
             "external_actions": ["Prepare a synthetic draft."],
             "deliverables": ["Synthetic deliverable"],
             "repository_references": [],
+            "repository_impact": True,
         })
             self.assertNotIn(CLAIM_TOKEN, draft.read_text(encoding="utf-8"))
             with self.assertRaises(ExecutionWorkerDraftError):
@@ -594,6 +596,7 @@ class ExecutionWorkerTests(unittest.TestCase):
             "result-questions.json",
             "result-external-actions.json",
             "result-deliverables.json",
+            "result-repository-impact.json",
         ):
             self.assertFalse((self.run_directory / name).exists())
 
@@ -708,6 +711,66 @@ class ExecutionWorkerTests(unittest.TestCase):
                     },
                     self.run_directory,
                 )
+
+    def test_repository_execution_requires_an_action_for_its_exact_origin(self):
+        state = SimpleNamespace(
+            database_path=self.database,
+            task_id=1,
+            phase=WorkflowPhase.EXECUTE,
+        )
+        origin = SimpleNamespace(
+            kind="issue",
+            record_id="github.com/example-org/example-repo",
+            item_id="42",
+        )
+        draft = {
+            "outcome": "awaiting_external",
+            "deliverables": ["Prepared status update draft"],
+            "external_actions": [{
+                "action": "Post the prepared update",
+                "target": "https://github.com/example-org/example-repo/issues/42",
+            }],
+        }
+        with mock.patch(
+            "foxhound.execution_worker._repository_origin", return_value=origin,
+        ):
+            self.assertEqual(
+                _repository_result(state, draft, self.run_directory),
+                {**draft, "repository_impact": True,
+                 "repository_references": []},
+            )
+            with self.assertRaisesRegex(
+                ExecutionWorkerDraftError, "targeting its origin",
+            ):
+                _repository_result(state, {
+                    **draft,
+                    "external_actions": [{
+                        "action": "Post the prepared update",
+                        "target": "https://github.com/example-org/example-repo/issues/41",
+                    }],
+                }, self.run_directory)
+
+    def test_analysis_only_repository_result_does_not_require_a_forge_update(self):
+        state = SimpleNamespace(
+            database_path=self.database,
+            task_id=1,
+            phase=WorkflowPhase.EXECUTE,
+        )
+        origin = SimpleNamespace(
+            kind="issue",
+            record_id="github.com/example-org/example-repo",
+            item_id="42",
+        )
+        with mock.patch(
+            "foxhound.execution_worker._repository_origin", return_value=origin,
+        ):
+            result = _repository_result(state, {
+                "outcome": "completed",
+                "deliverables": ["Analysis with a bounded recommendation"],
+                "external_actions": [],
+                "repository_impact": False,
+            }, self.run_directory)
+        self.assertEqual(result["repository_references"], [])
 
     def test_github_external_completion_needs_worker_receipt(self):
         state = SimpleNamespace(

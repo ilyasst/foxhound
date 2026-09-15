@@ -2589,13 +2589,14 @@ class CardRecord:
     text: str
     requires: str = ""
     channel: str = ""
+    target: str = ""
     label: str = ""
     recipient: str = ""
     subject: str = ""
 
     @property
     def structured(self) -> bool:
-        return bool(self.requires or self.channel or self.label
+        return bool(self.requires or self.channel or self.target or self.label
                     or self.recipient or self.subject)
 
 
@@ -2632,7 +2633,7 @@ def _stored_collection(value: object) -> tuple[CardRecord, ...]:
         text = item.get("action") or item.get("body") or ""
         fields = {
             name: item.get(name) or ""
-            for name in ("requires", "channel", "label", "recipient",
+            for name in ("requires", "channel", "target", "label", "recipient",
                          "subject")
         }
         if not isinstance(text, str) or not text or any(
@@ -3138,6 +3139,8 @@ def _record_detail_lines(record: CardRecord) -> list[str]:
         details.append("Needs: " + record.requires)
     if record.channel and record.channel.casefold() not in record.text.casefold():
         details.append("Channel: " + record.channel)
+    if record.target:
+        details.append("Target: " + record.target)
     return details
 
 
@@ -3367,10 +3370,15 @@ def _html_listed(
         segments = _escaped_source_lines(record.text)
         lines.append(f"• {segments[0]}")
         lines.extend(f"  {segment}" for segment in segments[1:])
-        lines.extend(
-            f"  {_escape(detail)}"
-            for detail in _record_detail_lines(record)
-        )
+        for detail in _record_detail_lines(record):
+            if detail.startswith("Target: https://"):
+                target = detail.removeprefix("Target: ")
+                lines.append(
+                    f'  Target: <a href="{_escape(target)}">'
+                    f'{_escape(target)}</a>'
+                )
+            else:
+                lines.append(f"  {_escape(detail)}")
     return lines
 
 
