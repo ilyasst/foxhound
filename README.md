@@ -558,6 +558,7 @@ The authenticated loopback card service exposes execution cards through a
 separate `/v1/execution-cards/*` route family. A trusted local gateway can read
 aggregate stats, read the bounded non-mutating `queue_view` projection at
 `POST /v1/execution-cards/queue`, run the explicit scheduler, claim one rendered card,
+or resolve one queue card atomically at `POST /v1/execution-cards/resolve`,
 acknowledge or retry delivery, submit one versioned reader action, submit
 one bounded discussion or reassignment response, submit one bounded
 Comment-and-Go note, and read one delivered card's
