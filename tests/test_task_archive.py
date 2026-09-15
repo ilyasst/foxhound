@@ -13,6 +13,7 @@ from foxhound.task_archive import (
     append_result,
     prepare_task_archive,
     preserve_run_files,
+    publish_deliverables,
 )
 
 
@@ -38,6 +39,105 @@ class TaskArchiveTests(unittest.TestCase):
             origin_kind="issue",
             origin_record="github.com/example/project-alpha",
             origin_item="42",
+        )
+
+    def _run(self, run_id: str, phase: str = "plan"):
+        return prepare_task_archive(
+            working_root=self.work,
+            kb_root=self.kb,
+            task_id=7,
+            task_text="Review synthetic result",
+            run_id=run_id,
+            phase=phase,
+            agent_display_name="Agent Example",
+        )
+
+    def test_repeated_runs_restate_the_task_instead_of_accumulating(self):
+        """The document says where the task IS, not how it got there.
+
+        It used to be append-only, so every run added a section and every
+        result appended its COMPLETE work text again. Eight runs of one real
+        task produced seven hundred lines carrying the same plan four times
+        over, with no statement anywhere of what was currently true.
+        """
+        first = self._run("b" * 32)
+        append_result(first, result={
+            "outcome": "awaiting_plan",
+            "summary": "First pass.",
+            "work_markdown": "ORIGINAL PLAN BODY",
+        })
+        second = self._run("c" * 32)
+        append_result(second, result={
+            "outcome": "completed",
+            "summary": "Second pass supersedes the first.",
+            "work_markdown": "REVISED PLAN BODY",
+        })
+
+        for path in (first.working_directory / "README.md", first.task_file):
+            text = path.read_text(encoding="utf-8")
+            # Only the current answer is restated in full.
+            self.assertIn("REVISED PLAN BODY", text)
+            self.assertNotIn("ORIGINAL PLAN BODY", text)
+            # The superseded run is still named, and still on disk.
+            self.assertIn("b" * 32, text)
+            self.assertIn("First pass.", text)
+            self.assertIn("## Objective", text)
+            self.assertIn("**Status:** completed", text)
+            # One "current result" heading however many runs there were.
+            self.assertEqual(text.count("## Current result"), 1)
+            self.assertEqual(text.count("## Work"), 1)
+
+    def test_a_corrupt_log_does_not_cost_the_result(self):
+        """A bad cache must never block recording; runs/ holds the evidence."""
+        paths = self._run("d" * 32)
+        (paths.working_directory / ".task-log.json").write_text(
+            "{not json", encoding="utf-8"
+        )
+        append_result(paths, result={
+            "outcome": "completed",
+            "summary": "Recorded anyway.",
+            "work_markdown": "BODY",
+        })
+        text = (paths.working_directory / "README.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("Recorded anyway.", text)
+
+    def test_deliverables_are_published_to_the_task_folder(self):
+        """The folder is the deliverable surface, not just an evidence store."""
+        paths = self._run("e" * 32)
+        (self.run / "Cost Breakdown.xlsx").write_bytes(b"synthetic")
+        nested = self.run / "nested"
+        nested.mkdir()
+        (nested / "Draft reply.txt").write_text("synthetic", encoding="utf-8")
+        (self.run / "result-artifacts.json").write_text(
+            json.dumps(["Cost Breakdown.xlsx", "nested/Draft reply.txt"]),
+            encoding="utf-8",
+        )
+
+        published = publish_deliverables(paths, self.run)
+
+        self.assertEqual(
+            set(published), {"Cost Breakdown.xlsx", "Draft reply.txt"}
+        )
+        # Flattened to the top level, where the reader opens the folder.
+        self.assertTrue(
+            (paths.working_directory / "Cost Breakdown.xlsx").is_file()
+        )
+        self.assertTrue(
+            (paths.working_directory / "Draft reply.txt").is_file()
+        )
+        # And the README is not overwritten by a deliverable of that name.
+        (self.run / "README.md").write_text("HOSTILE", encoding="utf-8")
+        (self.run / "result-artifacts.json").write_text(
+            json.dumps(["README.md"]), encoding="utf-8"
+        )
+        self.assertEqual(publish_deliverables(paths, self.run), ())
+        self.assertNotIn(
+            "HOSTILE",
+            (paths.working_directory / "README.md").read_text(
+                encoding="utf-8"
+            ),
         )
 
     def test_two_stable_locations_hold_result_and_review_links(self):
