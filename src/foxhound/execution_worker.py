@@ -1193,7 +1193,8 @@ def _repository_result(
     relying on the agent to copy a URL from a terminal response.
     """
     result = dict(draft)
-    if _repository_origin(state) is None:
+    origin = _repository_origin(state)
+    if origin is None:
         return result
     outcome = result.get("outcome")
     actions = result.get("external_actions")
@@ -1222,6 +1223,14 @@ def _repository_result(
             raise ExecutionWorkerDraftError(
                 "repository completion requires a worker action receipt"
             )
+        required = _required_repository_receipt_kinds(origin.kind)
+        received = {receipt["kind"] for receipt in receipts}
+        missing = required - received
+        if missing:
+            names = " and ".join(sorted(missing))
+            raise ExecutionWorkerDraftError(
+                f"repository {origin.kind} completion requires {names} receipt"
+            )
         result["deliverables"] = [
             *list(result.get("deliverables") or ()),
             *[
@@ -1231,6 +1240,21 @@ def _repository_result(
             ],
         ]
     return result
+
+
+def _required_repository_receipt_kinds(origin_kind: str) -> frozenset[str]:
+    """Return the visible follow-through required to complete a forge task.
+
+    An issue implementation is not discoverable unless it has both a proposed
+    change and an update on the originating issue.  A review task instead
+    requires a durable review receipt.  The worker creates every receipt, so
+    this check cannot be satisfied by an agent-authored URL.
+    """
+    if origin_kind == "issue":
+        return frozenset({"pull-request", "issue-comment"})
+    if origin_kind == "review_request":
+        return frozenset({"review"})
+    return frozenset()
 
 
 def _repository_receipts(run_directory: Path) -> tuple[dict[str, str], ...]:
