@@ -265,7 +265,7 @@ class ExecutionWorkerTests(unittest.TestCase):
         self.assertNotIn(CLAIM_TOKEN, rendered)
         self.assertNotIn(str(self.database), rendered)
         self.assertEqual(context["task"]["text"], "Synthetic task")
-        self.assertEqual(context["schema_version"], 5)
+        self.assertEqual(context["schema_version"], 6)
         self.assertEqual(context["runtime"]["today"], "2030-01-02")
         self.assertEqual(context["runtime"]["today_weekday"], "Wednesday")
         self.assertEqual(
@@ -328,6 +328,8 @@ class ExecutionWorkerTests(unittest.TestCase):
         external = _worker_operations(WorkflowPhase.EXTERNAL_ACTION)
         self.assertIn("act.worktree", external)
         self.assertIn("act.pull-request", external)
+        self.assertIn("act.comment", external)
+        self.assertIn("act.review", external)
 
     def test_context_omits_local_clients_missing_from_the_runner(self):
         with (

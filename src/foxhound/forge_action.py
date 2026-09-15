@@ -52,6 +52,15 @@ REVIEW_PROVENANCE = (
     "agent's._\n"
 )
 
+#: The same visible attribution for a progress update on a task's own issue.
+#: It deliberately says neither that the issue is resolved nor that the
+#: implementation is approved; those statements remain the reader's.
+ISSUE_COMMENT_PROVENANCE = (
+    "\n\n---\n_Updated by Foxhound for task {task_id} on {repository}"
+    "#{number}. A person has approved posting this; its contents are the "
+    "agent's._\n"
+)
+
 _PUSH_TIMEOUT_S = 120
 _CLONE_TIMEOUT_S = 600
 
@@ -184,6 +193,55 @@ class ReviewReceipt:
     repository: str
     number: int
     url: str
+
+
+@dataclass(frozen=True)
+class IssueCommentReceipt:
+    repository: str
+    number: int
+    url: str
+
+
+def post_issue_comment(
+    *,
+    repository: str,
+    number: str,
+    task_id: int,
+    body: str,
+) -> IssueCommentReceipt:
+    """Comment on the issue bound to a task, never an agent-supplied target."""
+    if not repository or repository.count("/") != 2:
+        raise ForgeActionError(
+            "the task's repository is not a canonical locator")
+    host, _, name_with_owner = repository.partition("/")
+    if host != "github.com":
+        raise ForgeActionError(
+            f"{host}: posting an issue comment is not supported here")
+    digits = (number or "").strip()
+    if not digits.isdigit() or int(digits) < 1:
+        raise ForgeActionError("the task does not name an issue")
+    if not (body or "").strip():
+        raise ForgeActionError("an issue comment body is required")
+
+    body = body.rstrip() + ISSUE_COMMENT_PROVENANCE.format(
+        task_id=task_id, repository=repository, number=digits)
+    rc, _out, err = _run(
+        "gh", "issue", "comment", digits, "--repo", name_with_owner,
+        "--body", body)
+    if rc != 0:
+        raise ForgeActionError(
+            f"{repository}#{digits}: the forge refused the issue comment "
+            f"({_detail(err)})")
+    url = ""
+    rc, detail, _err = _run("gh", "issue", "view", digits, "--repo",
+                            name_with_owner, "--json", "url")
+    if rc == 0:
+        try:
+            url = str(json.loads(detail).get("url") or "")
+        except (ValueError, TypeError):
+            pass
+    return IssueCommentReceipt(
+        repository=repository, number=int(digits), url=url)
 
 
 def post_review(

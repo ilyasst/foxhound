@@ -253,9 +253,9 @@ def general_profile() -> AgentProfile:
         runtime="hermes",
         prompt_template=_GENERAL_PROMPT_TEMPLATE,
         toolsets=("terminal", "file", "web"),
-        max_turns=50,
-        timeout_seconds=1_800,
-        claim_lease_seconds=2_700,
+        max_turns=80,
+        timeout_seconds=2_700,
+        claim_lease_seconds=3_300,
         heartbeat_seconds=60,
         kill_grace_seconds=30,
         allowed_phases=_PHASES,
@@ -365,6 +365,19 @@ def _historical_general_profiles() -> tuple[AgentProfile, ...]:
             display_name="General",
             runtime="hermes",
             prompt_template=_GENERAL_PROMPT_TEMPLATE_V7,
+            toolsets=("terminal", "file", "web"),
+            max_turns=50,
+            timeout_seconds=1_800,
+            claim_lease_seconds=2_700,
+            heartbeat_seconds=60,
+            kill_grace_seconds=30,
+            allowed_phases=_PHASES,
+        ),
+        AgentProfile(
+            profile_id="general",
+            display_name="General",
+            runtime="hermes",
+            prompt_template=_GENERAL_PROMPT_TEMPLATE_V8,
             toolsets=("terminal", "file", "web"),
             max_turns=50,
             timeout_seconds=1_800,
@@ -944,12 +957,25 @@ _GENERAL_PROMPT_TEMPLATE_V7 = _GENERAL_PROMPT_TEMPLATE_V6.replace(
 #: The length bound is not the point and is left to the contract, which
 #: already refuses over 1,200 characters. The shape is: prose, and
 #: nothing another field already carries.
-_GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V7.replace(
+_GENERAL_PROMPT_TEMPLATE_V8 = _GENERAL_PROMPT_TEMPLATE_V7.replace(
     "Prepare the reviewable result early enough that useful work cannot be lost to the turn limit. Write owner-only `result-summary.txt` and `result-work.md` in the starting directory, plus `result-questions.json`, `result-external-actions.json`, and `result-deliverables.json` only when those arrays are non-empty.",
     "\n".join((
         "Prepare the reviewable result early enough that useful work cannot be lost to the turn limit. Write owner-only `result-summary.txt` and `result-work.md` in the starting directory, plus `result-questions.json`, `result-external-actions.json`, and `result-deliverables.json` only when those arrays are non-empty.",
         "`result-summary.txt` is the opening of a review card, not a report. Write two to four plain sentences: what you did or propose, and the one thing that most affects whether the reader approves it. No headings, no bold labels, no bullet lists, no `Phase:`/`Outcome:`/`Status:` preamble, and do not restate the questions, external actions or deliverables -- the card renders those from their own files directly below it.",
         "`result-work.md` is where the detail belongs, in full. Nothing there needs shortening for the card.",
+    )),
+)
+
+
+_GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V8.replace(
+    "Task lifecycle is separate. A completed execution result does not authorize you to close or drop the task.",
+    "\n".join((
+        "Task lifecycle is separate. A completed execution result does not authorize you to close or drop the task.",
+        "# Repository follow-through",
+        "When `task.origin` identifies a GitHub issue or review request, that exact origin is the repository artifact for this task: an `issue` is updated on its issue, and a `review_request` on its pull request. Never substitute a similarly named repository, issue, or pull request.",
+        "Before recording repository work as completed, partial, or blocked, prepare a concise, sanitized update for that artifact. State the outcome, verification performed, any linked pull request, commit, or check, and one clear next step. Do not claim completion while material repository work is unfinished or its truthful follow-through has not been prepared.",
+        f"In `plan` or `execute`, do not post the update. Put its complete draft in the reviewable result and list posting it as an external action, so the reader can approve the exact external write. In `external_action`, use `{WORKER_COMMAND_TOKEN} act comment --body-file FILE` for an issue update and `{WORKER_COMMAND_TOKEN} act review --body-file FILE` for a pull-request update, but only when that matching operation is listed by `context`; record the receipt link in `result-work.md`. If the run cannot complete it, record the precise blocker and the bounded continuation needed; do not silently release or claim success.",
+        "When time or turns are becoming insufficient, stop lower-priority exploration, preserve the verified partial result, and record the smallest bounded continuation that can finish it. Do not discard useful work merely because the first pass is incomplete.",
     )),
 )
 
