@@ -173,6 +173,13 @@ class ExecutionCardScheduleResult:
 
 
 @dataclass(frozen=True)
+class ExecutionCardRequeueResult:
+    """A bounded re-presentation pass over unanswered delivered cards."""
+
+    requeued: int = 0
+
+
+@dataclass(frozen=True)
 class ExecutionCardStats:
     pending: int
     delivering: int
@@ -801,6 +808,63 @@ class ExecutionCardService:
                     delivered_at=None,
                 )
                 return _operation(values, ExecutionCardDisposition.APPLIED)
+            except Exception:
+                connection.rollback()
+                raise
+
+    def requeue_unanswered(self, *, limit: int = 100) -> ExecutionCardRequeueResult:
+        """Re-present current cards left unanswered for at least one hour.
+
+        The old chat message remains a historical presentation, but its
+        callbacks are version-stale before a replacement can be claimed.
+        Reusing the existing `delivery_failed` event shape records that the
+        presentation became unavailable without changing workflow state.
+        """
+        if not _valid_limit(limit):
+            return ExecutionCardRequeueResult()
+        stamp = self._clock_value()
+        now = stamp.isoformat(timespec="seconds")
+        due = (stamp - timedelta(hours=1)).isoformat(timespec="seconds")
+        with closing(self._connect()) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._cancel_stale(connection, now)
+                rows = connection.execute(
+                    self._card_select()
+                    + " WHERE c.status='delivered' AND c.delivered_at<=? "
+                    "ORDER BY c.delivered_at,c.id LIMIT ?",
+                    (due, limit),
+                ).fetchall()
+                requeued = 0
+                for row in rows:
+                    if not _current_card(row):
+                        continue
+                    card_id = int(row["id"])
+                    version = int(row["version"]) + 1
+                    updated = connection.execute(
+                        "UPDATE execution_review_cards SET status='pending',"
+                        "version=?,claim_token_digest=NULL,claim_expires_at=NULL,"
+                        "transport=NULL,delivery_ref=NULL,delivered_at=NULL,"
+                        "updated_at=? WHERE id=? AND version=? "
+                        "AND status='delivered'",
+                        (version, now, card_id, int(row["version"])),
+                    )
+                    if updated.rowcount != 1:
+                        raise TaskLedgerError("execution card state changed")
+                    self._event(
+                        connection,
+                        card_id=card_id,
+                        task_id=int(row["task_id"]),
+                        kind="delivery_failed",
+                        card_version=version,
+                        workflow_version=int(row["workflow_version"]),
+                        action=None,
+                        now=now,
+                    )
+                    requeued += 1
+                connection.commit()
+                return ExecutionCardRequeueResult(requeued=requeued)
             except Exception:
                 connection.rollback()
                 raise
