@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -1768,6 +1768,70 @@ _SCHEMA_V23 = (
     "ALTER TABLE task_review_cards ADD COLUMN consumer_digest TEXT;",
 )
 
+# One more event kind, so a revision the reader's own decision overtook can be
+# recorded as what it is. `candidate_revised` would claim the revision was
+# folded into the task, and the withdrawal path already established the
+# vocabulary for the other case: `candidate_withdrawal_conflict` and
+# `candidate_reactivation_conflict` both mean "the producer said something
+# about a task the reader had already settled, and we recorded it without
+# applying it".
+#
+# SQLite cannot alter a CHECK in place and nothing holds a foreign key to this
+# table, so the plain rename-copy-drop is enough here -- the same shape this
+# table's own earlier CHECK widenings used. The triggers come off first
+# because the table they guard is about to be renamed out from under them,
+# and go back on last so the window where events are mutable is inside this
+# transaction and nowhere else.
+_SCHEMA_V24 = (
+    "DROP TRIGGER task_events_no_update;",
+    "DROP TRIGGER task_events_no_delete;",
+    "ALTER TABLE task_events RENAME TO task_events_v23;",
+    """
+CREATE TABLE task_events (
+    sequence        INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id         INTEGER NOT NULL,
+    kind            TEXT NOT NULL CHECK(kind IN (
+                        'created','candidate_folded','candidate_revised',
+                        'candidate_revision_conflict',
+                        'candidate_withdrawn','candidate_withdrawal_conflict',
+                        'candidate_reactivated','candidate_reactivation_conflict',
+                        'status_changed'
+                    )),
+    task_version    INTEGER NOT NULL CHECK(task_version >= 1),
+    candidate_id    TEXT,
+    source_revision TEXT,
+    from_status     TEXT,
+    to_status       TEXT,
+    occurred_at     TEXT NOT NULL,
+    FOREIGN KEY(task_id) REFERENCES tasks(id)
+);
+""",
+    """
+INSERT INTO task_events(
+    sequence,task_id,kind,task_version,candidate_id,source_revision,
+    from_status,to_status,occurred_at
+)
+SELECT sequence,task_id,kind,task_version,candidate_id,source_revision,
+       from_status,to_status,occurred_at
+FROM task_events_v23;
+""",
+    "DROP TABLE task_events_v23;",
+    """
+CREATE TRIGGER task_events_no_update
+BEFORE UPDATE ON task_events
+BEGIN
+    SELECT RAISE(ABORT, 'task events are append-only');
+END;
+""",
+    """
+CREATE TRIGGER task_events_no_delete
+BEFORE DELETE ON task_events
+BEGIN
+    SELECT RAISE(ABORT, 'task events are append-only');
+END;
+""",
+)
+
 _SCHEMA_V20 = (
     # SQLite cannot alter a CHECK in place, and three tables carry a foreign
     # key to this one. Renaming the card table would rewrite all three to
@@ -2510,6 +2574,17 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 23
+            if version == 23:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V24:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 24")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 24
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:
