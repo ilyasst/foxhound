@@ -54,7 +54,7 @@ RUN_STATE_SCHEMA = "foxhound.execution-run-state"
 RUN_STATE_SCHEMA_VERSION = 4
 INSTRUCTIONS_NAME = "agent-instructions.json"
 WORK_CONTEXT_SCHEMA = "foxhound.execution-work-context"
-WORK_CONTEXT_SCHEMA_VERSION = 5
+WORK_CONTEXT_SCHEMA_VERSION = 6
 WORKER_SEARCH_SCHEMA = "foxhound.execution-worker-search"
 RESULT_DRAFT_SCHEMA = "foxhound.execution-result-draft"
 RESULT_DRAFT_READY_SCHEMA = "foxhound.execution-result-draft-ready"
@@ -115,6 +115,7 @@ def _worker_operations(phase: WorkflowPhase) -> list[str]:
         operations.append("act.worktree")
     if phase is WorkflowPhase.EXTERNAL_ACTION:
         operations.append("act.pull-request")
+        operations.extend(("act.comment", "act.review"))
     return operations
 
 
@@ -421,6 +422,41 @@ class ExecutionWorker:
         self._renew(service, state)
         return {
             "kind": "review",
+            "repository": receipt.repository,
+            "number": receipt.number,
+            "url": receipt.url,
+        }
+
+    def act_comment(self, *, body_file: str) -> dict[str, Any]:
+        """Post an approved status update on this task's own origin issue.
+
+        The origin supplies both repository and issue number. The agent can
+        choose the reviewed body but never redirect this external write to a
+        similarly named record.
+        """
+        state, service = self._active()
+        if state.phase is not WorkflowPhase.EXTERNAL_ACTION:
+            raise ExecutionWorkerClaimError(
+                "an external action is only available in the external_action "
+                "phase"
+            )
+        origin = TaskLedger(state.database_path).origin(state.task_id)
+        if origin is None or origin.kind != "issue":
+            raise ExecutionWorkerClaimError(
+                "this task is not about an issue that can receive a comment"
+            )
+        body = _read_private_text(
+            self._state_path.parent / body_file,
+            maximum=60_000, label="issue comment body")
+        try:
+            receipt = forge_action.post_issue_comment(
+                repository=origin.record_id, number=origin.item_id,
+                task_id=state.task_id, body=body)
+        except forge_action.ForgeActionError as exc:
+            raise ExecutionWorkerClaimError(str(exc)) from exc
+        self._renew(service, state)
+        return {
+            "kind": "issue-comment",
             "repository": receipt.repository,
             "number": receipt.number,
             "url": receipt.url,
@@ -1187,6 +1223,11 @@ def _parser() -> argparse.ArgumentParser:
         help="file beside the run state holding the review")
     review.add_argument(
         "--repository", help="canonical locator; defaults to the task origin")
+    comment = act_kinds.add_parser(
+        "comment", help="post an approved status update on the origin issue")
+    comment.add_argument(
+        "--body-file", required=True,
+        help="file beside the run state holding the status update")
     record = subcommands.add_parser("record")
     record.add_argument("draft")
     draft = subcommands.add_parser(
@@ -1218,6 +1259,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.operation == "act" and args.action_kind == "review":
             result = worker.act_review(
                 body_file=args.body_file, repository=args.repository)
+        elif args.operation == "act" and args.action_kind == "comment":
+            result = worker.act_comment(body_file=args.body_file)
         elif args.operation == "act":
             result = worker.act_pull_request(
                 head=args.head, title=args.title, body_file=args.body_file,
