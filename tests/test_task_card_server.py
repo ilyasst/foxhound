@@ -40,6 +40,7 @@ from foxhound.task_card_server import (
     EXECUTION_BRIEF_SCHEMA,
     EXECUTION_VIEW_SCHEMA,
     EXECUTION_CLAIM_SCHEMA,
+    EXECUTION_DETAIL_SCHEMA,
     EXECUTION_OPERATION_SCHEMA,
     EXECUTION_QUEUE_SCHEMA,
     EXECUTION_SCHEDULE_SCHEMA,
@@ -371,6 +372,75 @@ class TaskCardServerTests(unittest.TestCase):
             authorization=f"Bearer {queue_token}",
         )
         self.assertEqual(held["cards"], [])
+
+    def test_execution_detail_is_bounded_versioned_and_queue_scoped(self):
+        card = self._queue_card()
+        queue = "q" * 43
+        app = TaskCardApplication(
+            self.cards, {DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: queue},
+            execution_cards=self.execution_cards,
+            execution_tokens={DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: queue},
+        )
+        before = (self.execution_cards.count(), self.execution_cards.event_count())
+        detail = app.dispatch(
+            "execution_detail",
+            request_document(card_id=card.id, card_version=card.version),
+            authorization=f"Bearer {queue}",
+        )
+        self.assertEqual(detail["schema"], EXECUTION_DETAIL_SCHEMA)
+        self.assertTrue(detail["ok"])
+        self.assertEqual(detail["status"], "awaiting_start")
+        self.assertEqual(detail["phase"], "plan")
+        self.assertEqual(detail["deliverables"], [])
+        self.assertNotIn("work_markdown", detail)
+        self.assertNotIn("task_work_directory", detail)
+        self.assertEqual((self.execution_cards.count(), self.execution_cards.event_count()), before)
+        with self.assertRaises(TaskCardServerRequestError):
+            app.dispatch(
+                "execution_detail",
+                request_document(card_id=card.id, card_version=card.version, extra="x"),
+                authorization=f"Bearer {queue}",
+            )
+        with self.assertRaises(TaskCardServerRequestError):
+            app.dispatch(
+                "execution_detail",
+                request_document(card_id=card.id, card_version=card.version),
+                authorization=f"Bearer {TOKEN}",
+            )
+        claimed = self.execution_cards.claim_next(
+            consumer_digest=hashlib.sha256(TOKEN.encode()).hexdigest(),
+            consumer_role=DRIP_ROLE,
+        )
+        self.assertIsNotNone(claimed)
+        held = app.dispatch(
+            "execution_detail",
+            request_document(card_id=card.id, card_version=card.version),
+            authorization=f"Bearer {queue}",
+        )
+        self.assertFalse(held["ok"])
+        self.assertIsNone(held["summary"])
+
+    def test_execution_detail_stale_refusal_is_content_free_and_versioned(self):
+        card = self._queue_card()
+        queue = "q" * 43
+        app = TaskCardApplication(
+            self.cards, {DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: queue},
+            execution_cards=self.execution_cards,
+            execution_tokens={DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: queue},
+        )
+        response = app.dispatch(
+            "execution_detail",
+            request_document(card_id=card.id, card_version=card.version + 1),
+            authorization=f"Bearer {queue}",
+        )
+        self.assertEqual(
+            (response["schema"], response["schema_version"], response["ok"]),
+            (EXECUTION_DETAIL_SCHEMA, 1, False),
+        )
+        self.assertEqual(response["refusal"], "stale_version")
+        self.assertIsNone(response["summary"])
+        self.assertIsNone(response["work_digest"])
+        self.assertEqual(response["deliverables"], [])
 
     def test_claim_at_ceiling_is_distinct_and_content_free(self):
         self.cards.schedule()

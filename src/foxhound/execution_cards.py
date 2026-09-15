@@ -313,6 +313,30 @@ class ExecutionCardBrief:
 
 
 @dataclass(frozen=True)
+class ExecutionCardDetail:
+    """Bounded, non-mutating current-run projection for a queue reader."""
+
+    disposition: ExecutionCardDisposition
+    card_id: int
+    card_version: int | None = None
+    workflow_version: int | None = None
+    status: WorkflowStatus | None = None
+    phase: WorkflowPhase | None = None
+    updated_at: str | None = None
+    due_at: str | None = None
+    completed_at: str | None = None
+    outcome: ExecutionOutcome | None = None
+    summary: str = field(default="", repr=False)
+    work_digest: str = field(default="", repr=False)
+    deliverables: tuple[CardRecord, ...] = field(default=(), repr=False)
+    refusal: ExecutionCardRefusal | None = None
+
+    @property
+    def accepted(self) -> bool:
+        return self.disposition is not ExecutionCardDisposition.REFUSED
+
+
+@dataclass(frozen=True)
 class ExecutionCardOperationResult:
     disposition: ExecutionCardDisposition
     card_id: int
@@ -1266,6 +1290,58 @@ class ExecutionCardService:
             text=task_brief(card),
         )
 
+    def detail(
+        self, card_id: int, *, expected_version: int
+    ) -> ExecutionCardDetail:
+        """Return a bounded current-run view without claiming the card.
+
+        Only a current, unheld queue card is disclosed.  A queue reader can
+        therefore refresh a card it saw in ``due()`` but cannot probe a card
+        being delivered to another consumer.  The result projection is kept
+        deliberately separate from ``ExecutionReviewCard`` so paths,
+        prompts, profile revisions, and other private provenance never cross
+        this boundary.
+        """
+        def refused(reason: ExecutionCardRefusal) -> ExecutionCardDetail:
+            return ExecutionCardDetail(
+                ExecutionCardDisposition.REFUSED, card_id, refusal=reason
+            )
+
+        if not _valid_identity(card_id, expected_version):
+            return refused(ExecutionCardRefusal.INVALID_ARGUMENT)
+        now = self._clock_value().isoformat(timespec="seconds")
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                self._card_select() + " WHERE c.id=?", (card_id,)
+            ).fetchone()
+            refusal = _card_guard(row, expected_version)
+            if refusal is None and row["status"] != ExecutionCardStatus.PENDING:
+                refusal = ExecutionCardRefusal.CLAIM_MISMATCH
+            if refusal is None and row["workflow_status_current"] == WorkflowStatus.SNOOZED:
+                due_at = row["workflow_due_at"]
+                if due_at is not None and due_at > now:
+                    refusal = ExecutionCardRefusal.INVALID_STATE
+            if refusal is None and not _current_card(row):
+                refusal = ExecutionCardRefusal.STALE_VERSION
+            if refusal is not None:
+                return refused(refusal)
+            outcome = row["result_outcome"]
+            return ExecutionCardDetail(
+                ExecutionCardDisposition.UNCHANGED,
+                card_id,
+                card_version=expected_version,
+                workflow_version=int(row["workflow_version_current"]),
+                status=WorkflowStatus(row["workflow_status_current"]),
+                phase=WorkflowPhase(row["workflow_phase_current"]),
+                updated_at=str(row["workflow_updated_at"]),
+                due_at=row["workflow_due_at"],
+                completed_at=row["workflow_completed_at"],
+                outcome=None if outcome is None else ExecutionOutcome(outcome),
+                summary="" if row["summary"] is None else str(row["summary"]),
+                work_digest="" if row["work_digest"] is None else str(row["work_digest"]),
+                deliverables=_stored_collection(row["deliverables_json"]),
+            )
+
     def select_agent(
         self,
         card_id: int,
@@ -2009,6 +2085,9 @@ class ExecutionCardService:
             "w.phase AS workflow_phase_current,"
             "w.version AS workflow_version_current,"
             "w.task_version AS workflow_task_version_current,"
+            "w.updated_at AS workflow_updated_at,"
+            "w.due_at AS workflow_due_at,"
+            "w.completed_at AS workflow_completed_at,"
             "w.agent_profile_id AS workflow_agent_profile_id,"
             "w.agent_profile_revision AS workflow_agent_profile_revision,"
             "w.last_result_id AS workflow_result_id,"

@@ -578,6 +578,16 @@ kind-dependent ones. Its agent-options and
 agent-selection operations remain a bounded integration contract with opaque
 callbacks and a refreshed Start-card presentation; they are not exposed as an
 extra control in the legacy-compatible Start keyboard.
+
+The same `queue_view` consumer may request current card detail at
+`POST /v1/execution-cards/detail`, using the exact card id and version from
+the queue projection. This read-only, version-fenced response contains only
+workflow status, phase, bounded timestamps, fixed-vocabulary outcome, a
+bounded summary/work digest, and bounded deliverable records. It refuses
+non-current, held, or otherwise unavailable cards without disclosing content;
+prompts, logs, private paths, credentials, profile identifiers, and unbounded
+work-product text are never exposed. This follows ADR 0041's aggregate-scoped
+second-consumer decision and creates no new authority.
 The packaged service accepts `--agent-profile-directory`; deployments with
 private profiles must give it the same directory as the execution runner. The
 owner-conditioned control is disabled unless all three of `--gw-endpoint`,

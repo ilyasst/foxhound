@@ -26,6 +26,7 @@ from .execution_cards import (
     AGENT_SELECTION_TOKEN_CHARS,
     ExecutionCardOperationResult,
     ExecutionCardPresentation,
+    ExecutionCardDetail,
     ExecutionCardScheduleResult,
     ExecutionCardService,
     ClaimAtCeiling as ExecutionClaimAtCeiling,
@@ -70,6 +71,7 @@ EXECUTION_OPERATION_SCHEMA = "foxhound.execution-card-service.operation"
 EXECUTION_STATS_SCHEMA = "foxhound.execution-card-service.stats"
 EXECUTION_BRIEF_SCHEMA = "foxhound.execution-card-service.brief"
 EXECUTION_VIEW_SCHEMA = "foxhound.execution-card-service.view"
+EXECUTION_DETAIL_SCHEMA = "foxhound.execution-card-service.detail"
 EXECUTION_QUEUE_SCHEMA = "foxhound.execution-card-service.queue"
 EXECUTION_QUEUE_SCHEMA_VERSION = 1
 EXECUTION_RESOLVE_SCHEMA = "foxhound.execution-card-service.resolve"
@@ -115,6 +117,7 @@ ROUTES = {
     "/v1/execution-cards/agent-selection": "execution_agent_selection",
     "/v1/execution-cards/brief": "execution_brief",
     "/v1/execution-cards/view": "execution_view",
+    "/v1/execution-cards/detail": "execution_detail",
     "/v1/execution-cards/queue": "execution_queue",
     "/v1/execution-cards/resolve": "execution_resolve",
 }
@@ -786,6 +789,29 @@ class TaskCardApplication:
                         request["card_version"], minimum=1),
                 )
             )
+        if operation == "execution_detail":
+            request = _strict_request(
+                payload, required={"card_id", "card_version"}, optional=set()
+            )
+            identity = self.resolve_execution_consumer(authorization)
+            if identity is None:
+                raise TaskCardServerRequestError(
+                    "consumer_unresolved",
+                    "execution card consumer role is unresolved",
+                    HTTPStatus.FORBIDDEN,
+                )
+            if identity.role != QUEUE_VIEW_ROLE:
+                raise TaskCardServerRequestError(
+                    "role_forbidden",
+                    "execution card detail requires the queue_view role",
+                    HTTPStatus.FORBIDDEN,
+                )
+            return _execution_detail_document(
+                self._execution_cards().detail(
+                    _integer(request["card_id"], minimum=1),
+                    expected_version=_integer(request["card_version"], minimum=1),
+                )
+            )
         if operation == "execution_brief":
             request = _request(payload, required={"card_id", "card_version"})
             result = self._execution_cards().brief(
@@ -1425,6 +1451,35 @@ def _execution_view_document(
             "body": body,
             "reply_markup": reply_markup,
         }
+    return document
+
+
+def _execution_detail_document(result: ExecutionCardDetail) -> dict[str, Any]:
+    """Serialize only the bounded current-run/detail allowlist."""
+    document: dict[str, Any] = {
+        "schema": EXECUTION_DETAIL_SCHEMA,
+        "schema_version": 1,
+        "ok": result.accepted,
+        "disposition": result.disposition.value,
+        "card_id": result.card_id,
+        "card_version": result.card_version,
+        "workflow_version": result.workflow_version,
+        "status": None if result.status is None else result.status.value,
+        "phase": None if result.phase is None else result.phase.value,
+        "updated_at": result.updated_at,
+        "due_at": result.due_at,
+        "completed_at": result.completed_at,
+        "outcome": None if result.outcome is None else result.outcome.value,
+        "summary": _queue_projection_text(result.summary, 1_200),
+        "work_digest": _queue_projection_text(result.work_digest, 800),
+        "deliverables": _queue_projection_records(result.deliverables),
+        "refusal": None if result.refusal is None else result.refusal.value,
+    }
+    if not result.accepted:
+        for key in ("workflow_version", "status", "phase", "updated_at",
+                    "due_at", "completed_at", "outcome", "summary",
+                    "work_digest", "deliverables"):
+            document[key] = None if key != "deliverables" else []
     return document
 
 
