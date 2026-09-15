@@ -34,13 +34,19 @@ from .source_policy import (
 from .task_ledger import TaskLedgerError, TaskStatus
 
 
-START_SNOOZE_INTERVAL = timedelta(days=1)
 # Stable callback tokens shared with GW. Their presentation and behavior are
 # calendar choices, rather than durations: changing the vocabulary would make
 # a new Foxhound card fail closed in an older gateway deployment.
 REVIEW_SNOOZE_ACTIONS = frozenset({
     "snooze_1d", "snooze_7d", "snooze_14d", "snooze_30d",
 })
+
+#: The bare verb a card keyboard carries, alongside the explicit choices a
+#: picker offers. A gateway is expected to rewrite the bare verb into its own
+#: picker and never send it on, but a control the service refuses is a dead
+#: button, and one dead button teaches a reader that none of them are
+#: trustworthy. So it is answered here too, as the nearest choice.
+_SNOOZE_ACTIONS = frozenset({"snooze", *REVIEW_SNOOZE_ACTIONS})
 #: The agent a kind of work starts on, when that machine has it installed.
 #: A preference, not a rule: the reader may change it at the gate, and a
 #: machine without the profile falls back to its default rather than
@@ -1420,9 +1426,16 @@ def _apply_agent_selection(
 
 
 def _calendar_snooze_until(action: str, stamp: datetime) -> str:
-    """Resolve one review choice to 09:00 in the service host timezone."""
-    if action not in REVIEW_SNOOZE_ACTIONS:
+    """Resolve one snooze choice to 09:00 in the service host timezone.
+
+    The bare verb resolves here as well, to the nearest choice, so that the
+    mapping lives in one place rather than at each of the two gates that
+    accept it.
+    """
+    if action not in _SNOOZE_ACTIONS:
         raise TaskLedgerError("task execution snooze action is invalid")
+    if action == "snooze":
+        action = "snooze_1d"
     if stamp.tzinfo is None or stamp.utcoffset() is None:
         raise TaskLedgerError("task execution clock must include a timezone")
     current = stamp.astimezone()
@@ -1456,7 +1469,7 @@ def _apply_start_action(
     """Apply one start gate inside the caller transaction."""
     if not _valid_identity(task_id, expected_version):
         return _refused(task_id, WorkflowRefusal.INVALID_ARGUMENT)
-    if action not in {"start", "snooze", "cancel", *REVIEW_SNOOZE_ACTIONS}:
+    if action not in {"start", "cancel", *_SNOOZE_ACTIONS}:
         return _refused(task_id, WorkflowRefusal.INVALID_ACTION)
     if stamp.tzinfo is None or stamp.utcoffset() is None:
         raise TaskLedgerError("task execution clock must include a timezone")
@@ -1492,15 +1505,15 @@ def _apply_start_action(
         wake = None
         completed = None
         kind = "start_approved"
-    elif action == "snooze" or action in REVIEW_SNOOZE_ACTIONS:
-        # A bare `snooze` survives for already-delivered cards. New cards
-        # carry one of the explicit calendar choices instead.
+    elif action in _SNOOZE_ACTIONS:
+        # A bare `snooze` is the verb the keyboard carries; the explicit
+        # choices come back from a picker. It resolves to the nearest of
+        # them rather than to a raw offset from the tap, so a gate and a
+        # review deferred at the same moment return at the same moment --
+        # and so a card already delivered with the retired generic control
+        # wakes on the same schedule as one sent today.
         status = WorkflowStatus.SNOOZED
-        wake = (
-            (stamp + START_SNOOZE_INTERVAL).isoformat(timespec="seconds")
-            if action == "snooze"
-            else _calendar_snooze_until(action, stamp)
-        )
+        wake = _calendar_snooze_until(action, stamp)
         completed = None
         kind = "snoozed"
     else:
@@ -1569,7 +1582,7 @@ def _apply_review_action(
     if not _valid_identity(task_id, expected_version):
         return _refused(task_id, WorkflowRefusal.INVALID_ARGUMENT)
     if action not in {
-        "approve", "revise", "cancel", *REVIEW_SNOOZE_ACTIONS,
+        "approve", "revise", "cancel", "snooze", *REVIEW_SNOOZE_ACTIONS,
     }:
         return _refused(task_id, WorkflowRefusal.INVALID_ACTION)
     if stamp.tzinfo is None or stamp.utcoffset() is None:
@@ -1581,7 +1594,7 @@ def _apply_review_action(
         WorkflowStatus.AWAITING_REVIEW,
         WorkflowStatus.SNOOZED,
     }
-    if action in REVIEW_SNOOZE_ACTIONS:
+    if action in _SNOOZE_ACTIONS:
         allowed_statuses.add(WorkflowStatus.COMPLETED)
     refusal = _workflow_guard(
         row,
@@ -1619,7 +1632,7 @@ def _apply_review_action(
         completed = None
         kind = "revision_requested"
         wake = None
-    elif action in REVIEW_SNOOZE_ACTIONS:
+    elif action in _SNOOZE_ACTIONS:
         phase = WorkflowPhase(row["phase"])
         status = WorkflowStatus.SNOOZED
         completed = None
