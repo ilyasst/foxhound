@@ -930,7 +930,9 @@ class NativeCandidateIntakeTests(unittest.TestCase):
             self.database, clock=lambda: NOW, token_factory=lambda: "a" * 43
         )
         self.assertEqual(cards.schedule().created, 1)
-        claim = cards.claim_next()
+        claim = cards.claim_next(
+            consumer_digest=hashlib.sha256(b"synthetic-consumer").hexdigest()
+        )
         self.assertIsNotNone(claim)
         delivered = cards.complete_delivery(
             claim.card.id,
@@ -961,7 +963,9 @@ class NativeCandidateIntakeTests(unittest.TestCase):
             self.database, clock=lambda: NOW, token_factory=lambda: "a" * 43
         )
         self.assertEqual(cards.schedule().created, 1)
-        claim = cards.claim_next()
+        claim = cards.claim_next(
+            consumer_digest=hashlib.sha256(b"synthetic-consumer").hexdigest()
+        )
         delivered = cards.complete_delivery(
             claim.card.id,
             expected_version=claim.card.version,
