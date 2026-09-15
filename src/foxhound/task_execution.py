@@ -77,6 +77,12 @@ MAX_QUESTION_CHARS = 1_000
 # Agent processes are scarce independently of planned work.  The runner claim
 # transaction enforces this cap, so two hosts (or two local slots) cannot both
 # observe room and start a third process.
+#
+# These three are defaults only. A deployment overrides them by passing
+# execution_slot_cap / plan_ready_cap / awaiting_reader_cap to
+# TaskExecutionService, typically from a CLI flag set in that machine's own
+# process supervisor configuration -- not by editing this file, which a
+# deployment may keep synced to origin on its own schedule.
 EXECUTION_SLOT_CAP = 2
 # Keep a durable planning reserve separate from the running slots.  A claimed
 # plan leaves this many ready plans behind, rather than making the next slot
@@ -86,6 +92,9 @@ PLAN_READY_CAP = 10
 # now describes only active execution, not queued planning work.
 WORK_IN_PROGRESS_CAP = EXECUTION_SLOT_CAP
 AWAITING_READER_CAP = 20
+# Sentinel a caller passes to mean "no cap" for one of the three overrides
+# above, distinct from omitting the override (which keeps the default).
+UNBOUNDED_CAP = -1
 # How far down the ready queue one claim may look for a workflow it can
 # actually run.  Bounded so a large queue of unresolvable pins cannot turn a
 # single claim into a full table scan, and generous enough that a realistic
@@ -102,6 +111,24 @@ MAX_REPOSITORY_REFERENCES = 8
 _RESULT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _PROFILE_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _resolve_cap(override: int | None, default: int) -> int | None:
+    """Turn a constructor override into the cap this instance enforces.
+
+    None means the caller did not override this cap: keep the module
+    default. UNBOUNDED_CAP means the caller asked for no cap at all, and is
+    returned as None here -- the internal representation of "unbounded" at
+    every call site that checks a cap. Any other value must be a valid
+    capacity.
+    """
+    if override is None:
+        return default
+    if override == UNBOUNDED_CAP:
+        return None
+    if isinstance(override, bool) or not isinstance(override, int) or override < 0:
+        raise ValueError("capacity override is invalid")
+    return override
 FAILURE_REASONS = frozenset({
     "startup_failed",
     "process_exit",
@@ -287,11 +314,19 @@ class TaskExecutionService:
         profile_registry: AgentProfileRegistry | None = None,
         default_profile_id: str = "general",
         planning_grants: object = None,
+        execution_slot_cap: int | None = None,
+        plan_ready_cap: int | None = None,
+        awaiting_reader_cap: int | None = None,
     ) -> None:
         if (isinstance(max_attempts, bool)
                 or not isinstance(max_attempts, int)
                 or not 1 <= max_attempts <= MAX_ATTEMPTS):
             raise ValueError("maximum execution attempts are invalid")
+        self._execution_slot_cap = _resolve_cap(
+            execution_slot_cap, EXECUTION_SLOT_CAP)
+        self._plan_ready_cap = _resolve_cap(plan_ready_cap, PLAN_READY_CAP)
+        self._awaiting_reader_cap = _resolve_cap(
+            awaiting_reader_cap, AWAITING_READER_CAP)
         self.database_path = Path(database_path)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._token_factory = token_factory or (
@@ -393,11 +428,19 @@ class TaskExecutionService:
                     "ON t.id=w.task_id",
                     (now, *waiting_statuses),
                 ).fetchone()
-                plan_room = max(
-                    0, PLAN_READY_CAP - int(capacity["ready_plans"] or 0)
+                plan_room = (
+                    None if self._plan_ready_cap is None else max(
+                        0,
+                        self._plan_ready_cap
+                        - int(capacity["ready_plans"] or 0),
+                    )
                 )
-                waiting_room = max(
-                    0, AWAITING_READER_CAP - int(capacity["waiting"] or 0)
+                waiting_room = (
+                    None if self._awaiting_reader_cap is None else max(
+                        0,
+                        self._awaiting_reader_cap
+                        - int(capacity["waiting"] or 0),
+                    )
                 )
                 promoted = 0
                 waiting_rows = connection.execute(
@@ -477,13 +520,15 @@ class TaskExecutionService:
                     status = _initial_status(
                         row["origin_kind"], self._planning_grants)
                     if status.value in WORKING_STATUSES:
-                        if plan_room == 0:
-                            continue
-                        plan_room -= 1
+                        if plan_room is not None:
+                            if plan_room == 0:
+                                continue
+                            plan_room -= 1
                     else:
-                        if waiting_room == 0:
-                            continue
-                        waiting_room -= 1
+                        if waiting_room is not None:
+                            if waiting_room == 0:
+                                continue
+                            waiting_room -= 1
                     profile = self._profile_for(row["origin_kind"])
                     connection.execute(
                         "INSERT INTO task_execution_workflows("
@@ -742,7 +787,10 @@ class TaskExecutionService:
                     "WHERE w.status='running' AND t.status='open' "
                     "AND t.version=w.task_version"
                 ).fetchone()[0])
-                if running >= EXECUTION_SLOT_CAP:
+                if (
+                    self._execution_slot_cap is not None
+                    and running >= self._execution_slot_cap
+                ):
                     connection.commit()
                     return None
                 # A batch, not one row. A workflow can be pinned to a

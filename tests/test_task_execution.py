@@ -28,6 +28,7 @@ from foxhound.task_execution import (
     AWAITING_READER_CAP,
     EXECUTION_SLOT_CAP,
     PLAN_READY_CAP,
+    UNBOUNDED_CAP,
     WORK_IN_PROGRESS_CAP,
     ExecutionOutcome,
     ExecutionResultEnvelope,
@@ -962,6 +963,84 @@ class TaskExecutionTests(unittest.TestCase):
                 PLAN_READY_CAP + AWAITING_READER_CAP,
             )
 
+    def _seed_issue_and_meeting_tasks(self) -> None:
+        """34 open tasks: 10 issue-kind, 24 meeting-kind, alongside task 1."""
+        with closing(sqlite3.connect(self.database)) as connection:
+            for task_id in range(2, 36):
+                connection.execute(
+                    "INSERT INTO tasks(id,status,text,owner,due,version,"
+                    "created_at,updated_at,closed_at) "
+                    "VALUES(?,'open',?,'Person A',NULL,1,?,?,NULL)",
+                    (
+                        task_id,
+                        f"Synthetic task {task_id}",
+                        self._now(),
+                        self._now(),
+                    ),
+                )
+                kind = "issue" if task_id <= 11 else "meeting"
+                connection.execute(
+                    "INSERT INTO candidate_inbox(candidate_id,source_system,"
+                    "source_kind,source_record_id,source_item_id,"
+                    "source_revision,payload_json,created_at,"
+                    "first_imported_at,updated_at) "
+                    "VALUES(?,'gw',?,?,?,?,'{}',?,?,?)",
+                    (
+                        f"candidate-{task_id}",
+                        kind,
+                        f"record-{task_id}",
+                        f"item-{task_id}",
+                        "c" * 64,
+                        self._now(),
+                        self._now(),
+                        self._now(),
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO task_candidate_bindings(candidate_id,"
+                    "source_revision,task_id,relation,decided_at) "
+                    "VALUES(?,?,?,'accepted',?)",
+                    (
+                        f"candidate-{task_id}",
+                        "c" * 64,
+                        task_id,
+                        self._now(),
+                    ),
+                )
+            connection.commit()
+
+    def test_plan_ready_and_awaiting_reader_caps_are_overridable(self):
+        self._seed_issue_and_meeting_tasks()
+        narrow = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            planning_grants=["issue"],
+            profile_registry=self.service._profile_registry,
+            plan_ready_cap=3,
+            awaiting_reader_cap=4,
+        )
+        result = narrow.schedule_new(limit=100)
+        self.assertEqual((result.scheduled, result.remaining), (7, 28))
+        with closing(sqlite3.connect(self.database)) as connection:
+            counts = dict(connection.execute(
+                "SELECT status,COUNT(*) FROM task_execution_workflows "
+                "GROUP BY status"
+            ).fetchall())
+        self.assertEqual(counts, {"awaiting_start": 4, "queued": 3})
+
+    def test_plan_ready_and_awaiting_reader_caps_support_unbounded(self):
+        self._seed_issue_and_meeting_tasks()
+        wide = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            planning_grants=["issue"],
+            profile_registry=self.service._profile_registry,
+            plan_ready_cap=UNBOUNDED_CAP,
+            awaiting_reader_cap=UNBOUNDED_CAP,
+        )
+        result = wide.schedule_new(limit=100)
+        self.assertEqual((result.scheduled, result.remaining), (35, 0))
+
     def test_two_claims_can_run_but_a_third_is_not_claimed(self):
         with closing(sqlite3.connect(self.database)) as connection:
             for task_id in (2, 3):
@@ -984,6 +1063,41 @@ class TaskExecutionTests(unittest.TestCase):
         self.assertEqual({first.task_id, second.task_id}, {1, 2})
         self.assertIsNone(self.service.claim_next())
         self.assertEqual(self.service.get(3).status, WorkflowStatus.QUEUED)
+
+    def test_execution_slot_cap_override_lowers_concurrent_claims(self):
+        narrow = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: TOKEN,
+            profile_registry=self.service._profile_registry,
+            execution_slot_cap=1,
+        )
+        self._add_task(2, "Synthetic task 2")
+        for task_id in (1, 2):
+            scheduled = narrow.schedule(task_id, expected_task_version=1)
+            narrow.start_action(
+                task_id, expected_version=scheduled.version, action="start"
+            )
+        self.assertIsNotNone(narrow.claim_next())
+        self.assertIsNone(narrow.claim_next())
+
+    def test_execution_slot_cap_unbounded_allows_more_than_default(self):
+        wide = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: TOKEN,
+            profile_registry=self.service._profile_registry,
+            execution_slot_cap=UNBOUNDED_CAP,
+        )
+        for task_id in (2, 3):
+            self._add_task(task_id, f"Synthetic task {task_id}")
+        for task_id in (1, 2, 3):
+            scheduled = wide.schedule(task_id, expected_task_version=1)
+            wide.start_action(
+                task_id, expected_version=scheduled.version, action="start"
+            )
+        claimed = {wide.claim_next().task_id for _ in range(3)}
+        self.assertEqual(claimed, {1, 2, 3})
 
     def test_start_gate_snooze_cancel_and_stale_taps_are_fenced(self):
         scheduled = self.service.schedule(1, expected_task_version=1)
