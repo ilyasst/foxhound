@@ -72,6 +72,15 @@ class CardRefusal(StrEnum):
     CLAIM_MISMATCH = "claim_mismatch"
 
 
+# ADR 0036 invariant 5 fixes these ceilings in code rather than accepting
+# them from callers. ADR 0036 invariant 10 requires revalidating the current
+# gateway configuration before ever changing the drip ceiling.
+TASK_CARD_CLAIM_CEILINGS = {
+    "queue_view": 2,
+    "drip": 20,
+}
+
+
 @dataclass(frozen=True)
 class ScheduleResult:
     """Content-free aggregate result for one explicit scheduler pass."""
@@ -152,6 +161,18 @@ class DeliveryClaim:
     card: TaskReviewCard
     token: str = field(repr=False)
     expires_at: str
+
+
+@dataclass(frozen=True)
+class ClaimAtCeiling:
+    """Content-free result when a consumer has filled its claim capacity."""
+
+    held_count: int
+    ceiling: int
+
+    @property
+    def at_ceiling(self) -> bool:
+        return True
 
 
 @dataclass(frozen=True)
@@ -287,14 +308,19 @@ class TaskCardService:
         return tuple(_card(row) for row in rows)
 
     def claim_next(
-        self, *, lease_seconds: int = 60, consumer_digest: str
-    ) -> DeliveryClaim | None:
+        self, *, lease_seconds: int = 60, consumer_digest: str,
+        consumer_role: str = "drip",
+    ) -> DeliveryClaim | ClaimAtCeiling | None:
         if (isinstance(lease_seconds, bool)
                 or not isinstance(lease_seconds, int)
                 or not 5 <= lease_seconds <= 300):
             raise TaskLedgerError("task card delivery lease is invalid")
         if not _valid_digest(consumer_digest):
             raise TaskLedgerError("task card consumer digest is invalid")
+        try:
+            ceiling = TASK_CARD_CLAIM_CEILINGS[consumer_role]
+        except (KeyError, TypeError) as exc:
+            raise TaskLedgerError("task card consumer role is invalid") from exc
         now_dt = self._clock_value()
         now = now_dt.isoformat(timespec="seconds")
         expires_at = (now_dt + timedelta(seconds=lease_seconds)).isoformat(
@@ -332,6 +358,17 @@ class TaskCardService:
                         card_version=next_version,
                         task_version=int(row["task_version"]),
                         now=now,
+                    )
+                held_count = connection.execute(
+                    "SELECT count(*) FROM task_review_cards "
+                    "WHERE status IN ('delivering','delivered') "
+                    "AND consumer_digest=?",
+                    (consumer_digest,),
+                ).fetchone()[0]
+                if held_count >= ceiling:
+                    connection.commit()
+                    return ClaimAtCeiling(
+                        held_count=int(held_count), ceiling=ceiling
                     )
                 row = connection.execute(
                     self._card_select()
