@@ -207,6 +207,31 @@ class TaskCardServerTests(unittest.TestCase):
         self.assertIsNone(stale["text"])
         self.assertEqual(stale["refusal"], "stale_version")
 
+    def test_claim_at_ceiling_is_distinct_and_content_free(self):
+        self.cards.schedule()
+        app = TaskCardApplication(
+            self.cards, {DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: "q" * 43}
+        )
+        with running_server(app) as endpoint:
+            for _ in range(2):
+                status, _, body = request(
+                    endpoint, "/v1/task-cards/claim",
+                    request_document(lease_seconds=60),
+                    token="q" * 43,
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(body["status"], "claimed")
+            status, _, body = request(
+                endpoint, "/v1/task-cards/claim",
+                request_document(lease_seconds=60), token="q" * 43,
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "at_ceiling")
+        self.assertEqual(body["claim"], None)
+        self.assertEqual((body["held_count"], body["ceiling"]), (2, 2))
+        self.assertNotIn("card_id", body)
+        self.assertNotIn("task_id", body)
+
     def test_execution_view_route_restores_a_card_without_writing(self):
         self.execution.schedule(1, expected_task_version=1)
         self.execution_cards.schedule()

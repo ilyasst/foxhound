@@ -215,6 +215,9 @@ to exactly one token, so two tokens cannot share a role; two callers of
 the same role share that one token file. See
 [ADR 0036](docs/architecture/0036-consumer-scoped-card-claims.md) decision 1.
 
+Per ADR 0036 invariant 10, revalidate the current gateway configuration before
+ever changing the fixed `drip` claim ceiling.
+
 Foxhound now also owns a transport-neutral execution workflow ledger. An
 explicitly scheduled open task stops at a reader start gate, then advances
 through separately approved plan, execution, and external-action phases under

@@ -62,6 +62,7 @@ from .knowledge_client import (
     OwnerUpcomingMeeting,
 )
 from .task_cards import (
+    ClaimAtCeiling,
     CardDisposition,
     CardOperationResult,
     CardRefusal,
@@ -170,6 +171,7 @@ __all__ = (
     "KnowledgeResponseError",
     "KnowledgeSearchResult",
     "KnowledgeTransportError",
+    "ClaimAtCeiling",
     "CardDisposition",
     "CardOperationResult",
     "CardRefusal",
