@@ -11,6 +11,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 from foxhound.candidate_inbox import CandidateInbox
@@ -49,7 +50,7 @@ class TaskOriginRead(unittest.TestCase):
         The intake path is exercised elsewhere; this test is about the read.
         """
         source = candidate["source"]
-        with sqlite3.connect(self.db) as conn:
+        with closing(sqlite3.connect(self.db)) as conn, conn:
             conn.execute(
                 "INSERT INTO candidate_inbox(candidate_id,source_system,"
                 "source_kind,source_record_id,source_item_id,source_revision,"
@@ -91,7 +92,7 @@ class TaskOriginRead(unittest.TestCase):
 
     def test_a_task_bound_to_nothing_has_no_origin(self) -> None:
         # An ordinary state, not an error: a task may predate binding.
-        with sqlite3.connect(self.db) as conn:
+        with closing(sqlite3.connect(self.db)) as conn, conn:
             conn.execute(
                 "INSERT INTO tasks(id,status,text,owner,due,version,"
                 "created_at,updated_at) VALUES(7,'open','Freestanding',"
