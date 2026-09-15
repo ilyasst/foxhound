@@ -17,6 +17,11 @@ from foxhound.agent_profiles import (
     parse_profile,
 )
 from foxhound.candidate_inbox import CandidateInbox, SCHEMA_VERSION
+from foxhound.execution_cards import (
+    ExecutionCardRefusal,
+    ExecutionCardService,
+    ExecutionCardStatus,
+)
 from foxhound.task_execution import (
     AWAITING_READER_CAP,
     EXECUTION_SLOT_CAP,
@@ -738,6 +743,23 @@ class TaskExecutionTests(unittest.TestCase):
         self._bind_origin(1, "review_request")
         gated = self.service.schedule(1, expected_task_version=1)
         self.assertEqual(gated.status, WorkflowStatus.AWAITING_START)
+        cards = ExecutionCardService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: TOKEN,
+            profile_registry=self.service._profile_registry,
+        )
+        cards.schedule()
+        claim = cards.claim_next()
+        self.assertIsNotNone(claim)
+        delivered = cards.complete_delivery(
+            claim.card.id,
+            expected_version=claim.card.version,
+            claim_token=claim.token,
+            transport="synthetic",
+            delivery_ref="message-1",
+        )
+        self.assertEqual(delivered.card_status, ExecutionCardStatus.DELIVERED)
         service = TaskExecutionService(
             self.database, clock=self.clock,
             planning_grants=["review_request"],
@@ -752,6 +774,18 @@ class TaskExecutionTests(unittest.TestCase):
             (promoted.status, promoted.phase),
             (WorkflowStatus.QUEUED, WorkflowPhase.PLAN),
         )
+        stale = cards.act(
+            claim.card.id,
+            expected_version=delivered.card_version,
+            action="start",
+        )
+        self.assertEqual(stale.refusal, ExecutionCardRefusal.STALE_VERSION)
+        with closing(sqlite3.connect(self.database)) as connection:
+            status = connection.execute(
+                "SELECT status FROM execution_review_cards WHERE id=?",
+                (claim.card.id,),
+            ).fetchone()[0]
+        self.assertEqual(status, "cancelled")
 
     def test_schedule_new_is_bounded_and_never_resets_existing_workflows(self):
         with closing(sqlite3.connect(self.database)) as connection:
