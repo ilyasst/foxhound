@@ -27,13 +27,13 @@ from foxhound.agent_profiles import (
 
 
 EXPECTED_GENERAL_PROMPT_SHA256 = (
-    "5f3f7913642d395afe9ab3f6b02dd2e7ba98bdf522170735d2dd28c09a432aa0"
+    "3219fc10e7672e7237c205ca2f9a64a13f29bd931f7f59356dfdb0b0f875a3ff"
 )
 EXPECTED_GENERAL_REVISION = (
-    "54977e3c1d8c1d4ec0e4b0fea2d3ee3740db5af2a41cc99ae348e9fed64e1bec"
+    "8e20b5c0db9a45b464cf64d81ed05a78edc089a3a29983709734efc96b0b5360"
 )
 IMMEDIATE_PREVIOUS_GENERAL_REVISION = (
-    "a1ad27c9d410bd9dd67129ee0165d77a81fa2e785643379635ed93f4ebc0a59b"
+    "54977e3c1d8c1d4ec0e4b0fea2d3ee3740db5af2a41cc99ae348e9fed64e1bec"
 )
 DATE_SEMANTICS_GENERAL_REVISION = (
     "9b80c488634e614127dd1da15facbfbf78fe3f38ac000c0f2dde30c394aeb23a"
@@ -168,6 +168,14 @@ class AgentProfileTests(unittest.TestCase):
             "draft and record that partial result",
             "release` only when no truthful reviewable artifact can be produced",
             "only the exact reviewed action",
+            # `summary` is the first prose on the card. It was the one
+            # result field with no shape given, so agents wrote reports
+            # into it and the reader met the questions and the external
+            # actions twice before reaching the buttons.
+            "is the opening of a review card, not a report",
+            "two to four plain sentences",
+            "do not restate the questions, external actions or deliverables",
+            "Nothing there needs shortening for the card",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, prompt)
