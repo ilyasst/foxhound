@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 29
+SCHEMA_VERSION = 30
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -369,6 +369,7 @@ _SCHEMA_COLUMNS = {
         "created_at",
         "updated_at",
         "resolved_at",
+        "consumer_digest",
     ),
     "execution_review_card_events": (
         "sequence",
@@ -480,7 +481,8 @@ _SCHEMA_V26_COLUMNS = {
 
 _SCHEMA_V27_COLUMNS = {
     name: tuple(column for column in columns if not (
-        name == "task_duplicate_proposals" and column == "card_id"
+        (name == "task_duplicate_proposals" and column == "card_id")
+        or (name == "execution_review_cards" and column == "consumer_digest")
     ))
     for name, columns in _SCHEMA_V28_COLUMNS.items()
 }
@@ -488,7 +490,8 @@ _SCHEMA_V27_COLUMNS = {
 _SCHEMA_V24_COLUMNS = {
     name: tuple(
         column for column in columns
-        if not (name == "task_review_cards" and column == "source_revision")
+        if not ((name == "task_review_cards" and column == "source_revision")
+                or (name == "execution_review_cards" and column == "consumer_digest"))
     )
     for name, columns in _SCHEMA_V28_COLUMNS.items()
     if name not in {
@@ -501,7 +504,8 @@ _SCHEMA_V24_COLUMNS = {
 _SCHEMA_V25_COLUMNS = {
     name: tuple(
         column for column in columns
-        if not (name == "task_review_cards" and column == "source_revision")
+        if not ((name == "task_review_cards" and column == "source_revision")
+                or (name == "execution_review_cards" and column == "consumer_digest"))
     )
     for name, columns in _SCHEMA_V28_COLUMNS.items()
     if name not in {"task_duplicate_proposals", "task_duplicate_proposal_events"}
@@ -2174,6 +2178,13 @@ END;
 """,
 )
 
+# Consumer attribution is nullable so cards claimed by a pre-activation
+# binary remain unowned and can drain through the legacy path.
+_SCHEMA_V30 = (
+    "ALTER TABLE execution_review_cards ADD COLUMN consumer_digest TEXT "
+    "CHECK(consumer_digest IS NULL OR length(consumer_digest) = 64);",
+)
+
 
 # Structured forge evidence is separate from result prose.  Existing result
 # rows are historical facts, so they receive the empty collection rather than
@@ -3031,6 +3042,24 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 29
+            if version == 29:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    columns = tuple(row[1] for row in connection.execute(
+                        "PRAGMA table_info(execution_review_cards)"
+                    )) if connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_review_cards'"
+                    ).fetchone() else ()
+                    if columns and "consumer_digest" not in columns:
+                        for statement in _SCHEMA_V30:
+                            connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 30")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 30
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:

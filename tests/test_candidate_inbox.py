@@ -74,6 +74,9 @@ class CandidateInboxTests(unittest.TestCase):
                 "ALTER TABLE task_review_cards DROP COLUMN consumer_digest"
             )
             connection.execute(
+                "ALTER TABLE execution_review_cards DROP COLUMN consumer_digest"
+            )
+            connection.execute(
                 "ALTER TABLE task_review_cards DROP COLUMN source_revision"
             )
             if "repository_references_json" in {
