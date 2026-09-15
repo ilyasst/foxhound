@@ -28,6 +28,7 @@ from .execution_cards import (
     ExecutionCardPresentation,
     ExecutionCardScheduleResult,
     ExecutionCardService,
+    ClaimAtCeiling as ExecutionClaimAtCeiling,
     ExecutionAgentSelectorResult,
     render_execution_agent_selector,
     render_execution_review_card,
@@ -85,6 +86,7 @@ EXECUTION_AGENT_SELECTION_SCHEMA = (
 DRIP_ROLE = "drip"
 QUEUE_VIEW_ROLE = "queue_view"
 TASK_CARD_CONSUMER_ROLES = frozenset({DRIP_ROLE, QUEUE_VIEW_ROLE})
+EXECUTION_CARD_CONSUMER_ROLES = TASK_CARD_CONSUMER_ROLES
 
 ROUTES = {
     "/v1/task-cards/stats": "stats",
@@ -97,6 +99,7 @@ ROUTES = {
     "/v1/task-cards/delivery-failed": "delivery_failed",
     "/v1/task-cards/action": "action",
     "/v1/execution-cards/stats": "execution_stats",
+    "/v2/execution-cards/stats": "execution_stats_scoped",
     "/v1/execution-cards/schedule": "execution_schedule",
     "/v1/execution-cards/claim": "execution_claim",
     "/v1/execution-cards/delivered": "execution_delivered",
@@ -195,6 +198,7 @@ class TaskCardApplication:
         token: str | Mapping[str, str],
         *,
         execution_cards: ExecutionCardService | None = None,
+        execution_tokens: str | Mapping[str, str] | None = None,
         limits: TaskCardServerLimits | None = None,
     ) -> None:
         if not isinstance(cards, TaskCardService):
@@ -212,11 +216,26 @@ class TaskCardApplication:
         # keeps an existing single-token deployment behaving exactly as it
         # does today with no configuration change (ADR 0036, invariant 3).
         self.tokens = _normalize_role_tokens(token)
+        # Execution authorization is a separate aggregate policy. A bare
+        # legacy token remains drip-compatible; deployments with a role map
+        # must opt in to the execution map explicitly.
+        if execution_tokens is None and isinstance(token, str):
+            self.execution_tokens = _normalize_role_tokens(token)
+        elif execution_tokens is None:
+            # Role maps are task-aggregate policy. Never borrow one of their
+            # credentials for execution cards; omission means no execution
+            # consumer is configured.
+            self.execution_tokens = {}
+        else:
+            self.execution_tokens = _normalize_role_tokens(execution_tokens)
         self.limits = limits or TaskCardServerLimits()
         self.limits.validate()
 
     def authorized(self, header: str | None) -> bool:
         return self._match_role(header) is not None
+
+    def authorized_execution(self, header: str | None) -> bool:
+        return self.resolve_execution_consumer(header) is not None
 
     def resolve_consumer(self, header: str | None) -> ConsumerIdentity | None:
         """Return the consumer identity of whichever configured token
@@ -241,6 +260,21 @@ class TaskCardApplication:
         prefix = "Bearer "
         token = header[len(prefix):]  # type: ignore[index]
         return ConsumerIdentity(role=role, digest=_consumer_digest(token))
+
+    def resolve_execution_consumer(self, header: str | None) -> ConsumerIdentity | None:
+        prefix = "Bearer "
+        if not header or not header.startswith(prefix):
+            return None
+        candidate = header[len(prefix):]
+        matched: str | None = None
+        for role, value in self.execution_tokens.items():
+            if hmac.compare_digest(candidate, value):
+                matched = role
+        if matched is None:
+            return None
+        if matched not in EXECUTION_CARD_CONSUMER_ROLES:
+            raise TaskCardConsumerIdentityError("execution card consumer role is unresolved")
+        return ConsumerIdentity(role=matched, digest=_consumer_digest(candidate))
 
     def _match_role(self, header: str | None) -> str | None:
         """Return the role of whichever configured token matches
@@ -519,6 +553,16 @@ class TaskCardApplication:
                 "delivered": stats.delivered,
                 "active": stats.active,
             }
+        if operation == "execution_stats_scoped":
+            _request(payload, required=set())
+            identity = self.resolve_execution_consumer(authorization)
+            if identity is None:
+                raise TaskCardServerRequestError("consumer_unresolved", "execution card consumer role is unresolved", HTTPStatus.FORBIDDEN)
+            stats = self._execution_cards().stats_scoped(consumer_digest=identity.digest)
+            return {"schema": EXECUTION_STATS_SCHEMA, "schema_version": 2,
+                    "ok": True, "pending": stats.pending,
+                    "delivering": stats.delivering, "delivered": stats.delivered,
+                    "elsewhere": stats.elsewhere, "active": stats.active}
         if operation == "execution_schedule":
             request = _request(payload, required={"limit"})
             limit = _integer(request["limit"], minimum=1, maximum=1_000)
@@ -528,7 +572,17 @@ class TaskCardApplication:
         if operation == "execution_claim":
             request = _request(payload, required={"lease_seconds"})
             lease = _integer(request["lease_seconds"], minimum=5, maximum=300)
-            claim = self._execution_cards().claim_next(lease_seconds=lease)
+            identity = self.resolve_execution_consumer(authorization)
+            if identity is None:
+                raise TaskCardServerRequestError("consumer_unresolved", "execution card consumer role is unresolved", HTTPStatus.FORBIDDEN)
+            claim = self._execution_cards().claim_next(
+                lease_seconds=lease, consumer_digest=identity.digest,
+                consumer_role=identity.role)
+            if isinstance(claim, ExecutionClaimAtCeiling):
+                return {"schema": EXECUTION_CLAIM_SCHEMA, "schema_version": SERVICE_VERSION,
+                        "ok": True, "status": "at_ceiling",
+                        "held_count": claim.held_count, "ceiling": claim.ceiling,
+                        "claim": None}
             if claim is None:
                 return {
                     "schema": EXECUTION_CLAIM_SCHEMA,
@@ -758,7 +812,13 @@ class TaskCardRequestHandler(BaseHTTPRequestHandler):
             self._audit(HTTPStatus.NOT_FOUND, started)
             return
         auth_headers = self.headers.get_all("Authorization") or []
-        if len(auth_headers) != 1 or not self.app.authorized(auth_headers[0]):
+        authenticated = (
+            self.app.authorized_execution(auth_headers[0])
+            if operation.startswith("execution_") and len(auth_headers) == 1
+            else self.app.authorized(auth_headers[0]) if len(auth_headers) == 1
+            else False
+        )
+        if not authenticated:
             self._error(
                 HTTPStatus.UNAUTHORIZED,
                 "unauthorized",
@@ -1430,6 +1490,12 @@ def main(argv: list[str] | None = None) -> int:
             cards,
             load_role_tokens(arguments.token_file),
             execution_cards=execution_cards,
+            execution_tokens=(
+                load_token(arguments.token_file[0])
+                if len(arguments.token_file) == 1
+                and "=" not in arguments.token_file[0]
+                else None
+            ),
             limits=TaskCardServerLimits(
                 request_timeout_seconds=arguments.request_timeout
             ),

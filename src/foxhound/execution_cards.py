@@ -188,6 +188,24 @@ class ExecutionCardStats:
 
 
 @dataclass(frozen=True)
+class ExecutionCardScopedStats:
+    pending: int
+    delivering: int
+    delivered: int
+    elsewhere: int
+    active: int
+
+
+@dataclass(frozen=True)
+class ClaimAtCeiling:
+    held_count: int
+    ceiling: int
+
+
+EXECUTION_CARD_CLAIM_CEILINGS = {"queue_view": 2, "drip": 20}
+
+
+@dataclass(frozen=True)
 class ExecutionReviewCard:
     id: int
     task_id: int
@@ -499,10 +517,19 @@ class ExecutionCardService:
                 raise
 
     def claim_next(
-        self, *, lease_seconds: int = 60
-    ) -> ExecutionCardDeliveryClaim | None:
+        self, *, lease_seconds: int = 60, consumer_digest: str | None = None,
+        consumer_role: str = "drip",
+    ) -> ExecutionCardDeliveryClaim | "ClaimAtCeiling" | None:
         if not _valid_lease(lease_seconds):
             raise TaskLedgerError("execution card delivery lease is invalid")
+        if consumer_digest is None:
+            consumer_digest = _token_digest("legacy-execution-card-consumer")
+        if not _valid_digest(consumer_digest):
+            raise TaskLedgerError("execution card consumer digest is invalid")
+        try:
+            ceiling = EXECUTION_CARD_CLAIM_CEILINGS[consumer_role]
+        except (KeyError, TypeError) as exc:
+            raise TaskLedgerError("execution card consumer role is invalid") from exc
         stamp = self._clock_value()
         now = stamp.isoformat(timespec="seconds")
         expires = (stamp + timedelta(seconds=lease_seconds)).isoformat(
@@ -530,7 +557,7 @@ class ExecutionCardService:
                     connection.execute(
                         "UPDATE execution_review_cards SET status='pending',"
                         "version=?,claim_token_digest=NULL,"
-                        "claim_expires_at=NULL,updated_at=? "
+                        "claim_expires_at=NULL,consumer_digest=NULL,updated_at=? "
                         "WHERE id=? AND version=? AND status='delivering'",
                         (version, now, int(row["id"]), int(row["version"])),
                     )
@@ -544,6 +571,14 @@ class ExecutionCardService:
                         action=None,
                         now=now,
                     )
+                held = connection.execute(
+                    "SELECT count(*) FROM execution_review_cards "
+                    "WHERE status IN ('delivering','delivered') AND consumer_digest=?",
+                    (consumer_digest,),
+                ).fetchone()[0]
+                if held >= ceiling:
+                    connection.commit()
+                    return ClaimAtCeiling(int(held), ceiling)
                 row = connection.execute(
                     self._card_select()
                     + " WHERE c.status='pending' "
@@ -564,12 +599,14 @@ class ExecutionCardService:
                 updated = connection.execute(
                     "UPDATE execution_review_cards SET status='delivering',"
                     "version=?,claim_token_digest=?,claim_expires_at=?,"
+                    "consumer_digest=?,"
                     "transport=NULL,delivery_ref=NULL,delivered_at=NULL,"
                     "updated_at=? WHERE id=? AND version=? AND status='pending'",
                     (
                         version,
                         digest,
                         expires,
+                        consumer_digest,
                         now,
                         int(row["id"]),
                         int(row["version"]),
@@ -1599,6 +1636,24 @@ class ExecutionCardService:
             delivered=counts.get("delivered", 0),
             active=sum(counts.values()),
         )
+
+    def stats_scoped(self, *, consumer_digest: str) -> ExecutionCardScopedStats:
+        if not _valid_digest(consumer_digest):
+            raise TaskLedgerError("execution card consumer digest is invalid")
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT "
+                "SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,"
+                "SUM(CASE WHEN status='delivering' AND consumer_digest=? THEN 1 ELSE 0 END) AS delivering,"
+                "SUM(CASE WHEN status='delivered' AND consumer_digest=? THEN 1 ELSE 0 END) AS delivered,"
+                "SUM(CASE WHEN status IN ('delivering','delivered') AND consumer_digest IS NOT NULL AND consumer_digest<>? THEN 1 ELSE 0 END) AS elsewhere,"
+                "SUM(CASE WHEN status IN ('pending','delivering','delivered') THEN 1 ELSE 0 END) AS active "
+                "FROM execution_review_cards",
+                (consumer_digest, consumer_digest, consumer_digest),
+            ).fetchone()
+        return ExecutionCardScopedStats(*(int(row[name] or 0) for name in (
+            "pending", "delivering", "delivered", "elsewhere", "active"
+        )))
 
     def count(self) -> int:
         with closing(self._connect()) as connection:
@@ -4077,6 +4132,10 @@ def _valid_secret(value: object) -> bool:
         and 32 <= len(value) <= 512
         and not any(character.isspace() for character in value)
     )
+
+
+def _valid_digest(value: object) -> bool:
+    return isinstance(value, str) and bool(re.fullmatch(r"[0-9a-f]{64}", value))
 
 
 def _valid_opaque(value: object, maximum: int) -> bool:
