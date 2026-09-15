@@ -600,7 +600,7 @@ class ExecutionCardService:
                     return _refused_row(card_id, row, ExecutionCardRefusal.STALE_VERSION)
                 self._event(connection, card_id=card_id, task_id=int(row["task_id"]), kind="delivery_claimed",
                              card_version=version, workflow_version=int(row["workflow_version"]), action=None, now=now)
-                self._event(connection, card_id=card_id, task_id=int(row["task_id"]), kind="delivery_completed",
+                self._event(connection, card_id=card_id, task_id=int(row["task_id"]), kind="delivered",
                              card_version=version, workflow_version=int(row["workflow_version"]), action=None, now=now)
                 if action in {"discussion", "reassignment"}:
                     # Preserve the established input semantics in this same transaction.
