@@ -25,6 +25,8 @@ def run_schedule(
     agent_profile_directory: Path | None = None,
     default_agent_profile: str = "sigint",
     plan_without_asking: Sequence[str] | None = None,
+    plan_ready_cap: int | None = None,
+    awaiting_reader_cap: int | None = None,
 ) -> ExecutionScheduleResult:
     database = _private_database(database_path)
     registry = load_registry(agent_profile_directory)
@@ -49,6 +51,8 @@ def run_schedule(
         profile_registry=registry,
         default_profile_id=selected_profile,
         planning_grants=plan_without_asking,
+        plan_ready_cap=plan_ready_cap,
+        awaiting_reader_cap=awaiting_reader_cap,
     ).schedule_new(limit=limit)
 
 
@@ -71,6 +75,25 @@ def _parser() -> argparse.ArgumentParser:
             "asked about, which is the default and the cautious answer."
         ),
     )
+    parser.add_argument(
+        "--plan-ready-cap",
+        type=int,
+        default=None,
+        help=(
+            "how many workflows may sit ready to execute at once; -1 means "
+            "no cap. Omitted keeps this machine's compiled-in default."
+        ),
+    )
+    parser.add_argument(
+        "--awaiting-reader-cap",
+        type=int,
+        default=None,
+        help=(
+            "how many workflows may wait on an operator decision at once; "
+            "-1 means no cap. Omitted keeps this machine's compiled-in "
+            "default."
+        ),
+    )
     return parser
 
 
@@ -83,6 +106,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             agent_profile_directory=args.agent_profile_directory,
             default_agent_profile=args.default_agent_profile,
             plan_without_asking=args.plan_without_asking,
+            plan_ready_cap=args.plan_ready_cap,
+            awaiting_reader_cap=args.awaiting_reader_cap,
         )
     except (AgentProfileError, TaskBootstrapConfigError, ValueError):
         print(
