@@ -274,6 +274,15 @@ class ExecutionWorker:
                 # reads the discussion the fragment came from.
                 "root": state.knowledge_root,
             },
+            # Where this task's durable output lives. The agent is told to
+            # put deliverables in the task folder, so it has to be told
+            # where that is: it runs inside the run directory and cannot
+            # read run state to find its parent. Naming it here also means
+            # a deliverable path in the result is one the reader can open.
+            "workspace": {
+                "task_folder": state.task_work_directory,
+                "run_folder": state.task_run_directory,
+            },
             "workflow": {
                 "version": state.workflow_version,
                 "phase": state.phase.value,
