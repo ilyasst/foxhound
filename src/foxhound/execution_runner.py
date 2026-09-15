@@ -103,6 +103,9 @@ class ExecutionRunnerConfig:
     planning_grants: tuple[str, ...] = ()
     runner_slot: str = "default"
     poll_seconds: float = 0.1
+    execution_slot_cap: int | None = None
+    plan_ready_cap: int | None = None
+    awaiting_reader_cap: int | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -285,6 +288,9 @@ def run_once(
         profile_registry=config.profile_registry,
         default_profile_id=config.default_agent_profile,
         planning_grants=config.planning_grants,
+        execution_slot_cap=config.execution_slot_cap,
+        plan_ready_cap=config.plan_ready_cap,
+        awaiting_reader_cap=config.awaiting_reader_cap,
     )
     terminator = terminate or _terminate_process_group
     with _exclusive_lock(_runner_lock_path(root, config.runner_slot)) as acquired:
@@ -925,6 +931,34 @@ def _parser() -> argparse.ArgumentParser:
             "(default: all phases)"
         ),
     )
+    parser.add_argument(
+        "--execution-slot-cap",
+        type=int,
+        default=None,
+        help=(
+            "how many workflows this machine may execute at once; -1 means "
+            "no cap. Omitted keeps this machine's compiled-in default."
+        ),
+    )
+    parser.add_argument(
+        "--plan-ready-cap",
+        type=int,
+        default=None,
+        help=(
+            "how many workflows may sit ready to execute at once; -1 means "
+            "no cap. Omitted keeps this machine's compiled-in default."
+        ),
+    )
+    parser.add_argument(
+        "--awaiting-reader-cap",
+        type=int,
+        default=None,
+        help=(
+            "how many workflows may wait on an operator decision at once; "
+            "-1 means no cap. Omitted keeps this machine's compiled-in "
+            "default."
+        ),
+    )
     return parser
 
 
@@ -976,6 +1010,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if args.allowed_phases
                 else tuple(WorkflowPhase)
             ),
+            execution_slot_cap=args.execution_slot_cap,
+            plan_ready_cap=args.plan_ready_cap,
+            awaiting_reader_cap=args.awaiting_reader_cap,
         )
         result = run_once(config)
     except (
