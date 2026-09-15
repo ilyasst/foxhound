@@ -88,12 +88,13 @@ class ScheduleResult:
 
 @dataclass(frozen=True)
 class CardStats:
-    """Aggregate-only queue state from one database snapshot."""
+    """Consumer-scoped, aggregate-only queue state from one snapshot."""
 
     pending: int
     delivering: int
     delivered: int
     snoozed: int
+    elsewhere: int
     active: int
 
 
@@ -613,7 +614,37 @@ class TaskCardService:
                 "SELECT count(*) FROM task_review_cards"
             ).fetchone()[0])
 
-    def stats(self) -> CardStats:
+    def stats(self, *, consumer_digest: str) -> CardStats:
+        if not _valid_digest(consumer_digest):
+            raise TaskLedgerError("task card consumer digest is invalid")
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT "
+                "SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,"
+                "SUM(CASE WHEN status='delivering' AND consumer_digest=? "
+                "THEN 1 ELSE 0 END) AS delivering,"
+                "SUM(CASE WHEN status='delivered' AND consumer_digest=? "
+                "THEN 1 ELSE 0 END) AS delivered,"
+                "SUM(CASE WHEN status='snoozed' THEN 1 ELSE 0 END) AS snoozed,"
+                "SUM(CASE WHEN status IN ('delivering','delivered') "
+                "AND consumer_digest IS NOT NULL AND consumer_digest<>? "
+                "THEN 1 ELSE 0 END) AS elsewhere,"
+                "SUM(CASE WHEN status IN "
+                "('pending','delivering','delivered','snoozed') "
+                "THEN 1 ELSE 0 END) AS active "
+                "FROM task_review_cards",
+                (consumer_digest, consumer_digest, consumer_digest),
+            ).fetchone()
+        return CardStats(*(
+            int(row[name] or 0)
+            for name in (
+                "pending", "delivering", "delivered", "snoozed",
+                "elsewhere", "active",
+            )
+        ))
+
+    def stats_global(self) -> CardStats:
+        """Return the legacy unscoped queue snapshot for v1 clients."""
         with closing(self._connect()) as connection:
             row = connection.execute(
                 "SELECT "
@@ -626,10 +657,14 @@ class TaskCardService:
                 "THEN 1 ELSE 0 END) AS active "
                 "FROM task_review_cards"
             ).fetchone()
-        return CardStats(*(
-            int(row[name] or 0)
-            for name in ("pending", "delivering", "delivered", "snoozed", "active")
-        ))
+        return CardStats(
+            pending=int(row["pending"] or 0),
+            delivering=int(row["delivering"] or 0),
+            delivered=int(row["delivered"] or 0),
+            snoozed=int(row["snoozed"] or 0),
+            elsewhere=0,
+            active=int(row["active"] or 0),
+        )
 
     def event_count(self) -> int:
         with closing(self._connect()) as connection:

@@ -56,6 +56,7 @@ SCHEDULE_SCHEMA = "foxhound.task-card-service.schedule"
 CLAIM_SCHEMA = "foxhound.task-card-service.claim"
 OPERATION_SCHEMA = "foxhound.task-card-service.operation"
 STATS_SCHEMA = "foxhound.task-card-service.stats"
+STATS_SCHEMA_VERSION = 2
 EXECUTION_SCHEDULE_SCHEMA = "foxhound.execution-card-service.schedule"
 EXECUTION_CLAIM_SCHEMA = "foxhound.execution-card-service.claim"
 EXECUTION_OPERATION_SCHEMA = "foxhound.execution-card-service.operation"
@@ -82,6 +83,7 @@ TASK_CARD_CONSUMER_ROLES = frozenset({DRIP_ROLE, QUEUE_VIEW_ROLE})
 
 ROUTES = {
     "/v1/task-cards/stats": "stats",
+    "/v2/task-cards/stats": "stats_scoped",
     "/v1/task-cards/schedule": "schedule",
     "/v1/task-cards/claim": "claim",
     "/v1/task-cards/delivered": "delivered",
@@ -260,7 +262,7 @@ class TaskCardApplication:
     ) -> dict[str, Any]:
         if operation == "stats":
             _request(payload, required=set())
-            stats = self.cards.stats()
+            stats = self.cards.stats_global()
             return {
                 "schema": STATS_SCHEMA,
                 "schema_version": SERVICE_VERSION,
@@ -269,6 +271,34 @@ class TaskCardApplication:
                 "delivering": stats.delivering,
                 "delivered": stats.delivered,
                 "snoozed": stats.snoozed,
+                "active": stats.active,
+            }
+        if operation == "stats_scoped":
+            _request(payload, required=set())
+            try:
+                identity = self.resolve_consumer(authorization)
+            except TaskCardConsumerIdentityError as exc:
+                raise TaskCardServerRequestError(
+                    "consumer_unresolved",
+                    "task card consumer role is unresolved",
+                    HTTPStatus.FORBIDDEN,
+                ) from exc
+            if identity is None:
+                raise TaskCardServerRequestError(
+                    "consumer_unresolved",
+                    "task card consumer role is unresolved",
+                    HTTPStatus.FORBIDDEN,
+                )
+            stats = self.cards.stats(consumer_digest=identity.digest)
+            return {
+                "schema": STATS_SCHEMA,
+                "schema_version": STATS_SCHEMA_VERSION,
+                "ok": True,
+                "pending": stats.pending,
+                "delivering": stats.delivering,
+                "delivered": stats.delivered,
+                "snoozed": stats.snoozed,
+                "elsewhere": stats.elsewhere,
                 "active": stats.active,
             }
         if operation == "schedule":

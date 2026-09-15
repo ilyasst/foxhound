@@ -2,6 +2,14 @@
 
 Status: proposed.
 
+Implementation note (issue 194): the existing `/v1/task-cards/stats` route
+and response remain unchanged (schema version 1 and its original field set)
+for legacy/drip clients. Consumer-scoped stats, including `elsewhere`, are
+available at the explicitly versioned `/v2/task-cards/stats` route, whose
+response uses `STATS_SCHEMA_VERSION` 2. Both routes continue to validate the
+shared request contract at `SERVICE_VERSION` 1, so existing callers are not
+silently forced to understand the new field.
+
 ## Context
 
 ADR 0011 sized the task-card service for exactly one client, "a trusted local
