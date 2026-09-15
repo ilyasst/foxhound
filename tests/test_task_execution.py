@@ -152,6 +152,28 @@ class TaskExecutionTests(unittest.TestCase):
     def _now(self) -> str:
         return self.clock().isoformat(timespec="seconds")
 
+    def _bind_origin(self, task_id: int, kind: str) -> None:
+        """Attach one synthetic accepted origin to an existing task."""
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "INSERT INTO candidate_inbox(candidate_id,source_system,"
+                "source_kind,source_record_id,source_item_id,"
+                "source_revision,payload_json,created_at,"
+                "first_imported_at,updated_at) "
+                "VALUES(?,'gw',?,'forge.example/acme/widget',?,?,'{}',?,?,?)",
+                (
+                    f"origin-{task_id}", kind, str(task_id), "b" * 64,
+                    self._now(), self._now(), self._now(),
+                ),
+            )
+            connection.execute(
+                "INSERT INTO task_candidate_bindings(candidate_id,"
+                "source_revision,task_id,relation,decided_at) "
+                "VALUES(?,?,?,'accepted',?)",
+                (f"origin-{task_id}", "b" * 64, task_id, self._now()),
+            )
+            connection.commit()
+
     def _schedule_and_start(self):
         scheduled = self.service.schedule(1, expected_task_version=1)
         self.assertEqual(scheduled.status, WorkflowStatus.AWAITING_START)
@@ -583,12 +605,13 @@ class TaskExecutionTests(unittest.TestCase):
                 connection.commit()
 
         bind(2, "issue", "forge.example/acme/widget", "42")
-        bind(3, "meeting", "record_synthetic", "action-1")
-        # This machine grants issues and nothing else.
+        bind(3, "review_request", "forge.example/acme/widget", "7")
+        bind(4, "meeting", "record_synthetic", "action-1")
+        # This machine grants repository work and nothing else.
         TaskExecutionService(
             self.database,
             clock=self.clock,
-            planning_grants=["issue"],
+            planning_grants=["issue", "review_request"],
         ).schedule_new(limit=10)
 
         def status(task_id):
@@ -602,14 +625,51 @@ class TaskExecutionTests(unittest.TestCase):
         self.assertEqual((issue["status"], issue["phase"]),
                          ("queued", "plan"))
 
+        review = status(3)
+        self.assertEqual((review["status"], review["phase"]),
+                         ("queued", "plan"))
+
         # A task nobody granted standing permission for is still asked
         # about. The meeting it came from is not an enrolment.
-        meeting = status(3)
+        meeting = status(4)
         self.assertEqual(meeting["status"], "awaiting_start")
 
         # And a task bound to nothing at all keeps its gate.
         unbound = status(1)
         self.assertEqual(unbound["status"], "awaiting_start")
+
+    def test_a_granted_repository_origin_skips_an_explicit_start_gate(self):
+        """Direct scheduling must honor the same host grant as the runner."""
+        self._bind_origin(1, "issue")
+        service = TaskExecutionService(
+            self.database, clock=self.clock, planning_grants=["issue"],
+        )
+
+        scheduled = service.schedule(1, expected_task_version=1)
+
+        self.assertEqual(
+            (scheduled.status, scheduled.phase),
+            (WorkflowStatus.QUEUED, WorkflowPhase.PLAN),
+        )
+
+    def test_a_new_planning_grant_promotes_an_existing_start_gate(self):
+        """A previously delivered Start card must not survive the grant."""
+        self._bind_origin(1, "review_request")
+        gated = self.service.schedule(1, expected_task_version=1)
+        self.assertEqual(gated.status, WorkflowStatus.AWAITING_START)
+        service = TaskExecutionService(
+            self.database, clock=self.clock,
+            planning_grants=["review_request"],
+        )
+
+        result = service.schedule_new()
+
+        self.assertEqual((result.scheduled, result.remaining), (1, 0))
+        promoted = service.get(1)
+        self.assertEqual(
+            (promoted.status, promoted.phase),
+            (WorkflowStatus.QUEUED, WorkflowPhase.PLAN),
+        )
 
     def test_schedule_new_is_bounded_and_never_resets_existing_workflows(self):
         with closing(sqlite3.connect(self.database)) as connection:
