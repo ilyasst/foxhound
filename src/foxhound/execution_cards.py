@@ -209,6 +209,7 @@ class ExecutionReviewCard:
     first_raised: str | None = field(repr=False)
     last_mentioned: str | None = field(repr=False)
     owner_hold_eligible: bool = field(default=False, repr=False)
+    owner_hold_reason: str = field(default="", repr=False)
     summary: str = field(default="", repr=False)
     work_markdown: str = field(default="", repr=False)
     #: A few sentences derived from `work_markdown`; empty when the
@@ -2294,12 +2295,13 @@ def _card(
             due=row["due"],
             first_raised=row["first_raised"],
             last_mentioned=row["last_mentioned"],
-            owner_hold_eligible=_owner_hold_eligible(
+            owner_hold_eligible=not bool(owner_hold_reason := _owner_hold_reason(
                 row,
                 owner_display,
                 reader_aliases=reader_aliases,
                 condition_available=condition_available,
-            ),
+            )),
+            owner_hold_reason=owner_hold_reason,
             summary="" if row["summary"] is None else str(row["summary"]),
             work_markdown=(
                 ""
@@ -2347,31 +2349,32 @@ def _normalized_owner(value: str) -> str:
     )
 
 
-def _owner_hold_eligible(
+def _owner_hold_reason(
     row: Mapping[str, object],
     owner_display: str | None,
     *,
     reader_aliases: frozenset[str],
     condition_available: bool,
-) -> bool:
-    if (
-        not condition_available
-        or not reader_aliases
-        or owner_display in {None, "(unassigned)"}
-        or row["owner_ref_version"] != 1
-        or row["owner_kind"] not in {"person", "external"}
-        or row["owner_provisional"] != 0
-        or _normalized_owner(owner_display) in reader_aliases
-    ):
-        return False
+) -> str:
+    if not condition_available or not reader_aliases:
+        return "Meeting-aware hold is unavailable on this card service."
+    if owner_display in {None, "(unassigned)"}:
+        return "Owner needs confirmation before it can be held to a meeting."
+    if _normalized_owner(owner_display) in reader_aliases:
+        return "Until next meeting applies only to another owner."
+    if row["owner_kind"] not in {"person", "external"}:
+        return "Until next meeting applies only to an individual owner."
+    if row["owner_ref_version"] != 1 or row["owner_provisional"] != 0:
+        return "Owner identity needs confirmation before it can be held to a meeting."
     scoped = (
         row["owner_speaker_id"],
         row["owner_canonical_speaker_id"],
         row["owner_speaker_registry_id"],
     )
-    return all(value is None for value in scoped) or all(
-        isinstance(value, str) and bool(value) for value in scoped
-    )
+    if all(value is None for value in scoped) or all(
+            isinstance(value, str) and bool(value) for value in scoped):
+        return ""
+    return "Owner identity needs confirmation before it can be held to a meeting."
 
 
 def _owner_ref(row: Mapping[str, object]) -> dict[str, object]:
@@ -2743,6 +2746,11 @@ def _start_card_lines(
         lines.append(
             f"👤 <b>Owner:</b> {_escape(card.owner)}"
             if html else f"👤 Owner: {card.owner}"
+        )
+    if card.owner_hold_reason:
+        lines.append(
+            f"🗓 <i>{_escape(card.owner_hold_reason)}</i>"
+            if html else f"🗓 {card.owner_hold_reason}"
         )
     first = _card_date(card.first_raised)
     if first:
