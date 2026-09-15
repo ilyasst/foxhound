@@ -453,6 +453,11 @@ class NativeCandidateIntakeTests(unittest.TestCase):
                 "ALTER TABLE task_execution_results "
                 "DROP COLUMN task_work_directory"
             )
+            # v21 added this; a database at an older version has
+            # not got it yet.
+            connection.execute(
+                "ALTER TABLE task_execution_results DROP COLUMN work_digest"
+            )
             connection.execute("PRAGMA user_version = 15")
 
         CandidateInbox(self.database, clock=lambda: NOW).initialize()

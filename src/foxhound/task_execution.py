@@ -65,6 +65,8 @@ RETRY_MAX_SECONDS = 3_600
 MAX_RESULT_BYTES = 256 * 1024
 MAX_SUMMARY_CHARS = 1_200
 MAX_WORK_MARKDOWN_CHARS = 131_072
+#: A card blurb, not a summary of record. See `work_digest.py`.
+MAX_WORK_DIGEST_CHARS = 800
 MAX_COLLECTION_ITEMS = 20
 MAX_QUESTION_CHARS = 1_000
 
@@ -186,6 +188,9 @@ class ExecutionResultEnvelope:
     outcome: str = ""
     summary: str = field(default="", repr=False)
     work_markdown: str = field(default="", repr=False)
+    #: Derived from `work_markdown` by the worker, never by the agent.
+    #: Empty is normal and means the card falls back to an excerpt.
+    work_digest: str = field(default="", repr=False)
     questions: Sequence[str] = field(default=(), repr=False)
     external_actions: Sequence[object] = field(default=(), repr=False)
     deliverables: Sequence[object] = field(default=(), repr=False)
@@ -918,8 +923,8 @@ class TaskExecutionService:
                     "outcome,content_digest,summary,work_markdown,"
                     "questions_json,external_actions_json,deliverables_json,"
                     "created_at,agent_profile_id,agent_profile_revision,"
-                    "task_work_directory,task_kb_file) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "task_work_directory,task_kb_file,work_digest) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         result["result_id"], result["task_id"],
                         result["workflow_version"], result["task_version"],
@@ -932,6 +937,7 @@ class TaskExecutionService:
                         row["agent_profile_revision"],
                         result["task_work_directory"],
                         result["task_kb_file"],
+                        result["work_digest"],
                     ),
                 )
                 version = result["workflow_version"] + 1
@@ -1875,6 +1881,19 @@ def _validated_result(envelope: ExecutionResultEnvelope) -> dict[str, object]:
         primary="body", aliases=_DELIVERABLE_ALIASES,
         optional=_DELIVERABLE_FIELDS,
     )
+    # Deliberately absent from `document` below, and so from the content
+    # digest: the digest identifies what the AGENT produced, and this is
+    # produced afterwards from it. Folding it in would make the same
+    # result look like a different one whenever the small model phrased
+    # itself differently, which is exactly the replay dedupe this digest
+    # exists to perform.
+    work_digest = (
+        "" if not envelope.work_digest
+        else _bounded_text(
+            envelope.work_digest, "work digest", MAX_WORK_DIGEST_CHARS,
+            single_line=False,
+        )
+    )
     task_work_directory = _result_path(
         envelope.task_work_directory, "task work directory"
     )
@@ -1904,6 +1923,7 @@ def _validated_result(envelope: ExecutionResultEnvelope) -> dict[str, object]:
         raise ValueError("execution result digest is invalid")
     return {
         **document,
+        "work_digest": work_digest or None,
         "content_digest": digest,
         "questions_json": _canonical_json(questions),
         "external_actions_json": _canonical_json(actions),
