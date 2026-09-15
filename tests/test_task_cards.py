@@ -19,6 +19,7 @@ from foxhound.card_provenance import (
 from foxhound.candidate_inbox import SCHEMA_VERSION
 from foxhound.contracts import candidate_id_for, comparable_task_digest
 from foxhound.task_cards import (
+    ClaimAtCeiling,
     CardDisposition,
     CardRefusal,
     CardStatus,
@@ -361,6 +362,27 @@ class TaskCardTests(unittest.TestCase):
              stats.snoozed, stats.elsewhere, stats.active),
             (2, 1, 0, 1, 0, 4),
         )
+
+    def test_claim_ceiling_is_distinct_and_scoped_to_role_and_consumer(self):
+        self.cards.schedule()
+        first = self.cards.claim_next(
+            consumer_digest=CONSUMER_A, consumer_role="queue_view"
+        )
+        second = self.cards.claim_next(
+            consumer_digest=CONSUMER_A, consumer_role="queue_view"
+        )
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        at_ceiling = self.cards.claim_next(
+            consumer_digest=CONSUMER_A, consumer_role="queue_view"
+        )
+        self.assertIsInstance(at_ceiling, ClaimAtCeiling)
+        self.assertEqual((at_ceiling.held_count, at_ceiling.ceiling), (2, 2))
+        # A different consumer and a caller under its ceiling remain eligible.
+        other = self.cards.claim_next(
+            consumer_digest=CONSUMER_B, consumer_role="queue_view"
+        )
+        self.assertIsNotNone(other)
 
     def test_stats_scope_claimed_cards_and_hide_legacy_consumer_rows(self):
         self.cards.schedule()

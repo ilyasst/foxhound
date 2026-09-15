@@ -37,6 +37,7 @@ from .execution_worker import (
 )
 from .knowledge_client import GwKnowledgeClient, KnowledgeClientError
 from .task_cards import (
+    ClaimAtCeiling,
     CardOperationResult,
     ScheduleResult,
     TaskCardService,
@@ -334,8 +335,19 @@ class TaskCardApplication:
                     HTTPStatus.FORBIDDEN,
                 )
             claim = self.cards.claim_next(
-                lease_seconds=lease, consumer_digest=identity.digest
+                lease_seconds=lease, consumer_digest=identity.digest,
+                consumer_role=identity.role,
             )
+            if isinstance(claim, ClaimAtCeiling):
+                return {
+                    "schema": CLAIM_SCHEMA,
+                    "schema_version": SERVICE_VERSION,
+                    "ok": True,
+                    "status": "at_ceiling",
+                    "held_count": claim.held_count,
+                    "ceiling": claim.ceiling,
+                    "claim": None,
+                }
             if claim is None:
                 return {
                     "schema": CLAIM_SCHEMA,
