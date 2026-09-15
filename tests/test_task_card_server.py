@@ -38,6 +38,7 @@ from foxhound.task_card_server import (
     EXECUTION_AGENT_OPTIONS_SCHEMA,
     EXECUTION_AGENT_SELECTION_SCHEMA,
     EXECUTION_BRIEF_SCHEMA,
+    EXECUTION_VIEW_SCHEMA,
     EXECUTION_CLAIM_SCHEMA,
     EXECUTION_OPERATION_SCHEMA,
     EXECUTION_SCHEDULE_SCHEMA,
@@ -203,6 +204,50 @@ class TaskCardServerTests(unittest.TestCase):
         )
         self.assertFalse(stale["ok"])
         self.assertIsNone(stale["text"])
+        self.assertEqual(stale["refusal"], "stale_version")
+
+    def test_execution_view_route_restores_a_card_without_writing(self):
+        self.execution.schedule(1, expected_task_version=1)
+        self.execution_cards.schedule()
+        claim = self.execution_cards.claim_next()
+        self.execution_cards.complete_delivery(
+            claim.card.id,
+            expected_version=claim.card.version,
+            claim_token=claim.token,
+            transport="synthetic",
+            delivery_ref="view-message",
+        )
+        before = self.execution_cards.stats()
+
+        response = self.app.dispatch(
+            "execution_view",
+            request_document(
+                card_id=claim.card.id,
+                card_version=claim.card.version,
+            ),
+        )
+
+        self.assertEqual(response["schema"], EXECUTION_VIEW_SCHEMA)
+        self.assertTrue(response["ok"])
+        self.assertIn("Synthetic task 1", response["presentation"]["body"])
+        self.assertIn(
+            "inline_keyboard", response["presentation"]["reply_markup"]
+        )
+        self.assertEqual(response["kind"], "start")
+        self.assertEqual(self.execution_cards.stats(), before)
+
+        stale = self.app.dispatch(
+            "execution_view",
+            request_document(
+                card_id=claim.card.id,
+                card_version=claim.card.version + 1,
+            ),
+        )
+        self.assertFalse(stale["ok"])
+        # Absent, not partial: a caller that cannot restore the card must
+        # not be handed something that looks like it could be shown.
+        self.assertIsNone(stale["presentation"])
+        self.assertIsNone(stale["kind"])
         self.assertEqual(stale["refusal"], "stale_version")
 
     def test_configuration_requires_private_token_and_canonical_loopback(self):

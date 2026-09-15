@@ -23,6 +23,7 @@ from .agent_profiles import AgentProfileError, load_registry
 from .execution_cards import (
     AGENT_SELECTION_TOKEN_CHARS,
     ExecutionCardOperationResult,
+    ExecutionCardPresentation,
     ExecutionCardScheduleResult,
     ExecutionCardService,
     ExecutionAgentSelectorResult,
@@ -58,6 +59,7 @@ EXECUTION_CLAIM_SCHEMA = "foxhound.execution-card-service.claim"
 EXECUTION_OPERATION_SCHEMA = "foxhound.execution-card-service.operation"
 EXECUTION_STATS_SCHEMA = "foxhound.execution-card-service.stats"
 EXECUTION_BRIEF_SCHEMA = "foxhound.execution-card-service.brief"
+EXECUTION_VIEW_SCHEMA = "foxhound.execution-card-service.view"
 EXECUTION_AGENT_OPTIONS_SCHEMA = (
     "foxhound.execution-card-service.agent-options"
 )
@@ -93,6 +95,7 @@ ROUTES = {
     "/v1/execution-cards/agent-options": "execution_agent_options",
     "/v1/execution-cards/agent-selection": "execution_agent_selection",
     "/v1/execution-cards/brief": "execution_brief",
+    "/v1/execution-cards/view": "execution_view",
 }
 
 
@@ -494,6 +497,15 @@ class TaskCardApplication:
                     ),
                     kind=kind,
                     value=value,
+                )
+            )
+        if operation == "execution_view":
+            request = _request(payload, required={"card_id", "card_version"})
+            return _execution_view_document(
+                self._execution_cards().view(
+                    _integer(request["card_id"], minimum=1),
+                    expected_version=_integer(
+                        request["card_version"], minimum=1),
                 )
             )
         if operation == "execution_brief":
@@ -977,6 +989,40 @@ def _execution_operation_document(
         "wake_at": result.wake_at,
         "refusal": None if result.refusal is None else result.refusal.value,
     }
+
+
+def _execution_view_document(
+    result: ExecutionCardPresentation,
+) -> dict[str, Any]:
+    """The same presentation the delivery rendered, or a refusal.
+
+    `presentation` is absent rather than partial on a refusal: a caller that
+    cannot restore the card must not be handed something that looks like it
+    could be shown.
+    """
+    document: dict[str, Any] = {
+        "schema": EXECUTION_VIEW_SCHEMA,
+        "schema_version": SERVICE_VERSION,
+        "ok": result.accepted,
+        "disposition": result.disposition.value,
+        "card_id": result.card_id,
+        "card_version": result.card_version,
+        # The kind travels with the presentation. A caller restoring a card
+        # has only its id and version -- the claim that told it the kind is
+        # long gone -- and the checks worth keeping on a restored keyboard
+        # are the kind-dependent ones: no approval on work that has already
+        # run, no owner hold outside a start gate.
+        "kind": None if result.card is None else result.card.kind.value,
+        "presentation": None,
+        "refusal": None if result.refusal is None else result.refusal.value,
+    }
+    if result.accepted and result.card is not None:
+        body, reply_markup = render_execution_review_card(result.card)
+        document["presentation"] = {
+            "body": body,
+            "reply_markup": reply_markup,
+        }
+    return document
 
 
 def _execution_agent_options_document(
