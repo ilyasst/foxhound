@@ -425,9 +425,21 @@ class ExecutionCardService:
                     "  AND r.outcome='awaiting_external') OR "
                     " (w.status IN ('awaiting_review','completed') "
                     "  AND r.outcome IN ('completed','declined','ineligible'))"
-                    ") ORDER BY CASE WHEN w.status='awaiting_start' OR "
-                    "(w.status='snoozed' AND w.last_result_id IS NULL) "
-                    "THEN 1 ELSE 0 END,w.updated_at,w.task_id LIMIT ?",
+                    ") ORDER BY CASE "
+                    # A result is the only finished work in this queue.
+                    # Make its report visible before asking a reader to
+                    # begin or approve another piece of work.
+                    "WHEN r.outcome IN ('completed','declined','ineligible') "
+                    "THEN 0 "
+                    # Both kinds in this band need a decision to continue
+                    # work already under way.  An external authorisation is
+                    # not a completed result, but should not sit behind a
+                    # task that has not started either.
+                    "WHEN w.status IN ('awaiting_review','snoozed') AND ("
+                    " (w.phase='plan' AND r.outcome='awaiting_plan') OR "
+                    " (w.phase='execute' AND r.outcome='awaiting_external')"
+                    ") THEN 1 "
+                    "ELSE 2 END,w.updated_at,w.task_id LIMIT ?",
                     (now, now, limit),
                 ).fetchall()
                 for row in rows:
@@ -525,7 +537,12 @@ class ExecutionCardService:
                 row = connection.execute(
                     self._card_select()
                     + " WHERE c.status='pending' "
-                    "ORDER BY c.created_at,c.id LIMIT 1"
+                    "ORDER BY CASE c.kind "
+                    "WHEN 'result_review' THEN 0 "
+                    "WHEN 'plan_review' THEN 1 "
+                    "WHEN 'external_review' THEN 1 "
+                    "WHEN 'start' THEN 2 "
+                    "ELSE 3 END,c.created_at,c.id LIMIT 1"
                 ).fetchone()
                 if row is None:
                     connection.commit()
