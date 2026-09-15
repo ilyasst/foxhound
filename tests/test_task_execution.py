@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -246,6 +248,35 @@ class TaskExecutionTests(unittest.TestCase):
             deliverables=("Synthetic deliverable",),
         )
 
+    def test_repository_references_are_validated_and_persisted(self):
+        scheduled = self.service.schedule(1, expected_task_version=1)
+        self.service.start_action(
+            1, expected_version=scheduled.version, action="start")
+        claim = self._claim()
+        result = replace(self._result(claim), repository_references=(
+            {"kind": "pull-request",
+             "url": "https://github.com/example-org/example-repo/pull/12"},
+            {"kind": "commit",
+             "url": "https://github.com/example-org/example-repo/commit/abcdef1234567"},
+            {"kind": "check",
+             "url": "https://github.com/example-org/example-repo/actions/runs/34"},
+        ))
+        self.assertTrue(self.service.record_result(result).accepted)
+        with closing(sqlite3.connect(self.database)) as connection:
+            stored = connection.execute(
+                "SELECT repository_references_json FROM task_execution_results "
+                "WHERE result_id='result-001'"
+            ).fetchone()[0]
+        self.assertEqual(json.loads(stored)[1]["kind"], "commit")
+
+        invalid = replace(self._result(claim, result_id="result-invalid"),
+                          repository_references=(
+                              {"kind": "commit",
+                               "url": "https://example.com/commit/abcdef1"},
+                          ))
+        refused = self.service.record_result(invalid)
+        self.assertEqual(refused.refusal, WorkflowRefusal.INVALID_ARGUMENT)
+
     def test_schema_seven_migration_is_passive_and_append_only(self):
         with closing(sqlite3.connect(self.database)) as connection:
             _drop_owner_schema(connection)
@@ -310,6 +341,10 @@ class TaskExecutionTests(unittest.TestCase):
             # not got it yet.
             connection.execute(
                 "ALTER TABLE task_execution_results DROP COLUMN work_digest"
+            )
+            connection.execute(
+                "ALTER TABLE task_execution_results DROP COLUMN "
+                "repository_references_json"
             )
             # ADR 0036 added this at v23; a database at an older version
             # has not got it yet.

@@ -204,6 +204,7 @@ class ExecutionWorkerTests(unittest.TestCase):
             "questions": ["Should Example A proceed?"],
             "external_actions": ["Prepare a synthetic draft."],
             "deliverables": ["Synthetic deliverable"],
+            "repository_references": [],
         }
         document.update(changes)
         path = self.run_directory / f"result-{RESULT_ID}.json"
@@ -439,6 +440,7 @@ class ExecutionWorkerTests(unittest.TestCase):
             "questions": [],
             "external_actions": [],
             "deliverables": [],
+            "repository_references": [],
         }), encoding="utf-8")
         second.chmod(0o600)
         with knowledge_server() as endpoint:
@@ -575,10 +577,11 @@ class ExecutionWorkerTests(unittest.TestCase):
                 "outcome": "awaiting_plan",
                 "summary": "Synthetic result summary",
                 "work_markdown": "# Synthetic work\n\nNo private evidence.",
-                "questions": ["Should Example A proceed?"],
-                "external_actions": ["Prepare a synthetic draft."],
-                "deliverables": ["Synthetic deliverable"],
-            })
+            "questions": ["Should Example A proceed?"],
+            "external_actions": ["Prepare a synthetic draft."],
+            "deliverables": ["Synthetic deliverable"],
+            "repository_references": [],
+        })
             self.assertNotIn(CLAIM_TOKEN, draft.read_text(encoding="utf-8"))
             with self.assertRaises(ExecutionWorkerDraftError):
                 worker.draft(outcome="awaiting_plan")
