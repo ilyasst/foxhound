@@ -207,6 +207,11 @@ class TaskExecutionTests(unittest.TestCase):
             connection.execute("DROP TABLE task_execution_events")
             connection.execute("DROP TABLE task_execution_results")
             connection.execute("DROP TABLE task_execution_workflows")
+            # ADR 0036 added this at v23; a database at an older version
+            # has not got it yet.
+            connection.execute(
+                "ALTER TABLE task_review_cards DROP COLUMN consumer_digest"
+            )
             connection.execute("PRAGMA user_version = 7")
             connection.commit()
 
@@ -242,6 +247,11 @@ class TaskExecutionTests(unittest.TestCase):
             # not got it yet.
             connection.execute(
                 "ALTER TABLE task_execution_results DROP COLUMN work_digest"
+            )
+            # ADR 0036 added this at v23; a database at an older version
+            # has not got it yet.
+            connection.execute(
+                "ALTER TABLE task_review_cards DROP COLUMN consumer_digest"
             )
             connection.execute("PRAGMA user_version = 11")
             connection.commit()

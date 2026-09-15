@@ -68,6 +68,11 @@ class CandidateInboxTests(unittest.TestCase):
             connection.execute(
                 "ALTER TABLE task_execution_results DROP COLUMN work_digest"
             )
+            # ADR 0036 added this at v23; a database at an older version
+            # has not got it yet.
+            connection.execute(
+                "ALTER TABLE task_review_cards DROP COLUMN consumer_digest"
+            )
             connection.execute("PRAGMA user_version = 17")
             connection.commit()
 
@@ -88,6 +93,95 @@ class CandidateInboxTests(unittest.TestCase):
             "owner_ref_version", "owner_kind", "owner_pinned",
             "owner_provisional",
         } <= columns)
+
+    def _predates_consumer_digest(self) -> None:
+        """Roll `self.database` back to a v22 fixture with one live card.
+
+        ADR 0036 decision 2: `task_review_cards` gains a nullable
+        `consumer_digest` column at v23, recording the claiming consumer's
+        identity at claim time. This helper reproduces an installation that
+        predates that migration: the column is absent and a card created
+        under the older schema already exists.
+        """
+        now = NOW.isoformat(timespec="seconds")
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "INSERT INTO tasks(status,text,owner,due,version,created_at,"
+                "updated_at,closed_at) VALUES('open','Synthetic task',"
+                "'Person A',NULL,1,?,?,NULL)",
+                (now, now),
+            )
+            connection.execute(
+                "ALTER TABLE task_review_cards DROP COLUMN consumer_digest"
+            )
+            connection.execute(
+                "INSERT INTO task_review_cards(task_id,task_version,status,"
+                "version,due_at,created_at,updated_at) "
+                "VALUES(1,1,'pending',1,?,?,?)",
+                (now, now, now),
+            )
+            connection.execute("PRAGMA user_version = 22")
+            connection.commit()
+
+    def test_version_twenty_two_migration_adds_nullable_consumer_digest(self):
+        self._predates_consumer_digest()
+
+        CandidateInbox(self.database, clock=lambda: NOW).initialize()
+
+        with closing(sqlite3.connect(self.database)) as connection:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            columns = [
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(task_review_cards)"
+                )
+            ]
+            row = connection.execute(
+                "SELECT status,consumer_digest FROM task_review_cards "
+                "WHERE id=1"
+            ).fetchone()
+        self.assertEqual(version, SCHEMA_VERSION)
+        self.assertIn("consumer_digest", columns)
+        self.assertEqual(row, ("pending", None))
+
+    def test_version_twenty_two_migration_is_idempotent(self):
+        self._predates_consumer_digest()
+
+        CandidateInbox(self.database, clock=lambda: NOW).initialize()
+        CandidateInbox(self.database, clock=lambda: NOW).initialize()
+
+        with closing(sqlite3.connect(self.database)) as connection:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            columns = [
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(task_review_cards)"
+                )
+            ]
+            row = connection.execute(
+                "SELECT status,consumer_digest FROM task_review_cards "
+                "WHERE id=1"
+            ).fetchone()
+        self.assertEqual(version, SCHEMA_VERSION)
+        self.assertEqual(columns.count("consumer_digest"), 1)
+        self.assertEqual(row, ("pending", None))
+
+    def test_fresh_and_migrated_databases_end_up_in_the_same_shape(self):
+        fresh_database = Path(self.temporary.name) / "fresh.sqlite3"
+        CandidateInbox(fresh_database, clock=lambda: NOW).initialize()
+
+        self._predates_consumer_digest()
+        CandidateInbox(self.database, clock=lambda: NOW).initialize()
+
+        with closing(sqlite3.connect(fresh_database)) as connection:
+            fresh_columns = list(
+                connection.execute("PRAGMA table_info(task_review_cards)")
+            )
+        with closing(sqlite3.connect(self.database)) as connection:
+            migrated_columns = list(
+                connection.execute("PRAGMA table_info(task_review_cards)")
+            )
+        self.assertEqual(fresh_columns, migrated_columns)
 
     def test_first_import_inserts_candidate(self):
         result = self.inbox.import_document(fixture())
