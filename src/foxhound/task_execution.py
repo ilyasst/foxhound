@@ -430,6 +430,12 @@ class TaskExecutionService:
                             now, int(row["task_id"]), int(row["version"]),
                         ),
                     )
+                    _cancel_superseded_start_cards(
+                        connection,
+                        task_id=int(row["task_id"]),
+                        workflow_version=int(row["version"]),
+                        now=now,
+                    )
                     self._event(
                         connection, int(row["task_id"]), "scheduled",
                         version, int(row["task_version"]), WorkflowPhase.PLAN,
@@ -2161,6 +2167,40 @@ def _result_path(value: object, label: str) -> str | None:
     ):
         raise ValueError(f"execution result {label} is invalid")
     return value
+
+
+def _cancel_superseded_start_cards(
+    connection: sqlite3.Connection,
+    *,
+    task_id: int,
+    workflow_version: int,
+    now: str,
+) -> None:
+    """Retire Start cards in the same transaction as a planning grant."""
+    rows = connection.execute(
+        "SELECT id,version FROM execution_review_cards "
+        "WHERE task_id=? AND workflow_version=? AND kind='start' "
+        "AND status IN ('pending','delivering','delivered') ORDER BY id",
+        (task_id, workflow_version),
+    ).fetchall()
+    for row in rows:
+        card_id = int(row["id"])
+        card_version = int(row["version"]) + 1
+        updated = connection.execute(
+            "UPDATE execution_review_cards SET status='cancelled',"
+            "version=?,claim_token_digest=NULL,claim_expires_at=NULL,"
+            "resolved_at=?,updated_at=? WHERE id=? AND version=? "
+            "AND status IN ('pending','delivering','delivered')",
+            (card_version, now, now, card_id, int(row["version"])),
+        )
+        if updated.rowcount != 1:
+            raise TaskLedgerError("execution card state changed")
+        connection.execute(
+            "INSERT INTO execution_review_card_events("
+            "card_id,task_id,kind,card_version,workflow_version,action,"
+            "occurred_at) VALUES(?,?,'cancelled',?,?,NULL,?)",
+            (card_id, task_id, card_version, workflow_version, now),
+        )
 
 
 def _initial_status(
