@@ -634,6 +634,82 @@ class TaskCardService:
                 connection.rollback()
                 raise
 
+    def retry_delivery(
+        self, card_id: int, *, expected_version: int
+    ) -> CardOperationResult:
+        """Requeue a current delivered card for local operator recovery.
+
+        This is a local operator repair, not part of the transport API. It
+        clears the presentation metadata and consumer affinity, then versions
+        the card so callbacks from the failed presentation become stale.
+        """
+        if not _valid_identity(card_id, expected_version):
+            return _refused(card_id, CardRefusal.INVALID_ARGUMENT)
+        now = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    self._card_select() + " WHERE c.id=?", (card_id,)
+                ).fetchone()
+                refusal = _card_guard(row, expected_version)
+                if (
+                    refusal is None
+                    and row["status"] != CardStatus.DELIVERED
+                ):
+                    refusal = CardRefusal.INVALID_STATE
+                if (
+                    refusal is None
+                    and (
+                        row["task_status_current"] != TaskStatus.OPEN
+                        or int(row["task_version_current"])
+                        != int(row["task_version"])
+                        or (row["source_revision"] or None)
+                        != (row["source_revision_current"] or None)
+                    )
+                ):
+                    refusal = CardRefusal.STALE_VERSION
+                if refusal is not None:
+                    connection.rollback()
+                    return _refused_row(card_id, row, refusal)
+                version = expected_version + 1
+                updated = connection.execute(
+                    "UPDATE task_review_cards SET status='pending',"
+                    "version=?,claim_token_digest=NULL,claim_expires_at=NULL,"
+                    "consumer_digest=NULL,transport=NULL,delivery_ref=NULL,"
+                    "delivered_at=NULL,updated_at=? WHERE id=? AND version=? "
+                    "AND status='delivered'",
+                    (version, now, card_id, expected_version),
+                )
+                if updated.rowcount != 1:
+                    raise TaskLedgerError("task card state changed")
+                self._event(
+                    connection,
+                    card_id=card_id,
+                    task_id=int(row["task_id"]),
+                    kind="delivery_failed",
+                    card_version=version,
+                    task_version=int(row["task_version"]),
+                    now=now,
+                )
+                connection.commit()
+                values = dict(row)
+                values.update(
+                    status=CardStatus.PENDING,
+                    version=version,
+                    claim_token_digest=None,
+                    claim_expires_at=None,
+                    consumer_digest=None,
+                    transport=None,
+                    delivery_ref=None,
+                    delivered_at=None,
+                )
+                return _operation(values, CardDisposition.APPLIED)
+            except Exception:
+                connection.rollback()
+                raise
+
     def act(
         self, card_id: int, *, expected_version: int, action: str
     ) -> CardOperationResult:
