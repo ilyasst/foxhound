@@ -14,6 +14,7 @@ from contextlib import closing, contextmanager, redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Iterator
 from unittest import mock
 
@@ -28,6 +29,9 @@ from foxhound.execution_worker import (
     load_run_state,
     main,
     _local_calendar,
+    _append_repository_receipt,
+    _repository_result,
+    _repository_receipts,
     _worker_operations,
 )
 from foxhound.knowledge_client import KnowledgeClientConfig
@@ -220,6 +224,9 @@ class ExecutionWorkerTests(unittest.TestCase):
         )
         self._write_result_input(
             "result-work.md", "# Synthetic work\n\nNo private evidence.\n"
+        )
+        self._write_result_input(
+            "result-deliverables.json", ["Synthetic deliverable"]
         )
 
     def _enable_archive(self):
@@ -627,7 +634,9 @@ class ExecutionWorkerTests(unittest.TestCase):
             worker = self._worker(endpoint)
             with self.assertRaises(ExecutionWorkerDraftError):
                 worker.draft(outcome="awaiting_external")
-            self.assertEqual(list(self.run_directory.glob("result-*.json")), [])
+            self.assertEqual(
+                list(self.run_directory.glob("result-????????????????????????????????.json")), []
+            )
 
             questions = self._write_result_input(
                 "result-questions.json", [{"text": "not a string"}]
@@ -646,17 +655,73 @@ class ExecutionWorkerTests(unittest.TestCase):
             with self.assertRaises(ExecutionWorkerDraftError):
                 worker.draft(outcome="awaiting_plan")
 
-        self.assertEqual(list(self.run_directory.glob("result-*.json")), [])
+        self.assertEqual(
+            list(self.run_directory.glob("result-????????????????????????????????.json")), []
+        )
 
     def test_draft_defaults_missing_collection_files_to_empty_arrays(self):
         self._write_result_inputs()
+        (self.run_directory / "result-deliverables.json").unlink()
         with knowledge_server() as endpoint:
-            ready = self._worker(endpoint).draft(outcome="awaiting_plan")
-        document = json.loads(
-            (self.run_directory / ready["draft"]).read_text(encoding="utf-8")
+            draft = self._worker(endpoint).draft(outcome="awaiting_plan")
+        document = json.loads(draft.read_text())
+        self.assertEqual(document["questions"], [])
+        self.assertEqual(document["external_actions"], [])
+        self.assertEqual(document["deliverables"], [])
+
+    def test_repository_receipt_is_private_and_deduplicated(self):
+        receipt = {
+            "kind": "issue-comment",
+            "repository": "github.com/example-org/example-repo",
+            "url": "https://github.com/example-org/example-repo/issues/42#issuecomment-1",
+        }
+        _append_repository_receipt(self.run_directory, receipt)
+        _append_repository_receipt(self.run_directory, receipt)
+
+        self.assertEqual(_repository_receipts(self.run_directory), (receipt,))
+        path = self.run_directory / "repository-action-receipts.json"
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_github_execution_must_wait_for_repository_follow_through(self):
+        state = SimpleNamespace(
+            database_path=self.database,
+            task_id=1,
+            phase=WorkflowPhase.EXECUTE,
         )
-        for name in ("questions", "external_actions", "deliverables"):
-            self.assertEqual(document[name], [])
+        with mock.patch(
+            "foxhound.execution_worker._repository_origin",
+            return_value=object(),
+        ):
+            with self.assertRaisesRegex(
+                ExecutionWorkerDraftError, "await an approved follow-through"
+            ):
+                _repository_result(
+                    state,
+                    {
+                        "outcome": "completed",
+                        "deliverables": ["private note"],
+                    },
+                    self.run_directory,
+                )
+
+    def test_github_external_completion_needs_worker_receipt(self):
+        state = SimpleNamespace(
+            database_path=self.database,
+            task_id=1,
+            phase=WorkflowPhase.EXTERNAL_ACTION,
+        )
+        with mock.patch(
+            "foxhound.execution_worker._repository_origin",
+            return_value=object(),
+        ):
+            with self.assertRaisesRegex(
+                ExecutionWorkerDraftError, "requires a worker action receipt"
+            ):
+                _repository_result(
+                    state,
+                    {"outcome": "completed", "deliverables": []},
+                    self.run_directory,
+                )
 
     def test_draft_cli_errors_are_content_free(self):
         private_value = "synthetic-private-outcome-value"
@@ -759,6 +824,7 @@ class ExecutionWorkerTests(unittest.TestCase):
             outcome="awaiting_plan",
             summary="Synthetic result",
             work_markdown="Synthetic plan",
+            deliverables=("Synthetic plan deliverable",),
         ))
         service.review_action(
             1, expected_version=recorded.version, action="approve"

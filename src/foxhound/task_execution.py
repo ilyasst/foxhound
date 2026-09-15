@@ -48,9 +48,7 @@ REVIEW_SNOOZE_ACTIONS = frozenset({
 #: trustworthy. So it is answered here too, as the nearest choice.
 _SNOOZE_ACTIONS = frozenset({"snooze", *REVIEW_SNOOZE_ACTIONS})
 #: The agent a kind of work starts on, when that machine has it installed.
-#: A preference, not a rule: the reader may change it at the gate, and a
-#: machine without the profile falls back to its default rather than
-#: refusing the task.
+#: Repository work is routed to SigInt by the runtime profile catalog.
 SOURCE_KIND_PROFILES = {
     "issue": "sigint",
     "review_request": "sigint",
@@ -311,15 +309,17 @@ class TaskExecutionService:
         `general`, produced nothing recordable three times, and parked —
         with the review already written.
 
-        Falls back to the default when a preferred profile is not installed
-        on this machine, because a machine that lacks it should still work
-        rather than refuse every task of that kind.
+        Falls back to the configured default when a preferred profile is not
+        installed. The production scheduler validates that SigInt is installed
+        before accepting repository work; this keeps the library usable on
+        compatibility-only test and migration hosts.
         """
         preferred = SOURCE_KIND_PROFILES.get(origin_kind)
         if preferred:
             profile = self._profile_registry.get(preferred)
-            if profile is not None and (
-                WorkflowPhase.PLAN.value in profile.allowed_phases
+            if profile is not None and all(
+                phase.value in profile.allowed_phases
+                for phase in WorkflowPhase
             ):
                 return profile
         return self._default_profile
