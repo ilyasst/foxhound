@@ -376,6 +376,82 @@ class ExecutionRunnerTests(unittest.TestCase):
             specialist.revision,
         )
 
+    def test_configured_default_profile_is_bound_before_the_first_claim(self):
+        specialist = parse_profile({
+            **general_profile().document(),
+            "profile_id": "specialist",
+            "display_name": "Synthetic Specialist",
+        })
+        registry = AgentProfileRegistry((general_profile(), specialist))
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "INSERT INTO candidate_inbox(candidate_id,source_system,"
+                "source_kind,source_record_id,source_item_id,"
+                "source_revision,payload_json,created_at,"
+                "first_imported_at,updated_at) "
+                "VALUES('candidate-1','gw','legacy','record-1','item-1',"
+                "?,'{}','2030-01-02T03:04:05+00:00',"
+                "'2030-01-02T03:04:05+00:00','2030-01-02T03:04:05+00:00')",
+                ("a" * 64,),
+            )
+            connection.execute(
+                "INSERT INTO task_candidate_bindings(candidate_id,"
+                "source_revision,task_id,relation,decided_at) "
+                "VALUES('candidate-1',?,1,'accepted',?)",
+                ("a" * 64, "2030-01-02T03:04:05+00:00"),
+            )
+            connection.commit()
+        launched = {}
+
+        def popen(_argv, **kwargs):
+            state = load_run_state(
+                Path(kwargs["env"]["FOXHOUND_EXECUTION_STATE"])
+            )
+            launched["state"] = state
+
+            def release():
+                TaskExecutionService(state.database_path).release(
+                    state.task_id,
+                    expected_version=state.workflow_version,
+                    claim_token=state.claim_token,
+                )
+
+            return FakeProcess(callback=release)
+
+        result = run_once(
+            self._config(
+                profile_registry=registry,
+                default_agent_profile=specialist.profile_id,
+                planning_grants=("legacy",),
+            ),
+            popen=popen,
+            run_id_factory=lambda: "3" * 32,
+            terminate=self._terminator,
+        )
+
+        self.assertEqual(result.outcome, "released")
+        self.assertEqual(
+            launched["state"].agent_profile_id, specialist.profile_id,
+        )
+
+    def test_default_profile_must_be_installed_and_plan_eligible(self):
+        execute_only = parse_profile({
+            **general_profile().document(),
+            "profile_id": "execute-only",
+            "display_name": "Synthetic Executor",
+            "allowed_phases": ["execute"],
+        })
+        registry = AgentProfileRegistry((general_profile(), execute_only))
+        for profile_id in ("missing", execute_only.profile_id):
+            with self.subTest(profile_id=profile_id):
+                with self.assertRaisesRegex(
+                    ValueError, "default agent profile"
+                ):
+                    self._config(
+                        profile_registry=registry,
+                        default_agent_profile=profile_id,
+                    )
+
     def test_runner_honors_a_pinned_historical_general_policy(self):
         registry = load_registry()
         current = general_profile()
@@ -738,6 +814,7 @@ class ExecutionRunnerTests(unittest.TestCase):
             "--gw-alias", "primary",
             "--gw-token-file", str(self.token_file),
             "--agent-profile-directory", str(profiles),
+            "--default-agent-profile", "specialist",
             "--allowed-phase", "plan",
         ]
         with redirect_stdout(output), mock.patch(
@@ -749,6 +826,10 @@ class ExecutionRunnerTests(unittest.TestCase):
         self.assertEqual(
             run.call_args.args[0].allowed_phases,
             (WorkflowPhase.PLAN,),
+        )
+        self.assertEqual(
+            run.call_args.args[0].default_agent_profile,
+            "specialist",
         )
         self.assertIsNotNone(
             run.call_args.args[0].profile_registry.get("specialist")
