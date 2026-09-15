@@ -239,6 +239,31 @@ class ExecutionCardDeliveryClaim:
 
 
 @dataclass(frozen=True)
+class ExecutionCardPresentation:
+    """One delivered card, rendered again exactly as it was delivered.
+
+    Its own type for the same reason `ExecutionCardBrief` is: nothing was
+    operated on, and what a caller wants from it -- the card as a surface
+    should show it -- is not something an operation result carries.
+
+    It exists because a surface that replaces a card's controls with a
+    sub-menu no longer holds the controls it replaced, and they are decided
+    here. Without this, opening that sub-menu is irreversible: a reader who
+    taps it by mistake is left with a card they can only defer.
+    """
+
+    disposition: ExecutionCardDisposition
+    card_id: int
+    card_version: int | None = None
+    card: ExecutionReviewCard | None = field(default=None, repr=False)
+    refusal: ExecutionCardRefusal | None = None
+
+    @property
+    def accepted(self) -> bool:
+        return self.disposition is not ExecutionCardDisposition.REFUSED
+
+
+@dataclass(frozen=True)
 class ExecutionCardBrief:
     """One task described for an agent that is not this one.
 
@@ -919,6 +944,53 @@ class ExecutionCardService:
                 card=card,
                 options=options,
             )
+
+    def view(
+        self, card_id: int, *, expected_version: int
+    ) -> ExecutionCardPresentation:
+        """One delivered card, rendered again, so a surface can restore it.
+
+        A read, like `brief`: asking to see a card again is not answering
+        it. Nothing is written, no version moves, and the card stays
+        delivered -- so a reader who backs out of a sub-menu is exactly
+        where they were, and a tap on the restored controls still addresses
+        the same version it did before.
+
+        Delivered and current are both required, unlike `brief`. A card that
+        was never delivered has no presentation to restore, and one that has
+        been resolved or superseded must not be handed back looking
+        answerable; the caller gets the same stale refusal it would get for
+        acting on it.
+
+        Rendered through `_render_card`, not `_card`, because the reader
+        aliases decide whether the owner hold is offered. Restoring a card
+        without them would quietly drop a control the reader had a moment
+        ago, which is the failure this read exists to prevent.
+        """
+        def refused(reason: ExecutionCardRefusal) -> ExecutionCardPresentation:
+            return ExecutionCardPresentation(
+                ExecutionCardDisposition.REFUSED, card_id, refusal=reason)
+
+        if not _valid_identity(card_id, expected_version):
+            return refused(ExecutionCardRefusal.INVALID_ARGUMENT)
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                self._card_select() + " WHERE c.id=?", (card_id,)
+            ).fetchone()
+            refusal = _card_guard(row, expected_version)
+            if refusal is None and row["status"] != ExecutionCardStatus.DELIVERED:
+                refusal = ExecutionCardRefusal.INVALID_STATE
+            if refusal is None and not _current_card(row):
+                refusal = ExecutionCardRefusal.STALE_VERSION
+            if refusal is not None:
+                return refused(refusal)
+            card = self._render_card(row)
+        return ExecutionCardPresentation(
+            ExecutionCardDisposition.UNCHANGED,
+            card_id,
+            card_version=expected_version,
+            card=card,
+        )
 
     def brief(
         self, card_id: int, *, expected_version: int

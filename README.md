@@ -543,8 +543,15 @@ affirmative callbacks are refused. See
 The authenticated loopback card service exposes execution cards through a
 separate `/v1/execution-cards/*` route family. A trusted local gateway can read
 aggregate stats, run the explicit scheduler, claim one rendered card,
-acknowledge or retry delivery, submit one versioned reader action, and submit
-one bounded discussion or reassignment response. Its agent-options and
+acknowledge or retry delivery, submit one versioned reader action, submit
+one bounded discussion or reassignment response, and read one delivered card's
+presentation back. That last route is a read like the task brief: it renders a
+current delivered card exactly as the delivery rendered it, at an exact
+expected version, and writes nothing. It exists so a surface that replaces a
+card's controls with a sub-menu -- the snooze picker is the one in use -- can
+put the card back when the reader backs out, instead of stranding them with a
+card they can only defer. An undelivered, superseded or differently versioned
+card is refused and carries no presentation at all. Its agent-options and
 agent-selection operations remain a bounded integration contract with opaque
 callbacks and a refreshed Start-card presentation; they are not exposed as an
 extra control in the legacy-compatible Start keyboard.
