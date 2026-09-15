@@ -27,13 +27,13 @@ from foxhound.agent_profiles import (
 
 
 EXPECTED_GENERAL_PROMPT_SHA256 = (
-    "3219fc10e7672e7237c205ca2f9a64a13f29bd931f7f59356dfdb0b0f875a3ff"
+    "a560f24bda1fb1f459569340b6b42fb7530f12b19a0e35c77aad868801ee6310"
 )
 EXPECTED_GENERAL_REVISION = (
-    "8e20b5c0db9a45b464cf64d81ed05a78edc089a3a29983709734efc96b0b5360"
+    "f6d5ae8b442a0cae895d07a6f19cf955d9429bdd9d3ae49e7bac3d4b1f31e9a7"
 )
 IMMEDIATE_PREVIOUS_GENERAL_REVISION = (
-    "54977e3c1d8c1d4ec0e4b0fea2d3ee3740db5af2a41cc99ae348e9fed64e1bec"
+    "8e20b5c0db9a45b464cf64d81ed05a78edc089a3a29983709734efc96b0b5360"
 )
 DATE_SEMANTICS_GENERAL_REVISION = (
     "9b80c488634e614127dd1da15facbfbf78fe3f38ac000c0f2dde30c394aeb23a"
@@ -142,9 +142,9 @@ class AgentProfileTests(unittest.TestCase):
         self.assertEqual(profile.profile_id, "general")
         self.assertEqual(profile.runtime, "hermes")
         self.assertEqual(profile.revision, EXPECTED_GENERAL_REVISION)
-        self.assertEqual(profile.max_turns, 50)
-        self.assertEqual(profile.timeout_seconds, 1_800)
-        self.assertEqual(profile.claim_lease_seconds, 2_700)
+        self.assertEqual(profile.max_turns, 80)
+        self.assertEqual(profile.timeout_seconds, 2_700)
+        self.assertEqual(profile.claim_lease_seconds, 3_300)
         self.assertEqual(profile.heartbeat_seconds, 60)
         self.assertEqual(profile.kill_grace_seconds, 30)
         self.assertEqual(
@@ -176,6 +176,14 @@ class AgentProfileTests(unittest.TestCase):
             "two to four plain sentences",
             "do not restate the questions, external actions or deliverables",
             "Nothing there needs shortening for the card",
+            "# Repository follow-through",
+            "that exact origin is the repository artifact",
+            "State the outcome, verification performed",
+            "list posting it as an external action",
+            "act comment --body-file FILE",
+            "act review --body-file FILE",
+            "record the precise blocker and the bounded continuation needed",
+            "stop lower-priority exploration",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, prompt)

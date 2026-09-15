@@ -274,6 +274,50 @@ class ReviewIsBounded(unittest.TestCase):
             self.assertNotIn(forbidden, flat)
 
 
+class IssueCommentIsBounded(unittest.TestCase):
+    def test_the_comment_lands_on_the_task_s_own_issue(self):
+        runner = _gh([(
+            ("gh", "issue", "comment"), (0, "", "")),
+            (("gh", "issue", "view"),
+             (0, '{"url": "https://example.com/acme/w/issues/7"}', "")),
+        ])
+        with mock.patch.object(forge_action, "_run", runner):
+            receipt = forge_action.post_issue_comment(
+                repository="github.com/acme/widget", number="7",
+                task_id=4, body="Synthetic progress update.")
+
+        self.assertEqual(receipt.number, 7)
+        comment = next(
+            call for call in runner.calls
+            if call[:3] == ("gh", "issue", "comment")
+        )
+        self.assertIn("acme/widget", comment)
+        self.assertIn("7", comment)
+        body = comment[comment.index("--body") + 1]
+        self.assertIn("Synthetic progress update.", body)
+        self.assertIn("Foxhound for task 4", body)
+
+    def test_unusable_issue_comment_target_is_refused_before_writing(self):
+        runner = _gh([])
+        with mock.patch.object(forge_action, "_run", runner):
+            for change in (
+                {"repository": "widget"},
+                {"repository": "bitbucket.org/acme/widget"},
+                {"number": "not-a-number"},
+                {"number": "0"},
+                {"body": "  "},
+            ):
+                with self.subTest(change=change):
+                    values = {
+                        "repository": "github.com/acme/widget",
+                        "number": "7", "task_id": 4, "body": "x",
+                    }
+                    values.update(change)
+                    with self.assertRaises(ForgeActionError):
+                        forge_action.post_issue_comment(**values)
+        self.assertEqual(runner.calls, [])
+
+
 class PushIsBounded(unittest.TestCase):
     def test_the_refname_is_explicit_on_both_sides(self) -> None:
         # A misconfigured local push default cannot redirect it.
