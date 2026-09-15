@@ -45,6 +45,8 @@ from foxhound.task_card_server import (
     EXECUTION_STATS_SCHEMA,
     HEALTH_SCHEMA,
     OPERATION_SCHEMA,
+    QUEUE_SCHEMA,
+    QUEUE_SCHEMA_VERSION,
     QUEUE_VIEW_ROLE,
     REQUEST_SCHEMA,
     SCHEDULE_SCHEMA,
@@ -1194,6 +1196,79 @@ class TaskCardServerTests(unittest.TestCase):
 
 
 QUEUE_VIEW_TOKEN = "q" * 43
+
+
+class TaskCardQueueProjectionTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.database = Path(self.temporary.name) / "foxhound.sqlite3"
+        self.clock = Clock()
+        CandidateInbox(self.database, clock=self.clock).initialize()
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            for index in range(1, 4):
+                connection.execute(
+                    "INSERT INTO tasks(status,text,owner,due,version,created_at,"
+                    "updated_at,closed_at) VALUES('open',?,?,?,?,?,?,NULL)",
+                    (
+                        f"Synthetic queue task {index}", f"Person {index}",
+                        None, 1, f"2030-01-{index:02d}T12:00:00+00:00",
+                        NOW.isoformat(timespec="seconds"),
+                    ),
+                )
+        self.cards = TaskCardService(
+            self.database, clock=self.clock, token_factory=lambda: CLAIM_TOKEN
+        )
+        self.cards.schedule(limit=3)
+        self.app = TaskCardApplication(
+            self.cards, {DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: QUEUE_VIEW_TOKEN}
+        )
+
+    def test_queue_view_reads_due_cards_without_claiming_and_drip_is_refused(self):
+        before = (self.cards.count(), self.cards.event_count())
+        with running_server(self.app) as endpoint:
+            status, _, body = request(
+                endpoint, "/v1/task-cards/queue",
+                request_document(limit=3), token=QUEUE_VIEW_TOKEN,
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                (body["schema"], body["schema_version"], body["ok"]),
+                (QUEUE_SCHEMA, QUEUE_SCHEMA_VERSION, True),
+            )
+            self.assertEqual(len(body["cards"]), 3)
+            self.assertEqual(body["cards"][0]["text"], "Synthetic queue task 1")
+            self.assertEqual(body["cards"][0]["status"], "pending")
+            status, _, refused = request(
+                endpoint, "/v1/task-cards/queue",
+                request_document(limit=3), token=TOKEN,
+            )
+            self.assertEqual((status, refused["error"]["code"]),
+                             (403, "role_forbidden"))
+        self.assertEqual((self.cards.count(), self.cards.event_count()), before)
+        # A read did not consume a lease: the drip consumer can still claim.
+        claim = self.cards.claim_next(
+            lease_seconds=60,
+            consumer_digest=hashlib.sha256(TOKEN.encode()).hexdigest(),
+            consumer_role=DRIP_ROLE,
+        )
+        self.assertIsNotNone(claim)
+
+    def test_queue_projection_excludes_cards_held_by_any_consumer(self):
+        claim = self.cards.claim_next(
+            lease_seconds=60,
+            consumer_digest=hashlib.sha256(TOKEN.encode()).hexdigest(),
+            consumer_role=DRIP_ROLE,
+        )
+        self.assertIsNotNone(claim)
+        held_id = claim.card.id
+        with running_server(self.app) as endpoint:
+            status, _, body = request(
+                endpoint, "/v1/task-cards/queue",
+                request_document(limit=3), token=QUEUE_VIEW_TOKEN,
+            )
+        self.assertEqual(status, 200)
+        self.assertNotIn(held_id, {card["id"] for card in body["cards"]})
 
 
 class TaskCardTokenRoleTests(unittest.TestCase):

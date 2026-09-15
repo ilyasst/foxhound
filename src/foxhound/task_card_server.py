@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import hashlib
 import hmac
 import ipaddress
@@ -58,6 +59,8 @@ CLAIM_SCHEMA = "foxhound.task-card-service.claim"
 OPERATION_SCHEMA = "foxhound.task-card-service.operation"
 STATS_SCHEMA = "foxhound.task-card-service.stats"
 STATS_SCHEMA_VERSION = 2
+QUEUE_SCHEMA = "foxhound.task-card-service.queue"
+QUEUE_SCHEMA_VERSION = 1
 EXECUTION_SCHEDULE_SCHEMA = "foxhound.execution-card-service.schedule"
 EXECUTION_CLAIM_SCHEMA = "foxhound.execution-card-service.claim"
 EXECUTION_OPERATION_SCHEMA = "foxhound.execution-card-service.operation"
@@ -75,9 +78,8 @@ EXECUTION_AGENT_SELECTION_SCHEMA = (
 # exactly one role from this closed set. A single legacy token with no
 # explicit role is `DRIP_ROLE`, reproducing today's behavior -- the existing
 # chat gateway's drip delivery -- with no configuration change (invariant 3).
-# `QUEUE_VIEW_ROLE` is the console's read/resolve pattern; no route uses it
-# yet (that is issues #195/#197), but the role itself must exist now so a
-# token's role can be resolved, or refused, before any such route lands.
+# `QUEUE_VIEW_ROLE` is the console's read/resolve pattern. Both roles are
+# resolved, or refused, before a consumer-scoped operation runs.
 DRIP_ROLE = "drip"
 QUEUE_VIEW_ROLE = "queue_view"
 TASK_CARD_CONSUMER_ROLES = frozenset({DRIP_ROLE, QUEUE_VIEW_ROLE})
@@ -85,6 +87,7 @@ TASK_CARD_CONSUMER_ROLES = frozenset({DRIP_ROLE, QUEUE_VIEW_ROLE})
 ROUTES = {
     "/v1/task-cards/stats": "stats",
     "/v2/task-cards/stats": "stats_scoped",
+    "/v1/task-cards/queue": "queue",
     "/v1/task-cards/schedule": "schedule",
     "/v1/task-cards/claim": "claim",
     "/v1/task-cards/delivered": "delivered",
@@ -301,6 +304,37 @@ class TaskCardApplication:
                 "snoozed": stats.snoozed,
                 "elsewhere": stats.elsewhere,
                 "active": stats.active,
+            }
+        if operation == "queue":
+            request = _request(payload, required={"limit"})
+            try:
+                identity = self.resolve_consumer(authorization)
+            except TaskCardConsumerIdentityError as exc:
+                raise TaskCardServerRequestError(
+                    "consumer_unresolved",
+                    "task card consumer role is unresolved",
+                    HTTPStatus.FORBIDDEN,
+                ) from exc
+            if identity is None:
+                raise TaskCardServerRequestError(
+                    "consumer_unresolved",
+                    "task card consumer role is unresolved",
+                    HTTPStatus.FORBIDDEN,
+                )
+            if identity.role != QUEUE_VIEW_ROLE:
+                raise TaskCardServerRequestError(
+                    "role_forbidden",
+                    "task card queue requires the queue_view role",
+                    HTTPStatus.FORBIDDEN,
+                )
+            cards = self.cards.due(
+                limit=_integer(request["limit"], minimum=1, maximum=1_000)
+            )
+            return {
+                "schema": QUEUE_SCHEMA,
+                "schema_version": QUEUE_SCHEMA_VERSION,
+                "ok": True,
+                "cards": [_queue_card_document(card) for card in cards],
             }
         if operation == "schedule":
             request = _request(payload, required={"limit"})
@@ -1018,6 +1052,15 @@ def _schedule_document(result: ScheduleResult) -> dict[str, Any]:
         "cancelled": result.cancelled,
         "refusal": None if result.refusal is None else result.refusal.value,
     }
+
+
+def _queue_card_document(card: Any) -> dict[str, Any]:
+    """Expose the read-only ``due()`` projection without rendering or lease data."""
+    document = asdict(card)
+    # The service's enum is a str enum, but normalize it explicitly so this
+    # contract remains JSON-shaped if the internal enum implementation changes.
+    document["status"] = card.status.value
+    return document
 
 
 def _operation_document(result: CardOperationResult) -> dict[str, Any]:
