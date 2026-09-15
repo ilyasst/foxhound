@@ -83,6 +83,7 @@ _RESULT_INPUTS = (
     "result-external-actions.json",
     "result-deliverables.json",
     "result-repository-references.json",
+    "result-repository-impact.json",
     REPOSITORY_RECEIPTS_NAME,
     ARTIFACT_MANIFEST_NAME,
 )
@@ -566,6 +567,7 @@ class ExecutionWorker:
             external_actions=draft["external_actions"],
             deliverables=draft["deliverables"],
             repository_references=draft["repository_references"],
+            repository_impact=draft["repository_impact"],
             task_work_directory=state.task_work_directory,
             task_kb_file=state.task_kb_file,
         )
@@ -657,6 +659,10 @@ class ExecutionWorker:
                 run_directory / "result-repository-references.json",
                 label="execution result repository references",
             ),
+            "repository_impact": _read_optional_repository_impact(
+                run_directory / "result-repository-impact.json",
+                label="execution result repository impact",
+            ),
         }, run_directory)
         envelope = ExecutionResultEnvelope(
             result_id=result_id,
@@ -672,6 +678,7 @@ class ExecutionWorker:
             external_actions=draft["external_actions"],
             deliverables=draft["deliverables"],
             repository_references=draft["repository_references"],
+            repository_impact=draft["repository_impact"],
             task_work_directory=state.task_work_directory,
             task_kb_file=state.task_kb_file,
         )
@@ -703,6 +710,7 @@ class ExecutionWorker:
                 "deliverables": list(validated["deliverables"]),
                 "repository_references": list(
                     validated["repository_references"]),
+                "repository_impact": validated["repository_impact"],
             },
         )
         return {
@@ -920,7 +928,10 @@ def load_result_draft(
     supplied = set(document)
     if supplied == fields:
         document["repository_references"] = []
-    elif supplied != fields | {"repository_references"}:
+        document["repository_impact"] = True
+    elif supplied == fields | {"repository_references"}:
+        document["repository_impact"] = True
+    elif supplied != fields | {"repository_references", "repository_impact"}:
         raise ExecutionWorkerDraftError("execution result draft is invalid")
     if (
         document["schema"] != RESULT_DRAFT_SCHEMA
@@ -1079,6 +1090,35 @@ def _read_optional_repository_references(
     return value
 
 
+def _read_optional_repository_impact(
+    path: Path, *, label: str,
+) -> bool:
+    """Read the explicit exception for analysis-only repository work.
+
+    The safe default is true: an absent file must not let implementation
+    silently bypass its repository follow-through.
+    """
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return True
+    except OSError as exc:
+        raise ExecutionWorkerDraftError(f"{label} is unavailable") from exc
+    try:
+        raw = _read_private_bytes(path, maximum=64, label=label)
+        value = json.loads(raw, object_pairs_hook=_strict_object)
+    except (
+        ExecutionWorkerConfigError,
+        UnicodeDecodeError,
+        ValueError,
+        TypeError,
+    ) as exc:
+        raise ExecutionWorkerDraftError(f"{label} is invalid") from exc
+    if not isinstance(value, bool):
+        raise ExecutionWorkerDraftError(f"{label} is invalid")
+    return value
+
+
 def _read_private_text(path: Path, *, maximum: int, label: str) -> str:
     raw = _read_private_bytes(path, maximum=maximum, label=label)
     try:
@@ -1231,6 +1271,10 @@ def _repository_result(
     relying on the agent to copy a URL from a terminal response.
     """
     result = dict(draft)
+    repository_impact = result.get("repository_impact", True)
+    if not isinstance(repository_impact, bool):
+        raise ExecutionWorkerDraftError("repository impact is invalid")
+    result["repository_impact"] = repository_impact
     origin = _repository_origin(state)
     if origin is None:
         return result
@@ -1244,14 +1288,15 @@ def _repository_result(
         raise ExecutionWorkerDraftError(
             "repository result must name a deliverable"
         )
-    if state.phase is WorkflowPhase.EXECUTE:
+    if state.phase is WorkflowPhase.EXECUTE and repository_impact:
         if outcome == "completed":
             raise ExecutionWorkerDraftError(
                 "repository execution must await an approved follow-through"
             )
-        if outcome == "awaiting_external" and not actions:
+        if (outcome == "awaiting_external"
+                and not _has_origin_follow_through_action(actions, origin)):
             raise ExecutionWorkerDraftError(
-                "repository execution must request a repository action"
+                "repository execution must request an action targeting its origin"
             )
     if (
         state.phase is WorkflowPhase.EXTERNAL_ACTION
@@ -1293,6 +1338,26 @@ def _repository_result(
                 )
     result["repository_references"] = references
     return result
+
+
+def _has_origin_follow_through_action(
+    actions: object, origin: object,
+) -> bool:
+    """Require an approval card to name the exact pending forge update."""
+    if not isinstance(actions, list):
+        return False
+    record_id = getattr(origin, "record_id", None)
+    item_id = getattr(origin, "item_id", None)
+    kind = getattr(origin, "kind", None)
+    if not all(isinstance(value, str) and value for value in
+               (record_id, item_id, kind)):
+        return False
+    path = "issues" if kind == "issue" else "pull"
+    expected = f"https://{record_id}/{path}/{item_id.split('/', 1)[0]}"
+    return any(
+        isinstance(action, dict) and action.get("target") == expected
+        for action in actions
+    )
 
 
 def _reference_matches_origin(url: object, record_id: str) -> bool:
