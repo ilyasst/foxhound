@@ -59,6 +59,8 @@ WORKER_SEARCH_SCHEMA = "foxhound.execution-worker-search"
 RESULT_DRAFT_SCHEMA = "foxhound.execution-result-draft"
 RESULT_DRAFT_READY_SCHEMA = "foxhound.execution-result-draft-ready"
 RESULT_RECEIPT_SCHEMA = "foxhound.execution-result-receipt"
+REPOSITORY_RECEIPTS_NAME = "repository-action-receipts.json"
+REPOSITORY_RECEIPTS_SCHEMA = "foxhound.repository-action-receipts"
 WORKER_SCHEMA_VERSION = 1
 
 STATE_ENV = "FOXHOUND_EXECUTION_STATE"
@@ -80,6 +82,7 @@ _RESULT_INPUTS = (
     "result-questions.json",
     "result-external-actions.json",
     "result-deliverables.json",
+    REPOSITORY_RECEIPTS_NAME,
     ARTIFACT_MANIFEST_NAME,
 )
 
@@ -417,15 +420,17 @@ class ExecutionWorker:
             )
         except forge_action.ForgeActionError as exc:
             raise ExecutionWorkerClaimError(str(exc)) from exc
-        # Renewed only after the write succeeded, so a lease that lapses
-        # mid-post is not extended by the attempt itself.
-        self._renew(service, state)
-        return {
+        result = {
             "kind": "review",
             "repository": receipt.repository,
             "number": receipt.number,
             "url": receipt.url,
         }
+        _append_repository_receipt(self._state_path.parent, result)
+        # Renewed only after the write succeeded, so a lease that lapses
+        # mid-post is not extended by the attempt itself.
+        self._renew(service, state)
+        return result
 
     def act_comment(self, *, body_file: str) -> dict[str, Any]:
         """Post an approved status update on this task's own origin issue.
@@ -454,13 +459,15 @@ class ExecutionWorker:
                 task_id=state.task_id, body=body)
         except forge_action.ForgeActionError as exc:
             raise ExecutionWorkerClaimError(str(exc)) from exc
-        self._renew(service, state)
-        return {
+        result = {
             "kind": "issue-comment",
             "repository": receipt.repository,
             "number": receipt.number,
             "url": receipt.url,
         }
+        _append_repository_receipt(self._state_path.parent, result)
+        self._renew(service, state)
+        return result
 
     def act_pull_request(self, *, head: str, title: str,
                          body_file: str | None,
@@ -508,10 +515,7 @@ class ExecutionWorker:
             )
         except forge_action.ForgeActionError as exc:
             raise ExecutionWorkerClaimError(str(exc)) from exc
-        # Renewed only after the action succeeded: a lease that lapses mid-write
-        # must not be extended by the attempt itself.
-        self._renew(service, state)
-        return {
+        result = {
             "kind": "pull-request",
             "repository": receipt.repository,
             "issue": receipt.issue,
@@ -520,12 +524,18 @@ class ExecutionWorker:
             "head": receipt.head,
             "base": receipt.base,
         }
+        _append_repository_receipt(self._state_path.parent, result)
+        # Renewed only after the action succeeded: a lease that lapses mid-write
+        # must not be extended by the attempt itself.
+        self._renew(service, state)
+        return result
 
     def record(self, draft_name: str) -> dict[str, Any]:
         state = load_run_state(self._state_path)
         draft_path, draft = load_result_draft(
             self._state_path.parent, draft_name
         )
+        draft = _repository_result(state, draft, self._state_path.parent)
         envelope = ExecutionResultEnvelope(
             result_id=draft["result_id"],
             task_id=state.task_id,
@@ -610,6 +620,29 @@ class ExecutionWorker:
         state, service = self._active()
         run_directory = self._state_path.parent
         result_id = state.run_id
+        draft = _repository_result(state, {
+            "outcome": outcome,
+            "summary": _read_result_text(
+                run_directory / "result-summary.txt",
+                label="execution result summary",
+            ),
+            "work_markdown": _read_result_text(
+                run_directory / "result-work.md",
+                label="execution result work",
+            ),
+            "questions": _read_optional_string_array(
+                run_directory / "result-questions.json",
+                label="execution result questions",
+            ),
+            "external_actions": _read_optional_string_array(
+                run_directory / "result-external-actions.json",
+                label="execution result external actions",
+            ),
+            "deliverables": _read_optional_string_array(
+                run_directory / "result-deliverables.json",
+                label="execution result deliverables",
+            ),
+        }, run_directory)
         envelope = ExecutionResultEnvelope(
             result_id=result_id,
             task_id=state.task_id,
@@ -617,27 +650,12 @@ class ExecutionWorker:
             workflow_version=state.workflow_version,
             phase=state.phase.value,
             claim_token=state.claim_token,
-            outcome=outcome,
-            summary=_read_result_text(
-                run_directory / "result-summary.txt",
-                label="execution result summary",
-            ),
-            work_markdown=_read_result_text(
-                run_directory / "result-work.md",
-                label="execution result work",
-            ),
-            questions=_read_optional_string_array(
-                run_directory / "result-questions.json",
-                label="execution result questions",
-            ),
-            external_actions=_read_optional_string_array(
-                run_directory / "result-external-actions.json",
-                label="execution result external actions",
-            ),
-            deliverables=_read_optional_string_array(
-                run_directory / "result-deliverables.json",
-                label="execution result deliverables",
-            ),
+            outcome=draft["outcome"],
+            summary=draft["summary"],
+            work_markdown=draft["work_markdown"],
+            questions=draft["questions"],
+            external_actions=draft["external_actions"],
+            deliverables=draft["deliverables"],
             task_work_directory=state.task_work_directory,
             task_kb_file=state.task_kb_file,
         )
@@ -1140,6 +1158,155 @@ def _write_new_private_json(path: Path, document: dict[str, Any]) -> None:
             raise
     finally:
         os.close(descriptor)
+
+
+def _repository_origin(state: ExecutionRunState):
+    """Return the addressable forge origin for this run, if it has one."""
+    origin = TaskLedger(state.database_path).origin(state.task_id)
+    if (
+        origin is None
+        or origin.kind not in {"issue", "review_request"}
+        or not origin.record_id.startswith("github.com/")
+    ):
+        return None
+    return origin
+
+
+def _repository_result(
+    state: ExecutionRunState, draft: Mapping[str, Any], run_directory: Path,
+) -> dict[str, Any]:
+    """Require a visible repository follow-through for forge work.
+
+    Planning may remain a local review decision.  Once implementation is
+    complete, however, GitHub work must wait for an approved outside action;
+    an external completion is accepted only when the bounded worker action
+    left a durable receipt.  The receipt becomes a card deliverable instead of
+    relying on the agent to copy a URL from a terminal response.
+    """
+    result = dict(draft)
+    if _repository_origin(state) is None:
+        return result
+    outcome = result.get("outcome")
+    actions = result.get("external_actions")
+    if not result.get("deliverables") and not (
+        state.phase is WorkflowPhase.EXTERNAL_ACTION
+        and outcome == "completed"
+    ):
+        raise ExecutionWorkerDraftError(
+            "repository result must name a deliverable"
+        )
+    if state.phase is WorkflowPhase.EXECUTE:
+        if outcome == "completed":
+            raise ExecutionWorkerDraftError(
+                "repository execution must await an approved follow-through"
+            )
+        if outcome == "awaiting_external" and not actions:
+            raise ExecutionWorkerDraftError(
+                "repository execution must request a repository action"
+            )
+    if (
+        state.phase is WorkflowPhase.EXTERNAL_ACTION
+        and outcome == "completed"
+    ):
+        receipts = _repository_receipts(run_directory)
+        if not receipts:
+            raise ExecutionWorkerDraftError(
+                "repository completion requires a worker action receipt"
+            )
+        result["deliverables"] = [
+            *list(result.get("deliverables") or ()),
+            *[
+                "Repository follow-through: "
+                f"[{receipt['kind']}]({receipt['url']})"
+                for receipt in receipts
+            ],
+        ]
+    return result
+
+
+def _repository_receipts(run_directory: Path) -> tuple[dict[str, str], ...]:
+    path = run_directory / REPOSITORY_RECEIPTS_NAME
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return ()
+    except OSError as exc:
+        raise ExecutionWorkerDraftError(
+            "repository action receipts are unavailable"
+        ) from exc
+    try:
+        document = _read_private_json(
+            path, maximum=MAX_DRAFT_BYTES,
+            label="repository action receipts",
+        )
+    except ExecutionWorkerConfigError as exc:
+        raise ExecutionWorkerDraftError(
+            "repository action receipts are invalid"
+        ) from exc
+    if (
+        document.get("schema") != REPOSITORY_RECEIPTS_SCHEMA
+        or document.get("schema_version") != WORKER_SCHEMA_VERSION
+        or set(document) != {"schema", "schema_version", "receipts"}
+        or not isinstance(document.get("receipts"), list)
+        or not document["receipts"]
+        or len(document["receipts"]) > 8
+    ):
+        raise ExecutionWorkerDraftError("repository action receipts are invalid")
+    receipts: list[dict[str, str]] = []
+    for value in document["receipts"]:
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"kind", "repository", "url"}
+            or not isinstance(value.get("kind"), str)
+            or not isinstance(value.get("repository"), str)
+            or not isinstance(value.get("url"), str)
+            or value["kind"] not in {"issue-comment", "pull-request", "review"}
+            or not value["repository"].startswith("github.com/")
+            or not value["url"].startswith("https://github.com/")
+        ):
+            raise ExecutionWorkerDraftError(
+                "repository action receipts are invalid"
+            )
+        receipts.append({key: value[key] for key in ("kind", "repository", "url")})
+    return tuple(receipts)
+
+
+def _append_repository_receipt(
+    run_directory: Path, receipt: Mapping[str, object],
+) -> None:
+    """Durably retain a successful bounded forge action for final recording."""
+    try:
+        normalized = {
+            key: str(receipt[key])
+            for key in ("kind", "repository", "url")
+        }
+    except (KeyError, TypeError):
+        raise ExecutionWorkerClaimError("repository action receipt is invalid")
+    if (
+        normalized["kind"] not in {"issue-comment", "pull-request", "review"}
+        or not normalized["repository"].startswith("github.com/")
+        or not normalized["url"].startswith("https://github.com/")
+    ):
+        raise ExecutionWorkerClaimError("repository action receipt is invalid")
+    path = run_directory / REPOSITORY_RECEIPTS_NAME
+    try:
+        existing = list(_repository_receipts(run_directory))
+    except ExecutionWorkerDraftError as exc:
+        raise ExecutionWorkerClaimError("repository action receipt is unavailable") from exc
+    if normalized not in existing:
+        existing.append(normalized)
+    document = {
+        "schema": REPOSITORY_RECEIPTS_SCHEMA,
+        "schema_version": WORKER_SCHEMA_VERSION,
+        "receipts": existing,
+    }
+    try:
+        if path.exists():
+            _replace_private_json(path, document)
+        else:
+            _write_new_private_json(path, document)
+    except (OSError, ExecutionWorkerError) as exc:
+        raise ExecutionWorkerClaimError("repository action receipt is unavailable") from exc
 
 
 def _remove_result_inputs(run_directory: Path) -> None:

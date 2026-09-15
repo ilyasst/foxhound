@@ -10,7 +10,11 @@ from typing import Sequence
 
 from .agent_profiles import AgentProfileError, load_registry
 from .task_bootstrap import TaskBootstrapConfigError, _private_database
-from .task_execution import ExecutionScheduleResult, TaskExecutionService
+from .task_execution import (
+    ExecutionScheduleResult,
+    TaskExecutionService,
+    WorkflowPhase,
+)
 from .task_ledger import TaskLedgerError
 
 
@@ -19,15 +23,31 @@ def run_schedule(
     database_path: Path,
     limit: int = 100,
     agent_profile_directory: Path | None = None,
-    default_agent_profile: str = "general",
+    default_agent_profile: str = "sigint",
     plan_without_asking: Sequence[str] | None = None,
 ) -> ExecutionScheduleResult:
     database = _private_database(database_path)
     registry = load_registry(agent_profile_directory)
+    # The production scheduler must never silently run repository work on the
+    # compatibility profile when SigInt is missing or disabled.
+    if agent_profile_directory is not None and default_agent_profile == "sigint":
+        sigint = registry.get("sigint")
+        if sigint is None or any(
+            phase.value not in sigint.allowed_phases for phase in WorkflowPhase
+        ):
+            raise AgentProfileError(
+                "the installed SigInt profile is unavailable"
+            )
+    # A library/test invocation without the private catalog can only use the
+    # built-in compatibility profile. Production invocations pass the
+    # catalog directory and are rejected above when SigInt is unavailable.
+    selected_profile = default_agent_profile
+    if agent_profile_directory is None and selected_profile == "sigint":
+        selected_profile = "general"
     return TaskExecutionService(
         database,
         profile_registry=registry,
-        default_profile_id=default_agent_profile,
+        default_profile_id=selected_profile,
         planning_grants=plan_without_asking,
     ).schedule_new(limit=limit)
 
@@ -40,7 +60,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--database", required=True, type=Path)
     parser.add_argument("--limit", default=100, type=int)
     parser.add_argument("--agent-profile-directory", type=Path)
-    parser.add_argument("--default-agent-profile", default="general")
+    parser.add_argument("--default-agent-profile", default="sigint")
     parser.add_argument(
         "--plan-without-asking",
         action="append",
