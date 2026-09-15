@@ -1838,6 +1838,124 @@ class ExecutionCardTests(unittest.TestCase):
 
         self.assertEqual(self.cards.stats(), before)
 
+    def test_a_delivered_card_can_be_rendered_again_unchanged(self):
+        """Backing out of a sub-menu must land exactly where you left.
+
+        A surface that replaces the keyboard with a picker cannot put the
+        keyboard back on its own, so it asks for the card again. If that
+        ask moved any version, the restored controls would address a card
+        that no longer exists and every one of them would answer with a
+        stale refusal -- which is the same dead end, reached more slowly.
+        """
+        self._schedule_workflow(1)
+        self.cards.schedule()
+        claim = self._claim_and_deliver()
+        delivered_body, delivered_keyboard = render_execution_review_card(
+            claim.card
+        )
+        before = self.cards.stats()
+
+        view = self.cards.view(
+            claim.card.id, expected_version=claim.card.version
+        )
+
+        self.assertTrue(view.accepted, view.refusal)
+        self.assertEqual(view.card_version, claim.card.version)
+        body, keyboard = render_execution_review_card(view.card)
+        self.assertEqual(body, delivered_body)
+        self.assertEqual(keyboard, delivered_keyboard)
+        # The control the picker replaces is there to be restored.
+        self.assertIn(
+            "snooze",
+            [parse_execution_review_callback(button["callback_data"])[2]
+             for row in keyboard["inline_keyboard"] for button in row],
+        )
+        self.assertEqual(self.cards.stats(), before)
+
+        # Nothing moved, so the card is still answerable at that version.
+        answered = self.cards.act(
+            claim.card.id,
+            expected_version=claim.card.version,
+            action="start",
+        )
+        self.assertTrue(answered.accepted, answered.refusal)
+
+    def test_an_undelivered_or_superseded_card_has_no_presentation(self):
+        """A card with no message behind it has nothing to restore, and one
+        that has moved on must not be handed back looking answerable."""
+        self._schedule_workflow(1)
+        self.cards.schedule()
+        claim = self.cards.claim_next()
+
+        # Claimed but not yet acknowledged: there is no delivered message.
+        undelivered = self.cards.view(
+            claim.card.id, expected_version=claim.card.version
+        )
+        self.assertFalse(undelivered.accepted)
+        self.assertEqual(
+            undelivered.refusal, ExecutionCardRefusal.INVALID_STATE
+        )
+        self.assertIsNone(undelivered.card)
+
+        self.cards.complete_delivery(
+            claim.card.id,
+            expected_version=claim.card.version,
+            claim_token=claim.token,
+            transport="synthetic",
+            delivery_ref="view-message",
+        )
+        stale = self.cards.view(
+            claim.card.id, expected_version=claim.card.version + 5
+        )
+        self.assertFalse(stale.accepted)
+        self.assertEqual(stale.refusal, ExecutionCardRefusal.STALE_VERSION)
+        self.assertIsNone(stale.card)
+
+    def test_a_restored_card_keeps_the_owner_hold_control(self):
+        """The reader aliases decide whether the hold is offered.
+
+        Rendering the restoration without them would silently drop a
+        control the reader could see a moment earlier -- a quieter version
+        of the bug this read exists to fix.
+        """
+        self._set_structured_owner(
+            1,
+            "Person B",
+            speaker_id="SPK_010",
+            canonical_speaker_id="SPK_002",
+        )
+        cards = ExecutionCardService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: DELIVERY_TOKEN,
+            owner_condition=lambda *, owner, owner_ref: OwnerUpcomingMeeting(
+                False, self.clock().isoformat(timespec="seconds"), "a" * 64
+            ),
+            reader_aliases=("Person A", "A. Person"),
+        )
+        self._schedule_workflow(1)
+        self.assertEqual(cards.schedule().created, 1)
+        claim = cards.claim_next()
+        cards.complete_delivery(
+            claim.card.id,
+            expected_version=claim.card.version,
+            claim_token=claim.token,
+            transport="synthetic",
+            delivery_ref="hold-view",
+        )
+
+        view = cards.view(
+            claim.card.id, expected_version=claim.card.version
+        )
+
+        self.assertTrue(view.accepted, view.refusal)
+        _body, keyboard = render_execution_review_card(view.card)
+        self.assertIn(
+            "until_meeting",
+            [parse_execution_review_callback(button["callback_data"])[2]
+             for row in keyboard["inline_keyboard"] for button in row],
+        )
+
     def test_a_brief_for_a_card_that_has_moved_on_is_refused(self):
         task_id = 1
         self._plan_review(task_id, "brief-stale")
