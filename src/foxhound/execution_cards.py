@@ -533,6 +533,109 @@ class ExecutionCardService:
             self._render_card(row) for row in rows if _current_card(row)
         )
 
+    def resolve_queue_view(
+        self, card_id: int, *, expected_version: int, action: str,
+        input_kind: str | None = None, value: str | None = None,
+        selection_token: str | None = None, consumer_digest: str,
+    ) -> ExecutionCardOperationResult | "ClaimAtCeiling":
+        """Claim, internally deliver, and resolve one queue card atomically."""
+        if (not _valid_identity(card_id, expected_version)
+                or not _valid_digest(consumer_digest)):
+            return _refused(card_id, ExecutionCardRefusal.INVALID_ARGUMENT)
+        allowed = {"start", "snooze", OWNER_HOLD_ACTION, *REVIEW_DIRECT_ACTIONS,
+                   "discussion", "reassignment", "comment_and_go"}
+        if action not in allowed:
+            return _refused(card_id, ExecutionCardRefusal.INVALID_ACTION)
+        if action in {"discussion", "reassignment"}:
+            if input_kind != action or not _valid_reader_input(input_kind, value):
+                return _refused(card_id, ExecutionCardRefusal.INVALID_ARGUMENT)
+        elif action == "comment_and_go":
+            if input_kind != "discussion" or not _valid_reader_input("discussion", value):
+                return _refused(card_id, ExecutionCardRefusal.INVALID_ARGUMENT)
+        elif action == "select_agent":
+            return _refused(card_id, ExecutionCardRefusal.INVALID_ACTION)
+        elif input_kind is not None or value is not None or selection_token is not None:
+            return _refused(card_id, ExecutionCardRefusal.INVALID_ARGUMENT)
+        stamp = self._clock_value()
+        now = stamp.isoformat(timespec="seconds")
+        with closing(self._connect()) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(self._card_select() + " WHERE c.id=?", (card_id,)).fetchone()
+                refusal = _card_guard(row, expected_version)
+                if refusal is None and row["status"] != ExecutionCardStatus.PENDING:
+                    refusal = ExecutionCardRefusal.INVALID_STATE
+                if refusal is None and row is not None and (row["workflow_status_current"] == WorkflowStatus.SNOOZED
+                                        and row["workflow_due_at"] > now):
+                    refusal = ExecutionCardRefusal.INVALID_STATE
+                if refusal is None and not _current_card(row):
+                    refusal = ExecutionCardRefusal.STALE_VERSION
+                held = connection.execute(
+                    "SELECT count(*) FROM execution_review_cards WHERE status IN ('delivering','delivered') AND consumer_digest=?",
+                    (consumer_digest,),
+                ).fetchone()[0]
+                if refusal is None and held >= EXECUTION_CARD_CLAIM_CEILINGS["queue_view"]:
+                    connection.commit()
+                    return ClaimAtCeiling(int(held), EXECUTION_CARD_CLAIM_CEILINGS["queue_view"])
+                kind = ExecutionCardKind(row["kind"]) if row is not None else None
+                if refusal is None and action in {"start", "approve", "done"} and not _card_fits(self._render_card(row)):
+                    refusal = ExecutionCardRefusal.INVALID_STATE
+                if refusal is None and action not in {"discussion", "reassignment", "comment_and_go", "select_agent"} and action not in _direct_actions_for_kind(kind):
+                    refusal = ExecutionCardRefusal.INVALID_ACTION
+                if refusal is not None:
+                    connection.rollback()
+                    return _refused_row(card_id, row, refusal)
+                # This is an internal delivery transition: no transport or
+                # claim capability crosses the queue_view boundary.
+                version = expected_version + 1
+                changed = connection.execute(
+                    "UPDATE execution_review_cards SET status='delivered',version=?,consumer_digest=?,"
+                    "transport='queue_view',delivery_ref=NULL,delivered_at=?,updated_at=? "
+                    "WHERE id=? AND version=? AND status='pending'",
+                    (version, consumer_digest, now, now, card_id, expected_version),
+                )
+                if changed.rowcount != 1:
+                    connection.rollback()
+                    return _refused_row(card_id, row, ExecutionCardRefusal.STALE_VERSION)
+                self._event(connection, card_id=card_id, task_id=int(row["task_id"]), kind="delivery_claimed",
+                             card_version=version, workflow_version=int(row["workflow_version"]), action=None, now=now)
+                self._event(connection, card_id=card_id, task_id=int(row["task_id"]), kind="delivered",
+                             card_version=version, workflow_version=int(row["workflow_version"]), action=None, now=now)
+                if action in {"discussion", "reassignment"}:
+                    # Preserve the established input semantics in this same transaction.
+                    target = int(row["workflow_version"]) + 1
+                    connection.execute(
+                        "INSERT INTO execution_reader_inputs(card_id,task_id,card_version,task_version,workflow_version,target_workflow_version,kind,value,prior_value,occurred_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        (card_id, int(row["task_id"]), version, int(row["task_version"]), int(row["workflow_version"]), target, input_kind, value, row["owner"] if input_kind == "reassignment" else None, now),
+                    )
+                    if input_kind == "reassignment":
+                        task_version = int(row["task_version"]) + 1
+                        if connection.execute("UPDATE tasks SET owner=?,version=?,updated_at=?,owner_ref_version=1,owner_kind='external',owner_speaker_id=NULL,owner_canonical_speaker_id=NULL,owner_speaker_registry_id=NULL,owner_pinned=1,owner_provisional=0 WHERE id=? AND version=? AND status='open'", (value, task_version, now, int(row["task_id"]), int(row["task_version"]))).rowcount != 1:
+                            raise TaskLedgerError("task ownership state changed")
+                        status, phase, resolution = WorkflowStatus.AWAITING_START, WorkflowPhase.PLAN, "reassign"
+                    else:
+                        task_version = int(row["task_version"]); status, phase, resolution = (WorkflowStatus.AWAITING_START if kind is ExecutionCardKind.START else WorkflowStatus.QUEUED), WorkflowPhase.PLAN, "discuss"
+                    workflow = connection.execute("UPDATE task_execution_workflows SET task_version=?,status=?,phase=?,version=?,due_at=NULL,claim_token_digest=NULL,claimed_at=NULL,claim_heartbeat_at=NULL,claim_expires_at=NULL,updated_at=? WHERE task_id=? AND version=?", (task_version, status, phase, target, now, int(row["task_id"]), int(row["workflow_version"])))
+                    if workflow.rowcount != 1: raise TaskLedgerError("execution workflow state changed")
+                    TaskExecutionService._event(connection, int(row["task_id"]), "reassigned" if input_kind == "reassignment" else "discussion_requested", target, task_version, phase, status, now)
+                    workflow_version, workflow_status, workflow_phase = target, status, phase
+                else:
+                    if action == "comment_and_go":
+                        connection.execute("INSERT INTO execution_reader_inputs(card_id,task_id,card_version,task_version,workflow_version,target_workflow_version,kind,value,prior_value,occurred_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (card_id, int(row["task_id"]), version, int(row["task_version"]), int(row["workflow_version"]), int(row["workflow_version"])+1, "discussion", value, None, now))
+                    workflow = (_apply_review_lifecycle_action(connection, row, action=action, now=now) if action in {"done", "drop"} else (_apply_start_action(connection, int(row["task_id"]), expected_version=int(row["workflow_version"]), action=action if action != "comment_and_go" else "start", stamp=stamp) if kind is ExecutionCardKind.START else _apply_review_action(connection, int(row["task_id"]), expected_version=int(row["workflow_version"]), action=action if action != "comment_and_go" else "approve", stamp=stamp)))
+                    if workflow.disposition is WorkflowDisposition.REFUSED:
+                        connection.rollback(); return _refused_row(card_id, row, _workflow_refusal(workflow.refusal))
+                    workflow_version, workflow_status, workflow_phase = workflow.version, workflow.status, workflow.phase
+                    resolution = _stored_action(action)
+                final_version = version + 1
+                connection.execute("UPDATE execution_review_cards SET status='resolved',version=?,claim_token_digest=NULL,consumer_digest=NULL,resolution=?,resolved_at=?,updated_at=? WHERE id=? AND version=? AND status='delivered'", (final_version, resolution, now, now, card_id, version))
+                self._event(connection, card_id=card_id, task_id=int(row["task_id"]), kind="resolved", card_version=final_version, workflow_version=int(workflow_version), action=resolution, now=now)
+                connection.commit()
+                return ExecutionCardOperationResult(ExecutionCardDisposition.APPLIED, card_id, card_version=final_version, card_status=ExecutionCardStatus.RESOLVED, workflow_version=int(workflow_version), workflow_status=workflow_status, workflow_phase=workflow_phase)
+            except Exception:
+                connection.rollback(); raise
+
     def claim_next(
         self, *, lease_seconds: int = 60, consumer_digest: str | None = None,
         consumer_role: str = "drip",
