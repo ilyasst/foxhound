@@ -914,6 +914,67 @@ class TaskCardServerTests(unittest.TestCase):
                         value=value,
                     ))
 
+    def test_execution_comment_and_go_route_advances_a_plan_with_its_note(self):
+        workflow = self.execution.schedule(1, expected_task_version=1)
+        self.execution.start_action(
+            1, expected_version=workflow.version, action="start"
+        )
+        run = self.execution.claim_next()
+        self.execution.record_result(ExecutionResultEnvelope(
+            result_id="synthetic-comment-go-plan",
+            task_id=1,
+            task_version=1,
+            workflow_version=run.workflow_version,
+            phase="plan",
+            claim_token=run.token,
+            outcome="awaiting_plan",
+            summary="Synthetic plan.",
+            work_markdown="Synthetic work.",
+        ))
+        self.execution_cards.schedule()
+        claim = self.execution_cards.claim_next()
+        self.execution_cards.complete_delivery(
+            claim.card.id,
+            expected_version=claim.card.version,
+            claim_token=claim.token,
+            transport="synthetic",
+            delivery_ref="synthetic-comment-go-message",
+        )
+
+        result = self.app.dispatch(
+            "execution_comment_and_go",
+            request_document(
+                card_id=claim.card.id,
+                card_version=claim.card.version,
+                value="Use the synthetic constraint.",
+            ),
+        )
+
+        self.assertEqual(
+            (result["ok"], result["card_status"], result["workflow_status"],
+             result["workflow_phase"]),
+            (True, "resolved", "queued", "execute"),
+        )
+        stale = self.app.dispatch(
+            "execution_comment_and_go",
+            request_document(
+                card_id=claim.card.id,
+                card_version=claim.card.version,
+                value="A second synthetic instruction.",
+            ),
+        )
+        self.assertEqual((stale["ok"], stale["refusal"]),
+                         (False, "stale_version"))
+        with self.assertRaises(TaskCardServerRequestError):
+            self.app.dispatch(
+                "execution_comment_and_go",
+                request_document(
+                    card_id=claim.card.id,
+                    card_version=claim.card.version,
+                    value=" ",
+                ),
+            )
+
     def test_execution_action_route_forwards_owner_hold_exactly(self):
         with closing(sqlite3.connect(self.database)) as connection:
             connection.execute(

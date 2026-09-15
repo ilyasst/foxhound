@@ -1423,6 +1423,148 @@ class ExecutionCardService:
                 connection.rollback()
                 raise
 
+    def comment_and_go(
+        self,
+        card_id: int,
+        *,
+        expected_version: int,
+        value: str,
+    ) -> ExecutionCardOperationResult:
+        """Persist a reader note and advance this card in one transaction.
+
+        The note targets the workflow version the chosen transition creates,
+        so the next agent sees it exactly once.  Unlike ``discuss``, this
+        does not first send the workflow back to planning and then require a
+        second card decision.
+        """
+        if (
+            not _valid_identity(card_id, expected_version)
+            or not _valid_reader_input("discussion", value)
+        ):
+            return _refused(card_id, ExecutionCardRefusal.INVALID_ARGUMENT)
+        stamp = self._clock_value()
+        now = stamp.isoformat(timespec="seconds")
+        with closing(self._connect()) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    self._card_select() + " WHERE c.id=?", (card_id,)
+                ).fetchone()
+                refusal = _card_guard(row, expected_version)
+                if (
+                    refusal is None
+                    and row["status"] != ExecutionCardStatus.DELIVERED
+                ):
+                    refusal = ExecutionCardRefusal.INVALID_STATE
+                if refusal is None and not _current_card(row):
+                    refusal = ExecutionCardRefusal.STALE_VERSION
+                kind = None if row is None else ExecutionCardKind(row["kind"])
+                action = {
+                    ExecutionCardKind.START: "start",
+                    ExecutionCardKind.PLAN_REVIEW: "approve",
+                    ExecutionCardKind.EXTERNAL_REVIEW: "approve",
+                }.get(kind)
+                if refusal is None and action is None:
+                    refusal = ExecutionCardRefusal.INVALID_ACTION
+                if (
+                    refusal is None
+                    and not _card_fits(self._render_card(row))
+                ):
+                    refusal = ExecutionCardRefusal.INVALID_STATE
+                if refusal is not None:
+                    connection.rollback()
+                    return _refused_row(card_id, row, refusal)
+
+                target_workflow_version = int(row["workflow_version"]) + 1
+                connection.execute(
+                    "INSERT INTO execution_reader_inputs("
+                    "card_id,task_id,card_version,task_version,"
+                    "workflow_version,target_workflow_version,kind,value,"
+                    "prior_value,occurred_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        card_id,
+                        int(row["task_id"]),
+                        expected_version,
+                        int(row["task_version"]),
+                        int(row["workflow_version"]),
+                        target_workflow_version,
+                        "discussion",
+                        value,
+                        None,
+                        now,
+                    ),
+                )
+                if kind is ExecutionCardKind.START:
+                    workflow = _apply_start_action(
+                        connection,
+                        int(row["task_id"]),
+                        expected_version=int(row["workflow_version"]),
+                        action=action,
+                        stamp=stamp,
+                    )
+                else:
+                    workflow = _apply_review_action(
+                        connection,
+                        int(row["task_id"]),
+                        expected_version=int(row["workflow_version"]),
+                        action=action,
+                        stamp=stamp,
+                    )
+                if (
+                    workflow.disposition is WorkflowDisposition.REFUSED
+                    or workflow.version != target_workflow_version
+                ):
+                    connection.rollback()
+                    return _refused_row(
+                        card_id,
+                        row,
+                        ExecutionCardRefusal.INVALID_STATE
+                        if workflow.disposition is not WorkflowDisposition.REFUSED
+                        else _workflow_refusal(workflow.refusal),
+                    )
+
+                version = expected_version + 1
+                updated = connection.execute(
+                    "UPDATE execution_review_cards SET status='resolved',"
+                    "version=?,claim_token_digest=NULL,claim_expires_at=NULL,"
+                    "resolution=?,resolved_at=?,updated_at=? "
+                    "WHERE id=? AND version=? AND status='delivered'",
+                    (
+                        version,
+                        _stored_action(action),
+                        now,
+                        now,
+                        card_id,
+                        expected_version,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise TaskLedgerError("execution card state changed")
+                self._event(
+                    connection,
+                    card_id=card_id,
+                    task_id=int(row["task_id"]),
+                    kind="resolved",
+                    card_version=version,
+                    workflow_version=target_workflow_version,
+                    action=action,
+                    now=now,
+                )
+                connection.commit()
+                return ExecutionCardOperationResult(
+                    ExecutionCardDisposition.APPLIED,
+                    card_id,
+                    card_version=version,
+                    card_status=ExecutionCardStatus.RESOLVED,
+                    workflow_version=target_workflow_version,
+                    workflow_status=workflow.status,
+                    workflow_phase=workflow.phase,
+                )
+            except Exception:
+                connection.rollback()
+                raise
+
     def stats(self) -> ExecutionCardStats:
         """What is actually occupying the reader's surface.
 
@@ -1942,6 +2084,7 @@ def parse_execution_review_callback(
         return None
     if parts[3] not in {
         "start", "snooze", "cancel", "approve", "revise", "discuss",
+        "comment_go",
         "done", "reassign", "drop", "agent", "brief", OWNER_HOLD_ACTION,
         *REVIEW_SNOOZE_ACTIONS,
     }:
@@ -3431,6 +3574,7 @@ def _button_rows(
         rows: tuple[tuple[tuple[str, str], ...], ...] = (
             (("✅ Done", "done"), ("▶️ Continue", "start")),
             (("🗑 Drop", "drop"), ("✏️ Update", "discuss")),
+            (("💬 Comment and Go", "comment_go"),),
             SNOOZE_BUTTON_ROW,
             (("👥 Reassign", "reassign"),),
         )
@@ -3448,6 +3592,7 @@ def _button_rows(
     if kind is ExecutionCardKind.EXTERNAL_REVIEW:
         rows = (
             (("✅ Authorize action", "approve"), ("⛔ Not now", "revise")),
+            (("💬 Comment and Go", "comment_go"),),
             SNOOZE_BUTTON_ROW,
             (("💬 Discuss", "discuss"), ("✅ Mark as done", "done")),
             stop_row,
@@ -3463,6 +3608,7 @@ def _button_rows(
         rows = (
             (("🔎 Investigate further", "revise"), ("💬 Discuss", "discuss")),
             (("▶️ Execute plan", "approve"), ("🤖 Agents", "agent")),
+            (("💬 Comment and Go", "comment_go"),),
             SNOOZE_BUTTON_ROW,
             (("✅ Mark as done", "done"),),
             stop_row,
@@ -3470,9 +3616,15 @@ def _button_rows(
     if approvable:
         return rows + ((("📋 Task brief", "brief"),),)
     reduced = tuple(
-        tuple(button for button in row if button[1] not in {"approve", "done"})
+        tuple(
+            button for button in row
+            if button[1] not in {"approve", "comment_go", "done"}
+        )
         for row in rows
-        if any(button[1] not in {"approve", "done"} for button in row)
+        if any(
+            button[1] not in {"approve", "comment_go", "done"}
+            for button in row
+        )
     )
     return reduced + ((("📋 Task brief", "brief"),),)
 
