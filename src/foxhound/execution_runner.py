@@ -54,6 +54,7 @@ from .task_archive import (
     TRANSCRIPT_NAME,
     prepare_task_archive,
     preserve_run_files,
+    publish_deliverables,
 )
 from .task_ledger import TaskLedger, TaskLedgerError
 from .source_policy import planning_grants as _planning_grants
@@ -543,6 +544,10 @@ def _run_claim(
             instructions_path.unlink(missing_ok=True)
         if archive is not None:
             preserve_run_files(directory, archive.run_directory)
+            # Then again, flattened, at the top of the task folder. The run
+            # directory is the record; the folder is what the reader opens.
+            with contextlib.suppress(TaskArchiveError):
+                publish_deliverables(archive, directory)
 
 
 def _terminal_result(

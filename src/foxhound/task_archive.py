@@ -28,6 +28,16 @@ RESULT_INPUT_NAMES = (
     "result-deliverables.json",
     "repository-action-receipts.json",
 )
+#: The rendered review document is rebuilt from this, never parsed back out
+#: of the Markdown. Hidden because it is machinery: the folder belongs to the
+#: reader, and what they open should be the document, not the state behind it.
+TASK_LOG_NAME = ".task-log.json"
+MAX_LOG_BYTES = 1024 * 1024
+#: Runs kept in the rendered history. Older ones stay on disk under `runs/`.
+MAX_HISTORY_RUNS = 50
+#: One history line is a reminder, not the result. The full text of every run
+#: stays in its own run directory.
+MAX_HISTORY_SUMMARY_CHARS = 200
 MAX_ARTIFACTS = 100
 MAX_ARTIFACT_BYTES = 2 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 20 * 1024 * 1024
@@ -85,20 +95,23 @@ def prepare_task_archive(
     _make_directory(task_directory / "runs")
     _make_directory(run_directory)
     source = _origin_markdown(origin_kind, origin_record, origin_item)
-    header = _task_header(task_id, task_text, source, task_directory)
-    _write_if_missing(task_directory / "README.md", header)
-    _write_if_missing(task_file, header)
     stamp = datetime.now().astimezone().isoformat(timespec="seconds")
-    run_entry = (
-        f"\n## Run {phase} — {stamp}\n\n"
-        f"- Agent: {agent_display_name}\n"
-        f"- Run: `{run_directory}`\n"
-        "- Evidence: see the run directory; the transcript is retained even "
-        "when no result is recorded.\n"
-    )
-    _append_private(task_directory / "README.md", run_entry)
-    _append_private(task_file, run_entry)
-    return TaskArchivePaths(task_directory, task_file, run_directory)
+    log = _read_log(task_directory)
+    log["task_id"] = task_id
+    log["task_text"] = task_text
+    log["source"] = source
+    log["working_directory"] = str(task_directory)
+    log.setdefault("runs", []).append({
+        "stamp": stamp,
+        "phase": phase,
+        "agent": agent_display_name,
+        "run": run_directory.name,
+        "outcome": None,
+        "summary": "",
+    })
+    paths = TaskArchivePaths(task_directory, task_file, run_directory)
+    _publish_log(paths, log)
+    return paths
 
 
 def _task_basename(
@@ -202,6 +215,54 @@ def preserve_run_files(
     return tuple(copied)
 
 
+def publish_deliverables(
+    paths: TaskArchivePaths, source_directory: Path
+) -> tuple[str, ...]:
+    """Copy the run's manifested artifacts to the task folder itself.
+
+    An artifact copied only into `runs/<phase>-<id>/` is preserved but not
+    delivered: the reader opening the task folder sees a README and a `runs`
+    directory, and has to know which of several run directories holds the
+    thing they asked for. The folder is the deliverable surface, so what the
+    agent produced belongs at its top level, beside the document describing
+    it.
+
+    Flattened to base names on purpose -- the run directory keeps the
+    structured copy, and a reader wants `Cost Breakdown.xlsx`, not four
+    levels of scratch path. A later run replaces an earlier file of the same
+    name, which is the intended behaviour for a revised deliverable.
+    """
+    copied: list[str] = []
+    for relative in _artifact_manifest(source_directory):
+        source = source_directory / relative
+        try:
+            info = source.lstat()
+        except OSError:
+            continue
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_ARTIFACT_BYTES:
+            continue
+        name = Path(relative).name
+        if not name or name in _RESERVED_NAMES or name.startswith("."):
+            continue
+        if name in {"README.md", *RESULT_INPUT_NAMES, ARTIFACT_MANIFEST_NAME}:
+            continue
+        destination = paths.working_directory / name
+        if destination.is_symlink() or (
+            destination.exists() and not destination.is_file()
+        ):
+            continue
+        try:
+            # `_copy_regular_file` writes a temporary and `os.replace`s it,
+            # so a revised deliverable overwrites the earlier copy atomically.
+            _copy_regular_file(
+                source, destination, maximum=MAX_ARTIFACT_BYTES
+            )
+        except TaskArchiveError:
+            continue
+        copied.append(name)
+    return tuple(copied)
+
+
 def append_result(
     paths: TaskArchivePaths,
     *,
@@ -220,30 +281,219 @@ def append_result(
         origin_record=origin_record,
         origin_item=origin_item,
     )
-    lines = [
-        "",
-        "### Result",
-        "",
-        f"**Outcome:** {outcome}",
-        "",
-        f"**Summary:** {summary}",
-    ]
-    if links:
-        lines.extend(("", "**Review links:**", *[f"- {link}" for link in links]))
-    for label, key in (
-        ("Needs your input", "questions"),
-        ("External actions", "external_actions"),
-        ("Deliverables", "deliverables"),
+    log = _read_log(paths.working_directory)
+    runs = log.setdefault("runs", [])
+    entry = None
+    for candidate in reversed(runs):
+        if candidate.get("run") == paths.run_directory.name:
+            entry = candidate
+            break
+    if entry is None:
+        entry = {
+            "stamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "phase": "",
+            "agent": "",
+            "run": paths.run_directory.name,
+        }
+        runs.append(entry)
+    entry["outcome"] = outcome
+    entry["summary"] = summary
+    entry["questions"] = list(_result_collection(result.get("questions")))
+    entry["external_actions"] = list(
+        _result_collection(result.get("external_actions"))
+    )
+    entry["deliverables"] = list(
+        _result_collection(result.get("deliverables"))
+    )
+    entry["review_links"] = list(links)
+    # Only the current run carries its full text here. Every earlier run keeps
+    # its own `result-work.md` under `runs/`, so nothing is lost by not
+    # restating it: the document stays about where the task IS, and the
+    # history says where each earlier answer can be read in full.
+    for candidate in runs:
+        candidate.pop("work", None)
+    entry["work"] = work
+    _publish_log(paths, log)
+
+
+def _read_log(task_directory: Path) -> dict:
+    """Return the task's run log, or an empty one.
+
+    A malformed or oversized log is replaced rather than raising. The log is
+    a rendering convenience; every run's real evidence is under `runs/`, and
+    refusing to record a result because a cache went bad would lose the one
+    thing that cannot be reconstructed.
+    """
+    path = task_directory / TASK_LOG_NAME
+    try:
+        if path.is_symlink() or not path.is_file():
+            return {}
+        if path.stat().st_size > MAX_LOG_BYTES:
+            return {}
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(document, dict):
+        return {}
+    runs = document.get("runs")
+    if not isinstance(runs, list) or not all(
+        isinstance(entry, dict) for entry in runs
     ):
-        values = _result_collection(result.get(key))
+        document["runs"] = []
+    return document
+
+
+def _publish_log(paths: TaskArchivePaths, log: dict) -> None:
+    """Persist the log and re-render the reader-facing document from it."""
+    log["schema"] = "foxhound.task-log"
+    log["schema_version"] = 1
+    _write_private(
+        paths.working_directory / TASK_LOG_NAME,
+        json.dumps(log, ensure_ascii=False, indent=1, sort_keys=True) + "\n",
+    )
+    document = _render_task_document(log)
+    _write_private(paths.working_directory / "README.md", document)
+    _write_private(paths.task_file, document)
+
+
+def _render_task_document(log: Mapping[str, object]) -> str:
+    """Render one task's current state, not the log of how it got there.
+
+    This document used to be append-only: every run added a section and every
+    recorded result appended its COMPLETE work text again. Eight runs of one
+    task produced seven hundred lines in which the same plan appeared four
+    times, each a slight revision of the last, with no statement anywhere of
+    what was currently true. The reader had to read to the bottom and
+    reconstruct it.
+
+    So it is rebuilt from the log each time and says where the task IS: the
+    objective, the current answer, what happens next, what is being asked of
+    the reader, which files exist, and a one-line-per-run history. Earlier
+    answers are not deleted, they are linked -- each run keeps its own
+    directory, which is also what makes discarding the repetition safe.
+    """
+    runs = [entry for entry in log.get("runs", []) if isinstance(entry, dict)]
+    current = None
+    for entry in reversed(runs):
+        if entry.get("outcome"):
+            current = entry
+            break
+    latest = runs[-1] if runs else None
+    task_id = log.get("task_id")
+    task_text = str(log.get("task_text") or "").strip()
+    title = _single_line(task_text, 120) or "Task"
+
+    lines = [f"# T{task_id} — {title}", ""]
+    status = (
+        str(current.get("outcome")) if current else "no result recorded yet"
+    )
+    phase = str((latest or {}).get("phase") or "")
+    agent = str((latest or {}).get("agent") or "")
+    lines.append(f"**Status:** {status}")
+    if phase:
+        lines.append(f"**Phase:** {phase}")
+    if agent:
+        lines.append(f"**Agent:** {agent}")
+    source = log.get("source")
+    if source:
+        lines.append(f"**Source:** {source}")
+    lines.append(f"**Folder:** `{log.get('working_directory')}`")
+    lines.append("")
+
+    if task_text:
+        lines.extend(("## Objective", "", task_text, ""))
+
+    if current:
+        lines.append(f"## Current result — {current.get('stamp')}")
+        lines.append("")
+        summary = str(current.get("summary") or "").strip()
+        lines.extend((summary or "_No summary recorded._", ""))
+        # Absolute, once. The reader should be able to copy this straight
+        # into a terminal; History below stays relative to keep one line per
+        # run readable.
+        folder = log.get("working_directory")
+        if folder and current.get("run"):
+            lines.extend((
+                f"**Evidence:** `{Path(str(folder)) / 'runs' / str(current['run'])}`",
+                "",
+            ))
+
+    for heading, key in (
+        ("Next action", "external_actions"),
+        ("Questions for the reader", "questions"),
+        ("Deliverables", "deliverables"),
+        ("Review links", "review_links"),
+    ):
+        values = [
+            str(value) for value in (current or {}).get(key, []) if str(value)
+        ]
         if values:
-            lines.extend(("", f"**{label}:**", *[f"- {value}" for value in values]))
+            lines.append(f"## {heading}")
+            lines.append("")
+            lines.extend(f"- {value}" for value in values)
+            lines.append("")
+
+    if runs:
+        lines.extend(("## History", ""))
+        for entry in runs[-MAX_HISTORY_RUNS:]:
+            outcome = entry.get("outcome") or "no result recorded"
+            note = _single_line(
+                str(entry.get("summary") or ""), MAX_HISTORY_SUMMARY_CHARS
+            )
+            line = (
+                f"- {entry.get('stamp')} — {entry.get('phase')} — {outcome}"
+                f" — `runs/{entry.get('run')}`"
+            )
+            lines.append(f"{line}\n  {note}" if note else line)
+        if len(runs) > MAX_HISTORY_RUNS:
+            lines.append(
+                f"- _({len(runs) - MAX_HISTORY_RUNS} earlier run(s) not "
+                "listed; all remain under `runs/`.)_"
+            )
+        lines.append("")
+
+    work = str((current or {}).get("work") or "").strip()
     if work:
-        lines.extend(("", "**Work:**", "", work))
-    lines.extend(("", f"**Working files:** `{paths.run_directory}`", ""))
-    payload = "\n".join(lines)
-    _append_private(paths.working_directory / "README.md", payload)
-    _append_private(paths.task_file, payload)
+        lines.extend((
+            "## Work",
+            "",
+            "_The current result in full. Earlier results are in their own "
+            "run directories, listed under History._",
+            "",
+            work,
+            "",
+        ))
+    return "\n".join(lines)
+
+
+def _single_line(value: str, maximum: int) -> str:
+    text = " ".join(str(value).split())
+    if len(text) > maximum:
+        text = text[:maximum].rstrip() + "..."
+    return text
+
+
+def _write_private(path: Path, value: str) -> None:
+    """Replace a file's contents, following no symlink."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise TaskArchiveError("task archive file is unavailable") from exc
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise TaskArchiveError("task archive file is unsafe")
+        with os.fdopen(
+            descriptor, "w", encoding="utf-8", closefd=False
+        ) as handle:
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        os.close(descriptor)
 
 
 def _prepare_root(path: Path, label: str) -> Path:
