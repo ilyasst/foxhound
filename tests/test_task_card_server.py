@@ -49,6 +49,7 @@ from foxhound.task_card_server import (
     REQUEST_SCHEMA,
     SCHEDULE_SCHEMA,
     STATS_SCHEMA,
+    STATS_SCHEMA_VERSION,
     TASK_CARD_CONSUMER_ROLES,
     ConsumerIdentity,
     TaskCardApplication,
@@ -335,6 +336,12 @@ class TaskCardServerTests(unittest.TestCase):
                 "snoozed": 0,
                 "active": 0,
             })
+            status, _, body = request(
+                endpoint, "/v2/task-cards/stats", request_document()
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(body["schema_version"], STATS_SCHEMA_VERSION)
+            self.assertEqual(body["elsewhere"], 0)
             status, _, body = request(
                 endpoint,
                 "/v1/task-cards/stats",
@@ -1189,9 +1196,8 @@ class TaskCardTokenRoleTests(unittest.TestCase):
         self.assertEqual(identity.role, DRIP_ROLE)
 
         with running_server(app) as endpoint:
-            # The exact response bytes for /healthz and stats are the same
-            # shape ADR 0011 already documents: no route gains a role or
-            # consumer field, and no new top-level key appears.
+            # The response remains content-free and does not expose the
+            # resolved role or consumer identity.
             status, _, body = request(
                 endpoint, "/healthz", None, token=None, method="GET", raw=b""
             )
@@ -1541,8 +1547,18 @@ class TaskCardClaimConsumerIdentityTests(unittest.TestCase):
         stray_token = "z" * 43
         app = TaskCardApplication(self.cards, TOKEN)
         app.tokens = {**app.tokens, "not_a_real_role": stray_token}
-        before = self.cards.stats()
+        before = self.cards.stats(
+            consumer_digest=hashlib.sha256(TOKEN.encode()).hexdigest()
+        )
         with running_server(app) as endpoint:
+            status, _, body = request(
+                endpoint,
+                "/v2/task-cards/stats",
+                request_document(),
+                token=stray_token,
+            )
+            self.assertEqual(status, 403)
+            self.assertEqual(body["error"]["code"], "consumer_unresolved")
             status, _, body = request(
                 endpoint,
                 "/v1/task-cards/claim",
@@ -1554,7 +1570,12 @@ class TaskCardClaimConsumerIdentityTests(unittest.TestCase):
         self.assertEqual(body["error"]["code"], "consumer_unresolved")
         # Nothing was claimed: the pool is exactly as it was before the
         # refused attempt, and the legitimate drip token can still claim.
-        self.assertEqual(self.cards.stats(), before)
+        self.assertEqual(
+            self.cards.stats(
+                consumer_digest=hashlib.sha256(TOKEN.encode()).hexdigest()
+            ),
+            before,
+        )
         with running_server(app) as endpoint:
             status, _, claimed = request(
                 endpoint,
