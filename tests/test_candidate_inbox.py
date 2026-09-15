@@ -76,6 +76,15 @@ class CandidateInboxTests(unittest.TestCase):
             connection.execute(
                 "ALTER TABLE task_review_cards DROP COLUMN source_revision"
             )
+            if "repository_references_json" in {
+                row[1] for row in connection.execute(
+                    "PRAGMA table_info(task_execution_results)"
+                )
+            }:
+                connection.execute(
+                    "ALTER TABLE task_execution_results DROP COLUMN "
+                    "repository_references_json"
+                )
             connection.execute("PRAGMA user_version = 17")
             connection.commit()
 

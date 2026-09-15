@@ -218,6 +218,8 @@ class ExecutionReviewCard:
     questions: tuple[str, ...] = field(default=(), repr=False)
     external_actions: tuple[CardRecord, ...] = field(default=(), repr=False)
     deliverables: tuple[CardRecord, ...] = field(default=(), repr=False)
+    repository_references: tuple["RepositoryReference", ...] = field(
+        default=(), repr=False)
     revisions: int = 0
     revision_note: str = field(default="", repr=False)
     origin_kind: str = field(default="", repr=False)
@@ -1840,6 +1842,7 @@ class ExecutionCardService:
             "r.outcome AS result_outcome,r.summary,r.work_markdown,"
             "r.work_digest,"
             "r.questions_json,r.external_actions_json,r.deliverables_json,"
+            "r.repository_references_json,"
             "r.task_work_directory,r.task_kb_file,"
             "(SELECT min(h.created_at) "
             " FROM task_candidate_bindings AS b "
@@ -2315,6 +2318,8 @@ def _card(
             questions=_stored_lines(row["questions_json"]),
             external_actions=_stored_collection(row["external_actions_json"]),
             deliverables=_stored_collection(row["deliverables_json"]),
+            repository_references=_stored_repository_references(
+                row["repository_references_json"]),
             outcome=(
                 None
                 if row["result_outcome"] is None
@@ -2539,6 +2544,14 @@ class CardRecord:
                     or self.recipient or self.subject)
 
 
+@dataclass(frozen=True)
+class RepositoryReference:
+    """Validated forge evidence retained separately from result prose."""
+
+    kind: str
+    url: str
+
+
 def _stored_lines(value: object) -> tuple[str, ...]:
     """Questions are prose, so a record is flattened back to its sentence."""
     return tuple(record.text for record in _stored_collection(value))
@@ -2575,6 +2588,32 @@ def _stored_collection(value: object) -> tuple[CardRecord, ...]:
                 "execution review card result is invalid")
         records.append(CardRecord(text, **fields))
     return tuple(records)
+
+
+def _stored_repository_references(
+    value: object,
+) -> tuple[RepositoryReference, ...]:
+    """Read only the bounded forge-reference shape the result validator wrote."""
+    if value is None:
+        return ()
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        raise TaskLedgerError("execution review card result is invalid") from None
+    if not isinstance(parsed, list):
+        raise TaskLedgerError("execution review card result is invalid")
+    references: list[RepositoryReference] = []
+    for item in parsed:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"kind", "url"}
+            or item.get("kind") not in {"pull-request", "commit", "check"}
+            or not isinstance(item.get("url"), str)
+            or not item["url"].startswith("https://github.com/")
+        ):
+            raise TaskLedgerError("execution review card result is invalid")
+        references.append(RepositoryReference(item["kind"], item["url"]))
+    return tuple(references)
 
 
 #: The part of an identifier before its state, if it has one. A review
@@ -2898,6 +2937,20 @@ def _review_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
     repository = _repository_review_line(card, html=html)
     if repository:
         lines.extend(("", repository))
+    if card.repository_references:
+        lines.extend(("", "<b>Repository evidence:</b>" if html
+                      else "Repository evidence:"))
+        for reference in card.repository_references:
+            label = {
+                "pull-request": "Pull request",
+                "commit": "Commit",
+                "check": "Check",
+            }[reference.kind]
+            if html:
+                lines.append(
+                    f'• <a href="{_escape(reference.url)}">{label}</a>')
+            else:
+                lines.append(f"- [{label}]({reference.url})")
     links = review_links(
         "\n".join((
             card.summary,
@@ -2920,6 +2973,8 @@ def _review_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
     # could open, search for, or recognise.
     addressable = [
         link for link in links if _ADDRESSABLE_LINK_RE.fullmatch(link)
+        and not any(reference.url in link
+                    for reference in card.repository_references)
     ]
     if addressable:
         lines.extend(("", "<b>Review links:</b>" if html else "Review links:"))

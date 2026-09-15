@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 28
+SCHEMA_VERSION = 29
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -336,6 +336,7 @@ _SCHEMA_COLUMNS = {
         "task_work_directory",
         "task_kb_file",
         "work_digest",
+        "repository_references_json",
     ),
     "task_execution_events": (
         "sequence",
@@ -456,16 +457,24 @@ _SCHEMA_COLUMNS = {
 # existed -- otherwise a migration step verifies its own future. Five
 # subtractions, applied in version order: `source_revision` (task review
 # cards) arrives at v26, duplicate proposals arrive at v27, and their card
-# binding arrives at v28,
+# binding arrives at v28, and `repository_references_json` arrives at v29,
 # `task_completion_evidence` arrives at v25,
 # `consumer_digest` (task review cards, ADR 0036 decision 2) at v23,
 # `work_digest` at v22, and `task_relations` at v21 -- so the v24 state has
 # the new table removed, the v22 state also has the card column removed but
 # keeps `work_digest`, the v21 state has neither column but keeps
 # `task_relations`, and the v20 state has none of the five.
+_SCHEMA_V28_COLUMNS = {
+    name: tuple(column for column in columns if not (
+        name == "task_execution_results"
+        and column == "repository_references_json"
+    ))
+    for name, columns in _SCHEMA_COLUMNS.items()
+}
+
 _SCHEMA_V26_COLUMNS = {
     name: columns
-    for name, columns in _SCHEMA_COLUMNS.items()
+    for name, columns in _SCHEMA_V28_COLUMNS.items()
     if name not in {"task_duplicate_proposals", "task_duplicate_proposal_events"}
 }
 
@@ -473,7 +482,7 @@ _SCHEMA_V27_COLUMNS = {
     name: tuple(column for column in columns if not (
         name == "task_duplicate_proposals" and column == "card_id"
     ))
-    for name, columns in _SCHEMA_COLUMNS.items()
+    for name, columns in _SCHEMA_V28_COLUMNS.items()
 }
 
 _SCHEMA_V24_COLUMNS = {
@@ -481,7 +490,7 @@ _SCHEMA_V24_COLUMNS = {
         column for column in columns
         if not (name == "task_review_cards" and column == "source_revision")
     )
-    for name, columns in _SCHEMA_COLUMNS.items()
+    for name, columns in _SCHEMA_V28_COLUMNS.items()
     if name not in {
         "task_completion_evidence",
         "task_duplicate_proposals",
@@ -494,7 +503,7 @@ _SCHEMA_V25_COLUMNS = {
         column for column in columns
         if not (name == "task_review_cards" and column == "source_revision")
     )
-    for name, columns in _SCHEMA_COLUMNS.items()
+    for name, columns in _SCHEMA_V28_COLUMNS.items()
     if name not in {"task_duplicate_proposals", "task_duplicate_proposal_events"}
 }
 
@@ -2166,6 +2175,16 @@ END;
 )
 
 
+# Structured forge evidence is separate from result prose.  Existing result
+# rows are historical facts, so they receive the empty collection rather than
+# a guessed set of links extracted from their old Markdown.
+_SCHEMA_V29 = (
+    "ALTER TABLE task_execution_results ADD COLUMN "
+    "repository_references_json TEXT NOT NULL DEFAULT '[]' "
+    "CHECK(length(repository_references_json) <= 65536);",
+)
+
+
 _SCHEMA_V20 = (
     # SQLite cannot alter a CHECK in place, and three tables carry a foreign
     # key to this one. Renaming the card table would rewrite all three to
@@ -2991,6 +3010,27 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 28
+            if version == 28:
+                row = connection.execute(
+                    "SELECT type FROM sqlite_master WHERE "
+                    "name='task_execution_results'"
+                ).fetchone()
+                if row is None or row["type"] != "table":
+                    raise InboxError("candidate inbox schema is incomplete")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    columns = tuple(item["name"] for item in connection.execute(
+                        "PRAGMA table_info(task_execution_results)"
+                    ))
+                    if "repository_references_json" not in columns:
+                        for statement in _SCHEMA_V29:
+                            connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 29")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 29
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:

@@ -97,6 +97,7 @@ READER_WAITING_STATUSES = frozenset({
 })
 MAX_ACTION_CHARS = 4_000
 MAX_DELIVERABLE_CHARS = 16_000
+MAX_REPOSITORY_REFERENCES = 8
 
 _RESULT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _PROFILE_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
@@ -209,6 +210,10 @@ class ExecutionResultEnvelope:
     questions: Sequence[str] = field(default=(), repr=False)
     external_actions: Sequence[object] = field(default=(), repr=False)
     deliverables: Sequence[object] = field(default=(), repr=False)
+    #: Addressable forge evidence, separately validated from prose so cards
+    #: never have to infer a pull request, commit, or check from Markdown.
+    repository_references: Sequence[object] = field(
+        default=(), repr=False)
     task_work_directory: str | None = field(default=None, repr=False)
     task_kb_file: str | None = field(default=None, repr=False)
 
@@ -1059,9 +1064,10 @@ class TaskExecutionService:
                     "result_id,task_id,workflow_version,task_version,phase,"
                     "outcome,content_digest,summary,work_markdown,"
                     "questions_json,external_actions_json,deliverables_json,"
+                    "repository_references_json,"
                     "created_at,agent_profile_id,agent_profile_revision,"
                     "task_work_directory,task_kb_file,work_digest) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         result["result_id"], result["task_id"],
                         result["workflow_version"], result["task_version"],
@@ -1069,7 +1075,8 @@ class TaskExecutionService:
                         result["summary"], result["work_markdown"],
                         result["questions_json"],
                         result["external_actions_json"],
-                        result["deliverables_json"], now,
+                        result["deliverables_json"],
+                        result["repository_references_json"], now,
                         row["agent_profile_id"],
                         row["agent_profile_revision"],
                         result["task_work_directory"],
@@ -2104,6 +2111,8 @@ def _validated_result(envelope: ExecutionResultEnvelope) -> dict[str, object]:
         primary="body", aliases=_DELIVERABLE_ALIASES,
         optional=_DELIVERABLE_FIELDS,
     )
+    repository_references = _repository_references(
+        envelope.repository_references)
     # Deliberately absent from `document` below, and so from the content
     # digest: the digest identifies what the AGENT produced, and this is
     # produced afterwards from it. Folding it in would make the same
@@ -2135,6 +2144,7 @@ def _validated_result(envelope: ExecutionResultEnvelope) -> dict[str, object]:
         "questions": questions,
         "external_actions": actions,
         "deliverables": deliverables,
+        "repository_references": repository_references,
         "task_work_directory": task_work_directory,
         "task_kb_file": task_kb_file,
     }
@@ -2151,6 +2161,7 @@ def _validated_result(envelope: ExecutionResultEnvelope) -> dict[str, object]:
         "questions_json": _canonical_json(questions),
         "external_actions_json": _canonical_json(actions),
         "deliverables_json": _canonical_json(deliverables),
+        "repository_references_json": _canonical_json(repository_references),
         "claim_token": envelope.claim_token,
     }
 
@@ -2266,6 +2277,15 @@ _ACTION_FIELDS = ("requires", "channel")
 _DELIVERABLE_FIELDS = ("label", "recipient", "subject")
 _ACTION_ALIASES = ("action", "title", "text")
 _DELIVERABLE_ALIASES = ("body", "text")
+_REPOSITORY_REFERENCE_PATTERNS = {
+    "pull-request": re.compile(
+        r"^https://github\.com/[^/\s]+/[^/\s]+/pull/[1-9][0-9]*$"),
+    "commit": re.compile(
+        r"^https://github\.com/[^/\s]+/[^/\s]+/commit/[0-9a-fA-F]{7,64}$"),
+    "check": re.compile(
+        r"^https://github\.com/[^/\s]+/[^/\s]+/actions/runs/[1-9][0-9]*"
+        r"(?:/job/[1-9][0-9]*)?$")
+}
 
 
 def _record_text(value: dict, aliases: tuple[str, ...]) -> object:
@@ -2319,6 +2339,36 @@ def _structured_collection(
             raise ValueError(f"execution result {label} are invalid")
         records.append(record)
     return tuple(records)
+
+
+def _repository_references(value: object) -> tuple[dict[str, str], ...]:
+    """Validate the small forge-evidence vocabulary cards can render.
+
+    The origin remains the source of the repository and issue/review link.
+    These are the additional, independently addressable records produced by
+    implementation: a pull request, commit, or check run.  Free-form prose
+    still belongs in deliverables; accepting it here would make a card infer
+    links again and recreate the ambiguity this field removes.
+    """
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise ValueError("execution result repository references are invalid")
+    items = tuple(value)
+    if len(items) > MAX_REPOSITORY_REFERENCES:
+        raise ValueError("execution result repository references are invalid")
+    references: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in items:
+        if not isinstance(item, dict) or set(item) != {"kind", "url"}:
+            raise ValueError("execution result repository references are invalid")
+        kind, url = item.get("kind"), item.get("url")
+        pattern = _REPOSITORY_REFERENCE_PATTERNS.get(kind)
+        if not isinstance(url, str) or pattern is None or not pattern.fullmatch(url):
+            raise ValueError("execution result repository references are invalid")
+        reference = (kind, url)
+        if reference not in seen:
+            seen.add(reference)
+            references.append({"kind": kind, "url": url})
+    return tuple(references)
 
 
 def _canonical_json(value: object) -> str:
