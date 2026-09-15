@@ -967,7 +967,16 @@ _GENERAL_PROMPT_TEMPLATE_V8 = _GENERAL_PROMPT_TEMPLATE_V7.replace(
 )
 
 
-_GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V8.replace(
+_GENERAL_PROMPT_TEMPLATE_V9 = _GENERAL_PROMPT_TEMPLATE_V8.replace(
+    "Prepare the reviewable result early enough that useful work cannot be lost to the turn limit. Write owner-only `result-summary.txt` and `result-work.md` in the starting directory, plus `result-questions.json`, `result-external-actions.json`, and `result-deliverables.json` only when those arrays are non-empty.",
+    "\n".join((
+        "Prepare the reviewable result early enough that useful work cannot be lost to the turn limit. Write owner-only `result-summary.txt` and `result-work.md` in the starting directory, plus `result-questions.json`, `result-external-actions.json`, `result-deliverables.json`, and `result-repository-references.json` only when those arrays are non-empty.",
+        "For a repository-origin task, put each verified pull request, commit, and check in `result-repository-references.json` as `{\"kind\": \"pull-request\"|\"commit\"|\"check\", \"url\": \"https://github.com/...\"}`. Each URL must belong to the task origin's repository; these are the links the card renders.",
+    )),
+)
+
+
+_GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V9.replace(
     "Task lifecycle is separate. A completed execution result does not authorize you to close or drop the task.",
     "\n".join((
         "Task lifecycle is separate. A completed execution result does not authorize you to close or drop the task.",

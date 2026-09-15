@@ -26,6 +26,7 @@ RESULT_INPUT_NAMES = (
     "result-questions.json",
     "result-external-actions.json",
     "result-deliverables.json",
+    "result-repository-references.json",
     "repository-action-receipts.json",
 )
 #: The rendered review document is rebuilt from this, never parsed back out

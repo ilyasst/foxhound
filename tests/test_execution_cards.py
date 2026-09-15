@@ -33,6 +33,7 @@ from foxhound.execution_cards import (
     MAX_TRUNCATED_CARD_BODY_BYTES,
     MAX_WORK_EXCERPT_CHARS,
     CardRecord,
+    RepositoryReference,
     ExecutionCardDisposition,
     ExecutionCardKind,
     ExecutionCardRefusal,
@@ -349,6 +350,10 @@ class ExecutionCardTests(unittest.TestCase):
             # not got it yet.
             connection.execute(
                 "ALTER TABLE task_execution_results DROP COLUMN work_digest"
+            )
+            connection.execute(
+                "ALTER TABLE task_execution_results DROP COLUMN "
+                "repository_references_json"
             )
             # ADR 0036 added this at v23; a database at an older version
             # has not got it yet.
@@ -2919,6 +2924,25 @@ class ExecutionCardTests(unittest.TestCase):
                 )
         self.assertNotIn("\x00", body)
         self.assertNotIn("• 0", body)
+
+    def test_structured_repository_evidence_is_rendered_once(self):
+        reference = RepositoryReference(
+            "check",
+            "https://github.com/example-org/example-repo/actions/runs/12",
+        )
+        card = self._plan_card(
+            origin_kind="issue",
+            origin_record="github.com/example-org/example-repo",
+            origin_item="42",
+            repository_references=(reference,),
+            work_markdown="The check is https://github.com/example-org/example-repo/actions/runs/12.",
+        )
+
+        body, _ = render_execution_review_card(card)
+
+        self.assertIn("<b>Repository evidence:</b>", body)
+        self.assertEqual(body.count('href="' + reference.url + '"'), 1)
+        self.assertIn(">Check</a>", body)
 
     def test_inline_fragments_use_no_control_markers_or_input_collisions(self):
         rendered = _markdown_inline(

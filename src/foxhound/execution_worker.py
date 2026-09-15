@@ -82,6 +82,7 @@ _RESULT_INPUTS = (
     "result-questions.json",
     "result-external-actions.json",
     "result-deliverables.json",
+    "result-repository-references.json",
     REPOSITORY_RECEIPTS_NAME,
     ARTIFACT_MANIFEST_NAME,
 )
@@ -564,6 +565,7 @@ class ExecutionWorker:
             questions=draft["questions"],
             external_actions=draft["external_actions"],
             deliverables=draft["deliverables"],
+            repository_references=draft["repository_references"],
             task_work_directory=state.task_work_directory,
             task_kb_file=state.task_kb_file,
         )
@@ -651,6 +653,10 @@ class ExecutionWorker:
                 run_directory / "result-deliverables.json",
                 label="execution result deliverables",
             ),
+            "repository_references": _read_optional_repository_references(
+                run_directory / "result-repository-references.json",
+                label="execution result repository references",
+            ),
         }, run_directory)
         envelope = ExecutionResultEnvelope(
             result_id=result_id,
@@ -665,6 +671,7 @@ class ExecutionWorker:
             questions=draft["questions"],
             external_actions=draft["external_actions"],
             deliverables=draft["deliverables"],
+            repository_references=draft["repository_references"],
             task_work_directory=state.task_work_directory,
             task_kb_file=state.task_kb_file,
         )
@@ -694,6 +701,8 @@ class ExecutionWorker:
                 "questions": list(validated["questions"]),
                 "external_actions": list(validated["external_actions"]),
                 "deliverables": list(validated["deliverables"]),
+                "repository_references": list(
+                    validated["repository_references"]),
             },
         )
         return {
@@ -901,15 +910,18 @@ def load_result_draft(
         raise ExecutionWorkerDraftError(
             "execution result draft is invalid"
         ) from exc
-    _exact_fields(
-        document,
-        {
-            "schema", "schema_version", "result_id", "outcome", "summary",
-            "work_markdown", "questions", "external_actions", "deliverables",
-        },
-        "execution result draft",
-        error_type=ExecutionWorkerDraftError,
-    )
+    fields = {
+        "schema", "schema_version", "result_id", "outcome", "summary",
+        "work_markdown", "questions", "external_actions", "deliverables",
+    }
+    # A ready draft may predate structured evidence. It is private, short
+    # lived, and already bound to this claim, so preserve it as an empty
+    # collection rather than forcing an agent to recreate a correct result.
+    supplied = set(document)
+    if supplied == fields:
+        document["repository_references"] = []
+    elif supplied != fields | {"repository_references"}:
+        raise ExecutionWorkerDraftError("execution result draft is invalid")
     if (
         document["schema"] != RESULT_DRAFT_SCHEMA
         or document["schema_version"] != WORKER_SCHEMA_VERSION
@@ -1037,6 +1049,32 @@ def _read_optional_string_array(
             isinstance(field_value, str) for field_value in item.values()
         ):
             continue
+        raise ExecutionWorkerDraftError(f"{label} is invalid")
+    return value
+
+
+def _read_optional_repository_references(
+    path: Path, *, label: str,
+) -> list[object]:
+    """Read the structured evidence input without accepting arbitrary JSON."""
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise ExecutionWorkerDraftError(f"{label} is unavailable") from exc
+    try:
+        raw = _read_private_bytes(path, maximum=MAX_DRAFT_BYTES, label=label)
+        value = json.loads(raw, object_pairs_hook=_strict_object)
+    except (
+        ExecutionWorkerConfigError,
+        UnicodeDecodeError,
+        ValueError,
+        TypeError,
+    ) as exc:
+        raise ExecutionWorkerDraftError(f"{label} is invalid") from exc
+    if (not isinstance(value, list) or any(
+            not isinstance(item, dict) for item in value)):
         raise ExecutionWorkerDraftError(f"{label} is invalid")
     return value
 
@@ -1196,6 +1234,7 @@ def _repository_result(
     origin = _repository_origin(state)
     if origin is None:
         return result
+    references = list(result.get("repository_references") or ())
     outcome = result.get("outcome")
     actions = result.get("external_actions")
     if not result.get("deliverables") and not (
@@ -1239,7 +1278,30 @@ def _repository_result(
                 for receipt in receipts
             ],
         ]
+        references.extend(
+            {"kind": "pull-request", "url": receipt["url"]}
+            for receipt in receipts
+            if receipt["kind"] == "pull-request"
+        )
+    origin_record = getattr(origin, "record_id", None)
+    if isinstance(origin_record, str):
+        for reference in references:
+            if not isinstance(reference, dict) or not _reference_matches_origin(
+                    reference.get("url"), origin_record):
+                raise ExecutionWorkerDraftError(
+                    "repository references must belong to the task origin"
+                )
+    result["repository_references"] = references
     return result
+
+
+def _reference_matches_origin(url: object, record_id: str) -> bool:
+    """Keep structured evidence on the same forge repository as its task."""
+    if not isinstance(url, str) or not url.startswith("https://github.com/"):
+        return False
+    remainder = url.removeprefix("https://")
+    parts = remainder.split("/")
+    return len(parts) >= 3 and "/".join(parts[:3]) == record_id
 
 
 def _required_repository_receipt_kinds(origin_kind: str) -> frozenset[str]:
