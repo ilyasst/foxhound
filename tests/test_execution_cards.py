@@ -18,6 +18,7 @@ from foxhound.agent_profiles import (
     general_profile,
     parse_profile,
 )
+from foxhound import task_relations
 from foxhound.candidate_inbox import CandidateInbox, SCHEMA_VERSION
 from foxhound.contracts import candidate_id_for
 from foxhound.execution_cards import (
@@ -1845,6 +1846,70 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertEqual(card.prior_task_id, 4)
         body, _keyboard = render_execution_review_card(card)
         self.assertIn("Continues T4", body)
+
+    def test_a_recorded_relation_reaches_the_card(self):
+        # The derived predecessor above is inferred from source identity and
+        # cannot reach across sources. A recorded one can, carries a basis,
+        # and can be withdrawn — and both render through one path.
+        task_id = 6
+        self._schedule_workflow(task_id)
+        self.assertEqual(self.cards.schedule().created, 1)
+        with closing(sqlite3.connect(self.database)) as connection:
+            task_relations.assert_relation(
+                connection,
+                subject_id=task_id,
+                object_id=4,
+                kind="supersedes",
+                basis="the same ask, raised again from a different source",
+                asserted_by="reader",
+                note="folded in after the second meeting",
+            )
+            connection.commit()
+        card = self.cards.claim_next().card
+        body, _keyboard = render_execution_review_card(card)
+        self.assertIn("Continues T4", body)
+        self.assertIn("folded in after the second meeting", body)
+
+    def test_one_pair_is_named_once(self):
+        # A recorded relation and the derived predecessor can name the same
+        # pair. Two sentences about it is worse than either alone.
+        task_id = 6
+        with closing(sqlite3.connect(self.database)) as connection:
+            task_relations.assert_relation(
+                connection,
+                subject_id=task_id,
+                object_id=4,
+                kind="supersedes",
+                basis="recorded, and also derivable",
+                asserted_by="machine",
+            )
+            connection.commit()
+        self._schedule_workflow(task_id)
+        self.assertEqual(self.cards.schedule().created, 1)
+        card = self.cards.claim_next().card
+        body, _keyboard = render_execution_review_card(card)
+        self.assertEqual(body.count("Continues T4"), 1)
+
+    def test_a_withdrawn_relation_leaves_the_card(self):
+        task_id = 6
+        with closing(sqlite3.connect(self.database)) as connection:
+            relation = task_relations.assert_relation(
+                connection,
+                subject_id=task_id,
+                object_id=4,
+                kind="duplicate_of",
+                basis="the same ask from two sources",
+                asserted_by="machine",
+            )
+            task_relations.withdraw(
+                connection, relation.id, withdrawn_by="reader")
+            connection.commit()
+        self._schedule_workflow(task_id)
+        self.assertEqual(self.cards.schedule().created, 1)
+        card = self.cards.claim_next().card
+        self.assertEqual(card.relations, ())
+        body, _keyboard = render_execution_review_card(card)
+        self.assertNotIn("Same task as T4", body)
 
     def test_a_first_look_continues_nothing(self):
         # An ordinary state, and it must not be reported as a second pass.
