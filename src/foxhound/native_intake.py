@@ -111,10 +111,17 @@ def _run_document(result: NativeIntakeResult) -> dict[str, object]:
         "previous_cursor": result.previous_cursor,
         "current_cursor": result.current_cursor,
         "remaining": result.remaining,
+        # Every disposition a candidate can reach, so a pass that moved the
+        # cursor without folding anything in says why. `candidates_withdrawn`
+        # was already counted and never reported, and a revision the reader's
+        # decision overtook is the case most worth seeing: the producer
+        # changed a task and the change was deliberately not applied.
         "counts": {
             "tasks_created": result.tasks_created,
             "tasks_revised": result.tasks_revised,
             "candidates_unchanged": result.candidates_unchanged,
+            "candidates_withdrawn": result.candidates_withdrawn,
+            "candidates_after_close": result.candidates_after_close,
         },
         "refusal": None if result.refusal is None else result.refusal.value,
     }

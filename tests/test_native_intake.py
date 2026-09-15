@@ -807,6 +807,109 @@ class NativeCandidateIntakeTests(unittest.TestCase):
         self.assertEqual(lifecycle, ("withdrawn", "reader_conflict"))
         self.assertEqual(event, "candidate_withdrawal_conflict")
 
+    def test_a_revision_for_a_closed_task_is_recorded_not_applied(self):
+        """The reader closing a task is the end of its life, not a conflict.
+
+        A producer that still holds the task open keeps re-emitting it, so
+        refusing here did not pause the stream, it stopped it: the cursor
+        never advanced past the item, and every later candidate -- for open
+        tasks too -- was blocked behind a decision the reader had already
+        made correctly.
+        """
+        self.activate()
+        self.inbox.import_feed(feed(0, candidate(1)))
+        self.intake()
+        self.assertTrue(
+            self.ledger.transition(1, expected_version=1, action="done").accepted
+        )
+        closed = self.ledger.get(1)
+        revised = candidate(
+            1,
+            text="Prepare the revised synthetic summary",
+            owner="Person B",
+            due="2030-03-20",
+        )
+        self.inbox.import_feed(feed(1, revised))
+
+        result = self.intake()
+
+        self.assertTrue(result.accepted, result.refusal)
+        self.assertEqual(result.candidates_after_close, 1)
+        # Counted apart from a pass where nothing happened: the producer
+        # changed a task and the change was deliberately not applied.
+        self.assertEqual(result.candidates_unchanged, 0)
+        self.assertEqual(result.tasks_revised, 0)
+
+        # The reader's decision stands, untouched and unversioned.
+        after = self.ledger.get(1)
+        self.assertEqual(
+            (after.text, after.owner, after.due, after.status, after.version),
+            (closed.text, closed.owner, closed.due,
+             TaskStatus.DONE, closed.version),
+        )
+        with closing(sqlite3.connect(self.database)) as connection:
+            binding = connection.execute(
+                "SELECT source_revision FROM task_candidate_bindings"
+            ).fetchone()[0]
+            lifecycle = connection.execute(
+                "SELECT state,resolution,task_version "
+                "FROM task_candidate_lifecycle"
+            ).fetchone()
+            event = connection.execute(
+                "SELECT kind,task_version,source_revision FROM task_events "
+                "ORDER BY sequence DESC LIMIT 1"
+            ).fetchone()
+        # Advanced, so the producer is not asked about this revision again.
+        self.assertEqual(binding, revised["source"]["revision"])
+        self.assertEqual(
+            lifecycle, ("active", "reader_conflict", closed.version))
+        # Not `candidate_revised`: the ledger must not claim a revision was
+        # folded into a task when it was not.
+        self.assertEqual(
+            event,
+            ("candidate_revision_conflict", closed.version, binding),
+        )
+
+    def test_a_closed_task_does_not_block_the_candidates_behind_it(self):
+        """The whole point. One settled task must not stop the stream."""
+        self.activate()
+        self.inbox.import_feed(feed(0, candidate(1), candidate(2)))
+        self.intake()
+        self.assertTrue(
+            self.ledger.transition(1, expected_version=1, action="done").accepted
+        )
+        self.inbox.import_feed(feed(
+            2,
+            candidate(1, text="Revised after the reader closed it"),
+            candidate(2, text="Revised while still open"),
+        ))
+
+        result = self.intake()
+
+        self.assertTrue(result.accepted, result.refusal)
+        self.assertEqual(
+            (result.candidates_after_close, result.tasks_revised), (1, 1))
+        self.assertEqual(self.ledger.get(1).status, TaskStatus.DONE)
+        self.assertEqual(
+            self.ledger.get(2).text, "Revised while still open")
+
+    def test_a_revision_whose_task_is_gone_still_refuses(self):
+        """A binding pointing at a task that does not exist is corruption,
+        not a race, and must still stop the pass."""
+        self.activate()
+        self.inbox.import_feed(feed(0, candidate(1)))
+        self.intake()
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute("PRAGMA writable_schema = ON")
+            connection.execute("DELETE FROM tasks WHERE id=1")
+            connection.commit()
+        self.inbox.import_feed(feed(1, candidate(1, text="Revised")))
+
+        result = self.intake()
+
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.refusal, NativeIntakeRefusal.STATE_CONFLICT)
+
     def test_stale_generation_cannot_reactivate_withdrawn_candidate(self):
         active = lifecycle_candidate(1, generation=1)
         withdrawn = lifecycle_candidate(1, generation=2, state="withdrawn")
@@ -1046,7 +1149,16 @@ class NativeCandidateIntakeTests(unittest.TestCase):
         self.assertEqual(self.ledger.get(1).version, 1)
         self.assertEqual(self._intake_cursor(), 1)
 
-    def test_terminal_revision_fails_closed(self):
+    def test_terminal_revision_advances_the_cursor_past_itself(self):
+        """This used to fail closed, and that was the defect (#209).
+
+        Failing closed on a revision for a task the reader has closed reads
+        as caution, but the reader closing a task is the ordinary end of its
+        life and the producer keeps re-emitting it, so the cursor could never
+        get past the item. It did not pause the stream; it ended it. The task
+        is still protected -- nothing is applied to it -- but the pass
+        continues, which is what the cursor assertion here now checks.
+        """
         self.activate()
         first = candidate(1)
         self.inbox.import_feed(feed(0, first))
@@ -1054,8 +1166,13 @@ class NativeCandidateIntakeTests(unittest.TestCase):
         self.ledger.transition(1, expected_version=1, action="done")
         terminal_revision = candidate(1, text="Revise a closed synthetic task")
         self.inbox.import_feed(feed(1, terminal_revision))
-        self.assertEqual(self.intake().refusal, NativeIntakeRefusal.STATE_CONFLICT)
-        self.assertEqual(self._intake_cursor(), 1)
+
+        result = self.intake()
+
+        self.assertTrue(result.accepted, result.refusal)
+        self.assertEqual(result.candidates_after_close, 1)
+        self.assertEqual(self._intake_cursor(), 2)
+        self.assertEqual(self.ledger.get(1).status, TaskStatus.DONE)
 
     def test_folded_revision_fails_closed(self):
         self.activate()
