@@ -328,11 +328,14 @@ class TaskExecutionService:
         CandidateInbox(self.database_path, clock=self._clock).initialize()
 
     def schedule_new(self, *, limit: int = 100) -> ExecutionScheduleResult:
-        """Create bounded workflows only for never-scheduled open tasks.
+        """Queue granted planning and create bounded new workflows.
 
         Agent work, ready plans, and reader-waiting decisions have separate
-        capacities.  Existing over-cap rows are counted but never rewritten;
-        capacity returns as they drain.
+        capacities.  A newly granted source may already have an old Start
+        gate: promote that read-only plan directly so it does not keep
+        presenting a decision the host has since made.  New workflows still
+        respect the reserve caps.  Existing over-cap rows are counted but
+        never discarded; capacity returns as they drain.
         """
         if (
             isinstance(limit, bool)
@@ -379,6 +382,52 @@ class TaskExecutionService:
                 waiting_room = max(
                     0, AWAITING_READER_CAP - int(capacity["waiting"] or 0)
                 )
+                promoted = 0
+                waiting_rows = connection.execute(
+                    "SELECT w.*, ("
+                    " SELECT o.source_kind FROM task_candidate_bindings AS b "
+                    " JOIN candidate_inbox AS o "
+                    " ON o.candidate_id=b.candidate_id "
+                    " WHERE b.task_id=t.id AND b.relation='accepted'"
+                    ") AS origin_kind FROM task_execution_workflows AS w "
+                    "JOIN tasks AS t ON t.id=w.task_id "
+                    "WHERE w.status='awaiting_start' AND w.phase='plan' "
+                    "AND t.status='open' AND t.version=w.task_version "
+                    "AND NOT EXISTS("
+                    " SELECT 1 FROM task_candidate_bindings AS blocked JOIN "
+                    " task_candidate_lifecycle AS l "
+                    " ON l.candidate_id=blocked.candidate_id "
+                    " WHERE blocked.task_id=t.id AND blocked.relation='accepted' "
+                    " AND l.state='withdrawn' "
+                    " AND l.resolution='preserved_open'"
+                    ") ORDER BY w.task_id"
+                ).fetchall()
+                for row in waiting_rows:
+                    origin_kind = row["origin_kind"]
+                    if _initial_status(
+                        origin_kind, self._planning_grants
+                    ) is not WorkflowStatus.QUEUED:
+                        continue
+                    version = int(row["version"]) + 1
+                    profile = self._profile_for(origin_kind)
+                    connection.execute(
+                        "UPDATE task_execution_workflows SET status='queued',"
+                        "version=?,due_at=NULL,agent_profile_id=?,"
+                        "agent_profile_revision=?,updated_at=? "
+                        "WHERE task_id=? AND version=? "
+                        "AND status='awaiting_start' AND phase='plan'",
+                        (
+                            version, profile.profile_id, profile.revision,
+                            now, int(row["task_id"]), int(row["version"]),
+                        ),
+                    )
+                    self._event(
+                        connection, int(row["task_id"]), "scheduled",
+                        version, int(row["task_version"]), WorkflowPhase.PLAN,
+                        WorkflowStatus.QUEUED, now,
+                    )
+                    promoted += 1
+
                 rows = connection.execute(
                     "SELECT t.id,t.version,("
                     " SELECT o.source_kind FROM task_candidate_bindings AS b "
@@ -438,7 +487,7 @@ class TaskExecutionService:
                     scheduled += 1
                 connection.commit()
                 return ExecutionScheduleResult(
-                    scheduled=scheduled,
+                    scheduled=promoted + scheduled,
                     remaining=eligible - scheduled,
                 )
             except Exception:
@@ -456,7 +505,12 @@ class TaskExecutionService:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 task = connection.execute(
-                    "SELECT t.status,t.version,EXISTS("
+                    "SELECT t.status,t.version,("
+                    " SELECT o.source_kind FROM task_candidate_bindings AS b "
+                    " JOIN candidate_inbox AS o "
+                    " ON o.candidate_id=b.candidate_id "
+                    " WHERE b.task_id=t.id AND b.relation='accepted'"
+                    ") AS origin_kind,EXISTS("
                     " SELECT 1 FROM task_candidate_bindings AS b JOIN "
                     " task_candidate_lifecycle AS l ON l.candidate_id=b.candidate_id "
                     " WHERE b.task_id=t.id AND b.relation='accepted' "
@@ -485,35 +539,46 @@ class TaskExecutionService:
                     return _operation(row, WorkflowDisposition.UNCHANGED)
                 if row is None:
                     version = 1
+                    status = _initial_status(
+                        task["origin_kind"], self._planning_grants
+                    )
+                    profile = self._profile_for(task["origin_kind"])
                     connection.execute(
                         "INSERT INTO task_execution_workflows("
                         "task_id,task_version,status,phase,version,due_at,"
                         "failure_count,created_at,updated_at,agent_profile_id,"
                         "agent_profile_revision) "
-                        "VALUES(?,?,'awaiting_start','plan',?,NULL,0,?,?,?,?)",
+                        "VALUES(?,?,?,'plan',?,NULL,0,?,?,?,?)",
                         (
-                            task_id, expected_task_version, version, now, now,
-                            self._default_profile.profile_id,
-                            self._default_profile.revision,
+                            task_id, expected_task_version, status.value, version,
+                            now, now, profile.profile_id, profile.revision,
                         ),
                     )
                 else:
                     version = int(row["version"]) + 1
+                    status = _initial_status(
+                        task["origin_kind"], self._planning_grants
+                    )
+                    profile = self._profile_for(task["origin_kind"])
                     connection.execute(
                         "UPDATE task_execution_workflows SET task_version=?,"
-                        "status='awaiting_start',phase='plan',version=?,"
+                        "status=?,phase='plan',version=?,"
                         "due_at=NULL,claim_token_digest=NULL,claimed_at=NULL,"
                         "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
                         "failure_count=0,last_failure_reason=NULL,"
                         "last_failure_at=NULL,next_attempt_at=NULL,"
                         "parked_at=NULL,last_result_id=NULL,updated_at=?,"
-                        "completed_at=NULL WHERE task_id=?",
-                        (expected_task_version, version, now, task_id),
+                        "completed_at=NULL,agent_profile_id=?,"
+                        "agent_profile_revision=? WHERE task_id=?",
+                        (
+                            expected_task_version, status.value, version, now,
+                            profile.profile_id, profile.revision, task_id,
+                        ),
                     )
                 self._event(
                     connection, task_id, "scheduled", version,
                     expected_task_version, WorkflowPhase.PLAN,
-                    WorkflowStatus.AWAITING_START, now,
+                    status, now,
                 )
                 updated_row = connection.execute(
                     "SELECT * FROM task_execution_workflows WHERE task_id=?",
