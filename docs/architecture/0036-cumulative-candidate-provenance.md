@@ -30,6 +30,10 @@ They name each source file and show its escaped extract. When a producer has
 not supplied evidence, the card explicitly says so instead of presenting an
 opaque identifier as sufficient context.
 
+For an addressable issue or review request, the shared renderer keeps the
+clickable repository-and-number identity ahead of those extracts. Evidence
+explains the origin; it must not make the origin unreachable.
+
 A revision that changes only evidence advances the accepted candidate binding
 and creates an audit event, but does not increment the task version or cancel
 active work. Text, owner, and due-date changes retain the existing task-version

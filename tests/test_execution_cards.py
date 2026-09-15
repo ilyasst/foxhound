@@ -8,6 +8,7 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -21,6 +22,8 @@ from foxhound.candidate_inbox import CandidateInbox, SCHEMA_VERSION
 from foxhound.contracts import candidate_id_for
 from foxhound.execution_cards import (
     CALLBACK_DATA_LIMIT,
+    MAX_BRIEF_BYTES,
+    MAX_BRIEF_CHARS,
     MAX_CARD_BODY_BYTES,
     MAX_TRUNCATED_CARD_BODY_BYTES,
     ExecutionCardDisposition,
@@ -33,7 +36,9 @@ from foxhound.execution_cards import (
     parse_execution_review_callback,
     render_execution_agent_selector,
     render_execution_review_card,
+    task_brief,
 )
+from foxhound.card_provenance import CardSourceEvidence
 from foxhound.task_execution import (
     PARK_RETRY_INTERVAL,
     ExecutionOutcome,
@@ -496,7 +501,7 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertEqual(
             [parse_execution_review_callback(value)[2] for value in callbacks],
             ["done", "start", "drop", "discuss", "snooze", "reassign",
-             "agent"],
+             "agent", "brief"],
         )
         self.assertEqual(
             [[button["text"] for button in row]
@@ -506,6 +511,7 @@ class ExecutionCardTests(unittest.TestCase):
                 ["🗑 Drop", "✏️ Update"],
                 ["🕓 Snooze", "👥 Reassign"],
                 ["🤖 Agent"],
+                ["📋 Task brief"],
             ],
         )
         self.assertTrue(all(
@@ -1113,7 +1119,7 @@ class ExecutionCardTests(unittest.TestCase):
                  for value in callbacks],
                 [
                     "revise", "discuss", "approve", "snooze", "done",
-                    "reassign", "drop",
+                    "reassign", "drop", "brief",
                 ],
             )
             self.assertEqual(
@@ -1124,6 +1130,7 @@ class ExecutionCardTests(unittest.TestCase):
                     ["▶️ Execute plan", "🕒 Snooze"],
                     ["✅ Mark as done"],
                     ["👥 Reassign", "🗑 Drop task"],
+                    ["📋 Task brief"],
                 ],
             )
             result = self.cards.act(
@@ -1152,7 +1159,8 @@ class ExecutionCardTests(unittest.TestCase):
             for button in row
         ]
         self.assertEqual(
-            actions, ["revise", "discuss", "snooze", "reassign", "drop"]
+            actions,
+            ["revise", "discuss", "snooze", "reassign", "drop", "brief"],
         )
         before = self.execution.get(1)
         refused = self.cards.act(
@@ -1635,6 +1643,110 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertTrue(restarted.accepted, restarted.refusal)
         self.assertEqual(restarted.workflow_status, WorkflowStatus.QUEUED)
         self.assertEqual(self.execution.get(task_id).failure_count, 0)
+
+    def test_a_brief_describes_the_work_without_naming_this_machine(self):
+        """A brief is pasted into some other agent, so it must describe the
+        work rather than this pipeline. The prompt this agent runs is
+        useless there: it names local commands that do not exist and a
+        recording protocol that cannot be followed.
+        """
+        task_id = 1
+        self._plan_review(task_id, "brief-plan")
+        self.assertEqual(self.cards.schedule().created, 1)
+        claim = self.cards.claim_next()
+
+        result = self.cards.brief(
+            claim.card.id, expected_version=claim.card.version)
+
+        self.assertTrue(result.accepted, result.refusal)
+        text = result.text
+        self.assertIn("Synthetic task 1", text)
+        self.assertIn("Proceed with Example A?", text)
+        # Nothing only this machine can act on.
+        for local in ("foxhound-task-worker", "act worktree", "record ",
+                      "claim_token", str(self.database)):
+            with self.subTest(local=local):
+                self.assertNotIn(local, text)
+
+        enriched = replace(
+            claim.card,
+            origin_kind="issue",
+            origin_record="github.com/example-org/example-repo",
+            origin_item="42",
+            origin_sources=(CardSourceEvidence(
+                "issue-42.md",
+                "issue_body",
+                "Synthetic acceptance criterion from the issue body.",
+            ),),
+        )
+        enriched_text = task_brief(enriched)
+        self.assertIn(
+            "https://github.com/example-org/example-repo/issues/42",
+            enriched_text,
+        )
+        self.assertIn("issue-42.md (issue body)", enriched_text)
+        self.assertIn("Synthetic acceptance criterion", enriched_text)
+        enriched_body, _ = render_execution_review_card(enriched)
+        self.assertIn(
+            '<a href="https://github.com/example-org/example-repo/issues/42">',
+            enriched_body,
+        )
+        self.assertIn("issue-42.md", enriched_body)
+
+        long_brief = task_brief(replace(
+            enriched,
+            work_markdown="Synthetic detail. " * MAX_BRIEF_CHARS,
+        ))
+        self.assertLessEqual(len(long_brief), MAX_BRIEF_CHARS)
+        self.assertLessEqual(len(long_brief.encode("utf-8")), MAX_BRIEF_BYTES)
+        self.assertTrue(long_brief.endswith("Open the source for the rest.]"))
+
+        multibyte_brief = task_brief(replace(
+            enriched,
+            work_markdown="Synthetic detail é. " * MAX_BRIEF_CHARS,
+        ))
+        self.assertLessEqual(len(multibyte_brief), MAX_BRIEF_CHARS)
+        self.assertLessEqual(
+            len(multibyte_brief.encode("utf-8")), MAX_BRIEF_BYTES
+        )
+        self.assertTrue(
+            multibyte_brief.endswith("Open the source for the rest.]")
+        )
+
+        deceptive = replace(
+            enriched,
+            origin_record="github.com.example/example-org/example-repo",
+        )
+        deceptive_text = task_brief(deceptive)
+        self.assertNotIn("https://github.com.example", deceptive_text)
+        self.assertNotIn("github.com.example", deceptive_text)
+        self.assertIn("Source: Issue", deceptive_text)
+
+    def test_asking_for_a_brief_answers_nothing(self):
+        # A reader deciding to take the work elsewhere has not answered the
+        # card, so the card must still be there when they come back.
+        task_id = 1
+        self._plan_review(task_id, "brief-read")
+        self.assertEqual(self.cards.schedule().created, 1)
+        claim = self.cards.claim_next()
+        before = self.cards.stats()
+
+        self.cards.brief(claim.card.id, expected_version=claim.card.version)
+
+        self.assertEqual(self.cards.stats(), before)
+
+    def test_a_brief_for_a_card_that_has_moved_on_is_refused(self):
+        task_id = 1
+        self._plan_review(task_id, "brief-stale")
+        self.assertEqual(self.cards.schedule().created, 1)
+        claim = self.cards.claim_next()
+
+        stale = self.cards.brief(
+            claim.card.id, expected_version=claim.card.version + 5)
+
+        self.assertFalse(stale.accepted)
+        self.assertEqual(stale.refusal, ExecutionCardRefusal.STALE_VERSION)
+        self.assertEqual(stale.text, "")
 
     def test_a_gate_says_which_issue_it_is_asking_about(self):
         """Naming the task is not naming the thing.
@@ -2171,7 +2283,7 @@ class ExecutionCardTests(unittest.TestCase):
                 for row in keyboard["inline_keyboard"]
                 for button in row
             ],
-            ["done", "discuss", "snooze", "reassign", "drop"],
+            ["done", "discuss", "snooze", "reassign", "drop", "brief"],
         )
         self.cards.complete_delivery(
             claim.card.id,

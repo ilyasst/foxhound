@@ -56,6 +56,7 @@ EXECUTION_SCHEDULE_SCHEMA = "foxhound.execution-card-service.schedule"
 EXECUTION_CLAIM_SCHEMA = "foxhound.execution-card-service.claim"
 EXECUTION_OPERATION_SCHEMA = "foxhound.execution-card-service.operation"
 EXECUTION_STATS_SCHEMA = "foxhound.execution-card-service.stats"
+EXECUTION_BRIEF_SCHEMA = "foxhound.execution-card-service.brief"
 EXECUTION_AGENT_OPTIONS_SCHEMA = (
     "foxhound.execution-card-service.agent-options"
 )
@@ -79,6 +80,7 @@ ROUTES = {
     "/v1/execution-cards/input": "execution_input",
     "/v1/execution-cards/agent-options": "execution_agent_options",
     "/v1/execution-cards/agent-selection": "execution_agent_selection",
+    "/v1/execution-cards/brief": "execution_brief",
 }
 
 
@@ -380,6 +382,24 @@ class TaskCardApplication:
                     value=value,
                 )
             )
+        if operation == "execution_brief":
+            request = _request(payload, required={"card_id", "card_version"})
+            result = self._execution_cards().brief(
+                _integer(request["card_id"], minimum=1),
+                expected_version=_integer(
+                    request["card_version"], minimum=1),
+            )
+            return {
+                "schema": EXECUTION_BRIEF_SCHEMA,
+                "schema_version": SERVICE_VERSION,
+                "ok": result.accepted,
+                "card_id": result.card_id,
+                "card_version": result.card_version,
+                "text": result.text if result.accepted else None,
+                "refusal": (
+                    None if result.refusal is None else result.refusal.value
+                ),
+            }
         if operation == "execution_agent_options":
             request = _request(
                 payload, required={"card_id", "card_version"}

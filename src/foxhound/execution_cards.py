@@ -29,6 +29,7 @@ from .card_provenance import (
     ADDRESSABLE_ORIGINS,
     CardSourceEvidence,
     origin_lines as shared_origin_lines,
+    origin_url,
     stored_origin_sources,
 )
 from .knowledge_client import KnowledgeClientError, OwnerUpcomingMeeting
@@ -191,6 +192,26 @@ class ExecutionCardDeliveryClaim:
     card: ExecutionReviewCard
     token: str = field(repr=False)
     expires_at: str
+
+
+@dataclass(frozen=True)
+class ExecutionCardBrief:
+    """One task described for an agent that is not this one.
+
+    Its own type rather than an operation result: nothing was operated on,
+    and the one thing a caller wants from it — the text — is not something
+    any other result carries.
+    """
+
+    disposition: ExecutionCardDisposition
+    card_id: int
+    card_version: int | None = None
+    text: str = field(default="", repr=False)
+    refusal: ExecutionCardRefusal | None = None
+
+    @property
+    def accepted(self) -> bool:
+        return self.disposition is not ExecutionCardDisposition.REFUSED
 
 
 @dataclass(frozen=True)
@@ -854,6 +875,38 @@ class ExecutionCardService:
                 card=card,
                 options=options,
             )
+
+    def brief(
+        self, card_id: int, *, expected_version: int
+    ) -> ExecutionCardBrief:
+        """The task, described for an agent that is not this one.
+
+        A read: asking for it changes no workflow state, because a reader
+        deciding to take the work elsewhere has not answered the card.
+        """
+        def refused(reason: ExecutionCardRefusal) -> ExecutionCardBrief:
+            return ExecutionCardBrief(
+                ExecutionCardDisposition.REFUSED, card_id, refusal=reason)
+
+        if not _valid_identity(card_id, expected_version):
+            return refused(ExecutionCardRefusal.INVALID_ARGUMENT)
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                self._card_select() + " WHERE c.id=?", (card_id,)
+            ).fetchone()
+            if row is None:
+                return refused(ExecutionCardRefusal.NOT_FOUND)
+            if int(row["version"]) != expected_version:
+                return refused(ExecutionCardRefusal.STALE_VERSION)
+            if not _current_card(row):
+                return refused(ExecutionCardRefusal.STALE_VERSION)
+            card = _card(row, self._profile_registry)
+        return ExecutionCardBrief(
+            ExecutionCardDisposition.UNCHANGED,
+            card_id,
+            card_version=expected_version,
+            text=task_brief(card),
+        )
 
     def select_agent(
         self,
@@ -1654,7 +1707,7 @@ def parse_execution_review_callback(
         return None
     if parts[3] not in {
         "start", "snooze", "cancel", "approve", "revise", "discuss",
-        "done", "reassign", "drop", "agent", OWNER_HOLD_ACTION,
+        "done", "reassign", "drop", "agent", "brief", OWNER_HOLD_ACTION,
         *REVIEW_SNOOZE_INTERVALS,
     }:
         return None
@@ -2108,6 +2161,94 @@ _ITEM_STEM = (
     "(CASE WHEN instr({column},'/')>0 "
     "THEN substr({column},1,instr({column},'/')-1) ELSE {column} END)"
 )
+
+#: A brief is meant to be pasted somewhere else, so it carries no
+#: identifiers only this machine can resolve and no capability of any kind.
+MAX_BRIEF_CHARS = 12_000
+MAX_BRIEF_BYTES = 24_000
+
+
+def task_brief(card: ExecutionReviewCard) -> str:
+    """One self-contained description of this task, for an outside agent.
+
+    Not the prompt this agent runs. That one is written for a worker with
+    bounded local commands — `context`, `search`, `record`, `act` — and
+    pasted elsewhere it describes tools that do not exist and a recording
+    protocol that cannot be followed. What an outside reader needs is the
+    work: what is being asked, where it lives, what is already known, and
+    what would count as done.
+
+    Deliberately plain text. It is going into a chat box somewhere else,
+    and markup that renders here is noise there.
+    """
+    lines = [card.task_text.strip() or f"Task {card.task_id}"]
+    if card.origin_record and card.origin_item:
+        source_url = origin_url(
+            kind=card.origin_kind,
+            record=card.origin_record,
+            item=card.origin_item,
+        )
+        lines.append("")
+        if source_url:
+            lines.append(f"Source: {source_url}")
+        elif card.origin_sources:
+            shown_kind = card.origin_kind.replace("_", " ").title()
+            lines.append(f"Source: {shown_kind or 'Unknown source'}")
+        else:
+            lines.append(f"Source: {card.origin_record} {card.origin_item}")
+    if card.origin_sources:
+        lines += ["", "Source evidence:"]
+        for source in card.origin_sources:
+            role = source.role.replace("_", " ")
+            lines.append(f"- {source.name} ({role})")
+            lines.extend(f"  {line}" for line in source.extract.splitlines())
+    if card.owner:
+        lines.append(f"Owner: {card.owner}")
+    if card.due:
+        lines.append(f"Due: {card.due}")
+    if card.summary.strip():
+        lines += ["", "Where this stands:", card.summary.strip()]
+    if card.questions:
+        lines += ["", "Open questions:"]
+        lines += [f"- {question}" for question in card.questions]
+    if card.external_actions:
+        lines += ["", "Effects this would need, none of them taken yet:"]
+        for record in card.external_actions:
+            lines.append(f"- {record.text}")
+            if record.requires:
+                lines.append(f"  still needs: {record.requires}")
+    if card.work_markdown.strip():
+        lines += ["", "Work so far:", card.work_markdown.strip()]
+    for record in card.deliverables:
+        if not record.text.strip():
+            continue
+        heading = record.label or "Draft"
+        lines += ["", f"{heading}:"]
+        if record.recipient:
+            lines.append(f"To: {record.recipient}")
+        if record.subject:
+            lines.append(f"Subject: {record.subject}")
+        lines.append(record.text.strip())
+    brief = "\n".join(lines).strip()
+    if (
+        len(brief) > MAX_BRIEF_CHARS
+        or len(brief.encode("utf-8")) > MAX_BRIEF_BYTES
+    ):
+        # Truncated instructions stop mid-sentence, which is worse than a
+        # short brief that says so.
+        suffix = "\n\n[…truncated. Open the source for the rest.]"
+        character_limit = MAX_BRIEF_CHARS - len(suffix)
+        byte_limit = MAX_BRIEF_BYTES - len(suffix.encode("utf-8"))
+        fragments: list[str] = []
+        size = 0
+        for character in brief[:character_limit]:
+            width = len(character.encode("utf-8"))
+            if size + width > byte_limit:
+                break
+            fragments.append(character)
+            size += width
+        brief = "".join(fragments).rstrip() + suffix
+    return brief
 
 def _continues_lines(
     card: ExecutionReviewCard, *, html: bool
@@ -2861,6 +3002,7 @@ def _button_rows(
             # Only before it starts: once a workflow is running, changing
             # the agent underneath it would rebind work already in flight.
             rows += ((("🤖 Agent", "agent"),),)
+        rows += ((("📋 Task brief", "brief"),),)
         return rows if approvable else rows[1:]
     stop_row = (("👥 Reassign", "reassign"), ("🗑 Drop task", "drop"))
     if kind is ExecutionCardKind.EXTERNAL_REVIEW:
@@ -2884,12 +3026,13 @@ def _button_rows(
             stop_row,
         )
     if approvable:
-        return rows
-    return tuple(
+        return rows + ((("📋 Task brief", "brief"),),)
+    reduced = tuple(
         tuple(button for button in row if button[1] not in {"approve", "done"})
         for row in rows
         if any(button[1] not in {"approve", "done"} for button in row)
     )
+    return reduced + ((("📋 Task brief", "brief"),),)
 
 
 def _owner_hold_button_label(owner: str) -> str:
