@@ -512,8 +512,14 @@ bound to exact task, workflow, phase, and result state; delivery uses an
 expiring digest-fenced claim. Unrelated queued, running, or review-waiting
 workflows do not suppress a Start card; the gateway's one-card presentation
 limit queues reader decisions without silencing them. Start cards retain the
-established task context and Done/Continue, Drop/Update, and Snooze
-24h/Reassign layout. When a task has
+established task context and Done/Continue, Drop/Update, Snooze and Reassign
+layout. Every card kind carries exactly one Snooze control rather than a row
+of intervals: a card surface is expected to rewrite that control into its own
+picker and send back one of `snooze_1d`, `snooze_7d`, `snooze_14d` or
+`snooze_30d`, each of which resolves to 09:00 on a local calendar date. The
+bare control is answered too, as the nearest of those choices, so a surface
+that does not offer a picker still defers the card rather than leaving a
+button that does nothing. When a task has
 a resolved, non-provisional person owner other than the reader, a deployment
 with the GW condition boundary enabled also shows **Until next meeting with
 Person B**. The first Start card is always shown; Foxhound never silently

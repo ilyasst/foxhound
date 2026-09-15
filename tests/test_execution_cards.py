@@ -65,10 +65,10 @@ NOW = datetime(2030, 4, 5, 12, 0, tzinfo=timezone.utc)
 SNOOZE_ACTIONS = [
     "snooze_1d", "snooze_7d", "snooze_14d", "snooze_30d",
 ]
-SNOOZE_LABEL_ROWS = [
-    ["🕓 Tomorrow · 9 AM", "Friday · 9 AM"],
-    ["Next Monday · 9 AM", "In 2 weeks · 9 AM"],
-]
+#: What a keyboard carries: one verb. The four choices above are what a
+#: picker offers behind it, and what an already-delivered card may still
+#: address, so both remain answerable.
+SNOOZE_LABEL_ROW = ["🕓 Snooze"]
 
 
 @contextmanager
@@ -452,7 +452,11 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertNotIn("Synthetic task", repr(claim.card))
         self.assertNotIn(DELIVERY_TOKEN, repr(claim))
 
-        self.clock.advance(timedelta(days=1))
+        # Two days, not one: a snooze resolves to 09:00 on a local calendar
+        # date, so how far past it a one-day jump lands depends on the host
+        # timezone. This test is not about the interval, and pinning the
+        # timezone here would make it about that instead.
+        self.clock.advance(timedelta(days=2))
         self.assertEqual(self.cards.schedule().created, 1)
         self.assertEqual(self.cards.stats().active, 2)
         self.assertEqual(
@@ -562,7 +566,7 @@ class ExecutionCardTests(unittest.TestCase):
         ]
         self.assertEqual(
             [parse_execution_review_callback(value)[2] for value in callbacks],
-            ["done", "start", "drop", "discuss", *SNOOZE_ACTIONS,
+            ["done", "start", "drop", "discuss", "snooze",
              "reassign", "agent", "brief"],
         )
         self.assertEqual(
@@ -571,7 +575,7 @@ class ExecutionCardTests(unittest.TestCase):
             [
                 ["✅ Done", "▶️ Continue"],
                 ["🗑 Drop", "✏️ Update"],
-                *SNOOZE_LABEL_ROWS,
+                SNOOZE_LABEL_ROW,
                 ["👥 Reassign"],
                 ["🤖 Agent"],
                 ["📋 Task brief"],
@@ -1142,7 +1146,9 @@ class ExecutionCardTests(unittest.TestCase):
             expected_version=claim.card.version,
             action="snooze",
         )
-        self.clock.advance(timedelta(days=1))
+        # Past the snoozed morning in every host timezone; see the note in
+        # test_schedule_is_explicit_current_bounded_and_idempotent.
+        self.clock.advance(timedelta(days=2))
         self.assertEqual(self.cards.schedule().created, 1)
         resumed = self._claim_and_deliver()
         _body, keyboard = render_execution_review_card(resumed.card)
@@ -1184,7 +1190,7 @@ class ExecutionCardTests(unittest.TestCase):
                 [parse_execution_review_callback(value)[2]
                  for value in callbacks],
                 [
-                    "revise", "discuss", "approve", *SNOOZE_ACTIONS, "done",
+                    "revise", "discuss", "approve", "snooze", "done",
                     "reassign", "drop", "brief",
                 ],
             )
@@ -1194,7 +1200,7 @@ class ExecutionCardTests(unittest.TestCase):
                 [
                     ["🔎 Investigate further", "💬 Discuss"],
                     ["▶️ Execute plan"],
-                    *SNOOZE_LABEL_ROWS,
+                    SNOOZE_LABEL_ROW,
                     ["✅ Mark as done"],
                     ["👥 Reassign", "🗑 Drop task"],
                     ["📋 Task brief"],
@@ -1235,7 +1241,7 @@ class ExecutionCardTests(unittest.TestCase):
         # An external review, not a plan: same buttons, different order.
         self.assertEqual(
             actions,
-            ["revise", *SNOOZE_ACTIONS, "discuss",
+            ["revise", "snooze", "discuss",
              "reassign", "drop", "brief"],
         )
         before = self.execution.get(1)
@@ -2737,7 +2743,7 @@ class ExecutionCardTests(unittest.TestCase):
                 for row in keyboard["inline_keyboard"]
                 for button in row
             ],
-            ["done", "discuss", *SNOOZE_ACTIONS,
+            ["done", "discuss", "snooze",
              "reassign", "drop", "brief"],
         )
         self.cards.complete_delivery(
@@ -2817,7 +2823,8 @@ class ExecutionCardTests(unittest.TestCase):
             )
 
     def test_a_gate_still_takes_the_plain_snooze(self):
-        # Already-delivered cards can still carry the retired generic action.
+        # The verb every keyboard now carries, and the one an
+        # already-delivered card may still address.
         self._schedule_workflow(4)
         self.cards.schedule()
         claim = self._claim_and_deliver()
@@ -2828,6 +2835,44 @@ class ExecutionCardTests(unittest.TestCase):
         )
         self.assertTrue(snoozed.accepted, snoozed.refusal)
         self.assertEqual(snoozed.workflow_status, WorkflowStatus.SNOOZED)
+
+    def test_the_plain_snooze_means_the_nearest_calendar_choice(self):
+        """A gate and a review deferred together come back together.
+
+        The bare verb used to be a raw offset from the tap while every
+        explicit choice was a local morning, so two cards snoozed in the
+        same minute returned hours apart, and a card delivered before the
+        choices existed kept waking at whatever time of day it was first
+        put off.
+        """
+        with host_timezone("America/Toronto"):
+            self.clock.value = datetime(
+                2030, 3, 8, 12, 0, tzinfo=timezone.utc
+            )
+            self._schedule_workflow(1)
+            self.cards.schedule()
+            gate = self._claim_and_deliver()
+            gate_snooze = self.cards.act(
+                gate.card.id,
+                expected_version=gate.card.version,
+                action="snooze",
+            )
+            self._plan_review(2, "plain-snooze-plan")
+            self.cards.schedule()
+            review = self._claim_and_deliver()
+            review_snooze = self.cards.act(
+                review.card.id,
+                expected_version=review.card.version,
+                action="snooze",
+            )
+
+        self.assertTrue(review_snooze.accepted, review_snooze.refusal)
+        self.assertEqual(
+            review_snooze.workflow_status, WorkflowStatus.SNOOZED
+        )
+        # 09:00 the next local morning, which is what snooze_1d resolves to.
+        self.assertEqual(gate_snooze.wake_at, "2030-03-09T14:00:00+00:00")
+        self.assertEqual(review_snooze.wake_at, gate_snooze.wake_at)
 
     def test_review_snooze_is_durable_and_resumes_the_same_gate(self):
         with host_timezone("UTC"):
