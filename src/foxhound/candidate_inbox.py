@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -233,6 +233,26 @@ _SCHEMA_COLUMNS = {
         "card_id",
         "created_at",
         "settled_at",
+    ),
+    "task_duplicate_proposals": (
+        "id",
+        "left_task_id",
+        "right_task_id",
+        "left_task_version",
+        "right_task_version",
+        "basis",
+        "detector",
+        "state",
+        "created_at",
+        "updated_at",
+        "settled_at",
+    ),
+    "task_duplicate_proposal_events": (
+        "sequence",
+        "proposal_id",
+        "kind",
+        "actor",
+        "occurred_at",
     ),
     "task_owner_equivalences": (
         "candidate_id",
@@ -432,21 +452,32 @@ _SCHEMA_COLUMNS = {
 
 # Every historical map is derived from the current one by subtraction, so
 # anything added now has to be taken back out of the version before it
-# existed -- otherwise a migration step verifies its own future. Four
+# existed -- otherwise a migration step verifies its own future. Five
 # subtractions, applied in version order: `source_revision` (task review
-# cards) arrives at v26, `task_completion_evidence` arrives at v25,
+# cards) arrives at v26, duplicate proposals arrive at v27,
+# `task_completion_evidence` arrives at v25,
 # `consumer_digest` (task review cards, ADR 0036 decision 2) at v23,
 # `work_digest` at v22, and `task_relations` at v21 -- so the v24 state has
 # the new table removed, the v22 state also has the card column removed but
 # keeps `work_digest`, the v21 state has neither column but keeps
-# `task_relations`, and the v20 state has none of the four.
+# `task_relations`, and the v20 state has none of the five.
+_SCHEMA_V26_COLUMNS = {
+    name: columns
+    for name, columns in _SCHEMA_COLUMNS.items()
+    if name not in {"task_duplicate_proposals", "task_duplicate_proposal_events"}
+}
+
 _SCHEMA_V24_COLUMNS = {
     name: tuple(
         column for column in columns
         if not (name == "task_review_cards" and column == "source_revision")
     )
     for name, columns in _SCHEMA_COLUMNS.items()
-    if name != "task_completion_evidence"
+    if name not in {
+        "task_completion_evidence",
+        "task_duplicate_proposals",
+        "task_duplicate_proposal_events",
+    }
 }
 
 _SCHEMA_V25_COLUMNS = {
@@ -455,6 +486,7 @@ _SCHEMA_V25_COLUMNS = {
         if not (name == "task_review_cards" and column == "source_revision")
     )
     for name, columns in _SCHEMA_COLUMNS.items()
+    if name not in {"task_duplicate_proposals", "task_duplicate_proposal_events"}
 }
 
 _SCHEMA_V22_COLUMNS = {
@@ -541,6 +573,12 @@ _SCHEMA_OBJECTS = {
     "task_completion_evidence_open": "index",
     "task_completion_evidence_no_delete": "trigger",
     "task_completion_evidence_settle_only": "trigger",
+    "task_duplicate_proposals_pair": "index",
+    "task_duplicate_proposals_open": "index",
+    "task_duplicate_proposal_events_no_update": "trigger",
+    "task_duplicate_proposal_events_no_delete": "trigger",
+    "task_duplicate_proposals_no_delete": "trigger",
+    "task_duplicate_proposals_settle_only": "trigger",
     "task_owner_equivalences_no_update": "trigger",
     "task_owner_equivalences_no_delete": "trigger",
     "task_review_cards_one_active": "index",
@@ -1987,6 +2025,102 @@ _SCHEMA_V26 = (
 )
 
 
+# A private, durable question that two independently accepted source tasks may
+# describe one commitment.  Its identity is the unordered task pair, not the
+# detector's wording: a repeated scan must not ask the reader again after a
+# rejection.  The current state is intentionally small; the append-only event
+# history retains every machine recommendation and reader decision.
+_SCHEMA_V27 = (
+    """
+CREATE TABLE IF NOT EXISTS task_duplicate_proposals (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    left_task_id       INTEGER NOT NULL,
+    right_task_id      INTEGER NOT NULL,
+    left_task_version  INTEGER NOT NULL CHECK(left_task_version >= 1),
+    right_task_version INTEGER NOT NULL CHECK(right_task_version >= 1),
+    basis              TEXT NOT NULL CHECK(length(basis) BETWEEN 1 AND 1200),
+    detector           TEXT NOT NULL CHECK(length(detector) BETWEEN 1 AND 64),
+    state              TEXT NOT NULL CHECK(state IN (
+                           'proposed','confirmed','rejected'
+                       )),
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL,
+    settled_at         TEXT,
+    CHECK(left_task_id < right_task_id),
+    CHECK((state = 'proposed') = (settled_at IS NULL)),
+    FOREIGN KEY(left_task_id) REFERENCES tasks(id),
+    FOREIGN KEY(right_task_id) REFERENCES tasks(id)
+);
+""",
+    """
+CREATE UNIQUE INDEX IF NOT EXISTS task_duplicate_proposals_pair
+    ON task_duplicate_proposals(left_task_id, right_task_id);
+""",
+    """
+CREATE INDEX IF NOT EXISTS task_duplicate_proposals_open
+    ON task_duplicate_proposals(left_task_id, right_task_id)
+    WHERE state = 'proposed';
+""",
+    """
+CREATE TABLE IF NOT EXISTS task_duplicate_proposal_events (
+    sequence    INTEGER PRIMARY KEY AUTOINCREMENT,
+    proposal_id INTEGER NOT NULL,
+    kind        TEXT NOT NULL CHECK(kind IN (
+                    'proposed','confirmed','rejected','reopened'
+                )),
+    actor       TEXT NOT NULL CHECK(length(actor) BETWEEN 1 AND 200),
+    occurred_at TEXT NOT NULL,
+    FOREIGN KEY(proposal_id) REFERENCES task_duplicate_proposals(id)
+);
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS task_duplicate_proposal_events_no_update
+BEFORE UPDATE ON task_duplicate_proposal_events
+BEGIN
+    SELECT RAISE(ABORT, 'task duplicate proposal events are append-only');
+END;
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS task_duplicate_proposal_events_no_delete
+BEFORE DELETE ON task_duplicate_proposal_events
+BEGIN
+    SELECT RAISE(ABORT, 'task duplicate proposal events are append-only');
+END;
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS task_duplicate_proposals_no_delete
+BEFORE DELETE ON task_duplicate_proposals
+BEGIN
+    SELECT RAISE(ABORT, 'task duplicate proposals are append-only');
+END;
+""",
+    # Detector inputs are immutable.  Only a reader decision can settle an
+    # unanswered proposal, and only an explicit reopening can make a rejected
+    # proposal unanswered again; the event table records both decisions.
+    """
+CREATE TRIGGER IF NOT EXISTS task_duplicate_proposals_settle_only
+BEFORE UPDATE ON task_duplicate_proposals
+BEGIN
+    SELECT RAISE(ABORT, 'task duplicate proposal may only be settled or reopened')
+    WHERE OLD.left_task_id       <> NEW.left_task_id
+       OR OLD.right_task_id      <> NEW.right_task_id
+       OR OLD.left_task_version  <> NEW.left_task_version
+       OR OLD.right_task_version <> NEW.right_task_version
+       OR OLD.basis              <> NEW.basis
+       OR OLD.detector           <> NEW.detector
+       OR OLD.created_at         <> NEW.created_at
+       OR NOT (
+           (OLD.state = 'proposed' AND NEW.state IN ('confirmed','rejected')
+            AND NEW.settled_at IS NOT NULL)
+           OR
+           (OLD.state = 'rejected' AND NEW.state = 'proposed'
+            AND NEW.settled_at IS NULL)
+       );
+END;
+""",
+)
+
+
 _SCHEMA_V20 = (
     # SQLite cannot alter a CHECK in place, and three tables carry a foreign
     # key to this one. Renaming the card table would rewrite all three to
@@ -2775,6 +2909,23 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 26
+            if version == 26:
+                self._require_tables(
+                    connection,
+                    ("tasks",),
+                    columns=_SCHEMA_V26_COLUMNS,
+                )
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V27:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 27")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 27
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:
