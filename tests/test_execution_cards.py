@@ -838,10 +838,15 @@ class ExecutionCardTests(unittest.TestCase):
         )
         self.assertEqual(cards.schedule(limit=5).created, 5)
         eligibility = {}
+        hold_reasons = {}
+        group_body = None
         long_label = None
         for _ in range(5):
             claim = cards.claim_next()
             eligibility[claim.card.task_id] = claim.card.owner_hold_eligible
+            hold_reasons[claim.card.task_id] = claim.card.owner_hold_reason
+            if claim.card.task_id == 2:
+                group_body, _keyboard = render_execution_review_card(claim.card)
             if claim.card.task_id == 5:
                 _body, keyboard = render_execution_review_card(claim.card)
                 long_label = next(
@@ -867,6 +872,12 @@ class ExecutionCardTests(unittest.TestCase):
             eligibility,
             {1: False, 2: False, 3: False, 4: True, 5: True},
         )
+        self.assertEqual(hold_reasons[4], "")
+        self.assertEqual(
+            hold_reasons[2],
+            "Until next meeting applies only to an individual owner.",
+        )
+        self.assertIn(hold_reasons[2], group_body)
         self.assertLessEqual(len(long_label.encode("utf-8")), 64)
         self.assertNotIn("SPK_", long_label)
         self.clock.advance(timedelta(days=21) - timedelta(seconds=1))
