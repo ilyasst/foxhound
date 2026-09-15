@@ -725,6 +725,80 @@ class ExecutionWorkerTests(unittest.TestCase):
                     self.run_directory,
                 )
 
+    def test_github_issue_completion_needs_pull_request_and_comment(self):
+        state = SimpleNamespace(
+            database_path=self.database,
+            task_id=1,
+            phase=WorkflowPhase.EXTERNAL_ACTION,
+        )
+        origin = SimpleNamespace(kind="issue")
+        _append_repository_receipt(self.run_directory, {
+            "kind": "issue-comment",
+            "repository": "github.com/example-org/example-repo",
+            "url": "https://github.com/example-org/example-repo/issues/42#issuecomment-1",
+        })
+        with mock.patch(
+            "foxhound.execution_worker._repository_origin", return_value=origin,
+        ):
+            with self.assertRaisesRegex(
+                ExecutionWorkerDraftError, "requires pull-request receipt",
+            ):
+                _repository_result(
+                    state, {"outcome": "completed", "deliverables": []},
+                    self.run_directory,
+                )
+
+        _append_repository_receipt(self.run_directory, {
+            "kind": "pull-request",
+            "repository": "github.com/example-org/example-repo",
+            "url": "https://github.com/example-org/example-repo/pull/43",
+        })
+        with mock.patch(
+            "foxhound.execution_worker._repository_origin", return_value=origin,
+        ):
+            result = _repository_result(
+                state, {"outcome": "completed", "deliverables": []},
+                self.run_directory,
+            )
+        self.assertEqual(len(result["deliverables"]), 2)
+
+    def test_github_review_completion_needs_review_receipt(self):
+        state = SimpleNamespace(
+            database_path=self.database,
+            task_id=1,
+            phase=WorkflowPhase.EXTERNAL_ACTION,
+        )
+        origin = SimpleNamespace(kind="review_request")
+        _append_repository_receipt(self.run_directory, {
+            "kind": "issue-comment",
+            "repository": "github.com/example-org/example-repo",
+            "url": "https://github.com/example-org/example-repo/issues/42#issuecomment-1",
+        })
+        with mock.patch(
+            "foxhound.execution_worker._repository_origin", return_value=origin,
+        ):
+            with self.assertRaisesRegex(
+                ExecutionWorkerDraftError, "requires review receipt",
+            ):
+                _repository_result(
+                    state, {"outcome": "completed", "deliverables": []},
+                    self.run_directory,
+                )
+
+        _append_repository_receipt(self.run_directory, {
+            "kind": "review",
+            "repository": "github.com/example-org/example-repo",
+            "url": "https://github.com/example-org/example-repo/pull/43#pullrequestreview-1",
+        })
+        with mock.patch(
+            "foxhound.execution_worker._repository_origin", return_value=origin,
+        ):
+            result = _repository_result(
+                state, {"outcome": "completed", "deliverables": []},
+                self.run_directory,
+            )
+        self.assertEqual(len(result["deliverables"]), 2)
+
     def test_draft_cli_errors_are_content_free(self):
         private_value = "synthetic-private-outcome-value"
         self._write_result_inputs()
