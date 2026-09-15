@@ -970,6 +970,12 @@ def _execution_view_document(
         "disposition": result.disposition.value,
         "card_id": result.card_id,
         "card_version": result.card_version,
+        # The kind travels with the presentation. A caller restoring a card
+        # has only its id and version -- the claim that told it the kind is
+        # long gone -- and the checks worth keeping on a restored keyboard
+        # are the kind-dependent ones: no approval on work that has already
+        # run, no owner hold outside a start gate.
+        "kind": None if result.card is None else result.card.kind.value,
         "presentation": None,
         "refusal": None if result.refusal is None else result.refusal.value,
     }

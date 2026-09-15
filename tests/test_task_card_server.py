@@ -232,6 +232,7 @@ class TaskCardServerTests(unittest.TestCase):
         self.assertIn(
             "inline_keyboard", response["presentation"]["reply_markup"]
         )
+        self.assertEqual(response["kind"], "start")
         self.assertEqual(self.execution_cards.stats(), before)
 
         stale = self.app.dispatch(
@@ -245,6 +246,7 @@ class TaskCardServerTests(unittest.TestCase):
         # Absent, not partial: a caller that cannot restore the card must
         # not be handed something that looks like it could be shown.
         self.assertIsNone(stale["presentation"])
+        self.assertIsNone(stale["kind"])
         self.assertEqual(stale["refusal"], "stale_version")
 
     def test_configuration_requires_private_token_and_canonical_loopback(self):

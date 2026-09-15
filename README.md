@@ -551,7 +551,11 @@ expected version, and writes nothing. It exists so a surface that replaces a
 card's controls with a sub-menu -- the snooze picker is the one in use -- can
 put the card back when the reader backs out, instead of stranding them with a
 card they can only defer. An undelivered, superseded or differently versioned
-card is refused and carries no presentation at all. Its agent-options and
+card is refused and carries no presentation at all. The response names the
+card's kind alongside its presentation, because a caller restoring a card
+holds only its identifier and version -- the claim that told it the kind is
+long gone -- and the checks worth keeping on a restored keyboard are the
+kind-dependent ones. Its agent-options and
 agent-selection operations remain a bounded integration contract with opaque
 callbacks and a refreshed Start-card presentation; they are not exposed as an
 extra control in the legacy-compatible Start keyboard.
