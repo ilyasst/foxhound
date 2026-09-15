@@ -259,7 +259,7 @@ class ExecutionWorkerTests(unittest.TestCase):
         self.assertNotIn(CLAIM_TOKEN, rendered)
         self.assertNotIn(str(self.database), rendered)
         self.assertEqual(context["task"]["text"], "Synthetic task")
-        self.assertEqual(context["schema_version"], 4)
+        self.assertEqual(context["schema_version"], 5)
         self.assertEqual(context["runtime"]["today"], "2030-01-02")
         self.assertEqual(context["runtime"]["today_weekday"], "Wednesday")
         self.assertEqual(
@@ -278,6 +278,20 @@ class ExecutionWorkerTests(unittest.TestCase):
             context["capabilities"],
             {
                 "knowledge_layers": ["kb", "secondary", "emails"],
+                "local_research_clients": {
+                    "outlook": [
+                        "folders", "inbox", "search", "read", "thread",
+                        "draft",
+                    ],
+                    "moodle": [
+                        "renew", "whoami", "courses", "assignments",
+                        "submissions", "assessment",
+                    ],
+                    "qmd": [
+                        "query", "search", "get", "multi-get", "ls",
+                        "status",
+                    ],
+                },
                 "worker_operations": [
                     "context", "search", "draft", "record", "release"
                 ],
