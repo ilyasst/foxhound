@@ -523,6 +523,70 @@ class ExecutionCardTests(unittest.TestCase):
         )
         self.assertEqual(finished.workflow_status, WorkflowStatus.COMPLETED)
 
+    def test_cards_deliver_results_then_review_work_then_start_by_age(self):
+        """A later result must overtake an older Start gate.
+
+        The scheduler is deliberately exercised with a small limit as well
+        as the delivery queue: otherwise a large backlog could leave the
+        result unminted, and a correct claim query would never see it.
+        """
+        self._schedule_workflow(1)
+        self.clock.advance(timedelta(minutes=1))
+        self._plan_review(2, "older-plan")
+        self.clock.advance(timedelta(minutes=1))
+        self._plan_review(3, "newer-plan")
+        self.clock.advance(timedelta(minutes=1))
+        self._external_review(4, "external-decision")
+        self.clock.advance(timedelta(minutes=1))
+        self._plan_review(5, "result-plan")
+        approved = self.execution.review_action(
+            5,
+            expected_version=self.execution.get(5).version,
+            action="approve",
+        )
+        self.assertEqual(
+            (approved.status, approved.phase),
+            (WorkflowStatus.QUEUED, WorkflowPhase.EXECUTE),
+        )
+        self._record(
+            5,
+            phase=WorkflowPhase.EXECUTE,
+            outcome=ExecutionOutcome.COMPLETED,
+            result_id="finished-result",
+        )
+
+        # Bounded scheduling chooses the completed execution first, even
+        # though tasks 1 through 4 have been ready longer.
+        self.assertEqual(self.cards.schedule(limit=1).created, 1)
+        first = self.cards.claim_next()
+        self.assertEqual(
+            (first.card.task_id, first.card.kind),
+            (5, ExecutionCardKind.RESULT_REVIEW),
+        )
+
+        # Review cards are next.  The two plans retain their age order; the
+        # external authorisation is in the same continuation band.
+        self.assertEqual(self.cards.schedule(limit=3).created, 3)
+        second = self.cards.claim_next()
+        third = self.cards.claim_next()
+        fourth = self.cards.claim_next()
+        self.assertEqual(
+            [(claim.card.task_id, claim.card.kind)
+             for claim in (second, third, fourth)],
+            [
+                (2, ExecutionCardKind.PLAN_REVIEW),
+                (3, ExecutionCardKind.PLAN_REVIEW),
+                (4, ExecutionCardKind.EXTERNAL_REVIEW),
+            ],
+        )
+
+        self.assertEqual(self.cards.schedule(limit=1).created, 1)
+        last = self.cards.claim_next()
+        self.assertEqual(
+            (last.card.task_id, last.card.kind),
+            (1, ExecutionCardKind.START),
+        )
+
     def test_existing_over_capacity_work_does_not_hide_a_start_card(self):
         for task_id in range(1, 7):
             workflow = self._schedule_workflow(task_id)
