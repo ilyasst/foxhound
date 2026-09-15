@@ -19,6 +19,8 @@ from foxhound.agent_profiles import (
 from foxhound.candidate_inbox import CandidateInbox, SCHEMA_VERSION
 from foxhound.task_execution import (
     AWAITING_READER_CAP,
+    EXECUTION_SLOT_CAP,
+    PLAN_READY_CAP,
     WORK_IN_PROGRESS_CAP,
     ExecutionOutcome,
     ExecutionResultEnvelope,
@@ -705,18 +707,19 @@ class TaskExecutionTests(unittest.TestCase):
             planning_grants=["issue"],
         ).schedule_new(limit=100)
         self.assertEqual(
-            (WORK_IN_PROGRESS_CAP, AWAITING_READER_CAP), (5, 20)
+            (EXECUTION_SLOT_CAP, PLAN_READY_CAP, AWAITING_READER_CAP),
+            (2, 10, 20),
         )
         self.assertEqual(
             (result.scheduled, result.remaining),
-            (WORK_IN_PROGRESS_CAP + AWAITING_READER_CAP, 10),
+            (PLAN_READY_CAP + AWAITING_READER_CAP, 5),
         )
         with closing(sqlite3.connect(self.database)) as connection:
             counts = dict(connection.execute(
                 "SELECT status,COUNT(*) FROM task_execution_workflows "
                 "GROUP BY status"
             ).fetchall())
-        self.assertEqual(counts, {"awaiting_start": 20, "queued": 5})
+        self.assertEqual(counts, {"awaiting_start": 20, "queued": 10})
 
         # A capacity-bound pass is passive: no existing row is removed or
         # rewritten merely to make room for another candidate.
@@ -725,14 +728,37 @@ class TaskExecutionTests(unittest.TestCase):
             clock=self.clock,
             planning_grants=["issue"],
         ).schedule_new(limit=100)
-        self.assertEqual((replay.scheduled, replay.remaining), (0, 10))
+        self.assertEqual((replay.scheduled, replay.remaining), (0, 5))
         with closing(sqlite3.connect(self.database)) as connection:
             self.assertEqual(
                 connection.execute(
                     "SELECT COUNT(*) FROM task_execution_workflows"
                 ).fetchone()[0],
-                WORK_IN_PROGRESS_CAP + AWAITING_READER_CAP,
+                PLAN_READY_CAP + AWAITING_READER_CAP,
             )
+
+    def test_two_claims_can_run_but_a_third_is_not_claimed(self):
+        with closing(sqlite3.connect(self.database)) as connection:
+            for task_id in (2, 3):
+                connection.execute(
+                    "INSERT INTO tasks(id,status,text,owner,due,version,"
+                    "created_at,updated_at,closed_at) "
+                    "VALUES(?,'open',?,'Person A',NULL,1,?,?,NULL)",
+                    (task_id, f"Synthetic task {task_id}", self._now(),
+                     self._now()),
+                )
+            connection.commit()
+        for task_id in (1, 2, 3):
+            scheduled = self.service.schedule(task_id, expected_task_version=1)
+            self.service.start_action(
+                task_id, expected_version=scheduled.version, action="start"
+            )
+
+        first = self._claim()
+        second = self._claim()
+        self.assertEqual({first.task_id, second.task_id}, {1, 2})
+        self.assertIsNone(self.service.claim_next())
+        self.assertEqual(self.service.get(3).status, WorkflowStatus.QUEUED)
 
     def test_start_gate_snooze_cancel_and_stale_taps_are_fenced(self):
         scheduled = self.service.schedule(1, expected_task_version=1)
