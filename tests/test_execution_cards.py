@@ -910,6 +910,43 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertEqual(replacement.card.id, claim.card.id)
         self.assertGreater(replacement.card.version, retried.card_version)
 
+    def test_unanswered_delivered_card_is_represented_after_one_hour(self):
+        self._schedule_workflow(1)
+        self.cards.schedule()
+        claim = self._claim_and_deliver()
+
+        self.clock.advance(timedelta(hours=1) - timedelta(seconds=1))
+        self.assertEqual(self.cards.requeue_unanswered().requeued, 0)
+        self.clock.advance(timedelta(seconds=1))
+        requeued = self.cards.requeue_unanswered()
+
+        self.assertEqual(requeued.requeued, 1)
+        old_action = self.cards.act(
+            claim.card.id,
+            expected_version=claim.card.version,
+            action="start",
+        )
+        self.assertEqual(old_action.refusal, ExecutionCardRefusal.STALE_VERSION)
+        replacement = self.cards.claim_next(lease_seconds=60)
+        self.assertEqual(replacement.card.id, claim.card.id)
+        self.assertGreater(replacement.card.version, claim.card.version)
+
+    def test_represent_only_requeues_current_delivered_cards(self):
+        self._schedule_workflow(1)
+        self._schedule_workflow(2)
+        self.cards.schedule()
+        first = self._claim_and_deliver()
+        self._claim_and_deliver()
+        self.cards.act(
+            first.card.id,
+            expected_version=first.card.version,
+            action="start",
+        )
+
+        self.clock.advance(timedelta(hours=1))
+        self.assertEqual(self.cards.requeue_unanswered().requeued, 1)
+        self.assertEqual(self.cards.stats().pending, 1)
+
     def test_start_actions_atomically_apply_the_expected_task_lifecycle(self):
         expected = {
             1: ("start", WorkflowStatus.QUEUED, TaskStatus.OPEN),
