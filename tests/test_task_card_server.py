@@ -65,6 +65,7 @@ from foxhound.task_card_server import (
     load_role_tokens,
     load_token,
     make_server,
+    main,
 )
 from foxhound.task_cards import TaskCardService
 from foxhound.task_execution import (
@@ -1830,6 +1831,57 @@ class TaskCardTokenRoleTests(unittest.TestCase):
             load_role_tokens(
                 [f"drip={drip_path}", f"queue_view={missing_path}"]
             )
+
+    def test_cli_accepts_independent_execution_role_map(self):
+        root = Path(self.temporary.name)
+        task_path = root / "task.token"
+        task_path.write_text(TOKEN + "\n", encoding="utf-8")
+        task_path.chmod(0o600)
+        execution_path = root / "execution-queue.token"
+        execution_path.write_text(QUEUE_VIEW_TOKEN + "\n", encoding="utf-8")
+        execution_path.chmod(0o600)
+
+        with mock.patch("foxhound.task_card_server.serve") as serve:
+            self.assertEqual(
+                main([
+                    "--database", str(self.database),
+                    "--token-file", str(task_path),
+                    "--execution-token-file",
+                    f"queue_view={execution_path}",
+                    "--bind", "127.0.0.1",
+                    "--port", "8790",
+                ]),
+                0,
+            )
+        app = serve.call_args.args[2]
+        self.assertEqual(app.tokens, {DRIP_ROLE: TOKEN})
+        self.assertEqual(
+            app.execution_tokens,
+            {QUEUE_VIEW_ROLE: QUEUE_VIEW_TOKEN},
+        )
+
+    def test_cli_role_mapped_task_policy_does_not_borrow_for_execution(self):
+        root = Path(self.temporary.name)
+        task_path = root / "task.token"
+        task_path.write_text(TOKEN + "\n", encoding="utf-8")
+        task_path.chmod(0o600)
+        queue_path = root / "task-queue.token"
+        queue_path.write_text(QUEUE_VIEW_TOKEN + "\n", encoding="utf-8")
+        queue_path.chmod(0o600)
+
+        with mock.patch("foxhound.task_card_server.serve") as serve:
+            self.assertEqual(
+                main([
+                    "--database", str(self.database),
+                    "--token-file", f"drip={task_path}",
+                    "--token-file", f"queue_view={queue_path}",
+                    "--bind", "127.0.0.1",
+                    "--port", "8790",
+                ]),
+                0,
+            )
+        app = serve.call_args.args[2]
+        self.assertEqual(app.execution_tokens, {})
 
 
 class TaskCardClaimConsumerIdentityTests(unittest.TestCase):
