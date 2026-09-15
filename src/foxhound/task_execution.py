@@ -88,6 +88,11 @@ PLAN_READY_CAP = 10
 # now describes only active execution, not queued planning work.
 WORK_IN_PROGRESS_CAP = EXECUTION_SLOT_CAP
 AWAITING_READER_CAP = 20
+# How far down the ready queue one claim may look for a workflow it can
+# actually run.  Bounded so a large queue of unresolvable pins cannot turn a
+# single claim into a full table scan, and generous enough that a realistic
+# run of them still lets healthy work through on the same pass.
+MAX_CLAIM_SCAN = 50
 WORKING_STATUSES = frozenset({"queued", "running"})
 READER_WAITING_STATUSES = frozenset({
     "awaiting_start", "awaiting_review", "completed",
@@ -297,6 +302,10 @@ class TaskExecutionService:
         ):
             raise ValueError("default agent profile is unavailable")
         self._profile_registry = registry
+        # Task IDs the last claim deferred because their pinned profile could
+        # not be resolved.  Read by the runner so a queue that is quietly
+        # shedding work says so instead of just looking idle.
+        self._last_claim_deferred: tuple[int, ...] = ()
         # Empty unless this machine says otherwise: an operator who has not
         # decided is asked, rather than having the decision made for them
         # by whichever machine edited a shared file first.
@@ -689,6 +698,11 @@ class TaskExecutionService:
                 connection.rollback()
                 raise
 
+    @property
+    def last_claim_deferred(self) -> tuple[int, ...]:
+        """Task IDs the last claim could not run and deferred."""
+        return self._last_claim_deferred
+
     def claim_next(
         self,
         *,
@@ -717,7 +731,17 @@ class TaskExecutionService:
                 if running >= EXECUTION_SLOT_CAP:
                     connection.commit()
                     return None
-                row = connection.execute(
+                # A batch, not one row. A workflow can be pinned to a
+                # profile revision this machine cannot resolve -- the
+                # catalog was rewritten without it, or the install has not
+                # landed yet -- and resolving the head of the queue used to
+                # raise straight out of the claim. One such row then stopped
+                # every OTHER queued workflow behind it, for as long as it
+                # stayed at the head, with the runner reporting only that it
+                # had failed. An unresolvable pin is a property of that
+                # workflow, so it is deferred like any other per-task
+                # failure and the scan moves on.
+                rows = connection.execute(
                     "SELECT w.*,t.text,t.owner,t.due,t.status AS task_status,"
                     "t.version AS current_task_version "
                     "FROM task_execution_workflows AS w JOIN tasks AS t "
@@ -731,17 +755,38 @@ class TaskExecutionService:
                     f"AND w.phase IN ({placeholders}) "
                     "AND t.status='open' AND t.version=w.task_version "
                     "ORDER BY CASE WHEN w.failure_count=0 THEN 0 ELSE 1 END,"
-                    "w.updated_at,w.task_id LIMIT 1",
-                    (now, *(phase.value for phase in phases)),
-                ).fetchone()
-                if row is None:
+                    "w.updated_at,w.task_id LIMIT ?",
+                    (now, *(phase.value for phase in phases),
+                     MAX_CLAIM_SCAN),
+                ).fetchall()
+                row = None
+                profile = None
+                deferred: list[int] = []
+                for candidate in rows:
+                    try:
+                        resolved = self._resolve_profile(candidate)
+                        if candidate["phase"] not in resolved.allowed_phases:
+                            raise TaskLedgerError(
+                                "execution agent profile is unavailable"
+                            )
+                    except TaskLedgerError:
+                        # Same reason the runner already records when the
+                        # profile disappears AFTER the claim, so one cause
+                        # does not read as two. Retries first, then parks,
+                        # which is what raises the card.
+                        self._defer_failure(
+                            connection, candidate, "startup_failed", stamp,
+                            event_kind=None,
+                        )
+                        deferred.append(int(candidate["task_id"]))
+                        continue
+                    row = candidate
+                    profile = resolved
+                    break
+                self._last_claim_deferred = tuple(deferred)
+                if row is None or profile is None:
                     connection.commit()
                     return None
-                profile = self._resolve_profile(row)
-                if row["phase"] not in profile.allowed_phases:
-                    raise TaskLedgerError(
-                        "execution agent profile is unavailable"
-                    )
                 expires = (
                     stamp + timedelta(seconds=profile.claim_lease_seconds)
                 ).isoformat(timespec="seconds")
