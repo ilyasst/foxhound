@@ -24,3 +24,15 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "foxhound.contracts" = ["schemas/*.json"]
+
+[tool.pytest.ini_options]
+# Repo root ("."), not just "src", must be on sys.path: tools/ (the
+# public-diff guard) lives at the repo root, not under src/, and its test
+# imports it as `from tools.check_public_diff import findings`. Without this,
+# running plain `pytest` from the repo root fails that import even though the
+# documented `PYTHONPATH=src python3 -m unittest discover -s tests -v`
+# happens to work already (python -m unittest puts the current directory on
+# sys.path automatically; a bare `pytest` invocation does not). This makes
+# both invocations work without a PYTHONPATH environment variable.
+pythonpath = ["src", "."]
+testpaths = ["tests"]

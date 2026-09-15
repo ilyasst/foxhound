@@ -41,7 +41,10 @@ Before every remote write, inspect the exact diff and all accompanying text for
 personal data, secrets, operational details, and copied records. This includes
 issue bodies, branch names, commit messages, pull-request metadata, review
 comments, and command output. Automated scanning is helpful but does not
-replace this review.
+replace this review: see `CONFIDENTIALITY.md` for what `tools/check_public_diff.py`
+actually catches (four narrow, mechanical classes) and, more importantly, the
+much longer list of things — client, project, and person names among them —
+that no script here can see.
 
 If unsafe material reaches the remote, stop related work. Do not repeat the
 material in a cleanup discussion. Remove or sanitize the affected artifact,
@@ -94,3 +97,18 @@ workflow after bootstrap.
 - A change is not complete until tests pass, documentation is current, the
   publication-safety review is complete, and the issue/branch/worktree cleanup
   has been performed.
+
+## Publication-safety tooling
+
+Install the pre-commit hook once per checkout (each worktree needs its own):
+
+```sh
+git config core.hooksPath tools/hooks
+```
+
+It runs `tools/check_public_diff.py` over the staged diff before every
+commit, and separately refuses to commit on `main`. See `CONFIDENTIALITY.md`
+for what the guard does, how to run it by hand, and — read this part even if
+you skip the rest — an explicit list of what it cannot detect. There is no
+CI running any of this; GitHub Actions billing is unavailable for this
+account, so a workflow-based check would never run. Do not add one.
