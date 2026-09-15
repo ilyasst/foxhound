@@ -360,6 +360,19 @@ def _historical_general_profiles() -> tuple[AgentProfile, ...]:
             kill_grace_seconds=30,
             allowed_phases=_PHASES,
         ),
+        AgentProfile(
+            profile_id="general",
+            display_name="General",
+            runtime="hermes",
+            prompt_template=_GENERAL_PROMPT_TEMPLATE_V7,
+            toolsets=("terminal", "file", "web"),
+            max_turns=50,
+            timeout_seconds=1_800,
+            claim_lease_seconds=2_700,
+            heartbeat_seconds=60,
+            kill_grace_seconds=30,
+            allowed_phases=_PHASES,
+        ),
     )
 
 
@@ -907,13 +920,36 @@ _GENERAL_PROMPT_TEMPLATE_V6 = _GENERAL_PROMPT_TEMPLATE_V5.replace(
 )
 
 
-_GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V6.replace(
+_GENERAL_PROMPT_TEMPLATE_V7 = _GENERAL_PROMPT_TEMPLATE_V6.replace(
     "Prepare the reviewable result early enough that useful work cannot be lost to the turn limit. Write owner-only `result-summary.txt` and `result-work.md` in the starting directory, plus `result-questions.json`, `result-external-actions.json`, and `result-deliverables.json` only when those arrays are non-empty.",
     "\n".join((
         "Prepare the reviewable result early enough that useful work cannot be lost to the turn limit. Write owner-only `result-summary.txt` and `result-work.md` in the starting directory, plus `result-questions.json`, `result-external-actions.json`, and `result-deliverables.json` only when those arrays are non-empty.",
         "When you create working files that a reader needs to verify the result, list their relative paths as strings in owner-only `result-artifacts.json`. Foxhound preserves only that explicit list plus the transcript and standard result files; never list run state, instructions, repository checkouts, dependencies, caches, or copied private source material.",
         "Questions are strings. External actions may be strings or objects with `action` plus optional `requires` and `channel`; deliverables may be strings or objects with `body` plus optional `label`, `recipient`, and `subject`. Use objects when the extra fields make the review card complete.",
         "Put every verified source issue, related issue, pull request, commit, and check needed for review in `result-work.md` as a descriptive Markdown link. Do not make the reader reconstruct or search for those references.",
+    )),
+)
+
+
+#: What `summary` is FOR, which nothing told the agent until now.
+#:
+#: It is the first prose on a review card, above the buttons, and it was
+#: the only result field given no shape -- so agents wrote documents into
+#: it. One card carried a thousand characters of `# Result Summary`,
+#: `**Phase:**` and `**Outcome:**`, and then re-listed the external
+#: actions and the questions that the card renders from their own fields
+#: directly below it. The reader read the same three things twice, and
+#: the decision sat under both.
+#:
+#: The length bound is not the point and is left to the contract, which
+#: already refuses over 1,200 characters. The shape is: prose, and
+#: nothing another field already carries.
+_GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V7.replace(
+    "Prepare the reviewable result early enough that useful work cannot be lost to the turn limit. Write owner-only `result-summary.txt` and `result-work.md` in the starting directory, plus `result-questions.json`, `result-external-actions.json`, and `result-deliverables.json` only when those arrays are non-empty.",
+    "\n".join((
+        "Prepare the reviewable result early enough that useful work cannot be lost to the turn limit. Write owner-only `result-summary.txt` and `result-work.md` in the starting directory, plus `result-questions.json`, `result-external-actions.json`, and `result-deliverables.json` only when those arrays are non-empty.",
+        "`result-summary.txt` is the opening of a review card, not a report. Write two to four plain sentences: what you did or propose, and the one thing that most affects whether the reader approves it. No headings, no bold labels, no bullet lists, no `Phase:`/`Outcome:`/`Status:` preamble, and do not restate the questions, external actions or deliverables -- the card renders those from their own files directly below it.",
+        "`result-work.md` is where the detail belongs, in full. Nothing there needs shortening for the card.",
     )),
 )
 
