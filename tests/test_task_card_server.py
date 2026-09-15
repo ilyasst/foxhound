@@ -1107,6 +1107,59 @@ class TaskCardServerTests(unittest.TestCase):
                 thread.join(timeout=2)
         self.assertEqual(maximum, 1)
 
+    def test_database_contention_is_a_bounded_retryable_response(self):
+        cases = (
+            (
+                "/v1/task-cards/schedule",
+                request_document(limit=1),
+                self.cards,
+            ),
+            (
+                "/v1/execution-cards/schedule",
+                request_document(limit=1),
+                self.execution_cards,
+            ),
+        )
+        with running_server(self.app) as endpoint:
+            for path, document, service in cases:
+                with self.subTest(path=path), mock.patch.object(
+                    service,
+                    "schedule",
+                    side_effect=sqlite3.OperationalError("database is locked"),
+                ):
+                    status, headers, body = request(endpoint, path, document)
+
+                self.assertEqual(status, 503)
+                self.assertEqual(headers["Retry-After"], "1")
+                self.assertEqual(body, {
+                    "schema": ERROR_SCHEMA,
+                    "schema_version": 1,
+                    "ok": False,
+                    "error": {
+                        "code": "temporarily_unavailable",
+                        "message": "card service is temporarily busy",
+                    },
+                })
+
+    def test_other_database_errors_remain_opaque_and_non_retryable(self):
+        with running_server(self.app) as endpoint, mock.patch.object(
+            self.cards,
+            "schedule",
+            side_effect=sqlite3.OperationalError("synthetic database error"),
+        ):
+            status, headers, body = request(
+                endpoint,
+                "/v1/task-cards/schedule",
+                request_document(limit=1),
+            )
+
+        self.assertEqual(status, 500)
+        self.assertNotIn("Retry-After", headers)
+        self.assertEqual(body["error"], {
+            "code": "internal_error",
+            "message": "internal service error",
+        })
+
 
 QUEUE_VIEW_TOKEN = "q" * 43
 

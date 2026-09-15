@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import socket
+import sqlite3
 import stat
 import sys
 import time
@@ -47,6 +48,7 @@ from .task_ledger import TaskLedgerError
 log = logging.getLogger("foxhound.task_card_server")
 
 SERVICE_VERSION = 1
+RETRY_AFTER_SECONDS = 1
 REQUEST_SCHEMA = "foxhound.task-card-service.request"
 ERROR_SCHEMA = "foxhound.task-card-service.error"
 HEALTH_SCHEMA = "foxhound.task-card-service.health"
@@ -661,6 +663,15 @@ class TaskCardRequestHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             self._audit(499, started)
         except Exception as exc:  # pragma: no cover - defensive boundary
+            if _is_retryable_database_contention(exc):
+                self._error(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "temporarily_unavailable",
+                    "card service is temporarily busy",
+                    extra_headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
+                )
+                self._audit(HTTPStatus.SERVICE_UNAVAILABLE, started)
+                return
             log.error("status=500 exception=%s", type(exc).__name__)
             self._error(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -789,6 +800,29 @@ class TaskCardRequestHandler(BaseHTTPRequestHandler):
 
     def log_message(self, _format: str, *_args: Any) -> None:
         return
+
+
+def _is_retryable_database_contention(exc: BaseException) -> bool:
+    """True only for SQLite's bounded lock-contention outcomes.
+
+    The service never exposes exception text to the client.  Walking a short
+    exception chain recognizes a service-layer wrapper while leaving every
+    unrelated database failure as the ordinary non-retryable internal error.
+    """
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    for _ in range(4):
+        if current is None or id(current) in seen:
+            return False
+        seen.add(id(current))
+        if isinstance(current, sqlite3.OperationalError):
+            message = str(current).lower()
+            return (
+                "database is locked" in message
+                or "database is busy" in message
+            )
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _request(payload: object, *, required: set[str]) -> dict[str, Any]:
