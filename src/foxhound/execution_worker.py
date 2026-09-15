@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import stat
 import sys
 from dataclasses import dataclass, field
@@ -117,6 +118,33 @@ def _worker_operations(phase: WorkflowPhase) -> list[str]:
     return operations
 
 
+_LOCAL_RESEARCH_CLIENTS = {
+    "outlook": (
+        "folders", "inbox", "search", "read", "thread", "draft",
+    ),
+    "moodle": (
+        "renew", "whoami", "courses", "assignments", "submissions",
+        "assessment",
+    ),
+    "qmd": ("query", "search", "get", "multi-get", "ls", "status"),
+}
+
+
+def _local_research_clients() -> dict[str, list[str]]:
+    """Approved clients this runner can actually invoke.
+
+    Profiles are portable across workers, while local research clients are
+    deliberately host-specific. Advertising a command that is absent turns
+    an agent's first useful action into a misleading failure, so this is a
+    small runtime fact rather than a profile promise.
+    """
+    return {
+        name: list(operations)
+        for name, operations in _LOCAL_RESEARCH_CLIENTS.items()
+        if shutil.which(name) is not None
+    }
+
+
 class ExecutionWorkerError(RuntimeError):
     """A content-free worker-boundary failure."""
 
@@ -211,20 +239,7 @@ class ExecutionWorker:
                 # lack of mail or knowledge access.  Client guidance remains
                 # profile-versioned; this contract names only the approved
                 # read/research surface.
-                "local_research_clients": {
-                    "outlook": [
-                        "folders", "inbox", "search", "read", "thread",
-                        "draft",
-                    ],
-                    "moodle": [
-                        "renew", "whoami", "courses", "assignments",
-                        "submissions", "assessment",
-                    ],
-                    "qmd": [
-                        "query", "search", "get", "multi-get", "ls",
-                        "status",
-                    ],
-                },
+                "local_research_clients": _local_research_clients(),
                 "worker_operations": _worker_operations(state.phase),
                 "external_effects_allowed": (
                     state.phase is WorkflowPhase.EXTERNAL_ACTION
