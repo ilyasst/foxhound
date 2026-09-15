@@ -70,6 +70,8 @@ EXECUTION_OPERATION_SCHEMA = "foxhound.execution-card-service.operation"
 EXECUTION_STATS_SCHEMA = "foxhound.execution-card-service.stats"
 EXECUTION_BRIEF_SCHEMA = "foxhound.execution-card-service.brief"
 EXECUTION_VIEW_SCHEMA = "foxhound.execution-card-service.view"
+EXECUTION_QUEUE_SCHEMA = "foxhound.execution-card-service.queue"
+EXECUTION_QUEUE_SCHEMA_VERSION = 1
 EXECUTION_AGENT_OPTIONS_SCHEMA = (
     "foxhound.execution-card-service.agent-options"
 )
@@ -111,6 +113,7 @@ ROUTES = {
     "/v1/execution-cards/agent-selection": "execution_agent_selection",
     "/v1/execution-cards/brief": "execution_brief",
     "/v1/execution-cards/view": "execution_view",
+    "/v1/execution-cards/queue": "execution_queue",
 }
 
 
@@ -569,6 +572,31 @@ class TaskCardApplication:
             return _execution_schedule_document(
                 self._execution_cards().schedule(limit=limit)
             )
+        if operation == "execution_queue":
+            request = _request(payload, required={"limit"})
+            try:
+                identity = self.resolve_execution_consumer(authorization)
+            except TaskCardConsumerIdentityError as exc:
+                raise TaskCardServerRequestError(
+                    "consumer_unresolved",
+                    "execution card consumer role is unresolved",
+                    HTTPStatus.FORBIDDEN,
+                ) from exc
+            if identity is None or identity.role != QUEUE_VIEW_ROLE:
+                raise TaskCardServerRequestError(
+                    "role_forbidden",
+                    "execution card queue requires the queue_view role",
+                    HTTPStatus.FORBIDDEN,
+                )
+            cards = self._execution_cards().due(
+                limit=_integer(request["limit"], minimum=1, maximum=1000)
+            )
+            return {
+                "schema": EXECUTION_QUEUE_SCHEMA,
+                "schema_version": EXECUTION_QUEUE_SCHEMA_VERSION,
+                "ok": True,
+                "cards": [_execution_queue_card_document(card) for card in cards],
+            }
         if operation == "execution_claim":
             request = _request(payload, required={"lease_seconds"})
             lease = _integer(request["lease_seconds"], minimum=5, maximum=300)
@@ -1176,6 +1204,53 @@ def _queue_card_document(card: Any) -> dict[str, Any]:
     # contract remains JSON-shaped if the internal enum implementation changes.
     document["status"] = card.status.value
     return document
+
+
+def _queue_projection_text(value: object, maximum: int) -> str:
+    if not isinstance(value, str):
+        return ""
+    if len(value) <= maximum:
+        return value
+    return value[: maximum - 1].rstrip() + "…"
+
+
+def _queue_projection_records(records: object) -> list[dict[str, str]]:
+    if not isinstance(records, (tuple, list)):
+        return []
+    result: list[dict[str, str]] = []
+    for record in records[:32]:
+        if not hasattr(record, "text"):
+            continue
+        result.append({
+            "text": _queue_projection_text(record.text, 3_000),
+            "requires": _queue_projection_text(record.requires, 200),
+            "channel": _queue_projection_text(record.channel, 200),
+            "label": _queue_projection_text(record.label, 200),
+            "recipient": _queue_projection_text(record.recipient, 200),
+            "subject": _queue_projection_text(record.subject, 500),
+        })
+    return result
+
+
+def _execution_queue_card_document(card: Any) -> dict[str, Any]:
+    """Dedicated ADR 0041 allowlist; never serialize the card dataclass."""
+    return {
+        "id": card.id,
+        "version": card.version,
+        "kind": card.kind.value,
+        "phase": card.phase.value,
+        "task": _queue_projection_text(card.task_text, 2_000),
+        "owner": _queue_projection_text(card.owner, 200),
+        "summary": _queue_projection_text(card.summary, 3_000),
+        "work_digest": _queue_projection_text(card.work_digest, 3_000),
+        "questions": [
+            _queue_projection_text(question, 1_000)
+            for question in card.questions[:32]
+            if isinstance(question, str)
+        ],
+        "external_actions": _queue_projection_records(card.external_actions),
+        "deliverables": _queue_projection_records(card.deliverables),
+    }
 
 
 def _operation_document(result: CardOperationResult) -> dict[str, Any]:

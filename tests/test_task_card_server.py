@@ -41,6 +41,7 @@ from foxhound.task_card_server import (
     EXECUTION_VIEW_SCHEMA,
     EXECUTION_CLAIM_SCHEMA,
     EXECUTION_OPERATION_SCHEMA,
+    EXECUTION_QUEUE_SCHEMA,
     EXECUTION_SCHEDULE_SCHEMA,
     EXECUTION_STATS_SCHEMA,
     HEALTH_SCHEMA,
@@ -208,6 +209,54 @@ class TaskCardServerTests(unittest.TestCase):
         self.assertFalse(stale["ok"])
         self.assertIsNone(stale["text"])
         self.assertEqual(stale["refusal"], "stale_version")
+
+    def test_execution_queue_is_scoped_bounded_and_non_mutating(self):
+        self.execution.schedule(1, expected_task_version=1)
+        self.execution_cards.schedule()
+        before = (self.execution_cards.count(), self.execution_cards.event_count())
+        queue_token = "q" * 43
+        app = TaskCardApplication(
+            self.cards, {DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: queue_token},
+            execution_cards=self.execution_cards,
+            execution_tokens={DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: queue_token},
+        )
+        response = app.dispatch(
+            "execution_queue", request_document(limit=10),
+            authorization=f"Bearer {queue_token}",
+        )
+        self.assertEqual(
+            (response["schema"], response["schema_version"], response["ok"]),
+            (EXECUTION_QUEUE_SCHEMA, 1, True),
+        )
+        self.assertEqual(len(response["cards"]), 1)
+        card = response["cards"][0]
+        self.assertEqual(
+            set(card), {"id", "version", "kind", "phase", "task", "owner",
+                        "summary", "work_digest", "questions", "external_actions",
+                        "deliverables"},
+        )
+        for forbidden in ("task_id", "agent_profile_id", "agent_profile_revision",
+                          "task_work_directory", "task_kb_file", "origin_sources",
+                          "claim_token", "delivery_key", "status"):
+            self.assertNotIn(forbidden, card)
+        self.assertEqual((self.execution_cards.count(), self.execution_cards.event_count()), before)
+        with self.assertRaises(TaskCardServerRequestError):
+            app.dispatch("execution_queue", request_document(limit=0),
+                         authorization=f"Bearer {queue_token}")
+        with self.assertRaises(TaskCardServerRequestError):
+            app.dispatch("execution_queue", request_document(limit=1),
+                         authorization=f"Bearer {TOKEN}")
+
+        claim = self.execution_cards.claim_next(
+            consumer_digest=hashlib.sha256(TOKEN.encode()).hexdigest(),
+            consumer_role=DRIP_ROLE,
+        )
+        self.assertIsNotNone(claim)
+        held = app.dispatch(
+            "execution_queue", request_document(limit=10),
+            authorization=f"Bearer {queue_token}",
+        )
+        self.assertEqual(held["cards"], [])
 
     def test_claim_at_ceiling_is_distinct_and_content_free(self):
         self.cards.schedule()
