@@ -663,8 +663,10 @@ class ExecutionWorkerTests(unittest.TestCase):
         self._write_result_inputs()
         (self.run_directory / "result-deliverables.json").unlink()
         with knowledge_server() as endpoint:
-            draft = self._worker(endpoint).draft(outcome="awaiting_plan")
-        document = json.loads(draft.read_text())
+            ready = self._worker(endpoint).draft(outcome="awaiting_plan")
+        document = json.loads(
+            (self.run_directory / ready["draft"]).read_text(encoding="utf-8")
+        )
         self.assertEqual(document["questions"], [])
         self.assertEqual(document["external_actions"], [])
         self.assertEqual(document["deliverables"], [])
