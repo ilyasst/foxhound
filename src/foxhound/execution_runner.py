@@ -88,6 +88,7 @@ class ExecutionRunnerConfig:
     profile_registry: AgentProfileRegistry = field(
         default_factory=load_registry, repr=False
     )
+    default_agent_profile: str = "general"
     worker_command: str = "foxhound-task-worker"
     #: Where this machine keeps the knowledge base. Per host, never derived:
     #: the sync roots differ across the fleet.
@@ -114,6 +115,13 @@ class ExecutionRunnerConfig:
         _agent_command_argv(self.agent_command)
         if not isinstance(self.profile_registry, AgentProfileRegistry):
             raise ValueError("agent profile registry is invalid")
+        if (
+            not isinstance(self.default_agent_profile, str)
+        ):
+            raise ValueError("execution default agent profile is invalid")
+        profile = self.profile_registry.get(self.default_agent_profile)
+        if profile is None or WorkflowPhase.PLAN.value not in profile.allowed_phases:
+            raise ValueError("execution default agent profile is invalid")
         if not _COMMAND_NAME_RE.fullmatch(self.worker_command):
             raise ValueError("execution worker command is invalid")
         if (
@@ -271,6 +279,7 @@ def run_once(
     service = TaskExecutionService(
         database,
         profile_registry=config.profile_registry,
+        default_profile_id=config.default_agent_profile,
         planning_grants=config.planning_grants,
     )
     terminator = terminate or _terminate_process_group
@@ -869,6 +878,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--gw-token-file", required=True, type=Path)
     parser.add_argument("--agent-command", default="hermes")
     parser.add_argument("--agent-profile-directory", type=Path)
+    parser.add_argument("--default-agent-profile", default="general")
     parser.add_argument("--worker-command", default="foxhound-task-worker")
     parser.add_argument(
         "--runner-slot", default="default",
@@ -920,6 +930,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             gw_token_file=args.gw_token_file,
             agent_command=args.agent_command,
             profile_registry=load_registry(args.agent_profile_directory),
+            default_agent_profile=args.default_agent_profile,
             worker_command=args.worker_command,
             runner_slot=args.runner_slot,
             planning_grants=tuple(args.plan_without_asking or ()),
