@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import stat
 import sys
 from dataclasses import dataclass, field
@@ -53,7 +54,7 @@ RUN_STATE_SCHEMA = "foxhound.execution-run-state"
 RUN_STATE_SCHEMA_VERSION = 4
 INSTRUCTIONS_NAME = "agent-instructions.json"
 WORK_CONTEXT_SCHEMA = "foxhound.execution-work-context"
-WORK_CONTEXT_SCHEMA_VERSION = 4
+WORK_CONTEXT_SCHEMA_VERSION = 5
 WORKER_SEARCH_SCHEMA = "foxhound.execution-worker-search"
 RESULT_DRAFT_SCHEMA = "foxhound.execution-result-draft"
 RESULT_DRAFT_READY_SCHEMA = "foxhound.execution-result-draft-ready"
@@ -115,6 +116,33 @@ def _worker_operations(phase: WorkflowPhase) -> list[str]:
     if phase is WorkflowPhase.EXTERNAL_ACTION:
         operations.append("act.pull-request")
     return operations
+
+
+_LOCAL_RESEARCH_CLIENTS = {
+    "outlook": (
+        "folders", "inbox", "search", "read", "thread", "draft",
+    ),
+    "moodle": (
+        "renew", "whoami", "courses", "assignments", "submissions",
+        "assessment",
+    ),
+    "qmd": ("query", "search", "get", "multi-get", "ls", "status"),
+}
+
+
+def _local_research_clients() -> dict[str, list[str]]:
+    """Approved clients this runner can actually invoke.
+
+    Profiles are portable across workers, while local research clients are
+    deliberately host-specific. Advertising a command that is absent turns
+    an agent's first useful action into a misleading failure, so this is a
+    small runtime fact rather than a profile promise.
+    """
+    return {
+        name: list(operations)
+        for name, operations in _LOCAL_RESEARCH_CLIENTS.items()
+        if shutil.which(name) is not None
+    }
 
 
 class ExecutionWorkerError(RuntimeError):
@@ -205,6 +233,13 @@ class ExecutionWorker:
                 # supplied by task text.  It prevents a profile from routing
                 # work to an ambient Hermes tool that this run does not have.
                 "knowledge_layers": ["kb", "secondary", "emails"],
+                # Installed, task-scoped local research clients.  These are
+                # named here so an agent does not have to guess from an
+                # ambient host path or mistake a zero-result GW search for a
+                # lack of mail or knowledge access.  Client guidance remains
+                # profile-versioned; this contract names only the approved
+                # read/research surface.
+                "local_research_clients": _local_research_clients(),
                 "worker_operations": _worker_operations(state.phase),
                 "external_effects_allowed": (
                     state.phase is WorkflowPhase.EXTERNAL_ACTION

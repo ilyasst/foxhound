@@ -244,22 +244,28 @@ class ExecutionWorkerTests(unittest.TestCase):
         return paths
 
     def test_context_and_search_are_bounded_and_hide_the_capability(self):
-        with mock.patch(
-            "foxhound.execution_worker._local_today",
-            return_value="2030-01-02",
+        with (
+            mock.patch(
+                "foxhound.execution_worker._local_today",
+                return_value="2030-01-02",
+            ),
+            mock.patch(
+                "foxhound.execution_worker.shutil.which",
+                return_value="/usr/bin/synthetic-client",
+            ),
+            knowledge_server() as endpoint,
         ):
-            with knowledge_server() as endpoint:
-                worker = self._worker(endpoint)
-                context = worker.context()
-                result = worker.search(
-                    "synthetic query", max_results_per_layer=2
-                )
+            worker = self._worker(endpoint)
+            context = worker.context()
+            result = worker.search(
+                "synthetic query", max_results_per_layer=2
+            )
 
         rendered = json.dumps({"context": context, "search": result})
         self.assertNotIn(CLAIM_TOKEN, rendered)
         self.assertNotIn(str(self.database), rendered)
         self.assertEqual(context["task"]["text"], "Synthetic task")
-        self.assertEqual(context["schema_version"], 4)
+        self.assertEqual(context["schema_version"], 5)
         self.assertEqual(context["runtime"]["today"], "2030-01-02")
         self.assertEqual(context["runtime"]["today_weekday"], "Wednesday")
         self.assertEqual(
@@ -278,6 +284,20 @@ class ExecutionWorkerTests(unittest.TestCase):
             context["capabilities"],
             {
                 "knowledge_layers": ["kb", "secondary", "emails"],
+                "local_research_clients": {
+                    "outlook": [
+                        "folders", "inbox", "search", "read", "thread",
+                        "draft",
+                    ],
+                    "moodle": [
+                        "renew", "whoami", "courses", "assignments",
+                        "submissions", "assessment",
+                    ],
+                    "qmd": [
+                        "query", "search", "get", "multi-get", "ls",
+                        "status",
+                    ],
+                },
                 "worker_operations": [
                     "context", "search", "draft", "record", "release"
                 ],
@@ -308,6 +328,17 @@ class ExecutionWorkerTests(unittest.TestCase):
         external = _worker_operations(WorkflowPhase.EXTERNAL_ACTION)
         self.assertIn("act.worktree", external)
         self.assertIn("act.pull-request", external)
+
+    def test_context_omits_local_clients_missing_from_the_runner(self):
+        with (
+            mock.patch(
+                "foxhound.execution_worker.shutil.which", return_value=None
+            ),
+            knowledge_server() as endpoint,
+        ):
+            context = self._worker(endpoint).context()
+
+        self.assertEqual(context["capabilities"]["local_research_clients"], {})
 
     def test_calendar_context_computes_the_subsequent_week_across_years(self):
         with mock.patch(
