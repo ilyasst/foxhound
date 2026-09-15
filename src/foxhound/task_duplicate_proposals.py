@@ -58,6 +58,7 @@ class DuplicateProposal:
     created_at: str
     updated_at: str
     settled_at: str | None
+    card_id: int | None
 
     @property
     def open(self) -> bool:
@@ -240,6 +241,58 @@ def reopen(
     return True
 
 
+def reopen_confirmed(
+    connection: sqlite3.Connection,
+    *,
+    proposal_id: int,
+    actor: str,
+    now: str,
+) -> bool:
+    """Reconsider a confirmed pair after its reader relation is withdrawn."""
+    proposal_id = _identifier(proposal_id, "proposal id")
+    actor = _bounded(actor, "actor", MAX_ACTOR)
+    now = _bounded(now, "timestamp", 40)
+    cursor = connection.execute(
+        "UPDATE task_duplicate_proposals SET state='proposed',card_id=NULL,"
+        "updated_at=?,settled_at=NULL WHERE id=? AND state='confirmed'",
+        (now, proposal_id),
+    )
+    if cursor.rowcount != 1:
+        return False
+    connection.execute(
+        "INSERT INTO task_duplicate_proposal_events("
+        "proposal_id,kind,actor,occurred_at) VALUES(?, 'reopened', ?, ?)",
+        (proposal_id, actor, now),
+    )
+    return True
+
+
+def bind(connection: sqlite3.Connection, *, proposal_id: int, card_id: int,
+         now: str) -> bool:
+    """Attach an unanswered proposal to the one card that will show it."""
+    proposal_id = _identifier(proposal_id, "proposal id")
+    card_id = _identifier(card_id, "card id")
+    now = _bounded(now, "timestamp", 40)
+    cursor = connection.execute(
+        "UPDATE task_duplicate_proposals SET card_id=?,updated_at=? "
+        "WHERE id=? AND state='proposed' AND card_id IS NULL",
+        (card_id, now, proposal_id),
+    )
+    return cursor.rowcount == 1
+
+
+def release_for_card(connection: sqlite3.Connection, card_id: int, *, now: str) -> int:
+    """Make unanswered proposals on a stale card eligible for a fresh card."""
+    card_id = _identifier(card_id, "card id")
+    now = _bounded(now, "timestamp", 40)
+    cursor = connection.execute(
+        "UPDATE task_duplicate_proposals SET card_id=NULL,updated_at=? "
+        "WHERE card_id=? AND state='proposed'",
+        (now, card_id),
+    )
+    return int(cursor.rowcount)
+
+
 def next_open(connection: sqlite3.Connection) -> DuplicateProposal | None:
     """Return the oldest unanswered proposal, without claiming it."""
     row = connection.execute(
@@ -319,4 +372,5 @@ def _proposal(row: sqlite3.Row) -> DuplicateProposal:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         settled_at=row["settled_at"],
+        card_id=(None if row["card_id"] is None else int(row["card_id"])),
     )
