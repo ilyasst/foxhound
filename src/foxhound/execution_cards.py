@@ -516,6 +516,23 @@ class ExecutionCardService:
                 connection.rollback()
                 raise
 
+    def due(self, *, limit: int = 20) -> tuple[ExecutionReviewCard, ...]:
+        """Return current, unheld cards without acquiring a lease or lock."""
+        if not _valid_limit(limit):
+            raise TaskLedgerError("execution card due limit is invalid")
+        now = self._now()
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                self._card_select()
+                + " WHERE c.status='pending' AND ("
+                + "w.status<>'snoozed' OR w.due_at<=?) "
+                + "ORDER BY c.id LIMIT ?",
+                (now, limit),
+            ).fetchall()
+        return tuple(
+            self._render_card(row) for row in rows if _current_card(row)
+        )
+
     def claim_next(
         self, *, lease_seconds: int = 60, consumer_digest: str | None = None,
         consumer_role: str = "drip",
