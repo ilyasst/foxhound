@@ -214,6 +214,9 @@ class ExecutionResultEnvelope:
     #: never have to infer a pull request, commit, or check from Markdown.
     repository_references: Sequence[object] = field(
         default=(), repr=False)
+    #: A repository-origin execution defaults to impactful until its agent
+    #: explicitly records that the result is analysis or research only.
+    repository_impact: bool = field(default=True, repr=False)
     task_work_directory: str | None = field(default=None, repr=False)
     task_kb_file: str | None = field(default=None, repr=False)
 
@@ -1064,10 +1067,10 @@ class TaskExecutionService:
                     "result_id,task_id,workflow_version,task_version,phase,"
                     "outcome,content_digest,summary,work_markdown,"
                     "questions_json,external_actions_json,deliverables_json,"
-                    "repository_references_json,"
+                    "repository_references_json,repository_impact,"
                     "created_at,agent_profile_id,agent_profile_revision,"
                     "task_work_directory,task_kb_file,work_digest) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         result["result_id"], result["task_id"],
                         result["workflow_version"], result["task_version"],
@@ -1076,7 +1079,8 @@ class TaskExecutionService:
                         result["questions_json"],
                         result["external_actions_json"],
                         result["deliverables_json"],
-                        result["repository_references_json"], now,
+                        result["repository_references_json"],
+                        result["repository_impact"], now,
                         row["agent_profile_id"],
                         row["agent_profile_revision"],
                         result["task_work_directory"],
@@ -2113,6 +2117,8 @@ def _validated_result(envelope: ExecutionResultEnvelope) -> dict[str, object]:
     )
     repository_references = _repository_references(
         envelope.repository_references)
+    if not isinstance(envelope.repository_impact, bool):
+        raise ValueError("execution result repository impact is invalid")
     # Deliberately absent from `document` below, and so from the content
     # digest: the digest identifies what the AGENT produced, and this is
     # produced afterwards from it. Folding it in would make the same
@@ -2145,6 +2151,7 @@ def _validated_result(envelope: ExecutionResultEnvelope) -> dict[str, object]:
         "external_actions": actions,
         "deliverables": deliverables,
         "repository_references": repository_references,
+        "repository_impact": envelope.repository_impact,
         "task_work_directory": task_work_directory,
         "task_kb_file": task_kb_file,
     }
@@ -2273,7 +2280,7 @@ def _text_collection(
 #: A structured record is normalised on the way in, so everything that reads
 #: one later sees a single shape. The reader-facing fields an agent may fill
 #: are named here and nowhere else.
-_ACTION_FIELDS = ("requires", "channel")
+_ACTION_FIELDS = ("requires", "channel", "target")
 _DELIVERABLE_FIELDS = ("label", "recipient", "subject")
 _ACTION_ALIASES = ("action", "title", "text")
 _DELIVERABLE_ALIASES = ("body", "text")

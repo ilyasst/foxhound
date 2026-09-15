@@ -355,6 +355,10 @@ class ExecutionCardTests(unittest.TestCase):
                 "ALTER TABLE task_execution_results DROP COLUMN "
                 "repository_references_json"
             )
+            connection.execute(
+                "ALTER TABLE task_execution_results DROP COLUMN "
+                "repository_impact"
+            )
             # ADR 0036 added this at v23; a database at an older version
             # has not got it yet.
             connection.execute(
@@ -1520,6 +1524,8 @@ class ExecutionCardTests(unittest.TestCase):
             external_actions=(
                 {"action": "Post this review on the pull request",
                  "channel": "forge.example/acme/widget"},
+                {"action": "Post the repository update",
+                 "target": "https://github.com/example-org/example-repo/pull/42"},
             ),
             deliverables=(
                 {"label": "review", "body": "Line one.\nSynthetic finding."},
@@ -1532,6 +1538,10 @@ class ExecutionCardTests(unittest.TestCase):
         body, _keyboard = render_execution_review_card(card)
         self.assertIn("<b>review</b>", body)
         self.assertIn("Synthetic finding.", body)
+        self.assertIn(
+            'href="https://github.com/example-org/example-repo/pull/42"',
+            body,
+        )
 
     def test_external_review_requires_its_exact_separate_approval(self):
         self._external_review(1, "external-one")

@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 30
+SCHEMA_VERSION = 31
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -337,6 +337,7 @@ _SCHEMA_COLUMNS = {
         "task_kb_file",
         "work_digest",
         "repository_references_json",
+        "repository_impact",
     ),
     "task_execution_events": (
         "sequence",
@@ -458,19 +459,36 @@ _SCHEMA_COLUMNS = {
 # existed -- otherwise a migration step verifies its own future. Five
 # subtractions, applied in version order: `source_revision` (task review
 # cards) arrives at v26, duplicate proposals arrive at v27, and their card
-# binding arrives at v28, and `repository_references_json` arrives at v29,
+# binding arrives at v28, `repository_references_json` arrives at v29,
+# `consumer_digest` arrives at v30, and `repository_impact` arrives at v31,
 # `task_completion_evidence` arrives at v25,
 # `consumer_digest` (task review cards, ADR 0036 decision 2) at v23,
 # `work_digest` at v22, and `task_relations` at v21 -- so the v24 state has
 # the new table removed, the v22 state also has the card column removed but
 # keeps `work_digest`, the v21 state has neither column but keeps
 # `task_relations`, and the v20 state has none of the five.
+_SCHEMA_V30_COLUMNS = {
+    name: tuple(column for column in columns if not (
+        name == "task_execution_results"
+        and column == "repository_impact"
+    ))
+    for name, columns in _SCHEMA_COLUMNS.items()
+}
+
+_SCHEMA_V29_COLUMNS = {
+    name: tuple(column for column in columns if not (
+        name == "execution_review_cards"
+        and column == "consumer_digest"
+    ))
+    for name, columns in _SCHEMA_V30_COLUMNS.items()
+}
+
 _SCHEMA_V28_COLUMNS = {
     name: tuple(column for column in columns if not (
         name == "task_execution_results"
         and column == "repository_references_json"
     ))
-    for name, columns in _SCHEMA_COLUMNS.items()
+    for name, columns in _SCHEMA_V29_COLUMNS.items()
 }
 
 _SCHEMA_V26_COLUMNS = {
@@ -2196,6 +2214,15 @@ _SCHEMA_V29 = (
 )
 
 
+# Existing results predate the explicit distinction, so preserve the safe
+# interpretation: their repository-origin execution remains impactful.
+_SCHEMA_V31 = (
+    "ALTER TABLE task_execution_results ADD COLUMN "
+    "repository_impact INTEGER NOT NULL DEFAULT 1 "
+    "CHECK(repository_impact IN (0,1));",
+)
+
+
 _SCHEMA_V20 = (
     # SQLite cannot alter a CHECK in place, and three tables carry a foreign
     # key to this one. Renaming the card table would rewrite all three to
@@ -3060,6 +3087,27 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 30
+            if version == 30:
+                row = connection.execute(
+                    "SELECT type FROM sqlite_master WHERE "
+                    "name='task_execution_results'"
+                ).fetchone()
+                if row is None or row["type"] != "table":
+                    raise InboxError("candidate inbox schema is incomplete")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    columns = tuple(item["name"] for item in connection.execute(
+                        "PRAGMA table_info(task_execution_results)"
+                    ))
+                    if "repository_impact" not in columns:
+                        for statement in _SCHEMA_V31:
+                            connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 31")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 31
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:

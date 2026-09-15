@@ -264,10 +264,12 @@ class TaskExecutionTests(unittest.TestCase):
         self.assertTrue(self.service.record_result(result).accepted)
         with closing(sqlite3.connect(self.database)) as connection:
             stored = connection.execute(
-                "SELECT repository_references_json FROM task_execution_results "
+                "SELECT repository_references_json,repository_impact "
+                "FROM task_execution_results "
                 "WHERE result_id='result-001'"
-            ).fetchone()[0]
-        self.assertEqual(json.loads(stored)[1]["kind"], "commit")
+            ).fetchone()
+        self.assertEqual(json.loads(stored[0])[1]["kind"], "commit")
+        self.assertEqual(stored[1], 1)
 
         invalid = replace(self._result(claim, result_id="result-invalid"),
                           repository_references=(
@@ -345,6 +347,10 @@ class TaskExecutionTests(unittest.TestCase):
             connection.execute(
                 "ALTER TABLE task_execution_results DROP COLUMN "
                 "repository_references_json"
+            )
+            connection.execute(
+                "ALTER TABLE task_execution_results DROP COLUMN "
+                "repository_impact"
             )
             # ADR 0036 added this at v23; a database at an older version
             # has not got it yet.
