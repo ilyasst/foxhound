@@ -244,7 +244,10 @@ class TaskExecutionTests(unittest.TestCase):
         CandidateInbox(self.database, clock=self.clock).initialize()
 
         after = self.service.get(1)
-        self.assertEqual(SCHEMA_VERSION, 20)
+        # The point is that a version-11 database arrives at the current
+        # schema, not at one particular number — pinning the number means
+        # every later migration edits a test about an earlier one.
+        self.assertGreaterEqual(SCHEMA_VERSION, 20)
         self.assertEqual(
             (after.status, after.phase, after.version, after.task_version),
             (before.status, before.phase, before.version, before.task_version),
