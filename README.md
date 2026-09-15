@@ -483,10 +483,10 @@ foxhound-execution-schedule \
 
 The command schedules only tasks that have never had an execution workflow;
 it cannot reset a completed, cancelled, parked, or otherwise existing
-workflow. It fills two independent GW-compatible capacities: at most five
-newly scheduled workflows may be queued or running, while at most twenty may
-actively wait for a reader. Existing over-cap rows are preserved and drain
-normally. It does not advance Start or launch an agent. See
+workflow. It keeps ten eligible planning phases ready in `queued`, admits at
+most two running phases atomically, and allows at most twenty tasks to actively
+wait for a reader. Existing over-cap rows are preserved and drain normally. It
+does not advance Start or launch an agent. See
 [ADR 0019](docs/architecture/0019-new-task-execution-scheduler.md) and
 [ADR 0035](docs/architecture/0035-separate-execution-capacities.md).
 Deployments with an installed role-specific profile can bind new workflows to

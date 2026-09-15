@@ -17,14 +17,18 @@ an unrelated reader decision disappear.
 
 ## Decision
 
-Foxhound adopts the same independent bounds:
+Foxhound adopts three independent bounds:
 
-- at most five newly scheduled workflows may occupy `queued` or `running`;
+- at most two workflow phases may be `running`;
+- at least ten eligible planning phases are kept durably `queued`, excluding
+  the two running slots; and
 - at most twenty newly scheduled workflows may occupy an active
   reader-waiting state; and
 - the gateway continues to present at most one execution card at a time.
 
-The new-work scheduler fills each capacity independently in stable task order.
+The new-work scheduler refills the ready-plan reserve independently in stable
+task order. Claiming is the only operation that enters a running slot, and it
+counts active slots inside the same transaction as the claim.
 A source with explicit planning authority enters the work capacity; every
 other source enters the Start-card waiting capacity. A full capacity skips
 that class without preventing the other class from filling available room.
@@ -45,6 +49,6 @@ and the rule that every task is initially visible remain unchanged.
 
 Agent work may continue while a reader decision waits, and a running agent no
 longer silences the remaining Start-gated queue. Planning grants cannot fill
-the durable work queue without bound. A deployment with state already above a
+the durable reserve without bound. A deployment with state already above a
 capacity remains safe but will schedule nothing further in that class until
 enough workflows leave it.
