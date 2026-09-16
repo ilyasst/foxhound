@@ -49,7 +49,7 @@ class DeploymentConfigTests(unittest.TestCase):
     def _document(self) -> dict[str, object]:
         return {
             "schema": "foxhound.deployment-config",
-            "schema_version": 1,
+            "schema_version": 2,
             "database": str(self.database),
             "agent_profile_directory": None,
             "card_service": {
@@ -60,6 +60,9 @@ class DeploymentConfigTests(unittest.TestCase):
                 "task_token_files": {"drip": str(self.task_token)},
                 "execution_card_delivery": True,
                 "execution_token_files": {"drip": str(self.execution_token)},
+                "gw_endpoint": f"http://{LOOPBACK}:8787",
+                "gw_alias": "example-operator",
+                "gw_token_file": str(self.gateway_token),
             },
             "workflow": {
                 "default_agent_profile": "general",
@@ -96,6 +99,7 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertEqual(cards[0], "foxhound-task-cards")
         self.assertIn("drip=" + str(self.task_token), cards)
         self.assertIn("drip=" + str(self.execution_token), cards)
+        self.assertIn("--gw-endpoint", cards)
         schedule = config.argv("execution-schedule")
         self.assertEqual(schedule[0], "foxhound-execution-schedule")
         self.assertNotIn("--execution-slot-cap", schedule)
@@ -104,8 +108,30 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn("--execution-slot-cap", runner)
         self.assertIn("--plan-without-asking", runner)
 
+    def test_version_one_configuration_remains_valid_without_card_gw_settings(self) -> None:
+        document = self._document()
+        document["schema_version"] = 1
+        for key in ("gw_endpoint", "gw_alias", "gw_token_file"):
+            del document["card_service"][key]  # type: ignore[index]
+        self._write_config(document)
+
+        config = load_deployment_config(self.config_path)
+
+        self.assertNotIn("--gw-endpoint", config.argv("task-cards"))
+
+    def test_partial_card_gw_settings_are_rejected(self) -> None:
+        document = self._document()
+        document["card_service"]["gw_alias"] = None  # type: ignore[index]
+        self._write_config(document)
+
+        with self.assertRaises(DeploymentConfigError):
+            load_deployment_config(self.config_path)
+
     def test_rendered_arguments_are_accepted_by_the_supported_commands(self) -> None:
-        self._write_config(self._document())
+        document = self._document()
+        for key in ("gw_endpoint", "gw_alias", "gw_token_file"):
+            document["card_service"][key] = None  # type: ignore[index]
+        self._write_config(document)
         config = load_deployment_config(self.config_path)
 
         cards = config.argv("task-cards")
