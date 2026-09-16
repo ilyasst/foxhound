@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 32
+SCHEMA_VERSION = 33
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -255,6 +255,15 @@ _SCHEMA_COLUMNS = {
         "actor",
         "occurred_at",
     ),
+    "task_fused_title_jobs": (
+        "task_id",
+        "state",
+        "title",
+        "attempts",
+        "last_attempt_at",
+        "created_at",
+        "updated_at",
+    ),
     "task_owner_equivalences": (
         "candidate_id",
         "source_revision",
@@ -462,13 +471,19 @@ _SCHEMA_COLUMNS = {
 # cards) arrives at v26, duplicate proposals arrive at v27, and their card
 # binding arrives at v28, `repository_references_json` arrives at v29,
 # `consumer_digest` arrives at v30, `repository_impact` at v31, and
-# `queue_priority` at v32,
+# `queue_priority` at v32, and fused-title jobs at v33,
 # `task_completion_evidence` arrives at v25,
 # `consumer_digest` (task review cards, ADR 0036 decision 2) at v23,
 # `work_digest` at v22, and `task_relations` at v21 -- so the v24 state has
 # the new table removed, the v22 state also has the card column removed but
 # keeps `work_digest`, the v21 state has neither column but keeps
 # `task_relations`, and the v20 state has none of the five.
+_SCHEMA_V32_COLUMNS = {
+    name: columns
+    for name, columns in _SCHEMA_COLUMNS.items()
+    if name != "task_fused_title_jobs"
+}
+
 _SCHEMA_V30_COLUMNS = {
     name: tuple(column for column in columns if not (
         name == "task_execution_results"
@@ -477,7 +492,7 @@ _SCHEMA_V30_COLUMNS = {
         name == "task_execution_workflows"
         and column == "queue_priority"
     ))
-    for name, columns in _SCHEMA_COLUMNS.items()
+    for name, columns in _SCHEMA_V32_COLUMNS.items()
 }
 
 _SCHEMA_V29_COLUMNS = {
@@ -624,6 +639,8 @@ _SCHEMA_OBJECTS = {
     "task_duplicate_proposal_events_no_delete": "trigger",
     "task_duplicate_proposals_no_delete": "trigger",
     "task_duplicate_proposals_settle_only": "trigger",
+    "task_fused_title_jobs_pending": "index",
+    "task_fused_title_jobs_no_delete": "trigger",
     "task_owner_equivalences_no_update": "trigger",
     "task_owner_equivalences_no_delete": "trigger",
     "task_review_cards_one_active": "index",
@@ -2258,6 +2275,39 @@ _SCHEMA_V32 = (
 )
 
 
+# A derived title is deliberately separate from the immutable task text.  A
+# worker owns the small state machine: confirmation queues `pending`, a worker
+# leases it as `running`, and only a validated gateway response becomes
+# `ready`.  `idle` records that the supporting relation was withdrawn.
+_SCHEMA_V33 = (
+    """
+CREATE TABLE task_fused_title_jobs (
+    task_id INTEGER PRIMARY KEY REFERENCES tasks(id),
+    state TEXT NOT NULL CHECK(state IN ('idle','pending','running','ready')),
+    title TEXT CHECK(title IS NULL OR (
+        length(title) BETWEEN 1 AND 160
+        AND instr(title, char(10)) = 0 AND instr(title, char(13)) = 0
+    )),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+    last_attempt_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK((state = 'ready' AND title IS NOT NULL)
+          OR (state <> 'ready' AND title IS NULL))
+);
+""",
+    "CREATE INDEX task_fused_title_jobs_pending "
+    "ON task_fused_title_jobs(state,updated_at,task_id);",
+    """
+CREATE TRIGGER task_fused_title_jobs_no_delete
+BEFORE DELETE ON task_fused_title_jobs
+BEGIN
+    SELECT RAISE(ABORT, 'fused title jobs are retained');
+END;
+""",
+)
+
+
 _SCHEMA_V20 = (
     # SQLite cannot alter a CHECK in place, and three tables carry a foreign
     # key to this one. Renaming the card table would rewrite all three to
@@ -3163,6 +3213,25 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 32
+            if version == 32:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    row = connection.execute(
+                        "SELECT type FROM sqlite_master WHERE "
+                        "name='task_fused_title_jobs'"
+                    ).fetchone()
+                    if row is None:
+                        for statement in _SCHEMA_V33:
+                            connection.execute(statement)
+                    elif row["type"] != "table":
+                        raise InboxError("candidate inbox schema is incomplete")
+                    connection.execute("PRAGMA user_version = 33")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 33
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:
