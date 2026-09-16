@@ -10,6 +10,8 @@ process arguments, the run state, the receipt left behind, or the transcript.
 
 from __future__ import annotations
 
+from foxhound import migrate_database
+
 import json
 import sqlite3
 import subprocess
@@ -76,7 +78,7 @@ class FencedInstructionDeliveryTests(unittest.TestCase):
         self.root = Path(temporary.name)
         self.root.chmod(0o700)
         self.database = self.root / "foxhound.sqlite3"
-        CandidateInbox(self.database).initialize()
+        migrate_database(self.database)
         with closing(sqlite3.connect(self.database)) as connection:
             now = "2030-01-02T03:04:05+00:00"
             connection.execute(

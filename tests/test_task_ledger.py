@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from foxhound import migrate_database
+
 import copy
 import hashlib
 import json
@@ -166,7 +168,7 @@ class TaskLedgerTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.database = Path(self.temporary.name) / "foxhound.sqlite3"
         self.inbox = CandidateInbox(self.database, clock=lambda: NOW)
-        self.inbox.initialize()
+        migrate_database(self.database)
         self.ledger = TaskLedger(self.database, clock=lambda: NOW)
 
     def import_candidates(self, *items: dict) -> None:
@@ -528,7 +530,7 @@ class TaskLedgerTests(unittest.TestCase):
             connection.execute("DROP TABLE tasks")
             connection.execute("PRAGMA user_version = 3")
 
-        self.inbox.initialize()
+        migrate_database(self.database)
 
         self.assertEqual(self.inbox.count(), 1)
         self.assertEqual(self.ledger.count(), 0)
@@ -543,7 +545,7 @@ class TaskLedgerTests(unittest.TestCase):
             connection.execute("DROP TRIGGER task_owner_equivalences_no_update")
 
         with self.assertRaisesRegex(InboxError, "schema is incomplete"):
-            self.inbox.initialize()
+            migrate_database(self.database)
         with self.assertRaisesRegex(TaskLedgerError, "schema is incomplete"):
             self.ledger.count()
 

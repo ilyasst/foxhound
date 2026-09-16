@@ -11,7 +11,7 @@ import sqlite3
 import tempfile
 import unittest
 
-from foxhound.candidate_inbox import CandidateInbox
+from foxhound.database_lifecycle import migrate_database
 from foxhound.delivery_health import (
     DeliveryHealthPolicy,
     collect_delivery_health,
@@ -26,7 +26,7 @@ class DeliveryHealthTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.database = Path(self.temporary.name) / "foxhound.sqlite3"
-        CandidateInbox(self.database).initialize()
+        migrate_database(self.database)
 
     def tearDown(self) -> None:
         self.temporary.cleanup()

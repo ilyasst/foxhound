@@ -91,7 +91,6 @@ def import_outbox(
         snapshot = _read_snapshot(outbox, expected_stream)
         inbox = CandidateInbox(database)
         try:
-            inbox.initialize()
             previous_cursor = inbox.shadow_feed_cursor("gw", expected_stream)
             if previous_cursor > snapshot.cursor:
                 raise TaskShadowFeedImportError(

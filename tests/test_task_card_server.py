@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from foxhound import migrate_database
+
 import hashlib
 import hmac
 import http.client
@@ -147,7 +149,7 @@ class TaskCardServerTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.database = Path(self.temporary.name) / "foxhound.sqlite3"
         self.clock = Clock()
-        CandidateInbox(self.database, clock=self.clock).initialize()
+        migrate_database(self.database)
         with closing(sqlite3.connect(self.database)) as connection, connection:
             for index in range(1, 5):
                 connection.execute(
@@ -1484,7 +1486,7 @@ class TaskCardQueueProjectionTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.database = Path(self.temporary.name) / "foxhound.sqlite3"
         self.clock = Clock()
-        CandidateInbox(self.database, clock=self.clock).initialize()
+        migrate_database(self.database)
         with closing(sqlite3.connect(self.database)) as connection, connection:
             for index in range(1, 4):
                 connection.execute(
@@ -1616,7 +1618,7 @@ class TaskCardTokenRoleTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.database = Path(self.temporary.name) / "foxhound.sqlite3"
         self.cards = TaskCardService(self.database)
-        self.cards.initialize()
+        migrate_database(self.database)
 
     def test_single_configured_token_defaults_to_drip_role_unchanged(self):
         """ADR 0036, invariant 3: a lone configured token with no explicit
@@ -1941,7 +1943,7 @@ class TaskCardClaimConsumerIdentityTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.database = Path(self.temporary.name) / "foxhound.sqlite3"
         self.clock = Clock()
-        CandidateInbox(self.database, clock=self.clock).initialize()
+        migrate_database(self.database)
         with closing(sqlite3.connect(self.database)) as connection, connection:
             for index in range(1, 3):
                 connection.execute(

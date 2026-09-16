@@ -23,6 +23,22 @@ selected SQLite database. It does not create active tasks or connect to a
 producer. Applications must keep that database in private host-local state,
 outside a repository checkout.
 
+Database creation and schema upgrades are explicit deployment operations. Run
+them only after stopping or draining every Foxhound process that uses the
+database:
+
+```sh
+foxhound-database inspect \
+  --database /srv/example/private-foxhound-state/foxhound.sqlite3
+foxhound-database migrate \
+  --database /srv/example/private-foxhound-state/foxhound.sqlite3
+```
+
+`inspect` never creates or changes the database. `migrate` is the only
+Foxhound command that may create or upgrade it. Importers, schedulers, runners,
+and card services require an already-compatible database and fail rather than
+changing it during normal operation.
+
 An ordered feed page carries a bounded, contiguous producer cursor range. The
 inbox atomically stores every candidate in the page, a replay receipt, and the
 new cursor. Exact page retries are accepted; gaps, overlaps, altered retries,
@@ -239,6 +255,16 @@ allowlist, duplicate-role rejection, and duplicate-token rejection as
 `--token-file`. A single bare execution path is accepted as the legacy
 `drip` role; omitting the option with a role-mapped task policy leaves
 execution routes fail-closed.
+
+Deployment settings must not be maintained independently in source files and
+service definitions. `foxhound-deployment-config` validates one private,
+owner-only JSON document before restart and renders the task-card service,
+execution scheduler, and execution-runner arguments from it. In particular,
+execution-card delivery requires the `drip` role in both its task-card and
+execution-card token maps. The validator never prints private paths or token
+contents on failure. See
+[Private deployment configuration](docs/deployment-configuration.md) for the
+strict document shape and synthetic example.
 
 `foxhound-delivery-health` gives an independent, one-shot health signal for a
 private database. It reports only aggregate queue and workflow counts, pending

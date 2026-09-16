@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from foxhound import migrate_database
+
 import json
 import os
 import sqlite3
@@ -30,7 +32,7 @@ class LifecycleOutcomeExportTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.root.chmod(0o700)
         self.database = self.root / "foxhound.sqlite3"
-        CandidateInbox(self.database, clock=lambda: NOW).initialize()
+        migrate_database(self.database)
         self.database.chmod(0o600)
         self.outbox = self.root / "outcomes"
         self.outbox.mkdir(mode=0o700)

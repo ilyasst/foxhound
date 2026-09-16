@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from foxhound import migrate_database
+
 import hashlib
 import json
 import tempfile
@@ -83,7 +85,7 @@ class TaskBootstrapCommandTests(unittest.TestCase):
         self.root.chmod(0o700)
         self.database = self.root / "foxhound.sqlite3"
         self.inbox = CandidateInbox(self.database, clock=lambda: NOW)
-        self.inbox.initialize()
+        migrate_database(self.database)
         self.database.chmod(0o600)
         self.token = self.root / "knowledge.token"
         self.token.write_text(TOKEN, encoding="utf-8")
