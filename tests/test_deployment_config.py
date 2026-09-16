@@ -23,6 +23,7 @@ from foxhound.execution_runner import _parser as runner_parser
 from foxhound.execution_schedule import _parser as schedule_parser
 from foxhound.candidate_feed_import import _parser as candidate_import_parser
 from foxhound.execution_card_requeue import _parser as requeue_parser
+from foxhound.fused_task_titles import _parser as fused_titles_parser
 from foxhound.native_intake import _parser as native_intake_parser
 from foxhound import task_card_server
 from foxhound.task_lifecycle_outcome_export import _parser as lifecycle_export_parser
@@ -54,7 +55,7 @@ class DeploymentConfigTests(unittest.TestCase):
     def _document(self) -> dict[str, object]:
         return {
             "schema": "foxhound.deployment-config",
-            "schema_version": 3,
+            "schema_version": 4,
             "database": str(self.database),
             "agent_profile_directory": None,
             "card_service": {
@@ -120,6 +121,10 @@ class DeploymentConfigTests(unittest.TestCase):
                     "stream_id": "example-lifecycle",
                     "max_page_items": 100,
                 },
+                "fused_task_titles": {
+                    "enabled": True,
+                    "endpoint": f"http://{LOOPBACK}:8800",
+                },
             },
         }
 
@@ -159,9 +164,14 @@ class DeploymentConfigTests(unittest.TestCase):
             config.argv("lifecycle-outcome-export")[0],
             "foxhound-task-lifecycle-outcome-export",
         )
+        self.assertEqual(
+            config.argv("fused-task-titles")[0],
+            "foxhound-fused-task-titles",
+        )
         for component in (
             "candidate-feed-import", "native-intake-run",
             "execution-card-requeue", "lifecycle-outcome-export",
+            "fused-task-titles",
         ):
             command = config.argv(component)
             self.assertEqual(
@@ -194,6 +204,17 @@ class DeploymentConfigTests(unittest.TestCase):
             config.argv("execution-runner")[0], "foxhound-execution-runner"
         )
 
+    def test_version_three_configuration_remains_valid_without_title_worker(self) -> None:
+        document = self._document()
+        document["schema_version"] = 3
+        del document["database_consumers"]["fused_task_titles"]  # type: ignore[index]
+        self._write_config(document)
+
+        config = load_deployment_config(self.config_path)
+
+        with self.assertRaises(DeploymentConfigError):
+            config.argv("fused-task-titles")
+
     def test_partial_card_gw_settings_are_rejected(self) -> None:
         document = self._document()
         document["card_service"]["gw_alias"] = None  # type: ignore[index]
@@ -223,6 +244,7 @@ class DeploymentConfigTests(unittest.TestCase):
         lifecycle_export_parser().parse_args(
             config.argv("lifecycle-outcome-export")[1:]
         )
+        fused_titles_parser().parse_args(config.argv("fused-task-titles")[1:])
 
     def test_rejects_duplicate_runner_slots(self) -> None:
         document = self._document()
@@ -235,6 +257,16 @@ class DeploymentConfigTests(unittest.TestCase):
     def test_requires_complete_enabled_database_consumers(self) -> None:
         document = self._document()
         del document["database_consumers"]["native_intake_run"]["limit"]  # type: ignore[index]
+        self._write_config(document)
+
+        with self.assertRaises(DeploymentConfigError):
+            load_deployment_config(self.config_path)
+
+    def test_refuses_a_non_loopback_fused_title_endpoint(self) -> None:
+        document = self._document()
+        document["database_consumers"]["fused_task_titles"]["endpoint"] = (  # type: ignore[index]
+            "https://example.com"
+        )
         self._write_config(document)
 
         with self.assertRaises(DeploymentConfigError):

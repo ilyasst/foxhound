@@ -25,6 +25,7 @@ from .card_provenance import (
 from . import task_completion as completion
 from . import task_duplicate_proposals as duplicates
 from . import task_relations
+from . import fused_task_titles
 from .candidate_inbox import CandidateInbox, InboxError, SCHEMA_VERSION
 from .task_ledger import (
     TaskLedgerError,
@@ -991,6 +992,9 @@ class TaskCardService:
                 ):
                     connection.rollback()
                     return False
+                fused_task_titles.refresh_after_withdrawal(
+                    connection, task_id=relation.object_id, now=now,
+                )
                 connection.commit()
                 return True
             except (task_relations.TaskRelationError, sqlite3.Error):
@@ -1267,6 +1271,9 @@ class TaskCardService:
                 )
             except task_relations.TaskRelationError:
                 return None
+            # This is durable local bookkeeping only. The remote call happens
+            # after this reader action commits.
+            fused_task_titles.enqueue(connection, task_id=object_id, now=now)
             decision = duplicates.Decision.CONFIRMED
             self._cancel_duplicate_task_cards(
                 connection, task_id=subject_id, now=now,
@@ -1391,7 +1398,9 @@ class TaskCardService:
         return (
             "SELECT c.id,c.task_id,c.task_version,c.status,c.version,c.due_at,"
             "c.source_revision,"
-            "t.text,t.owner,t.owner_kind,t.due,"
+            "COALESCE((SELECT job.title FROM task_fused_title_jobs AS job "
+            "WHERE job.task_id=c.task_id AND job.state='ready'),t.text) AS text,"
+            "t.owner,t.owner_kind,t.due,"
             "(SELECT min(h.created_at) FROM task_candidate_bindings AS b "
             " JOIN candidate_revision_history AS h "
             " ON h.candidate_id=b.candidate_id WHERE b.task_id=c.task_id) "
