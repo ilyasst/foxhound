@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 
 
@@ -18,6 +19,7 @@ MAX_BASIS = 1_200
 MAX_DETECTOR = 64
 MAX_ACTOR = 200
 MAX_OPEN_PROPOSALS_PER_TASK = 5
+RECENTLY_CLOSED_DAYS = 30
 
 
 class DuplicateProposalError(ValueError):
@@ -117,7 +119,7 @@ def propose(
         )
     left_task_id, right_task_id = sorted((task_id_a, task_id_b))
     rows = connection.execute(
-        "SELECT id,status,version,owner_ref_version,owner_kind,"
+        "SELECT id,status,closed_at,version,owner_ref_version,owner_kind,"
         "owner_speaker_id,owner_canonical_speaker_id,"
         "owner_speaker_registry_id,owner_provisional "
         "FROM tasks WHERE id IN (?,?) ORDER BY id",
@@ -128,7 +130,7 @@ def propose(
             ProposalDisposition.REFUSED,
             refusal=ProposalRefusal.UNKNOWN_TASK,
         )
-    if any(row["status"] != "open" for row in rows):
+    if not _eligible_for_proposal(rows, now=now):
         return ProposalResult(
             ProposalDisposition.REFUSED,
             refusal=ProposalRefusal.TASK_NOT_OPEN,
@@ -340,6 +342,44 @@ def _same_confirmed_owner(left: sqlite3.Row, right: sqlite3.Row) -> bool:
         and bool(left["owner_speaker_registry_id"])
         and not bool(left["owner_provisional"])
     )
+
+
+def reviewable_status_pair(rows: tuple[sqlite3.Row, ...] | list[sqlite3.Row]) -> bool:
+    """Return whether a persisted proposal can still reach a reader.
+
+    A proposal may compare two open tasks, or one open task with a task that
+    was recently closed when the detector recorded the proposal.  The latter
+    stays reviewable after the lookback expires: the reader is deciding a
+    durable recorded comparison, not asking the detector to widen its window.
+    """
+    if len(rows) != 2:
+        return False
+    statuses = [str(row["status"]) for row in rows]
+    return statuses.count("open") == 2 or (
+        statuses.count("open") == 1
+        and any(status in {"done", "dropped"} for status in statuses)
+    )
+
+
+def _eligible_for_proposal(rows: tuple[sqlite3.Row, ...] | list[sqlite3.Row], *,
+                           now: str) -> bool:
+    if not reviewable_status_pair(rows):
+        return False
+    if all(str(row["status"]) == "open" for row in rows):
+        return True
+    closed = next(row for row in rows if str(row["status"]) != "open")
+    return _closed_within_lookback(closed["closed_at"], now)
+
+
+def _closed_within_lookback(closed_at: object, now: str) -> bool:
+    if not isinstance(closed_at, str):
+        return False
+    try:
+        closed = datetime.fromisoformat(closed_at).astimezone(timezone.utc)
+        observed = datetime.fromisoformat(now).astimezone(timezone.utc)
+    except ValueError:
+        return False
+    return observed - timedelta(days=RECENTLY_CLOSED_DAYS) <= closed <= observed
 
 
 def _identifier(value: int, field: str) -> int:

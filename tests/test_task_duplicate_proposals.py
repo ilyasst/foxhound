@@ -104,6 +104,26 @@ class DuplicateProposalTests(unittest.TestCase):
             duplicates.ProposalRefusal.INCOMPATIBLE_OWNER,
         )
 
+    def test_records_a_pair_with_a_recently_closed_task(self) -> None:
+        self._same_owner(1, 2)
+        self.connection.execute(
+            "UPDATE tasks SET status='done',closed_at=? WHERE id=1",
+            ("2030-02-15T12:00:00+00:00",),
+        )
+        result = self._propose()
+        self.assertIs(result.disposition, duplicates.ProposalDisposition.RECORDED)
+
+    def test_refuses_a_pair_with_a_task_closed_outside_the_lookback(self) -> None:
+        self._same_owner(1, 2)
+        self.connection.execute(
+            "UPDATE tasks SET status='done',closed_at=? WHERE id=1",
+            ("2030-01-01T12:00:00+00:00",),
+        )
+        self.assertIs(
+            self._propose().refusal,
+            duplicates.ProposalRefusal.TASK_NOT_OPEN,
+        )
+
     def test_refuses_unconfirmed_and_provisional_owners(self) -> None:
         self._same_owner(1, 2)
         self.connection.execute(

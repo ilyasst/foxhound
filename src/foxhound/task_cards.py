@@ -129,6 +129,7 @@ class CardDuplicateProposal:
 
     id: int
     other_task_id: int
+    other_status: str
     other_text: str = field(repr=False)
     other_origin_kind: str = field(repr=False)
     other_origin_record: str = field(repr=False)
@@ -1090,23 +1091,37 @@ class TaskCardService:
     def _ask_duplicate_proposals(
         self, connection: sqlite3.Connection, now: str, *, limit: int
     ) -> tuple[int, int]:
-        """Bind one unread duplicate proposal to its canonical task card."""
+        """Bind one unread duplicate proposal to its open task card."""
         rows = connection.execute(
-            "SELECT d.id AS proposal_id,d.left_task_id AS task_id,"
-            "d.left_task_version AS task_version,"
-            + _bound_source_revision("t.id") + " AS source_revision,"
-            "(SELECT c.id FROM task_review_cards AS c WHERE c.task_id=t.id "
+            "SELECT d.id AS proposal_id,"
+            "CASE WHEN left_task.status='open' THEN left_task.id "
+            "ELSE right_task.id END AS task_id,"
+            "CASE WHEN left_task.status='open' THEN d.left_task_version "
+            "ELSE d.right_task_version END AS task_version,"
+            + _bound_source_revision(
+                "CASE WHEN left_task.status='open' THEN left_task.id "
+                "ELSE right_task.id END"
+            ) + " AS source_revision,"
+            "(SELECT c.id FROM task_review_cards AS c WHERE c.task_id="
+            "(CASE WHEN left_task.status='open' THEN left_task.id "
+            "ELSE right_task.id END) "
             " AND c.status IN ('pending','delivering','delivered','snoozed')) "
             " AS active_id,"
-            "(SELECT c.status FROM task_review_cards AS c WHERE c.task_id=t.id "
+            "(SELECT c.status FROM task_review_cards AS c WHERE c.task_id="
+            "(CASE WHEN left_task.status='open' THEN left_task.id "
+            "ELSE right_task.id END) "
             " AND c.status IN ('pending','delivering','delivered','snoozed')) "
             " AS active_status "
-            "FROM task_duplicate_proposals AS d JOIN tasks AS t "
-            "ON t.id=d.left_task_id JOIN tasks AS other ON other.id=d.right_task_id "
+            "FROM task_duplicate_proposals AS d "
+            "JOIN tasks AS left_task ON left_task.id=d.left_task_id "
+            "JOIN tasks AS right_task ON right_task.id=d.right_task_id "
             "WHERE d.state='proposed' AND d.card_id IS NULL "
-            "AND t.status='open' AND other.status='open' "
-            "AND t.version=d.left_task_version "
-            "AND other.version=d.right_task_version ORDER BY d.id LIMIT ?",
+            "AND left_task.version=d.left_task_version "
+            "AND right_task.version=d.right_task_version "
+            "AND ((left_task.status='open' AND right_task.status "
+            "IN ('open','done','dropped')) OR (right_task.status='open' "
+            "AND left_task.status IN ('done','dropped'))) "
+            "ORDER BY d.id LIMIT ?",
             (limit,),
         ).fetchall()
         asked = raised = 0
@@ -1154,7 +1169,7 @@ class TaskCardService:
             "SELECT id,status,version FROM tasks WHERE id IN (?,?) ORDER BY id",
             (int(proposal["left_task_id"]), int(proposal["right_task_id"])),
         ).fetchall()
-        if (len(tasks) != 2 or any(item["status"] != "open" for item in tasks)
+        if (len(tasks) != 2 or not duplicates.reviewable_status_pair(tasks)
                 or int(tasks[0]["version"]) != int(proposal["left_task_version"])
                 or int(tasks[1]["version"]) != int(proposal["right_task_version"])):
             return None
@@ -1167,11 +1182,19 @@ class TaskCardService:
             return None
         proposal_id = int(proposal["id"])
         if action == "duplicate_confirm":
+            if tasks[0]["status"] == "open" and tasks[1]["status"] == "open":
+                subject_id = int(proposal["right_task_id"])
+                object_id = int(proposal["left_task_id"])
+            else:
+                open_task = next(item for item in tasks if item["status"] == "open")
+                closed_task = next(item for item in tasks if item["status"] != "open")
+                subject_id = int(open_task["id"])
+                object_id = int(closed_task["id"])
             try:
                 task_relations.assert_relation(
                     connection,
-                    subject_id=int(proposal["right_task_id"]),
-                    object_id=int(proposal["left_task_id"]),
+                    subject_id=subject_id,
+                    object_id=object_id,
                     kind="duplicate_of", basis=str(proposal["basis"])[:500],
                     asserted_by="reader", actor="reader",
                 )
@@ -1179,7 +1202,8 @@ class TaskCardService:
                 return None
             decision = duplicates.Decision.CONFIRMED
             self._cancel_duplicate_task_cards(
-                connection, task_id=int(proposal["right_task_id"]), now=now
+                connection, task_id=subject_id, now=now,
+                except_card_id=int(row["id"]),
             )
         else:
             decision = duplicates.Decision.REJECTED
@@ -1207,7 +1231,8 @@ class TaskCardService:
         )
 
     def _cancel_duplicate_task_cards(
-        self, connection: sqlite3.Connection, *, task_id: int, now: str
+        self, connection: sqlite3.Connection, *, task_id: int, now: str,
+        except_card_id: int | None = None,
     ) -> None:
         rows = connection.execute(
             "SELECT id,task_version,version FROM task_review_cards "
@@ -1215,6 +1240,8 @@ class TaskCardService:
             (task_id,),
         ).fetchall()
         for stale in rows:
+            if int(stale["id"]) == except_card_id:
+                continue
             next_version = int(stale["version"]) + 1
             connection.execute(
                 "UPDATE task_review_cards SET status='cancelled',version=?,"
@@ -1342,24 +1369,35 @@ class TaskCardService:
             "e.quotation AS completion_quotation,"
             "e.reason AS completion_reason,"
             "e.confidence AS completion_confidence,"
-            "d.id AS duplicate_id,d.right_task_id AS duplicate_other_task_id,"
+            "d.id AS duplicate_id,"
+            "CASE WHEN d.left_task_id=c.task_id THEN d.right_task_id "
+            "ELSE d.left_task_id END AS duplicate_other_task_id,"
+            "other.status AS duplicate_other_status,"
             "other.text AS duplicate_other_text,"
             "(SELECT o.source_kind FROM task_candidate_bindings AS b "
             " JOIN candidate_inbox AS o ON o.candidate_id=b.candidate_id "
-            " WHERE b.task_id=d.right_task_id AND b.relation='accepted') "
+            " WHERE b.task_id=(CASE WHEN d.left_task_id=c.task_id "
+            " THEN d.right_task_id ELSE d.left_task_id END) "
+            " AND b.relation='accepted') "
             " AS duplicate_other_kind,"
             "(SELECT o.source_record_id FROM task_candidate_bindings AS b "
             " JOIN candidate_inbox AS o ON o.candidate_id=b.candidate_id "
-            " WHERE b.task_id=d.right_task_id AND b.relation='accepted') "
+            " WHERE b.task_id=(CASE WHEN d.left_task_id=c.task_id "
+            " THEN d.right_task_id ELSE d.left_task_id END) "
+            " AND b.relation='accepted') "
             " AS duplicate_other_record,"
             "(SELECT o.source_item_id FROM task_candidate_bindings AS b "
             " JOIN candidate_inbox AS o ON o.candidate_id=b.candidate_id "
-            " WHERE b.task_id=d.right_task_id AND b.relation='accepted') "
+            " WHERE b.task_id=(CASE WHEN d.left_task_id=c.task_id "
+            " THEN d.right_task_id ELSE d.left_task_id END) "
+            " AND b.relation='accepted') "
             " AS duplicate_other_item,"
             "(SELECT h.payload_json FROM task_candidate_bindings AS b "
             " JOIN candidate_revision_history AS h ON h.candidate_id=b.candidate_id "
             " AND h.source_revision=b.source_revision "
-            " WHERE b.task_id=d.right_task_id AND b.relation='accepted') "
+            " WHERE b.task_id=(CASE WHEN d.left_task_id=c.task_id "
+            " THEN d.right_task_id ELSE d.left_task_id END) "
+            " AND b.relation='accepted') "
             " AS duplicate_other_payload,"
             "t.status AS task_status_current,t.version AS task_version_current,"
             + _bound_source_revision("t.id") + " AS source_revision_current "
@@ -1369,7 +1407,9 @@ class TaskCardService:
             "ON e.card_id=c.id AND e.state='proposed' "
             "LEFT JOIN task_duplicate_proposals AS d "
             "ON d.card_id=c.id AND d.state='proposed' "
-            "LEFT JOIN tasks AS other ON other.id=d.right_task_id"
+            "LEFT JOIN tasks AS other ON other.id="
+            "(CASE WHEN d.left_task_id=c.task_id THEN d.right_task_id "
+            "ELSE d.left_task_id END)"
         )
 
     def _connect(self) -> sqlite3.Connection:
@@ -1524,6 +1564,7 @@ def _render_done_check(card: TaskReviewCard, text: str) -> tuple[str, dict]:
 def _render_duplicate_check(card: TaskReviewCard, text: str) -> tuple[str, dict]:
     """Ask the reader to adjudicate one suspected cross-source duplicate."""
     duplicate = card.duplicate
+    recent_closed = duplicate.other_status in {"done", "dropped"}
     lines = [
         f"🔀 <b>Same task?</b>  <code>T{card.task_id}</code> and "
         f"<code>T{duplicate.other_task_id}</code>",
@@ -1545,7 +1586,12 @@ def _render_duplicate_check(card: TaskReviewCard, text: str) -> tuple[str, dict]
             html_output=True,
         ),
         "",
-        "Confirming keeps the lower-numbered task and preserves both sources.",
+        (
+            "Confirming records this open task as the same recently closed task "
+            "and preserves both sources."
+            if recent_closed
+            else "Confirming keeps the lower-numbered task and preserves both sources."
+        ),
     ]
 
     def callback(action: str) -> str:
@@ -1555,7 +1601,10 @@ def _render_duplicate_check(card: TaskReviewCard, text: str) -> tuple[str, dict]
         return value
 
     keyboard = {"inline_keyboard": [[
-        {"text": "✅ Same task", "callback_data": callback("duplicate_confirm")},
+        {
+            "text": "✅ Already completed" if recent_closed else "✅ Same task",
+            "callback_data": callback("duplicate_confirm"),
+        },
         {"text": "↔️ Keep separate", "callback_data": callback("duplicate_reject")},
     ]]}
     return "\n".join(lines), keyboard
@@ -1668,6 +1717,7 @@ def _duplicate(row) -> CardDuplicateProposal | None:
     return CardDuplicateProposal(
         id=int(row["duplicate_id"]),
         other_task_id=int(row["duplicate_other_task_id"]),
+        other_status=str(row["duplicate_other_status"] or ""),
         other_text=str(row["duplicate_other_text"] or ""),
         other_origin_kind=str(row["duplicate_other_kind"] or ""),
         other_origin_record=str(row["duplicate_other_record"] or ""),
