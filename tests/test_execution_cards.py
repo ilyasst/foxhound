@@ -973,6 +973,86 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertEqual(replacement.card.id, claim.card.id)
         self.assertGreater(replacement.card.version, claim.card.version)
 
+    def test_first_presentation_carries_no_superseded_handle(self):
+        self._schedule_workflow(1)
+        self.cards.schedule()
+
+        claim = self.cards.claim_next(lease_seconds=60)
+
+        self.assertIsNone(claim.superseded_delivery_ref)
+        self.assertIsNone(claim.superseded_transport)
+
+    def test_representation_carries_the_handle_it_replaces(self):
+        self._schedule_workflow(1)
+        self.cards.schedule()
+        first = self._claim_and_deliver()
+
+        self.clock.advance(timedelta(hours=1))
+        self.cards.requeue_unanswered()
+        replacement = self.cards.claim_next(lease_seconds=60)
+
+        # The consumer withdraws the message it is replacing, so the reader
+        # is never left choosing between two presentations of one decision.
+        self.assertEqual(
+            replacement.superseded_delivery_ref,
+            f"message-{first.card.id}",
+        )
+        self.assertEqual(replacement.superseded_transport, "synthetic")
+
+    def test_delivering_a_replacement_retires_the_superseded_handle(self):
+        self._schedule_workflow(1)
+        self.cards.schedule()
+        first = self._claim_and_deliver()
+        self.clock.advance(timedelta(hours=1))
+        self.cards.requeue_unanswered()
+        replacement = self.cards.claim_next(lease_seconds=60)
+        self.cards.complete_delivery(
+            replacement.card.id,
+            expected_version=replacement.card.version,
+            claim_token=replacement.token,
+            transport="synthetic",
+            delivery_ref="message-second",
+        )
+
+        # `retry_delivery` is the operator repair for a presentation that
+        # never landed, and it does not name a predecessor of its own. So it
+        # is the path that shows whether acknowledging the replacement
+        # actually retired the handle, rather than leaving the first one to
+        # be carried forward and withdrawn a second time.
+        retried = self.cards.retry_delivery(
+            replacement.card.id,
+            expected_version=replacement.card.version,
+        )
+        self.assertTrue(retried.accepted)
+        third = self.cards.claim_next(lease_seconds=60)
+
+        # A handle is withdrawn once. Carrying the first one forward again
+        # would ask the consumer to delete a message that is already gone
+        # while the message actually on screen stayed there.
+        self.assertIsNone(third.superseded_delivery_ref)
+        self.assertIsNone(third.superseded_transport)
+
+    def test_failed_delivery_keeps_the_handle_still_on_screen(self):
+        self._schedule_workflow(1)
+        self.cards.schedule()
+        first = self._claim_and_deliver()
+        self.clock.advance(timedelta(hours=1))
+        self.cards.requeue_unanswered()
+        attempt = self.cards.claim_next(lease_seconds=60)
+        self.cards.fail_delivery(
+            attempt.card.id,
+            expected_version=attempt.card.version,
+            claim_token=attempt.token,
+        )
+
+        retry = self.cards.claim_next(lease_seconds=60)
+
+        # Nothing replaced the predecessor, so it is still the message the
+        # next attempt has to withdraw.
+        self.assertEqual(
+            retry.superseded_delivery_ref, f"message-{first.card.id}"
+        )
+
     def test_represent_only_requeues_current_delivered_cards(self):
         self._schedule_workflow(1)
         self._schedule_workflow(2)

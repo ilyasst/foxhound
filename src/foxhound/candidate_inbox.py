@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 34
+SCHEMA_VERSION = 35
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -383,6 +383,8 @@ _SCHEMA_COLUMNS = {
         "updated_at",
         "resolved_at",
         "consumer_digest",
+        "superseded_delivery_ref",
+        "superseded_transport",
     ),
     "execution_review_card_events": (
         "sequence",
@@ -480,12 +482,20 @@ _SCHEMA_COLUMNS = {
 # the new table removed, the v22 state also has the card column removed but
 # keeps `work_digest`, the v21 state has neither column but keeps
 # `task_relations`, and the v20 state has none of the five.
+_SCHEMA_V34_COLUMNS = {
+    name: tuple(column for column in columns if not (
+        name == "execution_review_cards"
+        and column in {"superseded_delivery_ref", "superseded_transport"}
+    ))
+    for name, columns in _SCHEMA_COLUMNS.items()
+}
+
 _SCHEMA_V33_COLUMNS = {
     name: tuple(column for column in columns if not (
         name == "task_execution_workflows"
         and column in {"last_failure_exit_code", "last_failure_run_id"}
     ))
-    for name, columns in _SCHEMA_COLUMNS.items()
+    for name, columns in _SCHEMA_V34_COLUMNS.items()
 }
 
 _SCHEMA_V32_COLUMNS = {
@@ -2332,6 +2342,23 @@ _SCHEMA_V34 = (
 )
 
 
+# Re-presenting an unanswered card used to drop the handle of the message it
+# was replacing, so the surface accumulated a column of identical cards: the
+# reader saw the same decision repeated with no way to tell which one the
+# controls still answered.  Re-presentation now carries the
+# superseded handle forward so the consumer can withdraw its predecessor
+# before posting the replacement, which is what the legacy task-card re-ask
+# has always done.  The transport is carried with it because a handle is only
+# meaningful to the surface that issued it, and a consumer must be able to
+# tell that the ref it is holding is one of its own.
+_SCHEMA_V35 = (
+    "ALTER TABLE execution_review_cards ADD COLUMN "
+    "superseded_delivery_ref TEXT;",
+    "ALTER TABLE execution_review_cards ADD COLUMN "
+    "superseded_transport TEXT;",
+)
+
+
 _SCHEMA_V20 = (
     # SQLite cannot alter a CHECK in place, and three tables carry a foreign
     # key to this one. Renaming the card table would rewrite all three to
@@ -3276,6 +3303,26 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 34
+            if version == 34:
+                self._require_tables(
+                    connection,
+                    ("execution_review_cards",),
+                    columns=_SCHEMA_V34_COLUMNS,
+                )
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    columns = tuple(item["name"] for item in connection.execute(
+                        "PRAGMA table_info(execution_review_cards)"
+                    ))
+                    if "superseded_delivery_ref" not in columns:
+                        for statement in _SCHEMA_V35:
+                            connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 35")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 35
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:

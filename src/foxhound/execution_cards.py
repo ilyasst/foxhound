@@ -267,6 +267,13 @@ class ExecutionCardDeliveryClaim:
     card: ExecutionReviewCard
     token: str = field(repr=False)
     expires_at: str
+    #: The delivery handle of the presentation this claim replaces, and the
+    #: transport that issued it, or `None` for a first presentation.  A
+    #: consumer withdraws that message before posting the replacement, and
+    #: only when the transport is its own: a handle means nothing to a
+    #: surface that did not issue it.
+    superseded_delivery_ref: str | None = None
+    superseded_transport: str | None = None
 
 
 @dataclass(frozen=True)
@@ -775,7 +782,11 @@ class ExecutionCardService:
                 values = dict(row)
                 values.update(status=ExecutionCardStatus.DELIVERING, version=version)
                 return ExecutionCardDeliveryClaim(
-                    self._render_card(values), token, expires
+                    self._render_card(values),
+                    token,
+                    expires,
+                    row["superseded_delivery_ref"],
+                    row["superseded_transport"],
                 )
             except Exception:
                 connection.rollback()
@@ -834,7 +845,8 @@ class ExecutionCardService:
                 connection.execute(
                     "UPDATE execution_review_cards SET status='delivered',"
                     "claim_token_digest=NULL,claim_expires_at=NULL,transport=?,"
-                    "delivery_ref=?,delivered_at=?,updated_at=? "
+                    "delivery_ref=?,delivered_at=?,updated_at=?,"
+                    "superseded_delivery_ref=NULL,superseded_transport=NULL "
                     "WHERE id=? AND version=?",
                     (
                         transport,
@@ -864,6 +876,8 @@ class ExecutionCardService:
                     transport=transport,
                     delivery_ref=delivery_ref,
                     delivered_at=now,
+                    superseded_delivery_ref=None,
+                    superseded_transport=None,
                 )
                 return _operation(values, ExecutionCardDisposition.APPLIED)
             except Exception:
@@ -1031,6 +1045,8 @@ class ExecutionCardService:
                     updated = connection.execute(
                         "UPDATE execution_review_cards SET status='pending',"
                         "version=?,claim_token_digest=NULL,claim_expires_at=NULL,"
+                        "superseded_delivery_ref=delivery_ref,"
+                        "superseded_transport=transport,"
                         "transport=NULL,delivery_ref=NULL,delivered_at=NULL,"
                         "updated_at=? WHERE id=? AND version=? "
                         "AND status='delivered'",
