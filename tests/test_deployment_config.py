@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from foxhound.candidate_inbox import CandidateInbox
+from foxhound.database_lifecycle import migrate_database
 from foxhound.deployment_config import (
     DeploymentConfigError,
     load_deployment_config,
@@ -31,7 +31,7 @@ class DeploymentConfigTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.database = self.root / "foxhound.sqlite3"
-        CandidateInbox(self.database).initialize()
+        migrate_database(self.database)
         self.task_token = self._private_file("task.token", "a" * 32)
         self.execution_token = self._private_file("execution.token", "b" * 32)
         self.gateway_token = self._private_file("gateway.token", "c" * 32)

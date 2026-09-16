@@ -266,6 +266,22 @@ contents on failure. See
 [Private deployment configuration](docs/deployment-configuration.md) for the
 strict document shape and synthetic example.
 
+`foxhound-delivery-health` gives an independent, one-shot health signal for a
+private database. It reports only aggregate queue and workflow counts, pending
+age, recent delivery failures, and the age of the last successful delivery;
+it never prints card or task content, identifiers, tokens, transports, or the
+database path. A nonzero result is suitable for an external monitor that does
+not rely on the card path itself:
+
+```sh
+foxhound-delivery-health \
+  --database /srv/example/private-foxhound-state/foxhound.sqlite3
+```
+
+The default alert thresholds are 15 minutes for pending work and delivery
+freshness, and three failures within 15 minutes. Supply the explicit bounded
+threshold options when a deployment needs a different policy.
+
 Foxhound now also owns a transport-neutral execution workflow ledger. An
 explicitly scheduled open task stops at a reader start gate, then advances
 through separately approved plan, execution, and external-action phases under
