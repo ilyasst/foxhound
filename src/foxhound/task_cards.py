@@ -326,6 +326,41 @@ class TaskCardService:
                 connection.rollback()
                 raise
 
+    def schedule_duplicate_proposals(self, *, limit: int = 100) -> ScheduleResult:
+        """Bind proposed duplicates to reader cards without scheduling tasks.
+
+        Native intake has already made the narrow decision to propose a
+        duplicate.  Its timer needs to make that question deliverable, but it
+        must not incidentally create the ordinary task-review cards owned by
+        the broader scheduler above.
+        """
+        if not _valid_limit(limit):
+            return ScheduleResult(
+                CardDisposition.REFUSED,
+                refusal=CardRefusal.INVALID_ARGUMENT,
+            )
+        now = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cancelled = self._cancel_stale(connection, now)
+                asked, raised = self._ask_duplicate_proposals(
+                    connection, now, limit=limit
+                )
+                connection.commit()
+                return ScheduleResult(
+                    CardDisposition.APPLIED
+                    if cancelled or asked
+                    else CardDisposition.UNCHANGED,
+                    created=raised,
+                    cancelled=cancelled,
+                    asked=asked,
+                )
+            except Exception:
+                connection.rollback()
+                raise
+
     def due(self, *, limit: int = 20) -> tuple[TaskReviewCard, ...]:
         if not _valid_limit(limit):
             raise TaskLedgerError("task card due limit is invalid")

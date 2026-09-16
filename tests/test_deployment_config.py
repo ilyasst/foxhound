@@ -25,6 +25,9 @@ from foxhound.candidate_feed_import import _parser as candidate_import_parser
 from foxhound.execution_card_requeue import _parser as requeue_parser
 from foxhound.fused_task_titles import _parser as fused_titles_parser
 from foxhound.native_intake import _parser as native_intake_parser
+from foxhound.task_duplicate_card_schedule import (
+    _parser as duplicate_schedule_parser,
+)
 from foxhound import task_card_server
 from foxhound.task_lifecycle_outcome_export import _parser as lifecycle_export_parser
 
@@ -55,7 +58,7 @@ class DeploymentConfigTests(unittest.TestCase):
     def _document(self) -> dict[str, object]:
         return {
             "schema": "foxhound.deployment-config",
-            "schema_version": 4,
+            "schema_version": 5,
             "database": str(self.database),
             "agent_profile_directory": None,
             "card_service": {
@@ -125,6 +128,7 @@ class DeploymentConfigTests(unittest.TestCase):
                     "enabled": True,
                     "endpoint": f"http://{LOOPBACK}:8800",
                 },
+                "duplicate_card_schedule": {"enabled": True, "limit": 100},
             },
         }
 
@@ -168,10 +172,15 @@ class DeploymentConfigTests(unittest.TestCase):
             config.argv("fused-task-titles")[0],
             "foxhound-fused-task-titles",
         )
+        self.assertEqual(
+            config.argv("duplicate-card-schedule")[0],
+            "foxhound-task-duplicate-card-schedule",
+        )
         for component in (
             "candidate-feed-import", "native-intake-run",
             "execution-card-requeue", "lifecycle-outcome-export",
             "fused-task-titles",
+            "duplicate-card-schedule",
         ):
             command = config.argv(component)
             self.assertEqual(
@@ -208,12 +217,26 @@ class DeploymentConfigTests(unittest.TestCase):
         document = self._document()
         document["schema_version"] = 3
         del document["database_consumers"]["fused_task_titles"]  # type: ignore[index]
+        del document["database_consumers"]["duplicate_card_schedule"]  # type: ignore[index]
         self._write_config(document)
 
         config = load_deployment_config(self.config_path)
 
         with self.assertRaises(DeploymentConfigError):
             config.argv("fused-task-titles")
+
+    def test_version_four_configuration_remains_valid_without_duplicate_scheduler(
+        self,
+    ) -> None:
+        document = self._document()
+        document["schema_version"] = 4
+        del document["database_consumers"]["duplicate_card_schedule"]  # type: ignore[index]
+        self._write_config(document)
+
+        config = load_deployment_config(self.config_path)
+
+        with self.assertRaises(DeploymentConfigError):
+            config.argv("duplicate-card-schedule")
 
     def test_partial_card_gw_settings_are_rejected(self) -> None:
         document = self._document()
@@ -245,6 +268,9 @@ class DeploymentConfigTests(unittest.TestCase):
             config.argv("lifecycle-outcome-export")[1:]
         )
         fused_titles_parser().parse_args(config.argv("fused-task-titles")[1:])
+        duplicate_schedule_parser().parse_args(
+            config.argv("duplicate-card-schedule")[1:]
+        )
 
     def test_rejects_duplicate_runner_slots(self) -> None:
         document = self._document()
