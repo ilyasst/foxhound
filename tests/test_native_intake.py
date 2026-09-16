@@ -458,10 +458,11 @@ class NativeCandidateIntakeTests(unittest.TestCase):
         )
         self.assertEqual(fenced.refusal, NativeIntakeRefusal.ALREADY_ACTIVATED)
 
-    def test_schema_fifteen_migration_is_passive(self):
+    def test_schema_seventeen_migration_is_passive(self):
         item = candidate(1)
         self.assertTrue(self.inbox.import_document(item).accepted)
         with closing(sqlite3.connect(self.database)) as connection:
+            # v18 added the structured owner reference.
             for column in (
                 "owner_provisional",
                 "owner_pinned",
@@ -472,18 +473,18 @@ class NativeCandidateIntakeTests(unittest.TestCase):
                 "owner_ref_version",
             ):
                 connection.execute(f"ALTER TABLE tasks DROP COLUMN {column}")
-            connection.execute("DROP TABLE native_intake_historical_refusals")
-            connection.execute(
-                "ALTER TABLE task_execution_results DROP COLUMN task_kb_file"
-            )
-            connection.execute(
-                "ALTER TABLE task_execution_results "
-                "DROP COLUMN task_work_directory"
-            )
             # v21 added this; a database at an older version has
             # not got it yet.
             connection.execute(
                 "ALTER TABLE task_execution_results DROP COLUMN work_digest"
+            )
+            connection.execute(
+                "ALTER TABLE task_execution_results DROP COLUMN "
+                "repository_references_json"
+            )
+            connection.execute(
+                "ALTER TABLE task_execution_results DROP COLUMN "
+                "repository_impact"
             )
             # ADR 0036 added this at v23; a database at an older version
             # has not got it yet.
@@ -491,11 +492,11 @@ class NativeCandidateIntakeTests(unittest.TestCase):
                 "ALTER TABLE task_review_cards DROP COLUMN consumer_digest"
             )
             # Source-revision snapshots arrive at v26. This fixture models
-            # v15, before review cards carried that fence.
+            # v17, before review cards carried that fence.
             connection.execute(
                 "ALTER TABLE task_review_cards DROP COLUMN source_revision"
             )
-            connection.execute("PRAGMA user_version = 15")
+            connection.execute("PRAGMA user_version = 17")
 
         migrate_database(self.database)
 

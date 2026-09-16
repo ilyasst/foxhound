@@ -42,7 +42,7 @@ class TaskOriginRead(unittest.TestCase):
         self.addCleanup(self._dir.cleanup)
         self.db = Path(self._dir.name) / "foxhound.sqlite3"
         ledger = TaskLedger(self.db)
-        migrate_database(self.database)
+        migrate_database(self.db)
         self.ledger = ledger
 
     def _bind(self, task_id: int, candidate: dict, relation: str = "accepted",

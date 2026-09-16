@@ -504,6 +504,13 @@ _SCHEMA_V32_COLUMNS = {
     if name != "task_fused_title_jobs"
 }
 
+_SCHEMA_V31_COLUMNS = {
+    name: tuple(column for column in columns if not (
+        name == "task_execution_workflows" and column == "queue_priority"
+    ))
+    for name, columns in _SCHEMA_V32_COLUMNS.items()
+}
+
 _SCHEMA_V30_COLUMNS = {
     name: tuple(column for column in columns if not (
         name == "task_execution_results"
@@ -2955,6 +2962,7 @@ class CandidateInbox:
                     connection,
                     tuple(_SCHEMA_V14_COLUMNS),
                     columns=_SCHEMA_V14_COLUMNS,
+                    allow_appended_columns=True,
                 )
                 connection.execute("PRAGMA foreign_keys = ON")
                 connection.execute("BEGIN IMMEDIATE")
@@ -2972,6 +2980,7 @@ class CandidateInbox:
                     connection,
                     tuple(_SCHEMA_V15_COLUMNS),
                     columns=_SCHEMA_V15_COLUMNS,
+                    allow_appended_columns=True,
                 )
                 connection.execute("PRAGMA foreign_keys = ON")
                 connection.execute("BEGIN IMMEDIATE")
@@ -2989,6 +2998,7 @@ class CandidateInbox:
                     connection,
                     tuple(_SCHEMA_V16_COLUMNS),
                     columns=_SCHEMA_V16_COLUMNS,
+                    allow_appended_columns=True,
                 )
                 connection.execute("PRAGMA foreign_keys = ON")
                 connection.execute("BEGIN IMMEDIATE")
@@ -3006,6 +3016,7 @@ class CandidateInbox:
                     connection,
                     tuple(_SCHEMA_V17_COLUMNS),
                     columns=_SCHEMA_V17_COLUMNS,
+                    allow_appended_columns=True,
                 )
                 connection.execute("PRAGMA foreign_keys = ON")
                 connection.execute("BEGIN IMMEDIATE")
@@ -3023,6 +3034,7 @@ class CandidateInbox:
                     connection,
                     tuple(_SCHEMA_V18_COLUMNS),
                     columns=_SCHEMA_V18_COLUMNS,
+                    allow_appended_columns=True,
                 )
                 connection.execute("PRAGMA foreign_keys = ON")
                 connection.execute("BEGIN IMMEDIATE")
@@ -3039,6 +3051,8 @@ class CandidateInbox:
                 self._require_tables(
                     connection,
                     ("execution_review_cards",),
+                    columns=_SCHEMA_V18_COLUMNS,
+                    allow_appended_columns=True,
                 )
                 # Off before the transaction, not inside it: the pragma is a
                 # no-op once one is open, and the rebuild below drops a table
@@ -3067,7 +3081,8 @@ class CandidateInbox:
                 # The default expectation is the version-14 map, which is
                 # several tables and seven owner columns behind this point.
                 self._require_tables(
-                    connection, ("tasks",), columns=_SCHEMA_V20_COLUMNS)
+                    connection, ("tasks",), columns=_SCHEMA_V20_COLUMNS,
+                    allow_appended_columns=True)
                 connection.execute("PRAGMA foreign_keys = ON")
                 connection.execute("BEGIN IMMEDIATE")
                 try:
@@ -3119,6 +3134,7 @@ class CandidateInbox:
                     connection,
                     ("tasks", "task_review_cards"),
                     columns=_SCHEMA_V24_COLUMNS,
+                    allow_appended_columns=True,
                 )
                 connection.execute("PRAGMA foreign_keys = ON")
                 connection.execute("BEGIN IMMEDIATE")
@@ -3136,6 +3152,7 @@ class CandidateInbox:
                     connection,
                     ("task_review_cards",),
                     columns=_SCHEMA_V25_COLUMNS,
+                    allow_appended_columns=True,
                 )
                 connection.execute("BEGIN IMMEDIATE")
                 try:
@@ -3152,6 +3169,7 @@ class CandidateInbox:
                     connection,
                     ("tasks",),
                     columns=_SCHEMA_V26_COLUMNS,
+                    allow_appended_columns=True,
                 )
                 connection.execute("PRAGMA foreign_keys = ON")
                 connection.execute("BEGIN IMMEDIATE")
@@ -3248,6 +3266,8 @@ class CandidateInbox:
                 self._require_tables(
                     connection,
                     ("task_execution_workflows", "task_execution_events"),
+                    columns=_SCHEMA_V31_COLUMNS,
+                    allow_appended_columns=True,
                 )
                 connection.execute("PRAGMA foreign_keys = ON")
                 connection.execute("BEGIN IMMEDIATE")
@@ -3288,6 +3308,7 @@ class CandidateInbox:
                     connection,
                     ("task_execution_workflows",),
                     columns=_SCHEMA_V32_COLUMNS,
+                    allow_appended_columns=True,
                 )
                 connection.execute("BEGIN IMMEDIATE")
                 try:
@@ -3308,6 +3329,7 @@ class CandidateInbox:
                     connection,
                     ("execution_review_cards",),
                     columns=_SCHEMA_V34_COLUMNS,
+                    allow_appended_columns=True,
                 )
                 connection.execute("BEGIN IMMEDIATE")
                 try:
@@ -3952,6 +3974,7 @@ class CandidateInbox:
         tables: tuple[str, ...],
         *,
         columns: dict[str, tuple[str, ...]] | None = None,
+        allow_appended_columns: bool = False,
     ) -> None:
         expected_schema = _SCHEMA_V14_COLUMNS if columns is None else columns
         for table in tables:
@@ -3965,7 +3988,13 @@ class CandidateInbox:
                 item["name"]
                 for item in connection.execute(f"PRAGMA table_info({table})")
             )
-            if columns != expected_columns:
+            # Additive migrations append columns.  A predecessor with a
+            # durable later-column prefix may resume safely, but final schema
+            # validation below remains exact and rejects unknown columns.
+            if columns != expected_columns and not (
+                allow_appended_columns
+                and columns[:len(expected_columns)] == expected_columns
+            ):
                 raise InboxError("candidate inbox schema is incomplete")
 
     def _now(self) -> str:

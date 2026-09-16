@@ -15,6 +15,8 @@ from pathlib import Path
 from unittest import mock
 
 from foxhound.agent_profiles import (
+    GENERAL_PROFILE_RELEASE_PROMPT_SHA256,
+    GENERAL_PROFILE_RELEASE_REVISION,
     MAX_MANIFEST_BYTES,
     AgentProfileError,
     AgentProfileRegistry,
@@ -26,12 +28,6 @@ from foxhound.agent_profiles import (
 )
 
 
-EXPECTED_GENERAL_PROMPT_SHA256 = (
-    "a560f24bda1fb1f459569340b6b42fb7530f12b19a0e35c77aad868801ee6310"
-)
-EXPECTED_GENERAL_REVISION = (
-    "f6d5ae8b442a0cae895d07a6f19cf955d9429bdd9d3ae49e7bac3d4b1f31e9a7"
-)
 IMMEDIATE_PREVIOUS_GENERAL_REVISION = (
     "8e20b5c0db9a45b464cf64d81ed05a78edc089a3a29983709734efc96b0b5360"
 )
@@ -141,7 +137,7 @@ class AgentProfileTests(unittest.TestCase):
 
         self.assertEqual(profile.profile_id, "general")
         self.assertEqual(profile.runtime, "hermes")
-        self.assertEqual(profile.revision, EXPECTED_GENERAL_REVISION)
+        self.assertEqual(profile.revision, GENERAL_PROFILE_RELEASE_REVISION)
         self.assertEqual(profile.max_turns, 80)
         self.assertEqual(profile.timeout_seconds, 2_700)
         self.assertEqual(profile.claim_lease_seconds, 3_300)
@@ -149,7 +145,7 @@ class AgentProfileTests(unittest.TestCase):
         self.assertEqual(profile.kill_grace_seconds, 30)
         self.assertEqual(
             hashlib.sha256(prompt.encode()).hexdigest(),
-            EXPECTED_GENERAL_PROMPT_SHA256,
+            GENERAL_PROFILE_RELEASE_PROMPT_SHA256,
         )
         self.assertNotIn(WORKER_COMMAND_TOKEN, prompt)
         self.assertIn("synthetic-worker context", profile.render_prompt(
@@ -179,7 +175,7 @@ class AgentProfileTests(unittest.TestCase):
             "# Repository follow-through",
             "that exact origin is the repository artifact",
             "State the outcome, verification performed",
-            "list posting it as an external action",
+            "list posting it as a structured external action",
             "act comment --body-file FILE",
             "act review --body-file FILE",
             "record the precise blocker and the bounded continuation needed",
@@ -190,6 +186,14 @@ class AgentProfileTests(unittest.TestCase):
         self.assertNotIn("If useful work cannot be completed", prompt)
         with self.assertRaises(AgentProfileError):
             profile.render_prompt("worker; command")
+
+    def test_general_profile_refuses_an_unpublished_release_fingerprint(self):
+        with mock.patch(
+            "foxhound.agent_profiles.GENERAL_PROFILE_RELEASE_REVISION",
+            "0" * 64,
+        ):
+            with self.assertRaises(AgentProfileError):
+                general_profile()
 
     def test_superseded_general_revisions_are_resolution_only(self):
         registry = load_registry()
