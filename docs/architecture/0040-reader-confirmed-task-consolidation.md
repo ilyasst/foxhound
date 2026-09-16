@@ -17,30 +17,37 @@ cards, workflows, or task provenance.
 ## Decision
 
 Foxhound creates tasks normally, then may make a **reader-confirmed
-consolidation proposal** for two eligible tasks.  A detector can recommend a
-pair, but it never applies a relation or changes either task.  An unanswered
-proposal never blocks candidate intake, task cards, scheduling, or execution.
+consolidation proposal** for two eligible tasks.  Each native-intake batch that
+adds a task scans the complete eligible open queue and the preceding 30 days
+of closed tasks, so the new task and older tasks are considered together.  A
+detector can recommend a pair, but it never applies a relation or changes
+either task.  An unanswered proposal never blocks candidate intake, task
+cards, scheduling, or execution.  Operator-run scans remain available for
+deliberate reconciliation; task revisions alone do not trigger a scan.
 
 ### Eligibility and freshness
 
-A pair is eligible only when both tasks are open and have the same durable,
-confirmed owner identity and owner scope.  Two unassigned tasks are not
-eligible, nor are provisional, group, or differently scoped owners.  The two
-tasks must have different source kinds.
+A pair is eligible when both tasks are open, or when one newly open task is
+compared with a task closed in the preceding 30 days, and both have the same
+durable, confirmed owner identity and owner scope.  Two unassigned tasks are
+not eligible, nor are provisional, group, or differently scoped owners.  The
+two tasks must have different source kinds.
 
 The proposal records the task versions it compared.  Confirmation is refused
-without a write when either version has changed, either task is no longer open,
-ownership no longer matches, or an execution run is claimed, running, or
-awaiting a result review.  The caller must make or receive a fresh proposal;
-Foxhound never carries a similarity judgement over changed task state.
+without a write when either version has changed, the pair no longer has an
+open task and at most one closed task, ownership no longer matches, or an
+execution run is claimed, running, or awaiting a result review.  The caller
+must make or receive a fresh proposal; Foxhound never carries a similarity
+judgement over changed task state.
 
 ### Canonical task and preserved history
 
-The lower durable task identifier is the canonical task.  This deterministic
-rule is visible in the proposal card and does not use source kind, similarity
-score, owner text, or a mutable timestamp.  The other task remains an
-immutable historical task row with its status, events, candidate binding, and
-work products intact; it is not deleted, marked done, or marked dropped.
+When both tasks are open, the lower durable task identifier is canonical.  For
+a newly open task compared with a recently closed task, the closed task is
+canonical so a reader can say the new task was already completed.  The other
+task remains an immutable historical task row with its status, events,
+candidate binding, and work products intact; it is not deleted, marked done,
+or marked dropped.
 
 Confirmation atomically records a reader-asserted `duplicate_of` relation from
 the noncanonical task to the canonical task and suppresses future ordinary-card

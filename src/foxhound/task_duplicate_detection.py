@@ -1,9 +1,10 @@
-"""Explicit, recall-first discovery of cross-source duplicate tasks.
+"""Recall-first discovery of cross-source duplicate tasks.
 
-This is deliberately an operator-run scan.  Candidate intake stays fast and
-independent: it creates a task for each source item, while this module later
-asks whether two task descriptions with one confirmed owner may name one
-commitment.  The scan records a *proposal*, never a relation or task change.
+Native intake invokes this scan after adding tasks, and an operator can run it
+explicitly to reconcile an existing queue.  Candidate intake still creates a
+task for each source item; this module later asks whether two task descriptions
+with one confirmed owner may name one commitment.  The scan records a
+*proposal*, never a relation or task change.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ import json
 import re
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -39,6 +40,8 @@ class DuplicateCandidate:
     task_id: int
     task_text: str
     task_version: int
+    task_status: str
+    task_closed_at: str | None
     source_kind: str
     source_created_at: str
     owner_ref_version: int
@@ -73,6 +76,8 @@ def scan(connection: sqlite3.Connection, *, now: str) -> DetectionRun:
     for index, left in enumerate(candidates):
         for right in candidates[index + 1:]:
             if left.source_kind == right.source_kind:
+                continue
+            if not _eligible_status_pair(left, right, now=now):
                 continue
             if not _same_confirmed_owner(left, right):
                 continue
@@ -146,14 +151,15 @@ def _candidates(connection: sqlite3.Connection) -> Iterable[DuplicateCandidate]:
     # the cross-source gate; neither evidence nor source identifiers leave the
     # database through this scan.
     rows = connection.execute(
-        "SELECT t.id,t.text,t.version,c.source_kind,c.created_at,"
+        "SELECT t.id,t.text,t.version,t.status,t.closed_at,c.source_kind,c.created_at,"
         "t.owner_ref_version,t.owner_kind,t.owner_speaker_id,"
         "t.owner_canonical_speaker_id,t.owner_speaker_registry_id,"
         "t.owner_provisional "
         "FROM tasks AS t "
         "JOIN task_candidate_bindings AS b ON b.task_id=t.id "
         "JOIN candidate_inbox AS c ON c.candidate_id=b.candidate_id "
-        "WHERE t.status='open' AND b.relation='accepted' "
+        "WHERE (t.status='open' OR (t.status IN ('done','dropped') "
+        "AND t.closed_at IS NOT NULL)) AND b.relation='accepted' "
         "ORDER BY t.id"
     ).fetchall()
     for row in rows:
@@ -161,6 +167,8 @@ def _candidates(connection: sqlite3.Connection) -> Iterable[DuplicateCandidate]:
             task_id=int(row["id"]),
             task_text=row["text"],
             task_version=int(row["version"]),
+            task_status=str(row["status"]),
+            task_closed_at=row["closed_at"],
             source_kind=row["source_kind"],
             source_created_at=row["created_at"],
             owner_ref_version=int(row["owner_ref_version"]),
@@ -188,6 +196,30 @@ def _same_confirmed_owner(left: DuplicateCandidate,
         and bool(left.owner_canonical_speaker_id)
         and bool(left.owner_speaker_registry_id)
         and not left.owner_provisional
+    )
+
+
+def _eligible_status_pair(left: DuplicateCandidate, right: DuplicateCandidate,
+                          *, now: str) -> bool:
+    statuses = (left.task_status, right.task_status)
+    if statuses == ("open", "open"):
+        return True
+    if statuses.count("open") != 1:
+        return False
+    closed_at = (
+        left.task_closed_at if left.task_status != "open"
+        else right.task_closed_at
+    )
+    if not isinstance(closed_at, str):
+        return False
+    try:
+        closed = datetime.fromisoformat(closed_at).astimezone(timezone.utc)
+        observed = datetime.fromisoformat(now).astimezone(timezone.utc)
+    except ValueError:
+        return False
+    return (
+        observed - timedelta(days=proposals.RECENTLY_CLOSED_DAYS)
+        <= closed <= observed
     )
 
 
