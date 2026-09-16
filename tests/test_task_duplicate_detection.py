@@ -237,40 +237,24 @@ class OneReadingTests(DetectionFixture):
         self.assertEqual(result.proposals_recorded, 0)
 
 
-class ForgeLinkTests(DetectionFixture):
-    """A review names the issue it closes; read it instead of guessing."""
+class ForgeTests(DetectionFixture):
+    """Forge prose is noise, and an issue-to-review pairing is not a merge."""
 
     def _forge(self, task_id, *, kind, number, text, body=""):
         self._task(task_id, kind=kind, record="forge/example", item=str(number),
                    text=text, payload=json.dumps({"body": body}))
 
-    def test_review_is_paired_with_the_issue_it_closes(self):
+    def test_an_issue_and_the_review_that_closes_it_are_not_proposed(self):
+        """The forge already records that pairing; a merge card would bury the
+        duplicates that nothing else records."""
         self._forge(1, kind="issue", number=10, text="Add the synthetic widget")
-        self._forge(2, kind="issue", number=11,
-                    text="Add the synthetic widget renderer")
-        self._forge(3, kind="review_request", number=12,
-                    text="Review: add the synthetic widget renderer",
-                    body="Closes #10. Parent epic: #99.")
-        result = detection.scan(self.connection, now=NOW)
-        proposal = proposals.next_open(self.connection)
-        self.assertEqual(result.proposals_recorded, 1)
-        # Paired with #10 as stated, not with the closer-reading #11.
-        self.assertEqual((proposal.left_task_id, proposal.right_task_id), (1, 3))
-
-    def test_a_stated_closing_keyword_excludes_context_references(self):
-        """A body naming a parent epic must not propose merging the epic."""
-        self._forge(1, kind="issue", number=10, text="Add the synthetic widget")
-        self._forge(2, kind="issue", number=99, text="Epic: synthetic widgets")
-        self._forge(3, kind="review_request", number=12,
+        self._forge(2, kind="review_request", number=12,
                     text="Review: add the synthetic widget",
-                    body="Closes #10. Parent epic: #99.")
-        detection.scan(self.connection, now=NOW)
-        recorded = self.connection.execute(
-            "SELECT left_task_id,right_task_id FROM task_duplicate_proposals"
-        ).fetchall()
-        self.assertEqual([tuple(row) for row in recorded], [(1, 3)])
+                    body="Closes #10.")
+        result = detection.scan(self.connection, now=NOW)
+        self.assertEqual(result.proposals_recorded, 0)
 
-    def test_forge_prose_is_not_compared_without_a_reference(self):
+    def test_forge_prose_is_not_compared(self):
         """Forge titles share a house grammar that scores high when unrelated."""
         self._forge(1, kind="issue", number=10,
                     text="Expose a bounded synthetic projection for readers")
@@ -279,14 +263,23 @@ class ForgeLinkTests(DetectionFixture):
         result = detection.scan(self.connection, now=NOW)
         self.assertEqual(result.proposals_recorded, 0)
 
-    def test_identical_forge_text_is_still_a_duplicate(self):
-        """One review requested twice is a genuine double-carding."""
+    def test_one_item_carded_twice_is_still_a_duplicate(self):
+        """Identical text under one kind is a double-carding, not a lookalike."""
         self._forge(1, kind="review_request", number=10,
                     text="Review: explain the synthetic hold")
         self._forge(2, kind="review_request", number=11,
                     text="Review: explain the synthetic hold")
         result = detection.scan(self.connection, now=NOW)
         self.assertEqual(result.proposals_recorded, 1)
+
+    def test_identical_text_across_forge_kinds_is_not_a_duplicate(self):
+        """An issue and its review are one work item, never a merge question."""
+        self._forge(1, kind="issue", number=10,
+                    text="Explain the synthetic hold")
+        self._forge(2, kind="review_request", number=11,
+                    text="Explain the synthetic hold")
+        result = detection.scan(self.connection, now=NOW)
+        self.assertEqual(result.proposals_recorded, 0)
 
     def test_a_forge_task_is_still_compared_with_a_meeting_task(self):
         """One commitment can be tracked as an issue and stated in a meeting."""

@@ -80,10 +80,6 @@ _IDENTIFIER_PATTERNS = (
     ("grant", re.compile(r"\b([A-Z]{2}\d{5})\b")),
 )
 
-_CLOSES = re.compile(r"\b(?:closes|fixes|resolves)\s+#(\d+)\b", re.I)
-_ANY_REFERENCE = re.compile(r"#(\d+)\b")
-
-
 @dataclass(frozen=True)
 class DuplicateCandidate:
     """Private detector input; it must not be included in command output."""
@@ -96,8 +92,6 @@ class DuplicateCandidate:
     source_kind: str
     source_created_at: str
     source_record_id: str
-    source_item_id: str
-    source_payload: str
     owner_ref_version: int
     owner_kind: str | None
     owner_speaker_id: str | None
@@ -163,10 +157,6 @@ def scan(connection: sqlite3.Connection, *, now: str,
         signalled += 1
         offer(left, right, _reread_basis(left, right))
 
-    for left, right in _forge_links(candidates, focus=focus, now=now):
-        signalled += 1
-        offer(left, right, _forge_basis(left, right))
-
     recorded = unchanged = refused = 0
     for (left_id, right_id), basis in sorted(pairs.items()):
         result = proposals.propose(
@@ -194,9 +184,13 @@ def _comparable(left: DuplicateCandidate, right: DuplicateCandidate,
     if _one_reading(left, right):
         return False
     if left.source_kind in FORGE_KINDS and right.source_kind in FORGE_KINDS:
-        # ...unless the text is effectively identical, which is one review
-        # requested twice rather than two pieces of work that read alike.
-        return _fold(left.task_text) == _fold(right.task_text)
+        # ...unless one item was carded twice, which shows up as identical text
+        # under one kind.  An issue and the review that closes it are one work
+        # item, but a merge is not the question the reader wants put to them:
+        # the forge already records that pairing, and asking would bury the
+        # duplicates that nothing else records.
+        return (left.source_kind == right.source_kind
+                and _fold(left.task_text) == _fold(right.task_text))
     return True
 
 
@@ -250,65 +244,10 @@ def _reread_pairs(candidates: tuple[DuplicateCandidate, ...], *,
                 yield left, right
 
 
-def _forge_links(candidates: tuple[DuplicateCandidate, ...], *,
-                 focus: frozenset[int] | None, now: str):
-    """A review card names the issue it closes; that reference is the answer.
-
-    Reading the stored reference is exact where comparing two forge titles is
-    guesswork, and it attaches a review to the right issue when several read
-    alike.
-    """
-    issues: dict[tuple[str, str], DuplicateCandidate] = {}
-    reviews: list[DuplicateCandidate] = []
-    for candidate in candidates:
-        if candidate.source_kind == "issue":
-            issues[(candidate.source_record_id,
-                    _item_number(candidate.source_item_id))] = candidate
-        elif candidate.source_kind == "review_request":
-            reviews.append(candidate)
-    for review in reviews:
-        own = _item_number(review.source_item_id)
-        for number in _closed_issues(review.source_payload, own):
-            if number == own:
-                continue
-            issue = issues.get((review.source_record_id, number))
-            if issue is None:
-                continue
-            if focus is not None and issue.task_id not in focus \
-                    and review.task_id not in focus:
-                continue
-            # The forge reference stands on its own: the family gate in
-            # _comparable() exists only to suppress prose guessing.
-            if not _eligible_status_pair(issue, review, now=now):
-                continue
-            yield issue, review
-
-
-def _closed_issues(payload: str, own: str) -> set[str]:
-    """Issue numbers a review says it closes.
-
-    Prefer an explicit closing keyword.  A body that names one is precise, and
-    its other references are context -- a parent epic, a follow-up -- which are
-    related work rather than the same commitment.  Only when no keyword is
-    present does every reference become a candidate, because some bodies state
-    the link in prose ("required by #257").
-    """
-    stated = {match.group(1) for match in _CLOSES.finditer(payload)}
-    if not stated:
-        stated = {match.group(1) for match in _ANY_REFERENCE.finditer(payload)}
-    stated.discard(own)
-    return stated
-
-
 def _own_record(candidate: DuplicateCandidate) -> bool:
     """False for feed identifiers, which name a stream rather than one item."""
     record = candidate.source_record_id
     return bool(record) and candidate.source_kind not in FORGE_KINDS
-
-
-def _item_number(value: str) -> str:
-    # A review item id can carry a revision suffix: "258/2030-01-01T00:00:00Z".
-    return str(value).split("/", 1)[0]
 
 
 def _within(left: str, right: str, seconds: int) -> bool:
@@ -395,7 +334,7 @@ def _candidates(connection: sqlite3.Connection) -> Iterable[DuplicateCandidate]:
     # database through this scan.
     rows = connection.execute(
         "SELECT t.id,t.text,t.version,t.status,t.closed_at,c.source_kind,c.created_at,"
-        "c.source_record_id,c.source_item_id,c.payload_json,"
+        "c.source_record_id,"
         "t.owner_ref_version,t.owner_kind,t.owner_speaker_id,"
         "t.owner_canonical_speaker_id,t.owner_speaker_registry_id,"
         "t.owner_provisional "
@@ -417,8 +356,6 @@ def _candidates(connection: sqlite3.Connection) -> Iterable[DuplicateCandidate]:
             source_kind=row["source_kind"],
             source_created_at=row["created_at"],
             source_record_id=str(row["source_record_id"] or ""),
-            source_item_id=str(row["source_item_id"] or ""),
-            source_payload=str(row["payload_json"] or ""),
             owner_ref_version=int(row["owner_ref_version"]),
             owner_kind=row["owner_kind"],
             owner_speaker_id=row["owner_speaker_id"],
@@ -516,13 +453,6 @@ def _overlap_basis(left: DuplicateCandidate, right: DuplicateCandidate,
 def _reread_basis(left: DuplicateCandidate, right: DuplicateCandidate) -> str:
     return _bounded(
         f"one {left.source_kind} source record carded again at a later reading"
-    )
-
-
-def _forge_basis(issue: DuplicateCandidate, review: DuplicateCandidate) -> str:
-    return _bounded(
-        f"review {_item_number(review.source_item_id)} names issue "
-        f"{_item_number(issue.source_item_id)} as the work it closes"
     )
 
 
