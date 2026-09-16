@@ -35,7 +35,7 @@ from .task_execution import TaskExecutionService
 
 
 DEPLOYMENT_SCHEMA = "foxhound.deployment-config"
-DEPLOYMENT_SCHEMA_VERSION = 1
+DEPLOYMENT_SCHEMA_VERSION = 2
 MAX_CONFIG_BYTES = 64 * 1024
 
 
@@ -52,6 +52,9 @@ class CardServiceConfig:
     task_token_files: tuple[tuple[str, Path], ...] = ()
     execution_card_delivery: bool = False
     execution_token_files: tuple[tuple[str, Path], ...] = ()
+    gw_endpoint: str | None = None
+    gw_alias: str | None = None
+    gw_token_file: Path | None = None
 
     def argv(self, database: Path, profile_directory: Path | None) -> list[str]:
         if not self.enabled:
@@ -75,6 +78,14 @@ class CardServiceConfig:
         ))
         if profile_directory is not None:
             result.extend(("--agent-profile-directory", str(profile_directory)))
+        if self.gw_endpoint is not None:
+            assert self.gw_alias is not None
+            assert self.gw_token_file is not None
+            result.extend((
+                "--gw-endpoint", self.gw_endpoint,
+                "--gw-alias", self.gw_alias,
+                "--gw-token-file", str(self.gw_token_file),
+            ))
         return result
 
 
@@ -262,7 +273,7 @@ def _parse_document(document: object) -> DeploymentConfig:
     })
     if (
         root["schema"] != DEPLOYMENT_SCHEMA
-        or root["schema_version"] != DEPLOYMENT_SCHEMA_VERSION
+        or root["schema_version"] not in {1, DEPLOYMENT_SCHEMA_VERSION}
         or isinstance(root["schema_version"], bool)
     ):
         raise DeploymentConfigError("deployment configuration version is invalid")
@@ -271,13 +282,15 @@ def _parse_document(document: object) -> DeploymentConfig:
         agent_profile_directory=_optional_absolute_path(
             root["agent_profile_directory"]
         ),
-        card_service=_parse_card_service(root["card_service"]),
+        card_service=_parse_card_service(
+            root["card_service"], version=int(root["schema_version"])
+        ),
         workflow=_parse_workflow(root["workflow"]),
         execution_runner=_parse_execution_runner(root["execution_runner"]),
     )
 
 
-def _parse_card_service(value: object) -> CardServiceConfig:
+def _parse_card_service(value: object, *, version: int) -> CardServiceConfig:
     if not isinstance(value, Mapping):
         raise DeploymentConfigError("card service configuration is invalid")
     enabled = value.get("enabled")
@@ -286,10 +299,13 @@ def _parse_card_service(value: object) -> CardServiceConfig:
     if not enabled:
         _object(value, {"enabled"})
         return CardServiceConfig(enabled=False)
-    document = _object(value, {
+    fields = {
         "enabled", "bind", "port", "request_timeout_seconds",
         "task_token_files", "execution_card_delivery", "execution_token_files",
-    })
+    }
+    if version >= 2:
+        fields.update({"gw_endpoint", "gw_alias", "gw_token_file"})
+    document = _object(value, fields)
     bind = document["bind"]
     port = document["port"]
     timeout = document["request_timeout_seconds"]
@@ -301,6 +317,18 @@ def _parse_card_service(value: object) -> CardServiceConfig:
         or not isinstance(delivery, bool)
     ):
         raise DeploymentConfigError("card service configuration is invalid")
+    gw_values = (
+        document.get("gw_endpoint"),
+        document.get("gw_alias"),
+        document.get("gw_token_file"),
+    )
+    if any(value is not None for value in gw_values) and not all(gw_values):
+        raise DeploymentConfigError("card service configuration is invalid")
+    if all(gw_values) and (
+        not isinstance(gw_values[0], str)
+        or not isinstance(gw_values[1], str)
+    ):
+        raise DeploymentConfigError("card service configuration is invalid")
     return CardServiceConfig(
         enabled=True,
         bind=bind,
@@ -310,6 +338,11 @@ def _parse_card_service(value: object) -> CardServiceConfig:
         execution_card_delivery=delivery,
         execution_token_files=_role_paths(
             document["execution_token_files"], allow_empty=True
+        ),
+        gw_endpoint=gw_values[0] if isinstance(gw_values[0], str) else None,
+        gw_alias=gw_values[1] if isinstance(gw_values[1], str) else None,
+        gw_token_file=(
+            _absolute_path(gw_values[2]) if gw_values[2] is not None else None
         ),
     )
 
@@ -456,6 +489,12 @@ def _validate_runtime(config: DeploymentConfig) -> None:
     TaskCardServerLimits(
         request_timeout_seconds=cards.request_timeout_seconds
     ).validate()
+    if cards.gw_endpoint is not None:
+        assert cards.gw_alias is not None
+        assert cards.gw_token_file is not None
+        load_knowledge_config(
+            cards.gw_endpoint, cards.gw_alias, cards.gw_token_file
+        )
     task_roles = {role for role, _ in cards.task_token_files}
     if DRIP_ROLE not in task_roles:
         raise DeploymentConfigError("task card delivery role is unavailable")
