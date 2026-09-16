@@ -42,10 +42,21 @@ from .candidate_inbox import CandidateInbox, InboxError
 # term is enough for recall: the reader, rather than this lexical filter,
 # decides semantic sameness on the later card.
 _STOP_WORDS = frozenset({
+    # English
     "a", "an", "and", "as", "at", "by", "for", "from", "in", "is",
     "of", "on", "or", "the", "to", "with", "action", "draft", "follow",
     "make", "next", "prepare", "review", "send", "task", "this", "that",
     "will", "work", "write",
+    # French.  The corpus is bilingual, and an English-only list let function
+    # words like "des" and "les" count as shared subject matter, which is how
+    # two unrelated "vérifier la disponibilité de ..." tasks came to look
+    # alike.  Terms are matched after accent folding, so the unaccented
+    # spellings are the ones that must appear here.
+    "aux", "avec", "dans", "des", "elle", "est", "les", "leur", "lors",
+    "notre", "our", "par", "pas", "plus", "pour", "sans", "ses", "son",
+    "sur", "une", "vers", "votre", "afin",
+    "compléter", "completer", "envoyer", "faire", "preparer", "realiser",
+    "rediger", "suivre", "tache", "transmettre", "valider", "verifier",
 })
 
 

@@ -280,3 +280,143 @@ class DuplicateReviewCardTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DuplicateCardDetailTests(DuplicateReviewCardTests):
+    """A merge question is only answerable from facts shown on the card."""
+
+    def _enrich(self, task_id, *, owner, due, created, closed=None,
+                status="open"):
+        self.connection.execute(
+            "UPDATE tasks SET owner=?,due=?,created_at=?,closed_at=?,status=? "
+            "WHERE id=?",
+            (owner, due, created, closed, status, task_id),
+        )
+        self.connection.commit()
+
+    def _render(self):
+        self.cards.schedule()
+        claim = self.cards.claim_next(consumer_digest=CONSUMER)
+        self.assertIsNotNone(claim)
+        self.assertIsNotNone(claim.card.duplicate)
+        return render_task_review_card(claim.card)[0]
+
+    def test_both_sides_carry_owner_due_and_when_raised(self) -> None:
+        self._enrich(1, owner="Person A", due="2030-04-01",
+                     created="2030-01-05T09:00:00+00:00")
+        self._enrich(2, owner="Person B", due="2030-09-01",
+                     created="2030-02-09T09:00:00+00:00")
+        text = self._render()
+        for expected in ("Person A", "Person B", "2030-04-01", "2030-09-01",
+                         "2030-01-05", "2030-02-09"):
+            self.assertIn(expected, text)
+
+    def test_a_closed_counterpart_shows_when_it_closed(self) -> None:
+        self._enrich(2, owner="Person B", due=None,
+                     created="2030-02-09T09:00:00+00:00",
+                     closed="2030-02-20T09:00:00+00:00", status="done")
+        text = self._render()
+        self.assertIn("2030-02-20", text)
+        self.assertIn("done", text)
+
+
+class DuplicateBasisTests(unittest.TestCase):
+    """The card explains its own evidence, so a reader can weigh it.
+
+    `basis` is immutable once recorded, so each case builds its own proposal
+    rather than editing one.
+    """
+
+    def _card_text(self, basis: str) -> str:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        database = Path(directory.name) / "foxhound.sqlite3"
+        migrate_database(database)
+        connection = sqlite3.connect(database)
+        connection.row_factory = sqlite3.Row
+        self.addCleanup(connection.close)
+        for task_id, kind, text in (
+            (1, "email", "Prepare the synthetic rollout checklist"),
+            (2, "meeting", "Draft the synthetic rollout checklist"),
+        ):
+            revision = f"{task_id:064x}"
+            connection.execute(
+                "INSERT INTO tasks(id,status,text,version,created_at,updated_at,"
+                "owner_ref_version,owner_kind,owner_speaker_id,"
+                "owner_canonical_speaker_id,owner_speaker_registry_id,"
+                "owner_pinned,owner_provisional) VALUES(?, 'open', ?, 1, ?, ?,"
+                "1, 'person', 'SPK_1', 'SPK_1', 'registry-A', 0, 0)",
+                (task_id, text, NOW.isoformat(), NOW.isoformat()),
+            )
+            connection.execute(
+                "INSERT INTO candidate_inbox(candidate_id,source_system,"
+                "source_kind,source_record_id,source_item_id,source_revision,"
+                "payload_json,created_at,first_imported_at,updated_at) "
+                "VALUES(?, 'gw', ?, 'record', ?, ?, '{}', ?, ?, ?)",
+                (f"candidate-{task_id}", kind, str(task_id), revision,
+                 NOW.isoformat(), NOW.isoformat(), NOW.isoformat()),
+            )
+            connection.execute(
+                "INSERT INTO task_candidate_bindings(candidate_id,"
+                "source_revision,task_id,relation,decided_at) "
+                "VALUES(?,?,?,'accepted',?)",
+                (f"candidate-{task_id}", revision, task_id, NOW.isoformat()),
+            )
+        proposals.propose(
+            connection, task_id_a=1, task_id_b=2, basis=basis,
+            detector="synthetic-detector", now=NOW.isoformat(),
+        )
+        connection.commit()
+        cards = TaskCardService(
+            database, clock=lambda: NOW, token_factory=lambda: TOKEN
+        )
+        cards.schedule()
+        claim = cards.claim_next(consumer_digest=CONSUMER)
+        self.assertIsNotNone(claim)
+        self.assertIsNotNone(claim.card.duplicate)
+        return render_task_review_card(claim.card)[0]
+
+    def test_shared_wording_is_shown_as_the_matched_terms(self) -> None:
+        text = self._card_text(
+            "shared task terms across email and meeting: alpha, beta"
+        )
+        self.assertIn("Matched on", text)
+        self.assertIn("alpha", text)
+        self.assertIn("beta", text)
+
+    def test_a_re_read_source_is_explained_in_words(self) -> None:
+        """'later reading' is detector shorthand; the card says what it means."""
+        text = self._card_text(
+            "one email source record carded again at a later reading"
+        )
+        self.assertIn("read again later", text)
+
+
+class DuplicateSchedulingCollisionTests(DuplicateReviewCardTests):
+    def test_a_task_in_two_proposals_gets_one_card_at_a_time(self) -> None:
+        """Three copies of one commitment put a task in two proposals at once.
+
+        Only one active card per task is allowed, so the second proposal must
+        wait rather than insert a card that violates that guarantee.
+        """
+        self._task(3, "note", "Prepare the synthetic rollout checklist again")
+        self.connection.commit()
+        second = proposals.propose(
+            self.connection, task_id_a=1, task_id_b=3,
+            basis="Another synthetic overlap.", detector="synthetic-detector",
+            now=NOW.isoformat(),
+        )
+        self.assertTrue(second.accepted)
+        self.connection.commit()
+        result = self.cards.schedule_duplicate_proposals(limit=50)
+        self.assertIsNot(result.disposition, CardDisposition.REFUSED)
+        active = self.connection.execute(
+            "SELECT count(*) FROM task_review_cards WHERE task_id=1 "
+            "AND status IN ('pending','delivering','delivered','snoozed')"
+        ).fetchone()[0]
+        self.assertEqual(active, 1)
+        bound = self.connection.execute(
+            "SELECT count(*) FROM task_duplicate_proposals "
+            "WHERE card_id IS NOT NULL"
+        ).fetchone()[0]
+        self.assertEqual(bound, 1)

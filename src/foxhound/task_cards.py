@@ -6,13 +6,14 @@ import hashlib
 import html
 import os
 import secrets
+import re
 import sqlite3
 from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 
 from .card_provenance import (
     CardSourceEvidence,
@@ -145,6 +146,11 @@ class CardDuplicateProposal:
     other_origin_sources: tuple[CardSourceEvidence, ...] = field(
         default=(), repr=False
     )
+    other_owner: str | None = field(default=None, repr=False)
+    other_due: str | None = field(default=None, repr=False)
+    other_raised: str | None = field(default=None, repr=False)
+    other_closed_at: str | None = field(default=None, repr=False)
+    basis: str = field(default="", repr=False)
 
 
 @dataclass(frozen=True)
@@ -161,6 +167,7 @@ class TaskReviewCard:
     owner: str | None = field(repr=False)
     due: str | None = field(repr=False)
     first_raised: str | None = field(default=None, repr=False)
+    task_created: str | None = field(default=None, repr=False)
     last_mentioned: str | None = field(default=None, repr=False)
     origin_kind: str = field(default="", repr=False)
     origin_record: str = field(default="", repr=False)
@@ -1231,12 +1238,31 @@ class TaskCardService:
             (limit,),
         ).fetchall()
         asked = raised = 0
+        # A task can carry several proposals at once -- three copies of one
+        # commitment guarantee it -- but only one active card, and a card shows
+        # exactly one comparison.  The candidate rows were read in a single
+        # query, so their view of what is already active does not see cards
+        # raised earlier in this same pass; without tracking that here, the
+        # second proposal for a task inserts a second active card and violates
+        # `task_review_cards_one_active`.  The remaining proposals keep their
+        # place and are asked once this card is settled.
+        handled: set[int] = set()
         for row in rows:
+            task_id = int(row["task_id"])
+            if task_id in handled:
+                continue
             status = row["active_status"]
             if status is not None and status != CardStatus.PENDING:
                 continue
             if status == CardStatus.PENDING:
                 card_id = int(row["active_id"])
+                if connection.execute(
+                    "SELECT 1 FROM task_duplicate_proposals "
+                    "WHERE card_id=? AND state='proposed'", (card_id,)
+                ).fetchone() is not None:
+                    # That card already asks a different comparison.
+                    handled.add(task_id)
+                    continue
                 connection.execute(
                     "UPDATE task_review_cards SET due_at=?,updated_at=? "
                     "WHERE id=? AND status='pending'", (now, now, card_id)
@@ -1246,16 +1272,17 @@ class TaskCardService:
                     "INSERT INTO task_review_cards("
                     "task_id,task_version,source_revision,status,version,"
                     "due_at,created_at,updated_at) VALUES(?,?,?,'pending',1,?,?,?)",
-                    (int(row["task_id"]), int(row["task_version"]),
+                    (task_id, int(row["task_version"]),
                      row["source_revision"], now, now, now),
                 )
                 card_id = int(cursor.lastrowid)
                 self._event(
-                    connection, card_id=card_id, task_id=int(row["task_id"]),
+                    connection, card_id=card_id, task_id=task_id,
                     kind="scheduled", card_version=1,
                     task_version=int(row["task_version"]), now=now,
                 )
                 raised += 1
+            handled.add(task_id)
             if duplicates.bind(
                 connection, proposal_id=int(row["proposal_id"]),
                 card_id=card_id, now=now,
@@ -1435,7 +1462,7 @@ class TaskCardService:
             "c.source_revision,"
             "COALESCE((SELECT job.title FROM task_fused_title_jobs AS job "
             "WHERE job.task_id=c.task_id AND job.state='ready'),t.text) AS text,"
-            "t.owner,t.owner_kind,t.due,"
+            "t.owner,t.owner_kind,t.due,t.created_at AS task_created,"
             "(SELECT min(h.created_at) FROM task_candidate_bindings AS b "
             " JOIN candidate_revision_history AS h "
             " ON h.candidate_id=b.candidate_id WHERE b.task_id=c.task_id) "
@@ -1485,6 +1512,15 @@ class TaskCardService:
             "ELSE d.left_task_id END AS duplicate_other_task_id,"
             "other.status AS duplicate_other_status,"
             "other.text AS duplicate_other_text,"
+            "other.owner AS duplicate_other_owner,"
+            "other.due AS duplicate_other_due,"
+            "COALESCE((SELECT min(h.created_at) "
+            " FROM task_candidate_bindings AS b "
+            " JOIN candidate_revision_history AS h "
+            " ON h.candidate_id=b.candidate_id WHERE b.task_id=other.id),"
+            " other.created_at) AS duplicate_other_created,"
+            "other.closed_at AS duplicate_other_closed,"
+            "d.basis AS duplicate_basis,"
             "(SELECT o.source_kind FROM task_candidate_bindings AS b "
             " JOIN candidate_inbox AS o ON o.candidate_id=b.candidate_id "
             " WHERE b.task_id=(CASE WHEN d.left_task_id=c.task_id "
@@ -1673,7 +1709,18 @@ def _render_done_check(card: TaskReviewCard, text: str) -> tuple[str, dict]:
 
 
 def _render_duplicate_check(card: TaskReviewCard, text: str) -> tuple[str, dict]:
-    """Ask the reader to adjudicate one suspected cross-source duplicate."""
+    """Ask the reader to adjudicate one suspected duplicate.
+
+    The question is only answerable from facts the reader can compare, so the
+    card carries them for both sides: who owns it, when it is due, when it was
+    raised, and where it came from.  Two tasks that read alike but were raised
+    months apart and fall due in different terms are a recurrence, not a copy,
+    and nothing in the two sentences alone shows that.
+
+    The detector's own reason is shown as well.  A reader who can see that the
+    pair was matched on one re-read mail thread, rather than on a handful of
+    shared words, knows how much to trust the suggestion before answering.
+    """
     duplicate = card.duplicate
     recent_closed = duplicate.other_status in {"done", "dropped"}
     lines = [
@@ -1681,21 +1728,36 @@ def _render_duplicate_check(card: TaskReviewCard, text: str) -> tuple[str, dict]
         f"<code>T{duplicate.other_task_id}</code>",
         "",
         f"<b>Task T{card.task_id}</b>", text,
+        *_comparison_facts(
+            owner=card.owner, due=card.due,
+            raised=card.first_raised or card.task_created,
+            last=card.last_mentioned, status="open", closed_at=None,
+        ),
         *origin_lines(
             kind=card.origin_kind, record=card.origin_record,
-            item=card.origin_item, sources=card.origin_sources,
+            item=card.origin_item, sources=_quotable_sources(card.origin_sources),
             html_output=True,
         ),
         "",
         f"<b>Task T{duplicate.other_task_id}</b>",
         _escape(duplicate.other_text),
+        *_comparison_facts(
+            owner=duplicate.other_owner, due=duplicate.other_due,
+            raised=duplicate.other_raised, last=None,
+            status=duplicate.other_status, closed_at=duplicate.other_closed_at,
+        ),
         *origin_lines(
             kind=duplicate.other_origin_kind,
             record=duplicate.other_origin_record,
             item=duplicate.other_origin_item,
-            sources=duplicate.other_origin_sources,
+            sources=_quotable_sources(duplicate.other_origin_sources),
             html_output=True,
         ),
+    ]
+    reason = _duplicate_reason(duplicate.basis)
+    if reason:
+        lines.extend(("", f"🔎 <b>Matched on:</b> {reason}"))
+    lines.extend((
         "",
         (
             "Confirming records this open task as the same recently closed task "
@@ -1703,7 +1765,7 @@ def _render_duplicate_check(card: TaskReviewCard, text: str) -> tuple[str, dict]
             if recent_closed
             else "Confirming keeps the lower-numbered task and preserves both sources."
         ),
-    ]
+    ))
 
     def callback(action: str) -> str:
         value = f"{CALLBACK_PREFIX}|{card.id}|{card.version}|{action}"
@@ -1719,6 +1781,55 @@ def _render_duplicate_check(card: TaskReviewCard, text: str) -> tuple[str, dict]
         {"text": "↔️ Keep separate", "callback_data": callback("duplicate_reject")},
     ]]}
     return "\n".join(lines), keyboard
+
+
+def _quotable_sources(
+    sources: Sequence[CardSourceEvidence],
+) -> tuple[CardSourceEvidence, ...]:
+    """Evidence a reader can read, without the machine handoff.
+
+    The handoff extract is the task record itself rendered as JSON: it repeats
+    the sentence printed directly above it and adds the owner and due date that
+    the facts line already carries. On a card showing two tasks at once it
+    crowds out the one thing worth reading, which is the source's own words.
+    Dropped only here; a single-task card has the room.
+    """
+    kept = tuple(source for source in sources if source.role != "handoff")
+    return kept or tuple(sources)
+
+
+def _comparison_facts(*, owner: str | None, due: str | None,
+                      raised: str | None, last: str | None,
+                      status: str, closed_at: str | None) -> tuple[str, ...]:
+    """One compact line of the facts that separate a copy from a recurrence."""
+    parts: list[str] = []
+    if owner:
+        parts.append(f"👤 {_escape(owner)}")
+    if due:
+        parts.append(f"📅 due {_escape(str(due)[:10])}")
+    if raised:
+        parts.append(f"📌 raised {_escape(str(raised)[:10])}")
+    if last and str(last)[:10] != str(raised or "")[:10]:
+        parts.append(f"🕑 last seen {_escape(str(last)[:10])}")
+    if status in {"done", "dropped"}:
+        closed = f" {str(closed_at)[:10]}" if closed_at else ""
+        parts.append(f"🔒 {_escape(status)}{_escape(closed)}")
+    return (" · ".join(parts),) if parts else ()
+
+
+def _duplicate_reason(basis: str) -> str:
+    """The detector's evidence, in the reader's words rather than its own."""
+    if not basis:
+        return ""
+    if "later reading" in basis:
+        return "the same source was read again later and carded twice"
+    match = re.search(r"shared task terms[^:]*:\s*(.+)$", basis)
+    if match:
+        terms = ", ".join(
+            term.strip() for term in match.group(1).split(",")[:8] if term.strip()
+        )
+        return f"shared wording — {_escape(terms)}" if terms else ""
+    return _escape(basis[:180])
 
 
 def _source_line(question: CardCompletionQuestion) -> str:
@@ -1773,6 +1884,7 @@ def _card(row) -> TaskReviewCard:
         owner=canonical_owner_display(row["owner"], row["owner_kind"]),
         due=row["due"],
         first_raised=row["first_raised"],
+        task_created=_optional_text(row["task_created"]),
         last_mentioned=row["last_mentioned"],
         origin_kind=str(row["origin_kind"] or ""),
         origin_record=str(row["origin_record"] or ""),
@@ -1834,7 +1946,17 @@ def _duplicate(row) -> CardDuplicateProposal | None:
         other_origin_record=str(row["duplicate_other_record"] or ""),
         other_origin_item=str(row["duplicate_other_item"] or ""),
         other_origin_sources=stored_origin_sources(row["duplicate_other_payload"]),
+        other_owner=_optional_text(row["duplicate_other_owner"]),
+        other_due=_optional_text(row["duplicate_other_due"]),
+        other_raised=_optional_text(row["duplicate_other_created"]),
+        other_closed_at=_optional_text(row["duplicate_other_closed"]),
+        basis=str(row["duplicate_basis"] or ""),
     )
+
+
+def _optional_text(value: object) -> str | None:
+    text = "" if value is None else str(value).strip()
+    return text or None
 
 
 def _valid_limit(value: object) -> bool:
