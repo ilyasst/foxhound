@@ -14,7 +14,7 @@ paths are absolute.
 ```json
 {
   "schema": "foxhound.deployment-config",
-  "schema_version": 1,
+  "schema_version": 2,
   "database": "/srv/example/private-foxhound-state/foxhound.sqlite3",
   "agent_profile_directory": null,
   "card_service": {
@@ -28,7 +28,10 @@ paths are absolute.
     "execution_card_delivery": true,
     "execution_token_files": {
       "drip": "/srv/example/private-foxhound-state/execution-drip.token"
-    }
+    },
+    "gw_endpoint": "http://<canonical IPv4 loopback address>:8787",
+    "gw_alias": "example-operator",
+    "gw_token_file": "/srv/example/private-foxhound-state/gw.token"
   },
   "workflow": {
     "default_agent_profile": "general",
