@@ -358,8 +358,8 @@ launching an agent. See
 
 Agent definitions are strict, revisioned Foxhound profiles. The built-in
 `general` profile preserves the existing Hermes prompt, tools, and phase
-policy. Its current bounded local-work budget is 50 turns and 30 minutes, with
-a 45-minute renewable claim lease. A former built-in revision remains
+policy. Its current bounded local-work budget is 80 turns and 45 minutes, with
+a 55-minute renewable claim lease. A former built-in revision remains
 resolution-only so workflows already pinned to it retain their exact policy;
 it is not offered for new selection. Actual role profiles and prompts belong
 in one explicitly configured, owner-only directory outside every Git checkout.
