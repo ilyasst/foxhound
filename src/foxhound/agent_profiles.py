@@ -247,7 +247,7 @@ def render_bootstrap(worker_command: str = "foxhound-task-worker") -> str:
 
 def general_profile() -> AgentProfile:
     """Return the current built-in compatibility profile."""
-    return AgentProfile(
+    profile = AgentProfile(
         profile_id="general",
         display_name="General",
         runtime="hermes",
@@ -260,6 +260,9 @@ def general_profile() -> AgentProfile:
         kill_grace_seconds=30,
         allowed_phases=_PHASES,
     )
+    if profile.revision != GENERAL_PROFILE_RELEASE_REVISION:
+        raise AgentProfileError("built-in general profile release is inconsistent")
+    return profile
 
 
 def _historical_general_profiles() -> tuple[AgentProfile, ...]:
@@ -991,6 +994,17 @@ _GENERAL_PROMPT_TEMPLATE_V10 = _GENERAL_PROMPT_TEMPLATE_V9.replace(
 
 
 _GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V10
+
+# A built-in profile is a release artifact.  Keep its fingerprints beside the
+# prompt so changing the prompt or policy without publishing a new profile
+# revision fails at every runner and scheduler startup, rather than leaving a
+# stale test in a different file to discover the mismatch later.
+GENERAL_PROFILE_RELEASE_REVISION = (
+    "2018a6f332e26540adb1aded36144458ebf724da2aac8519b6fa29c6b8a383d8"
+)
+GENERAL_PROFILE_RELEASE_PROMPT_SHA256 = (
+    "a06302650b0c55a453ef64baabc68a72486dfbe141828a3d39ad6332d47e05dd"
+)
 
 
 if __name__ == "__main__":
