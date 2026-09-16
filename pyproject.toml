@@ -10,6 +10,7 @@ requires-python = ">=3.11"
 
 [project.scripts]
 foxhound-task-cards = "foxhound.task_card_server:main"
+foxhound-database = "foxhound.database_lifecycle:main"
 foxhound-execution-runner = "foxhound.execution_runner:main"
 foxhound-task-worker = "foxhound.execution_worker:main"
 foxhound-task-bootstrap = "foxhound.task_bootstrap:main"

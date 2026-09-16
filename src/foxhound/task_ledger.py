@@ -251,9 +251,6 @@ class TaskLedger:
         self.database_path = Path(database_path)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
-    def initialize(self) -> None:
-        CandidateInbox(self.database_path, clock=self._clock).initialize()
-
     def refuse_divergent_history(
         self,
         *,

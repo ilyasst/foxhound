@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from foxhound import migrate_database
+
 import json
 import os
 import sqlite3
@@ -155,7 +157,7 @@ class ExecutionCardTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.database = Path(self.temporary.name) / "foxhound.sqlite3"
         self.clock = Clock()
-        CandidateInbox(self.database, clock=self.clock).initialize()
+        migrate_database(self.database)
         with closing(sqlite3.connect(self.database)) as connection:
             for task_id in range(1, 7):
                 connection.execute(
@@ -370,7 +372,7 @@ class ExecutionCardTests(unittest.TestCase):
             connection.execute("PRAGMA user_version = 8")
             connection.commit()
 
-        CandidateInbox(self.database, clock=self.clock).initialize()
+        migrate_database(self.database)
         with closing(sqlite3.connect(self.database)) as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
             workflows = connection.execute(
@@ -423,7 +425,7 @@ class ExecutionCardTests(unittest.TestCase):
             connection.execute("PRAGMA user_version = 10")
             connection.commit()
 
-        CandidateInbox(database, clock=self.clock).initialize()
+        migrate_database(database)
 
         with closing(sqlite3.connect(database)) as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]

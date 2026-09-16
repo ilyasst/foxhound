@@ -31,6 +31,12 @@ from .candidate_inbox import (
     ShadowFeedImportRefusal,
     ShadowFeedImportResult,
 )
+from .database_lifecycle import (
+    DatabaseInspection,
+    DatabaseState,
+    inspect_database,
+    migrate_database,
+)
 from .task_ledger import (
     BootstrapDisposition,
     BootstrapRefusal,
@@ -146,6 +152,10 @@ __all__ = (
     "ShadowFeedImportDisposition",
     "ShadowFeedImportRefusal",
     "ShadowFeedImportResult",
+    "DatabaseInspection",
+    "DatabaseState",
+    "inspect_database",
+    "migrate_database",
     "BootstrapDisposition",
     "BootstrapRefusal",
     "BootstrapResult",

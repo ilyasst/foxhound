@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
-from foxhound import CandidateInbox
+from foxhound import CandidateInbox, migrate_database
 from foxhound.shadow_cycle import ShadowCycleError, run_cycle
 from foxhound.task_shadow_feed_import import TaskShadowFeedImportError
 
@@ -75,6 +75,7 @@ class ShadowCycleTests(unittest.TestCase):
         page.chmod(0o600)
 
     def _populate(self) -> None:
+        migrate_database(self.database)
         self._write_page(
             self.candidates, fixture("candidate-feed-page-v1.json")
         )
@@ -200,6 +201,7 @@ class ShadowCycleTests(unittest.TestCase):
             )
 
     def test_empty_ledgers_and_cli_output_are_aggregate_only(self):
+        migrate_database(self.database)
         environment = dict(os.environ)
         environment["PYTHONPATH"] = str(SOURCE_ROOT)
         process = subprocess.run(

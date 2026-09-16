@@ -226,9 +226,6 @@ class TaskCardService:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._token_factory = token_factory or (lambda: secrets.token_urlsafe(32))
 
-    def initialize(self) -> None:
-        CandidateInbox(self.database_path, clock=self._clock).initialize()
-
     def schedule(self, *, limit: int = 100) -> ScheduleResult:
         if not _valid_limit(limit):
             return ScheduleResult(
