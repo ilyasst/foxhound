@@ -670,7 +670,10 @@ for one exact ready workflow at `POST /v1/execution-workflows/priority` with
 `lower`, or `clear`. It never accepts a numeric score, a relative position, or
 an arbitrary list of work. `raise`, `normal` (the result of `clear`), and
 `lower` are applied ahead of the scheduler's existing stable first-attempt,
-update-time, and task-id tie-breakers. The acknowledgement contains only the
+update-time, and task-id tie-breakers. Email- and meeting-origin workflows are
+selected ahead of other sources, including repository issues; within that
+source class, the explicit priority control and stable tie-breakers apply. The
+acknowledgement contains only the
 requested identity, resulting workflow version, fixed priority vocabulary, and
 fixed refusal code. A queue reader can therefore expose simple **Raise**,
 **Lower**, and **Clear priority** controls alongside a current workflow without

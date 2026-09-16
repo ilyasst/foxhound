@@ -470,7 +470,9 @@ class TaskExecutionService:
                     " WHERE blocked.task_id=t.id AND blocked.relation='accepted' "
                     " AND l.state='withdrawn' "
                     " AND l.resolution='preserved_open'"
-                    ") ORDER BY w.task_id"
+                    ") ORDER BY CASE origin_kind "
+                    "WHEN 'email' THEN 0 WHEN 'meeting' THEN 0 ELSE 1 END,"
+                    "w.task_id"
                 ).fetchall()
                 for row in waiting_rows:
                     origin_kind = row["origin_kind"]
@@ -519,7 +521,9 @@ class TaskExecutionService:
                     " ON l.candidate_id=blocked.candidate_id "
                     " WHERE blocked.task_id=t.id AND blocked.relation='accepted' "
                     " AND l.state='withdrawn' AND l.resolution='preserved_open'"
-                    ") ORDER BY t.id"
+                    ") ORDER BY CASE origin_kind "
+                    "WHEN 'email' THEN 0 WHEN 'meeting' THEN 0 ELSE 1 END,"
+                    "t.id"
                 )
                 scheduled = 0
                 for row in rows:
@@ -816,7 +820,12 @@ class TaskExecutionService:
                 # failure and the scan moves on.
                 rows = connection.execute(
                     "SELECT w.*,t.text,t.owner,t.due,t.status AS task_status,"
-                    "t.version AS current_task_version "
+                    "t.version AS current_task_version,("
+                    " SELECT o.source_kind FROM task_candidate_bindings AS b "
+                    " JOIN candidate_inbox AS o "
+                    " ON o.candidate_id=b.candidate_id "
+                    " WHERE b.task_id=t.id AND b.relation='accepted'"
+                    ") AS origin_kind "
                     "FROM task_execution_workflows AS w JOIN tasks AS t "
                     # `parked` is claimable once its retry time arrives.
                     # Parking stops the immediate retries; it is not a
@@ -827,7 +836,9 @@ class TaskExecutionService:
                     "AND (w.next_attempt_at IS NULL OR w.next_attempt_at<=?) "
                     f"AND w.phase IN ({placeholders}) "
                     "AND t.status='open' AND t.version=w.task_version "
-                    "ORDER BY CASE w.queue_priority "
+                    "ORDER BY CASE origin_kind "
+                    "WHEN 'email' THEN 0 WHEN 'meeting' THEN 0 ELSE 1 END,"
+                    "CASE w.queue_priority "
                     "WHEN 'raised' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END,"
                     "CASE WHEN w.failure_count=0 THEN 0 ELSE 1 END,"
                     "w.updated_at,w.task_id LIMIT ?",
