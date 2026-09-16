@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 33
+SCHEMA_VERSION = 34
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -326,6 +326,8 @@ _SCHEMA_COLUMNS = {
         "agent_profile_id",
         "agent_profile_revision",
         "queue_priority",
+        "last_failure_exit_code",
+        "last_failure_run_id",
     ),
     "task_execution_results": (
         "result_id",
@@ -478,9 +480,17 @@ _SCHEMA_COLUMNS = {
 # the new table removed, the v22 state also has the card column removed but
 # keeps `work_digest`, the v21 state has neither column but keeps
 # `task_relations`, and the v20 state has none of the five.
+_SCHEMA_V33_COLUMNS = {
+    name: tuple(column for column in columns if not (
+        name == "task_execution_workflows"
+        and column in {"last_failure_exit_code", "last_failure_run_id"}
+    ))
+    for name, columns in _SCHEMA_COLUMNS.items()
+}
+
 _SCHEMA_V32_COLUMNS = {
     name: columns
-    for name, columns in _SCHEMA_COLUMNS.items()
+    for name, columns in _SCHEMA_V33_COLUMNS.items()
     if name != "task_fused_title_jobs"
 }
 
@@ -2308,6 +2318,20 @@ END;
 )
 
 
+# A process exit is a safe, bounded machine diagnostic.  It never contains
+# transcript text, a filesystem path, or a command line; the opaque run id
+# only correlates the workflow with its private archive.
+_SCHEMA_V34 = (
+    "ALTER TABLE task_execution_workflows ADD COLUMN "
+    "last_failure_exit_code INTEGER CHECK(last_failure_exit_code IS NULL OR "
+    "(last_failure_exit_code >= 1 AND last_failure_exit_code <= 255));",
+    "ALTER TABLE task_execution_workflows ADD COLUMN "
+    "last_failure_run_id TEXT CHECK(last_failure_run_id IS NULL OR "
+    "(length(last_failure_run_id) = 32 AND "
+    "last_failure_run_id GLOB '[0-9a-f]*'));",
+)
+
+
 _SCHEMA_V20 = (
     # SQLite cannot alter a CHECK in place, and three tables carry a foreign
     # key to this one. Renaming the card table would rewrite all three to
@@ -3232,6 +3256,26 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 33
+            if version == 33:
+                self._require_tables(
+                    connection,
+                    ("task_execution_workflows",),
+                    columns=_SCHEMA_V32_COLUMNS,
+                )
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    columns = tuple(item["name"] for item in connection.execute(
+                        "PRAGMA table_info(task_execution_workflows)"
+                    ))
+                    if "last_failure_exit_code" not in columns:
+                        for statement in _SCHEMA_V34:
+                            connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 34")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 34
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:

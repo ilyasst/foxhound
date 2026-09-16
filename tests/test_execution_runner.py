@@ -279,6 +279,8 @@ class ExecutionRunnerTests(unittest.TestCase):
         state = self.service.get(1)
         self.assertEqual(state.status, WorkflowStatus.QUEUED)
         self.assertEqual(state.last_failure_reason, "process_exit")
+        self.assertEqual(state.last_failure_exit_code, 3)
+        self.assertEqual(state.last_failure_run_id, "b" * 32)
         self.assertEqual(state.failure_count, 1)
 
         self.service.retry(1, expected_version=state.version)
@@ -611,6 +613,7 @@ class ExecutionRunnerTests(unittest.TestCase):
             expected_version,
             claim_token,
             reason,
+            **diagnostics,
         ):
             accepted = TaskExecutionService(self.database).record_result(
                 ExecutionResultEnvelope(
@@ -632,6 +635,7 @@ class ExecutionRunnerTests(unittest.TestCase):
                 expected_version=expected_version,
                 claim_token=claim_token,
                 reason=reason,
+                **diagnostics,
             )
 
         with mock.patch.object(

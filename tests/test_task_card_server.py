@@ -437,10 +437,14 @@ class TaskCardServerTests(unittest.TestCase):
             authorization=f"Bearer {queue}",
         )
         self.assertEqual(detail["schema"], EXECUTION_DETAIL_SCHEMA)
+        self.assertEqual(detail["schema_version"], 2)
         self.assertTrue(detail["ok"])
         self.assertEqual(detail["status"], "awaiting_start")
         self.assertEqual(detail["phase"], "plan")
         self.assertEqual(detail["deliverables"], [])
+        self.assertIsNone(detail["failure_reason"])
+        self.assertIsNone(detail["failure_exit_code"])
+        self.assertIsNone(detail["failure_run_id"])
         self.assertNotIn("work_markdown", detail)
         self.assertNotIn("task_work_directory", detail)
         self.assertEqual((self.execution_cards.count(), self.execution_cards.event_count()), before)
@@ -484,12 +488,15 @@ class TaskCardServerTests(unittest.TestCase):
         )
         self.assertEqual(
             (response["schema"], response["schema_version"], response["ok"]),
-            (EXECUTION_DETAIL_SCHEMA, 1, False),
+            (EXECUTION_DETAIL_SCHEMA, 2, False),
         )
         self.assertEqual(response["refusal"], "stale_version")
         self.assertIsNone(response["summary"])
         self.assertIsNone(response["work_digest"])
         self.assertEqual(response["deliverables"], [])
+        self.assertIsNone(response["failure_reason"])
+        self.assertIsNone(response["failure_exit_code"])
+        self.assertIsNone(response["failure_run_id"])
 
     def test_claim_at_ceiling_is_distinct_and_content_free(self):
         self.cards.schedule()
