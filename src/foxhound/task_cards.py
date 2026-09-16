@@ -110,6 +110,13 @@ class CardStats:
 
 
 @dataclass(frozen=True)
+class TaskCardRequeueResult:
+    """Content-free result of re-presenting unanswered task-review cards."""
+
+    requeued: int = 0
+
+
+@dataclass(frozen=True)
 class CardCompletionQuestion:
     """The one detection a card is asking about; private card content."""
 
@@ -739,6 +746,69 @@ class TaskCardService:
                     delivered_at=None,
                 )
                 return _operation(values, CardDisposition.APPLIED)
+            except Exception:
+                connection.rollback()
+                raise
+
+    def requeue_unanswered(
+        self, *, limit: int = 100
+    ) -> TaskCardRequeueResult:
+        """Re-present current task-review cards unanswered for one hour.
+
+        A delivered row otherwise occupies the reader surface forever when a
+        presentation disappears.  Requeueing clears only transport and claim
+        state, so the replacement receives a new version while the task
+        itself remains unchanged.
+        """
+        if not _valid_limit(limit):
+            return TaskCardRequeueResult()
+        stamp = self._clock_value()
+        now = stamp.isoformat(timespec="seconds")
+        due = (stamp - timedelta(hours=1)).isoformat(timespec="seconds")
+        with closing(self._connect()) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._cancel_stale(connection, now)
+                rows = connection.execute(
+                    self._card_select()
+                    + " WHERE c.status='delivered' AND c.delivered_at<=? "
+                    "ORDER BY c.delivered_at,c.id LIMIT ?",
+                    (due, limit),
+                ).fetchall()
+                requeued = 0
+                for row in rows:
+                    if (
+                        row["task_status_current"] != TaskStatus.OPEN
+                        or int(row["task_version_current"])
+                        != int(row["task_version"])
+                        or (row["source_revision"] or None)
+                        != (row["source_revision_current"] or None)
+                    ):
+                        continue
+                    version = int(row["version"]) + 1
+                    updated = connection.execute(
+                        "UPDATE task_review_cards SET status='pending',"
+                        "version=?,claim_token_digest=NULL,claim_expires_at=NULL,"
+                        "consumer_digest=NULL,transport=NULL,delivery_ref=NULL,"
+                        "delivered_at=NULL,updated_at=? WHERE id=? AND version=? "
+                        "AND status='delivered'",
+                        (version, now, int(row["id"]), int(row["version"])),
+                    )
+                    if updated.rowcount != 1:
+                        raise TaskLedgerError("task card state changed")
+                    self._event(
+                        connection,
+                        card_id=int(row["id"]),
+                        task_id=int(row["task_id"]),
+                        kind="delivery_failed",
+                        card_version=version,
+                        task_version=int(row["task_version"]),
+                        now=now,
+                    )
+                    requeued += 1
+                connection.commit()
+                return TaskCardRequeueResult(requeued=requeued)
             except Exception:
                 connection.rollback()
                 raise

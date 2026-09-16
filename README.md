@@ -568,9 +568,17 @@ foxhound-execution-schedule \
 ```
 
 Run this bounded command hourly through the local scheduler to re-present only
-still-current execution cards that have been delivered without a reader action
-for at least one hour. The replacement card has a new version, so callbacks on
-the earlier presentation are stale:
+still-current task-review cards that have been delivered without a reader
+action for at least one hour. The replacement card has a new version, so
+callbacks on the earlier presentation are stale:
+
+```sh
+foxhound-task-card-requeue \
+  --database /srv/example/private-foxhound-state/foxhound.sqlite3 \
+  --limit 100
+```
+
+Use the equivalent execution-card command for execution review cards:
 
 ```sh
 foxhound-execution-card-requeue \
