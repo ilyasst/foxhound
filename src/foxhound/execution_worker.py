@@ -632,35 +632,46 @@ class ExecutionWorker:
         """Build one schema-valid draft without exposing result text in argv."""
         state, service = self._active()
         run_directory = self._state_path.parent
+        # A result is authored where the reader will look for it. The task
+        # folder is a synchronised directory the owner opens from another
+        # machine to review the work; the run directory is private scratch on
+        # this host that nobody browses. Reading only the run directory meant
+        # an agent that put its result where the reader wanted it had its
+        # finished work refused as missing, which is exactly backwards.
+        #
+        # The run directory stays a valid location so nothing that already
+        # records keeps working by accident, but the task folder is tried
+        # first because that is the intended home.
+        search_directories = _result_search_path(state, run_directory)
         result_id = state.run_id
         draft = _repository_result(state, {
             "outcome": outcome,
             "summary": _read_result_text(
-                run_directory / "result-summary.txt",
+                _locate_result(search_directories, "result-summary.txt"),
                 label="execution result summary",
             ),
             "work_markdown": _read_result_text(
-                run_directory / "result-work.md",
+                _locate_result(search_directories, "result-work.md"),
                 label="execution result work",
             ),
             "questions": _read_optional_string_array(
-                run_directory / "result-questions.json",
+                _locate_result(search_directories, "result-questions.json"),
                 label="execution result questions",
             ),
             "external_actions": _read_optional_string_array(
-                run_directory / "result-external-actions.json",
+                _locate_result(search_directories, "result-external-actions.json"),
                 label="execution result external actions",
             ),
             "deliverables": _read_optional_string_array(
-                run_directory / "result-deliverables.json",
+                _locate_result(search_directories, "result-deliverables.json"),
                 label="execution result deliverables",
             ),
             "repository_references": _read_optional_repository_references(
-                run_directory / "result-repository-references.json",
+                _locate_result(search_directories, "result-repository-references.json"),
                 label="execution result repository references",
             ),
             "repository_impact": _read_optional_repository_impact(
-                run_directory / "result-repository-impact.json",
+                _locate_result(search_directories, "result-repository-impact.json"),
                 label="execution result repository impact",
             ),
         }, run_directory)
@@ -1016,11 +1027,96 @@ def _read_private_json(
     return value
 
 
+def _result_search_path(state, run_directory: Path) -> tuple[Path, ...]:
+    """Where an authored result may legitimately live, in preference order.
+
+    The task folder first: it is the synchronised directory the owner reviews
+    from, so a result written there is a result the reader can actually open.
+    The run directory second, because results authored in the agent's own
+    working directory were the only ones accepted before this and must keep
+    recording unchanged.
+
+    A task folder is only offered when the workflow carries one; a claim
+    without one falls back to the run directory alone rather than guessing.
+    """
+    directories: list[Path] = []
+    task_folder = getattr(state, "task_work_directory", None)
+    if task_folder:
+        candidate = Path(task_folder)
+        if candidate.is_absolute():
+            directories.append(candidate)
+    directories.append(run_directory)
+    return tuple(directories)
+
+
+def _locate_result(directories: tuple[Path, ...], name: str) -> Path:
+    """The first directory that actually holds `name`.
+
+    When none does, the first candidate is returned so the caller reports the
+    location the reader was most likely aiming at, rather than the private
+    scratch directory they never chose.
+    """
+    for directory in directories:
+        candidate = directory / name
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            continue
+    return directories[0] / name
+
+
+def _result_read_failure(path: Path, exc: Exception) -> str:
+    """A safe, specific reason a result file could not be read.
+
+    Paths here are the agent's own working locations, which it supplied or
+    was given; echoing one back tells it nothing it did not already know.
+    """
+    reason = str(exc)
+    if not path.exists():
+        return f"not found at {path}"
+    if path.is_dir():
+        return f"is a directory, not a file: {path}"
+    try:
+        mode = path.lstat().st_mode
+    except OSError:
+        return f"could not be read at {path}"
+    if mode & 0o077:
+        return (
+            f"is readable by others at {path}; results must be owner-only "
+            f"(chmod 600)"
+        )
+    if "not private" in reason:
+        return (
+            f"sits in a directory readable by others: {path.parent}; the "
+            f"folder must be owner-only (chmod 700)"
+        )
+    try:
+        if path.stat().st_size > MAX_DRAFT_BYTES:
+            return f"is larger than {MAX_DRAFT_BYTES} bytes: {path}"
+    except OSError:
+        pass
+    return f"could not be decoded as UTF-8: {path}"
+
+
 def _read_result_text(path: Path, *, label: str) -> str:
+    """Read one authored result file, saying which condition actually failed.
+
+    Every underlying refusal used to arrive as "<label> is invalid", which
+    covers a missing file, a world-readable one, an oversized one and a
+    mis-encoded one alike. An agent told only "invalid" goes looking for a
+    content rule that does not exist -- and the one observed doing so spent
+    the rest of its turn budget reading worker source, then lost finished
+    work it had merely written somewhere else. Naming the condition, and the
+    path we looked at, is the difference between a fixable mistake and a
+    dead run.
+    """
     try:
         value = _read_private_text(path, maximum=MAX_DRAFT_BYTES, label=label)
     except ExecutionWorkerConfigError as exc:
-        raise ExecutionWorkerDraftError(f"{label} is invalid") from exc
+        raise ExecutionWorkerDraftError(
+            f"{label}: {_result_read_failure(path, exc)}"
+        ) from exc
     if value.endswith("\n"):
         value = value[:-1]
         if value.endswith("\r"):
