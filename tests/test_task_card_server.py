@@ -42,6 +42,7 @@ from foxhound.task_card_server import (
     EXECUTION_CLAIM_SCHEMA,
     EXECUTION_DETAIL_SCHEMA,
     EXECUTION_OPERATION_SCHEMA,
+    EXECUTION_PRIORITY_SCHEMA,
     EXECUTION_QUEUE_SCHEMA,
     EXECUTION_SCHEDULE_SCHEMA,
     EXECUTION_STATS_SCHEMA,
@@ -238,6 +239,51 @@ class TaskCardServerTests(unittest.TestCase):
             self.assertEqual(row[0], "resolved")
             self.assertIsNone(row[1])
             self.assertEqual(row[2], "queue_view")
+
+    def test_execution_priority_is_queue_scoped_and_version_fenced(self):
+        queue = "q" * 43
+        self.execution.schedule(1, expected_task_version=1)
+        ready = self.execution.start_action(1, expected_version=1, action="start")
+        app = TaskCardApplication(
+            self.cards,
+            {DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: queue},
+            execution_cards=self.execution_cards,
+            execution_workflows=self.execution,
+            execution_tokens={DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: queue},
+        )
+        with running_server(app) as endpoint:
+            status, _, response = request(
+                endpoint,
+                "/v1/execution-workflows/priority",
+                request_document(
+                    task_id=1, workflow_version=ready.version, action="raise"
+                ),
+                token=queue,
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(response["schema"], EXECUTION_PRIORITY_SCHEMA)
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["priority"], "raised")
+        self.assertEqual(response["workflow_version"], ready.version + 1)
+        self.assertEqual(self.execution.claim_next().task_id, 1)
+
+        with self.assertRaises(TaskCardServerRequestError):
+            app.dispatch(
+                "execution_priority",
+                request_document(
+                    task_id=1, workflow_version=ready.version, action="raise"
+                ),
+                authorization=f"Bearer {TOKEN}",
+            )
+        with self.assertRaises(TaskCardServerRequestError):
+            app.dispatch(
+                "execution_priority",
+                request_document(
+                    task_id=1, workflow_version=ready.version, action="raise",
+                    extra="rejected",
+                ),
+                authorization=f"Bearer {queue}",
+            )
 
     def test_execution_queue_resolve_is_strict_and_queue_view_only(self):
         card = self._queue_card()

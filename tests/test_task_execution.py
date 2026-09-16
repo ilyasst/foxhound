@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import tempfile
+import threading
 import unittest
 from contextlib import closing
 from dataclasses import replace
@@ -35,6 +36,7 @@ from foxhound.task_execution import (
     TaskExecutionService,
     WorkflowDisposition,
     WorkflowPhase,
+    WorkflowPriority,
     WorkflowRefusal,
     WorkflowStatus,
 )
@@ -353,10 +355,21 @@ class TaskExecutionTests(unittest.TestCase):
                 "ALTER TABLE task_execution_results DROP COLUMN "
                 "repository_impact"
             )
+            connection.execute(
+                "DROP INDEX task_execution_workflows_priority_ready"
+            )
+            connection.execute(
+                "ALTER TABLE task_execution_workflows DROP COLUMN "
+                "queue_priority"
+            )
             # ADR 0036 added this at v23; a database at an older version
             # has not got it yet.
             connection.execute(
                 "ALTER TABLE task_review_cards DROP COLUMN consumer_digest"
+            )
+            connection.execute(
+                "ALTER TABLE execution_review_cards DROP COLUMN "
+                "consumer_digest"
             )
             connection.execute(
                 "ALTER TABLE task_review_cards DROP COLUMN source_revision"
@@ -652,6 +665,124 @@ class TaskExecutionTests(unittest.TestCase):
         self.assertIsNotNone(claim)
         self.assertEqual(claim.task_id, 2)
         self.assertEqual(without_profile.last_claim_deferred, (1,))
+
+    def test_queue_priority_is_bounded_fenced_and_consumed_by_claim(self):
+        self._add_task(2, "Second synthetic task")
+        self._add_task(3, "Third synthetic task")
+        first = self._schedule_and_start()
+        second = self.service.schedule(2, expected_task_version=1)
+        second = self.service.start_action(
+            2, expected_version=second.version, action="start"
+        )
+        third = self.service.schedule(3, expected_task_version=1)
+        third = self.service.start_action(
+            3, expected_version=third.version, action="start"
+        )
+
+        raised = self.service.set_priority(
+            3, expected_version=third.version, action="raise"
+        )
+        self.assertEqual(raised.disposition, WorkflowDisposition.APPLIED)
+        self.assertEqual(raised.priority, WorkflowPriority.RAISED)
+        self.assertEqual(
+            self.service.set_priority(
+                3, expected_version=third.version, action="lower"
+            ).refusal,
+            WorkflowRefusal.STALE_WORKFLOW,
+        )
+        self.assertEqual(
+            self.service.set_priority(
+                2, expected_version=second.version, action="unexpected"
+            ).refusal,
+            WorkflowRefusal.INVALID_ACTION,
+        )
+
+        claim = self.service.claim_next()
+        self.assertEqual(claim.task_id, 3)
+        self.assertEqual(self.service.get(3).priority, WorkflowPriority.NORMAL)
+        self.assertEqual(self.service.get(1).priority, WorkflowPriority.NORMAL)
+        self.assertEqual(self.service.get(2).priority, WorkflowPriority.NORMAL)
+        self.assertEqual(first.status, WorkflowStatus.QUEUED)
+
+    def test_queue_priority_refuses_non_ready_workflow_states(self):
+        scheduled = self.service.schedule(1, expected_task_version=1)
+        self.assertEqual(
+            self.service.set_priority(
+                1, expected_version=scheduled.version, action="raise"
+            ).refusal,
+            WorkflowRefusal.INVALID_STATE,
+        )
+        snoozed = self.service.start_action(
+            1, expected_version=scheduled.version, action="snooze"
+        )
+        self.assertEqual(
+            self.service.set_priority(
+                1, expected_version=snoozed.version, action="raise"
+            ).refusal,
+            WorkflowRefusal.INVALID_STATE,
+        )
+        self.clock.advance(days=2)
+        resumed = self.service.start_action(
+            1, expected_version=snoozed.version, action="start"
+        )
+        claimed = self.service.claim_next()
+        self.assertEqual(claimed.task_id, 1)
+        self.assertEqual(
+            self.service.set_priority(
+                1, expected_version=claimed.workflow_version, action="raise"
+            ).refusal,
+            WorkflowRefusal.INVALID_STATE,
+        )
+        self.assertEqual(resumed.status, WorkflowStatus.QUEUED)
+
+    def test_concurrent_claims_preserve_raised_priority_without_duplication(self):
+        self._add_task(2, "Second synthetic task")
+        self._add_task(3, "Third synthetic task")
+        self._schedule_and_start()
+        for task_id in (2, 3):
+            scheduled = self.service.schedule(task_id, expected_task_version=1)
+            self.service.start_action(
+                task_id, expected_version=scheduled.version, action="start"
+            )
+        ready = self.service.get(3)
+        self.assertIsNotNone(ready)
+        self.assertTrue(self.service.set_priority(
+            3, expected_version=ready.version, action="raise"
+        ).accepted)
+
+        barrier = threading.Barrier(3)
+        claimed: list[int] = []
+        claimed_lock = threading.Lock()
+
+        def claim_once() -> None:
+            worker = TaskExecutionService(
+                self.database,
+                clock=self.clock,
+                token_factory=lambda: TOKEN,
+                profile_registry=AgentProfileRegistry((
+                    general_profile(),
+                    _profile(
+                        "sigint",
+                        phases=("plan", "execute", "external_action"),
+                    ),
+                )),
+            )
+            barrier.wait()
+            claim = worker.claim_next()
+            if claim is not None:
+                with claimed_lock:
+                    claimed.append(claim.task_id)
+
+        threads = [threading.Thread(target=claim_once) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(len(claimed), 2)
+        self.assertEqual(len(set(claimed)), 2)
+        self.assertIn(3, claimed)
 
     def test_schedule_is_explicit_idempotent_and_task_version_fenced(self):
         scheduled = self.service.schedule(1, expected_task_version=1)
