@@ -1031,6 +1031,53 @@ class TaskExecutionTests(unittest.TestCase):
         replay = self.service.schedule_new(limit=10)
         self.assertEqual((replay.scheduled, replay.remaining), (0, 0))
 
+    def test_schedule_new_prioritizes_email_and_meeting_origins(self):
+        """Communication work fills the planning reserve before issue work."""
+        for task_id, kind in ((2, "issue"), (3, "email"), (4, "meeting")):
+            self._add_task(task_id, f"Synthetic task {task_id}")
+            self._bind_origin(task_id, kind)
+
+        service = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            planning_grants=["email", "issue", "meeting"],
+            plan_ready_cap=2,
+            profile_registry=self.service._profile_registry,
+        )
+
+        result = service.schedule_new(limit=10)
+
+        self.assertEqual((result.scheduled, result.remaining), (3, 1))
+        self.assertEqual(service.get(3).status, WorkflowStatus.QUEUED)
+        self.assertEqual(service.get(4).status, WorkflowStatus.QUEUED)
+        self.assertIsNone(service.get(2))
+
+    def test_claim_prioritizes_communication_over_a_raised_issue(self):
+        """Source priority is stronger than an issue's explicit queue raise."""
+        self._add_task(2, "Synthetic issue task")
+        self._add_task(3, "Synthetic email task")
+        self._bind_origin(2, "issue")
+        self._bind_origin(3, "email")
+        service = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: TOKEN,
+            execution_slot_cap=1,
+            profile_registry=self.service._profile_registry,
+        )
+        issue = service.schedule(2, expected_task_version=1)
+        issue = service.start_action(
+            2, expected_version=issue.version, action="start"
+        )
+        email = service.schedule(3, expected_task_version=1)
+        service.start_action(3, expected_version=email.version, action="start")
+        service.set_priority(2, expected_version=issue.version, action="raise")
+
+        claim = service.claim_next()
+
+        self.assertIsNotNone(claim)
+        self.assertEqual(claim.task_id, 3)
+
     def test_new_work_and_reader_waiting_have_separate_gw_caps(self):
         with closing(sqlite3.connect(self.database)) as connection:
             for task_id in range(2, 36):
