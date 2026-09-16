@@ -539,6 +539,46 @@ class TaskCardTests(unittest.TestCase):
         self.assertEqual(event, ("delivery_failed", claim.card.version + 1))
         self.assertEqual(self.cards.event_count(), before_events + 1)
 
+    def test_unanswered_delivered_card_is_represented_after_one_hour(self):
+        self.cards.schedule(limit=1)
+        claim = self.claim_and_deliver()
+
+        self.clock.advance(timedelta(hours=1) - timedelta(seconds=1))
+        self.assertEqual(self.cards.requeue_unanswered().requeued, 0)
+        self.clock.advance(timedelta(seconds=1))
+        self.assertEqual(self.cards.requeue_unanswered().requeued, 1)
+
+        stale = self.cards.act(
+            claim.card.id, expected_version=claim.card.version, action="done"
+        )
+        self.assertEqual(stale.refusal, CardRefusal.STALE_VERSION)
+        replacement = self.cards.claim_next(consumer_digest=CONSUMER_A)
+        self.assertEqual(replacement.card.id, claim.card.id)
+        self.assertGreater(replacement.card.version, claim.card.version)
+        with closing(sqlite3.connect(self.database)) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT status,version FROM tasks WHERE id=?",
+                    (claim.card.task_id,),
+                ).fetchone(),
+                ("open", claim.card.task_version),
+            )
+
+    def test_represent_only_requeues_current_delivered_cards(self):
+        self.cards.schedule(limit=2)
+        first = self.claim_and_deliver()
+        self.claim_and_deliver()
+        self.cards.act(
+            first.card.id, expected_version=first.card.version, action="snooze"
+        )
+
+        self.clock.advance(timedelta(hours=1))
+        self.assertEqual(self.cards.requeue_unanswered().requeued, 1)
+        self.assertEqual(
+            self.cards.stats(consumer_digest=CONSUMER_A).pending,
+            1,
+        )
+
     def test_delivered_card_repair_refuses_stale_or_noncurrent_cards(self):
         self.cards.schedule(limit=1)
         claim = self.claim_and_deliver()
