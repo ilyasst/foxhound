@@ -6,17 +6,17 @@ make it owner-only (`0600`), and do not commit it, paste it into issues, or
 send its rendered command lines to logs. It contains paths but never token
 values.
 
-Version 4 covers every enabled component that reads or writes the shared
+Version 5 covers every enabled component that reads or writes the shared
 database: the task-card service, scheduler, one or more runners, feed import,
-native intake, execution-card requeue, lifecycle-outcome export, and fused
-task titles. It is intentionally strict: every field below is required when
-that component is enabled, unknown fields are rejected, and all paths are
-absolute.
+native intake, execution-card requeue, lifecycle-outcome export, fused task
+titles, and duplicate-card scheduling. It is intentionally strict: every field
+below is required when that component is enabled, unknown fields are rejected,
+and all paths are absolute.
 
 ```json
 {
   "schema": "foxhound.deployment-config",
-  "schema_version": 4,
+  "schema_version": 5,
   "database": "/srv/example/private-foxhound-state/foxhound.sqlite3",
   "agent_profile_directory": null,
   "card_service": {
@@ -80,6 +80,10 @@ absolute.
     "fused_task_titles": {
       "enabled": true,
       "endpoint": "http://<canonical IPv4 loopback address>:8800"
+    },
+    "duplicate_card_schedule": {
+      "enabled": true,
+      "limit": 100
     }
   }
 }
@@ -92,8 +96,8 @@ Set a disabled `card_service`, runner, or database consumer to exactly
 `{"enabled": false}`. The `execution_runners` list permits each running slot
 to be declared separately; enabled slots must have distinct names. The
 workflow section remains required because it owns the shared policy and
-limits. Versions 1 through 3 remain readable for a controlled transition, but
-only version 4 can declare the complete deployment boundary.
+limits. Versions 1 through 4 remain readable for a controlled transition, but
+only version 5 can declare the complete deployment boundary.
 
 Validate before changing a service definition or restarting anything:
 
@@ -121,9 +125,10 @@ foxhound-deployment-config \
 Supported names are `task-cards`, `execution-schedule`,
 `execution-runner:<slot>`, `candidate-feed-import`, `native-intake-run`,
 `execution-card-requeue`, `lifecycle-outcome-export`, and `fused-task-titles`.
-Use the configured slot name when rendering a runner. Rendering reads no token
-contents. Its JSON output does contain private paths, so consume it only in the
-private deployment mechanism, never in a repository, issue, or shared log.
+`duplicate-card-schedule` is also available. Use the configured slot name when
+rendering a runner. Rendering reads no token contents. Its JSON output does
+contain private paths, so consume it only in the private deployment mechanism,
+never in a repository, issue, or shared log.
 
 Private service units can use `exec` to start a declared component from the
 same installed release as the configuration command:
@@ -147,3 +152,10 @@ through `foxhound-deployment-config exec --component fused-task-titles` after
 task-card delivery is available. Its endpoint is a canonical loopback HTTP
 gateway selected in the private deployment document. The worker asks for the
 `thinking_no` capability and prints aggregate counts only.
+
+## Duplicate review cards
+
+`duplicate-card-schedule` is a bounded one-shot database consumer. Run it from
+a private timer after native intake. It binds only proposed duplicate pairs to
+reader cards; it does not create ordinary task-review cards. The existing
+delivery consumer then claims and sends those cards to Telegram.

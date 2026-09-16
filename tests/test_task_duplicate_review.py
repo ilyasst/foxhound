@@ -90,6 +90,24 @@ class DuplicateReviewCardTests(unittest.TestCase):
         self.assertIn("Task T2", text)
         self.assertEqual(len(keyboard["inline_keyboard"][0]), 2)
 
+    def test_duplicate_only_scheduler_does_not_create_ordinary_task_cards(self) -> None:
+        self._task(3, "note", "Review an unrelated synthetic topic")
+        self.connection.commit()
+
+        scheduled = self.cards.schedule_duplicate_proposals()
+
+        self.assertEqual((scheduled.created, scheduled.asked), (1, 1))
+        cards = self.connection.execute(
+            "SELECT task_id FROM task_review_cards ORDER BY id"
+        ).fetchall()
+        self.assertEqual([int(row[0]) for row in cards], [1])
+
+        proposal = self.connection.execute(
+            "SELECT card_id FROM task_duplicate_proposals WHERE id=?",
+            (self.proposal.proposal_id,),
+        ).fetchone()
+        self.assertIsNotNone(proposal[0])
+
     def test_confirm_records_relation_and_hides_the_noncanonical_task(self) -> None:
         claim = self._deliver()
         result = self.cards.act(
