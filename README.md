@@ -610,6 +610,24 @@ non-current, held, or otherwise unavailable cards without disclosing content;
 prompts, logs, private paths, credentials, profile identifiers, and unbounded
 work-product text are never exposed. This follows ADR 0041's aggregate-scoped
 second-consumer decision and creates no new authority.
+
+The same execution `queue_view` credential may also request bounded priority
+for one exact ready workflow at `POST /v1/execution-workflows/priority` with
+`task_id`, the exact current `workflow_version`, and one action: `raise`,
+`lower`, or `clear`. It never accepts a numeric score, a relative position, or
+an arbitrary list of work. `raise`, `normal` (the result of `clear`), and
+`lower` are applied ahead of the scheduler's existing stable first-attempt,
+update-time, and task-id tie-breakers. The acknowledgement contains only the
+requested identity, resulting workflow version, fixed priority vocabulary, and
+fixed refusal code. A queue reader can therefore expose simple **Raise**,
+**Lower**, and **Clear priority** controls alongside a current workflow without
+claiming a card merely to reorder it. Priority is accepted only for an open,
+current, immediately ready queued workflow; snoozed, cooling, parked or held,
+inactive, stale, and already-running workflows are refused unchanged. A
+successful runner claim clears the preference atomically, so it cannot steer a
+later phase. Each successful change is an append-only workflow event; workflow
+capacity and runner-slot ceilings remain unchanged.
+
 The packaged service accepts `--agent-profile-directory`; deployments with
 private profiles must give it the same directory as the execution runner. The
 owner-conditioned control is disabled unless all three of `--gw-endpoint`,
