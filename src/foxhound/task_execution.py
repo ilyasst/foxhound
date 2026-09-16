@@ -111,6 +111,7 @@ MAX_REPOSITORY_REFERENCES = 8
 _RESULT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _PROFILE_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+_RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
 def _resolve_cap(override: int | None, default: int) -> int | None:
@@ -201,6 +202,8 @@ class ExecutionWorkflow:
     due_at: str | None
     failure_count: int
     last_failure_reason: str | None
+    last_failure_exit_code: int | None
+    last_failure_run_id: str | None
     last_failure_at: str | None
     next_attempt_at: str | None
     parked_at: str | None
@@ -641,6 +644,7 @@ class TaskExecutionService:
                         "due_at=NULL,claim_token_digest=NULL,claimed_at=NULL,"
                         "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
                         "failure_count=0,last_failure_reason=NULL,"
+                        "last_failure_exit_code=NULL,last_failure_run_id=NULL,"
                         "last_failure_at=NULL,next_attempt_at=NULL,"
                         "parked_at=NULL,last_result_id=NULL,updated_at=?,"
                         "completed_at=NULL,agent_profile_id=?,"
@@ -1082,14 +1086,29 @@ class TaskExecutionService:
         expected_version: int,
         claim_token: str,
         reason: str,
+        exit_code: int | None = None,
+        run_id: str | None = None,
     ) -> WorkflowOperationResult:
         if reason not in FAILURE_REASONS or reason == "claim_expired":
+            return _refused(task_id, WorkflowRefusal.INVALID_ARGUMENT)
+        if reason == "process_exit":
+            if (exit_code is None) != (run_id is None):
+                return _refused(task_id, WorkflowRefusal.INVALID_ARGUMENT)
+            if exit_code is not None and (
+                    isinstance(exit_code, bool) or not isinstance(exit_code, int)
+                    or exit_code < 1 or exit_code > 255
+                    or not isinstance(run_id, str)
+                    or not _RUN_ID_RE.fullmatch(run_id)):
+                return _refused(task_id, WorkflowRefusal.INVALID_ARGUMENT)
+        elif exit_code is not None or run_id is not None:
             return _refused(task_id, WorkflowRefusal.INVALID_ARGUMENT)
         return self._finish_claim(
             task_id,
             expected_version=expected_version,
             claim_token=claim_token,
             failure_reason=reason,
+            failure_exit_code=exit_code,
+            failure_run_id=run_id,
         )
 
     def _finish_claim(
@@ -1099,6 +1118,8 @@ class TaskExecutionService:
         expected_version: int,
         claim_token: str,
         failure_reason: str | None,
+        failure_exit_code: int | None = None,
+        failure_run_id: str | None = None,
     ) -> WorkflowOperationResult:
         if (not _valid_identity(task_id, expected_version)
                 or not _valid_secret(claim_token)):
@@ -1144,6 +1165,8 @@ class TaskExecutionService:
                     result = self._defer_failure(
                         connection, row, failure_reason, stamp,
                         event_kind=None,
+                        exit_code=failure_exit_code,
+                        run_id=failure_run_id,
                     )
                 connection.commit()
                 return result
@@ -1253,6 +1276,7 @@ class TaskExecutionService:
                     "claim_token_digest=NULL,claimed_at=NULL,"
                     "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
                     "failure_count=0,last_failure_reason=NULL,"
+                    "last_failure_exit_code=NULL,last_failure_run_id=NULL,"
                     "last_failure_at=NULL,next_attempt_at=NULL,parked_at=NULL,"
                     "last_result_id=?,updated_at=?,completed_at=? "
                     "WHERE task_id=? AND version=? AND status='running'",
@@ -1303,6 +1327,7 @@ class TaskExecutionService:
                 connection.execute(
                     "UPDATE task_execution_workflows SET status='queued',"
                     "version=?,failure_count=0,last_failure_reason=NULL,"
+                    "last_failure_exit_code=NULL,last_failure_run_id=NULL,"
                     "last_failure_at=NULL,next_attempt_at=NULL,parked_at=NULL,"
                     "updated_at=? WHERE task_id=? AND version=?",
                     (version, now, task_id, expected_version),
@@ -1521,6 +1546,8 @@ class TaskExecutionService:
         stamp: datetime,
         *,
         event_kind: str | None,
+        exit_code: int | None = None,
+        run_id: str | None = None,
     ) -> WorkflowOperationResult:
         if reason not in FAILURE_REASONS:
             raise ValueError("execution failure reason is invalid")
@@ -1556,11 +1583,13 @@ class TaskExecutionService:
             "claim_token_digest=NULL,claimed_at=NULL,"
             "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
             "failure_count=?,last_failure_reason=?,last_failure_at=?,"
+            "last_failure_exit_code=?,last_failure_run_id=?,"
             "next_attempt_at=?,parked_at=?,updated_at=? "
             "WHERE task_id=? AND version=?",
             (
-                status, version, failures, reason, now, next_attempt, parked,
-                now, int(row["task_id"]), int(row["version"]),
+                status, version, failures, reason, now, exit_code, run_id,
+                next_attempt, parked, now, int(row["task_id"]),
+                int(row["version"]),
             ),
         )
         self._event(
@@ -1911,7 +1940,9 @@ def _apply_start_action(
         "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
         # Restarting clears what parked it, so a retry gets a full set of
         # attempts rather than immediately parking again on the next slip.
-        "failure_count=0,last_failure_reason=NULL,last_failure_at=NULL,"
+        "failure_count=0,last_failure_reason=NULL,"
+        "last_failure_exit_code=NULL,last_failure_run_id=NULL,"
+        "last_failure_at=NULL,"
         "next_attempt_at=NULL,parked_at=NULL,updated_at=?,completed_at=? "
         "WHERE task_id=? AND version=?",
         (
@@ -2034,7 +2065,8 @@ def _apply_review_action(
         "UPDATE task_execution_workflows SET status=?,phase=?,version=?,"
         "due_at=?,claim_token_digest=NULL,claimed_at=NULL,"
         "claim_heartbeat_at=NULL,claim_expires_at=NULL,failure_count=0,"
-        "last_failure_reason=NULL,last_failure_at=NULL,next_attempt_at=NULL,"
+        "last_failure_reason=NULL,last_failure_exit_code=NULL,"
+        "last_failure_run_id=NULL,last_failure_at=NULL,next_attempt_at=NULL,"
         "parked_at=NULL,updated_at=?,completed_at=? "
         "WHERE task_id=? AND version=?",
         (
@@ -2090,6 +2122,8 @@ def _workflow(row: sqlite3.Row) -> ExecutionWorkflow:
             due_at=row["due_at"],
             failure_count=int(row["failure_count"]),
             last_failure_reason=row["last_failure_reason"],
+            last_failure_exit_code=row["last_failure_exit_code"],
+            last_failure_run_id=row["last_failure_run_id"],
             last_failure_at=row["last_failure_at"],
             next_attempt_at=row["next_attempt_at"],
             parked_at=row["parked_at"],

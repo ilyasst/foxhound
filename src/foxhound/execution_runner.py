@@ -499,6 +499,7 @@ def _run_claim(
                     reason="process_exit",
                     outcome="process_exit",
                     exit_code=normalized or NO_PROGRESS_EXIT_CODE,
+                    run_id=run_id,
                 )
 
             if now - started >= profile.timeout_seconds:
@@ -612,14 +613,24 @@ def _open_transcript(directory: Path):
 
 
 def _fail_claim(
-    service: TaskExecutionService, claim: ExecutionClaim, reason: str
+    service: TaskExecutionService,
+    claim: ExecutionClaim,
+    reason: str,
+    *,
+    exit_code: int | None = None,
+    run_id: str | None = None,
 ) -> WorkflowOperationResult | None:
     try:
+        diagnostics: dict[str, object] = {}
+        if exit_code is not None:
+            diagnostics["exit_code"] = exit_code
+            diagnostics["run_id"] = run_id
         return service.fail(
             claim.task_id,
             expected_version=claim.workflow_version,
             claim_token=claim.token,
             reason=reason,
+            **diagnostics,
         )
     except Exception:
         return None
@@ -633,9 +644,16 @@ def _failure_result(
     reason: str,
     outcome: str,
     exit_code: int,
+    run_id: str | None = None,
     forced: bool = False,
 ) -> ExecutionRunResult:
-    failed = _fail_claim(service, claim, reason)
+    failed = _fail_claim(
+        service,
+        claim,
+        reason,
+        exit_code=exit_code if reason == "process_exit" else None,
+        run_id=run_id if reason == "process_exit" else None,
+    )
     if (
         failed is not None
         and failed.disposition is WorkflowDisposition.APPLIED

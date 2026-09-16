@@ -252,6 +252,8 @@ class ExecutionReviewCard:
     #: abandoned.
     failure_count: int = 0
     failure_reason: str = field(default="", repr=False)
+    failure_exit_code: int | None = field(default=None, repr=False)
+    failure_run_id: str | None = field(default=None, repr=False)
     task_work_directory: str = field(default="", repr=False)
     task_kb_file: str = field(default="", repr=False)
     origin_sources: tuple["CardSourceEvidence", ...] = field(
@@ -329,6 +331,9 @@ class ExecutionCardDetail:
     summary: str = field(default="", repr=False)
     work_digest: str = field(default="", repr=False)
     deliverables: tuple[CardRecord, ...] = field(default=(), repr=False)
+    failure_reason: str | None = None
+    failure_exit_code: int | None = None
+    failure_run_id: str | None = None
     refusal: ExecutionCardRefusal | None = None
 
     @property
@@ -1337,6 +1342,9 @@ class ExecutionCardService:
                 summary="" if row["summary"] is None else str(row["summary"]),
                 work_digest="" if row["work_digest"] is None else str(row["work_digest"]),
                 deliverables=_stored_collection(row["deliverables_json"]),
+                failure_reason=row["workflow_failure_reason"],
+                failure_exit_code=row["workflow_failure_exit_code"],
+                failure_run_id=row["workflow_failure_run_id"],
             )
 
     def select_agent(
@@ -1537,6 +1545,7 @@ class ExecutionCardService:
                         "claim_token_digest=NULL,claimed_at=NULL,"
                         "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
                         "failure_count=0,last_failure_reason=NULL,"
+                        "last_failure_exit_code=NULL,last_failure_run_id=NULL,"
                         "last_failure_at=NULL,next_attempt_at=NULL,"
                         "parked_at=NULL,updated_at=?,completed_at=NULL "
                         "WHERE task_id=? AND version=?",
@@ -1591,6 +1600,7 @@ class ExecutionCardService:
                         "due_at=NULL,claim_token_digest=NULL,claimed_at=NULL,"
                         "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
                         "failure_count=0,last_failure_reason=NULL,"
+                        "last_failure_exit_code=NULL,last_failure_run_id=NULL,"
                         "last_failure_at=NULL,next_attempt_at=NULL,"
                         "parked_at=NULL,last_result_id=NULL,updated_at=?,"
                         "completed_at=NULL WHERE task_id=? AND version=?",
@@ -1987,6 +1997,7 @@ class ExecutionCardService:
                     "due_at=NULL,claim_token_digest=NULL,claimed_at=NULL,"
                     "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
                     "failure_count=0,last_failure_reason=NULL,"
+                    "last_failure_exit_code=NULL,last_failure_run_id=NULL,"
                     "last_failure_at=NULL,next_attempt_at=NULL,"
                     "parked_at=NULL,updated_at=?,completed_at=NULL "
                     "WHERE task_id=? AND task_version=? AND version=? "
@@ -2079,6 +2090,8 @@ class ExecutionCardService:
             "w.status AS workflow_status_current,"
             "w.failure_count AS workflow_failure_count,"
             "w.last_failure_reason AS workflow_failure_reason,"
+            "w.last_failure_exit_code AS workflow_failure_exit_code,"
+            "w.last_failure_run_id AS workflow_failure_run_id,"
             "w.phase AS workflow_phase_current,"
             "w.version AS workflow_version_current,"
             "w.task_version AS workflow_task_version_current,"
@@ -2541,6 +2554,8 @@ def _card(
             workflow_status=WorkflowStatus(row["workflow_status_current"]),
             failure_count=int(row["workflow_failure_count"] or 0),
             failure_reason=str(row["workflow_failure_reason"] or ""),
+            failure_exit_code=row["workflow_failure_exit_code"],
+            failure_run_id=row["workflow_failure_run_id"],
             agent_profile_id=profile_id,
             agent_profile_revision=profile_revision,
             agent_display_name=profile_name,
@@ -2681,7 +2696,8 @@ def _apply_owner_hold(
         "UPDATE task_execution_workflows SET status='snoozed',phase='plan',"
         "version=?,due_at=?,claim_token_digest=NULL,claimed_at=NULL,"
         "claim_heartbeat_at=NULL,claim_expires_at=NULL,failure_count=0,"
-        "last_failure_reason=NULL,last_failure_at=NULL,next_attempt_at=NULL,"
+        "last_failure_reason=NULL,last_failure_exit_code=NULL,"
+        "last_failure_run_id=NULL,last_failure_at=NULL,next_attempt_at=NULL,"
         "parked_at=NULL,updated_at=?,completed_at=NULL "
         "WHERE task_id=? AND version=? AND task_version=? "
         "AND status IN ('awaiting_start','snoozed','parked')",
@@ -3072,6 +3088,16 @@ def _start_card_lines(
             + (f" ({card.failure_reason})" if card.failure_reason else "")
         )
         lines.append(f"<b>{_escape(stopped)}</b>" if html else stopped)
+        if card.failure_exit_code is not None:
+            diagnostic = f"Last agent exit code: {card.failure_exit_code}"
+            lines.append(
+                f"<b>{_escape(diagnostic)}</b>" if html else diagnostic
+            )
+        if card.failure_run_id is not None:
+            reference = f"Run diagnostic: {card.failure_run_id}"
+            lines.append(
+                f"<code>{_escape(reference)}</code>" if html else reference
+            )
         explanation = (
             "Continue tries again. The runs so far left nothing recorded."
         )
@@ -4037,7 +4063,8 @@ def _apply_review_lifecycle_action(
         "UPDATE task_execution_workflows SET task_version=?,status=?,"
         "version=?,due_at=NULL,claim_token_digest=NULL,claimed_at=NULL,"
         "claim_heartbeat_at=NULL,claim_expires_at=NULL,failure_count=0,"
-        "last_failure_reason=NULL,last_failure_at=NULL,next_attempt_at=NULL,"
+        "last_failure_reason=NULL,last_failure_exit_code=NULL,"
+        "last_failure_run_id=NULL,last_failure_at=NULL,next_attempt_at=NULL,"
         "parked_at=NULL,updated_at=?,completed_at=? "
         "WHERE task_id=? AND version=?",
         (

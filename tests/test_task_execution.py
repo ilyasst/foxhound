@@ -364,6 +364,14 @@ class TaskExecutionTests(unittest.TestCase):
                 "ALTER TABLE task_execution_workflows DROP COLUMN "
                 "queue_priority"
             )
+            connection.execute(
+                "ALTER TABLE task_execution_workflows DROP COLUMN "
+                "last_failure_exit_code"
+            )
+            connection.execute(
+                "ALTER TABLE task_execution_workflows DROP COLUMN "
+                "last_failure_run_id"
+            )
             # ADR 0036 added this at v23; a database at an older version
             # has not got it yet.
             connection.execute(

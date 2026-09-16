@@ -73,6 +73,7 @@ EXECUTION_STATS_SCHEMA = "foxhound.execution-card-service.stats"
 EXECUTION_BRIEF_SCHEMA = "foxhound.execution-card-service.brief"
 EXECUTION_VIEW_SCHEMA = "foxhound.execution-card-service.view"
 EXECUTION_DETAIL_SCHEMA = "foxhound.execution-card-service.detail"
+EXECUTION_DETAIL_SCHEMA_VERSION = 2
 EXECUTION_QUEUE_SCHEMA = "foxhound.execution-card-service.queue"
 EXECUTION_QUEUE_SCHEMA_VERSION = 1
 EXECUTION_RESOLVE_SCHEMA = "foxhound.execution-card-service.resolve"
@@ -1509,7 +1510,7 @@ def _execution_detail_document(result: ExecutionCardDetail) -> dict[str, Any]:
     """Serialize only the bounded current-run/detail allowlist."""
     document: dict[str, Any] = {
         "schema": EXECUTION_DETAIL_SCHEMA,
-        "schema_version": 1,
+        "schema_version": EXECUTION_DETAIL_SCHEMA_VERSION,
         "ok": result.accepted,
         "disposition": result.disposition.value,
         "card_id": result.card_id,
@@ -1524,12 +1525,16 @@ def _execution_detail_document(result: ExecutionCardDetail) -> dict[str, Any]:
         "summary": _queue_projection_text(result.summary, 1_200),
         "work_digest": _queue_projection_text(result.work_digest, 800),
         "deliverables": _queue_projection_records(result.deliverables),
+        "failure_reason": result.failure_reason,
+        "failure_exit_code": result.failure_exit_code,
+        "failure_run_id": result.failure_run_id,
         "refusal": None if result.refusal is None else result.refusal.value,
     }
     if not result.accepted:
         for key in ("workflow_version", "status", "phase", "updated_at",
                     "due_at", "completed_at", "outcome", "summary",
-                    "work_digest", "deliverables"):
+                    "work_digest", "deliverables", "failure_reason",
+                    "failure_exit_code", "failure_run_id"):
             document[key] = None if key != "deliverables" else []
     return document
 
