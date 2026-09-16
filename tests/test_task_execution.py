@@ -1031,52 +1031,67 @@ class TaskExecutionTests(unittest.TestCase):
         replay = self.service.schedule_new(limit=10)
         self.assertEqual((replay.scheduled, replay.remaining), (0, 0))
 
-    def test_schedule_new_prioritizes_email_and_meeting_origins(self):
-        """Communication work fills the planning reserve before issue work."""
-        for task_id, kind in ((2, "issue"), (3, "email"), (4, "meeting")):
+    def test_schedule_new_prioritizes_reviews_then_communication_then_issues(
+        self,
+    ):
+        """Planning reserve follows the three source-priority tiers."""
+        for task_id, kind in (
+            (2, "issue"),
+            (3, "email"),
+            (4, "meeting"),
+            (5, "review_request"),
+        ):
             self._add_task(task_id, f"Synthetic task {task_id}")
             self._bind_origin(task_id, kind)
 
         service = TaskExecutionService(
             self.database,
             clock=self.clock,
-            planning_grants=["email", "issue", "meeting"],
-            plan_ready_cap=2,
+            planning_grants=["email", "issue", "meeting", "review_request"],
+            plan_ready_cap=3,
             profile_registry=self.service._profile_registry,
         )
 
         result = service.schedule_new(limit=10)
 
-        self.assertEqual((result.scheduled, result.remaining), (3, 1))
+        self.assertEqual((result.scheduled, result.remaining), (4, 1))
         self.assertEqual(service.get(3).status, WorkflowStatus.QUEUED)
         self.assertEqual(service.get(4).status, WorkflowStatus.QUEUED)
+        self.assertEqual(service.get(5).status, WorkflowStatus.QUEUED)
         self.assertIsNone(service.get(2))
 
-    def test_claim_prioritizes_communication_over_a_raised_issue(self):
-        """Source priority is stronger than an issue's explicit queue raise."""
+    def test_claim_prioritizes_reviews_then_communication_over_a_raised_issue(
+        self,
+    ):
+        """Source tiers are stronger than an issue's explicit queue raise."""
         self._add_task(2, "Synthetic issue task")
         self._add_task(3, "Synthetic email task")
+        self._add_task(4, "Synthetic meeting task")
+        self._add_task(5, "Synthetic review task")
         self._bind_origin(2, "issue")
         self._bind_origin(3, "email")
+        self._bind_origin(4, "meeting")
+        self._bind_origin(5, "review_request")
         service = TaskExecutionService(
             self.database,
             clock=self.clock,
             token_factory=lambda: TOKEN,
-            execution_slot_cap=1,
+            execution_slot_cap=4,
             profile_registry=self.service._profile_registry,
         )
-        issue = service.schedule(2, expected_task_version=1)
-        issue = service.start_action(
-            2, expected_version=issue.version, action="start"
+        started = {}
+        for task_id in (2, 3, 4, 5):
+            workflow = service.schedule(task_id, expected_task_version=1)
+            started[task_id] = service.start_action(
+                task_id, expected_version=workflow.version, action="start"
+            )
+        service.set_priority(
+            2, expected_version=started[2].version, action="raise"
         )
-        email = service.schedule(3, expected_task_version=1)
-        service.start_action(3, expected_version=email.version, action="start")
-        service.set_priority(2, expected_version=issue.version, action="raise")
 
-        claim = service.claim_next()
+        claims = [service.claim_next() for _ in range(4)]
 
-        self.assertIsNotNone(claim)
-        self.assertEqual(claim.task_id, 3)
+        self.assertEqual([claim.task_id for claim in claims], [5, 3, 4, 2])
 
     def test_new_work_and_reader_waiting_have_separate_gw_caps(self):
         with closing(sqlite3.connect(self.database)) as connection:

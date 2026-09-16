@@ -54,6 +54,15 @@ SOURCE_KIND_PROFILES = {
     "review_request": "sigint",
 }
 
+#: Source ordering is stronger than a reader's bounded queue preference.
+#: Pull-request reviews lead the queue, repository issues trail it, and
+#: communication plus every other non-issue source remain in the middle tier.
+_SOURCE_QUEUE_ORDER_SQL = (
+    "CASE origin_kind "
+    "WHEN 'review_request' THEN 0 "
+    "WHEN 'issue' THEN 2 ELSE 1 END,"
+)
+
 DEFAULT_LEASE_SECONDS = 300
 MIN_LEASE_SECONDS = 5
 MAX_LEASE_SECONDS = 3_600
@@ -470,8 +479,7 @@ class TaskExecutionService:
                     " WHERE blocked.task_id=t.id AND blocked.relation='accepted' "
                     " AND l.state='withdrawn' "
                     " AND l.resolution='preserved_open'"
-                    ") ORDER BY CASE origin_kind "
-                    "WHEN 'email' THEN 0 WHEN 'meeting' THEN 0 ELSE 1 END,"
+                    f") ORDER BY {_SOURCE_QUEUE_ORDER_SQL}"
                     "w.task_id"
                 ).fetchall()
                 for row in waiting_rows:
@@ -521,8 +529,7 @@ class TaskExecutionService:
                     " ON l.candidate_id=blocked.candidate_id "
                     " WHERE blocked.task_id=t.id AND blocked.relation='accepted' "
                     " AND l.state='withdrawn' AND l.resolution='preserved_open'"
-                    ") ORDER BY CASE origin_kind "
-                    "WHEN 'email' THEN 0 WHEN 'meeting' THEN 0 ELSE 1 END,"
+                    f") ORDER BY {_SOURCE_QUEUE_ORDER_SQL}"
                     "t.id"
                 )
                 scheduled = 0
@@ -836,8 +843,7 @@ class TaskExecutionService:
                     "AND (w.next_attempt_at IS NULL OR w.next_attempt_at<=?) "
                     f"AND w.phase IN ({placeholders}) "
                     "AND t.status='open' AND t.version=w.task_version "
-                    "ORDER BY CASE origin_kind "
-                    "WHEN 'email' THEN 0 WHEN 'meeting' THEN 0 ELSE 1 END,"
+                    f"ORDER BY {_SOURCE_QUEUE_ORDER_SQL}"
                     "CASE w.queue_priority "
                     "WHEN 'raised' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END,"
                     "CASE WHEN w.failure_count=0 THEN 0 ELSE 1 END,"
