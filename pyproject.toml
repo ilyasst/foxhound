@@ -20,6 +20,7 @@ foxhound-native-intake = "foxhound.native_intake:main"
 foxhound-scheduler-cutover = "foxhound.scheduler_cutover:main"
 foxhound-agent-profiles = "foxhound.agent_profiles:main"
 foxhound-agent-profile-store = "foxhound.profile_store:main"
+foxhound-deployment-config = "foxhound.deployment_config:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
