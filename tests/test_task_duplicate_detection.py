@@ -72,10 +72,10 @@ class CrossSourceDetectionTests(unittest.TestCase):
         self.assertEqual((proposal.left_task_id, proposal.right_task_id), (1, 2))
         self.assertIn("email and meeting", proposal.basis)
 
-    def test_same_source_and_different_owner_pairs_are_not_signalled(self):
+    def test_same_source_pairs_are_not_signalled(self):
         self._task(1, kind="email", text="Prepare the synthetic checklist")
         self._task(2, kind="email", text="Draft the synthetic checklist")
-        self._task(3, kind="meeting", text="Draft the synthetic checklist",
+        self._task(3, kind="email", text="Draft the synthetic checklist",
                    owner="B")
         result = detection.scan(self.connection, now=NOW)
         self.assertEqual(result.pairs_considered, 0)
@@ -87,6 +87,13 @@ class CrossSourceDetectionTests(unittest.TestCase):
         result = detection.scan(self.connection, now=NOW)
         self.assertEqual((result.pairs_considered, result.pairs_signalled), (1, 0))
         self.assertIsNone(proposals.next_open(self.connection))
+
+    def test_cross_source_overlap_without_a_shared_owner_is_reviewable(self):
+        self._task(1, kind="email", text="Prepare the synthetic rollout checklist")
+        self._task(2, kind="meeting", text="Draft the synthetic rollout checklist",
+                   owner="B")
+        result = detection.scan(self.connection, now=NOW)
+        self.assertEqual((result.pairs_signalled, result.proposals_recorded), (1, 1))
 
     def test_recently_closed_task_is_compared_with_a_new_open_task(self):
         self._task(
