@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from foxhound import migrate_database
+
 import json
 import sqlite3
 import tempfile
@@ -134,7 +136,7 @@ class TaskExecutionTests(unittest.TestCase):
         self.root.chmod(0o700)
         self.database = self.root / "foxhound.sqlite3"
         self.clock = MutableClock()
-        CandidateInbox(self.database, clock=self.clock).initialize()
+        migrate_database(self.database)
         with closing(sqlite3.connect(self.database)) as connection:
             connection.execute(
                 "INSERT INTO tasks(id,status,text,owner,due,version,"
@@ -312,7 +314,7 @@ class TaskExecutionTests(unittest.TestCase):
             connection.execute("PRAGMA user_version = 7")
             connection.commit()
 
-        CandidateInbox(self.database, clock=self.clock).initialize()
+        migrate_database(self.database)
 
         with closing(sqlite3.connect(self.database)) as connection:
             self.assertEqual(
@@ -364,7 +366,7 @@ class TaskExecutionTests(unittest.TestCase):
             connection.execute("PRAGMA user_version = 11")
             connection.commit()
 
-        CandidateInbox(self.database, clock=self.clock).initialize()
+        migrate_database(self.database)
 
         after = self.service.get(1)
         # The point is that a version-11 database arrives at the current

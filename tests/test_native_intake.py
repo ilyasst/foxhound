@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from foxhound import migrate_database
+
 import copy
 import hashlib
 import json
@@ -312,7 +314,7 @@ class NativeCandidateIntakeTests(unittest.TestCase):
         self.root.chmod(0o700)
         self.database = self.root / "foxhound.sqlite3"
         self.inbox = CandidateInbox(self.database, clock=lambda: NOW)
-        self.inbox.initialize()
+        migrate_database(self.database)
         self.database.chmod(0o600)
         self.ledger = TaskLedger(self.database, clock=lambda: NOW)
 
@@ -470,7 +472,7 @@ class NativeCandidateIntakeTests(unittest.TestCase):
             )
             connection.execute("PRAGMA user_version = 15")
 
-        CandidateInbox(self.database, clock=lambda: NOW).initialize()
+        migrate_database(self.database)
 
         with closing(sqlite3.connect(self.database)) as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]

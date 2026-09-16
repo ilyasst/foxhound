@@ -376,9 +376,6 @@ class TaskExecutionService:
                 return profile
         return self._default_profile
 
-    def initialize(self) -> None:
-        CandidateInbox(self.database_path, clock=self._clock).initialize()
-
     def schedule_new(self, *, limit: int = 100) -> ExecutionScheduleResult:
         """Queue granted planning and create bounded new workflows.
 

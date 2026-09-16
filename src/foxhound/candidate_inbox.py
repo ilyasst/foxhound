@@ -2455,8 +2455,8 @@ class CandidateInbox:
         self.database_path = Path(database_path)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
-    def initialize(self) -> None:
-        """Create or verify the inbox schema without touching parent paths."""
+    def _migrate(self) -> None:
+        """Create or upgrade the inbox schema for the database command only."""
         self._prepare_database_file()
         with closing(self._connect()) as connection:
             version = self._schema_version(connection)

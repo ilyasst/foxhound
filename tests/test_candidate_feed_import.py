@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from foxhound import migrate_database
+
 import copy
 import fcntl
 import hashlib
@@ -94,6 +96,7 @@ class CandidateFeedShadowImportTests(unittest.TestCase):
         self.write_page(first)
         self.write_page(second)
         before = self._outbox_state()
+        migrate_database(self.database)
 
         result = self.import_once()
 
@@ -111,6 +114,7 @@ class CandidateFeedShadowImportTests(unittest.TestCase):
         first, second = split_pages()
         self.write_page(first)
         self.write_page(second)
+        migrate_database(self.database)
         self.import_once()
         inbox = CandidateInbox(self.database)
         before = (inbox.count(), inbox.feed_cursor("gw", "primary"))
@@ -127,6 +131,7 @@ class CandidateFeedShadowImportTests(unittest.TestCase):
     def test_new_revision_updates_the_same_candidate(self):
         first, _ = split_pages()
         first_path = self.write_page(first)
+        migrate_database(self.database)
         self.import_once()
         revised = copy.deepcopy(first)
         revised["from_cursor"] = 1
@@ -152,6 +157,15 @@ class CandidateFeedShadowImportTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
                 CandidateFeedImportError, "not contiguous"):
+            self.import_once()
+
+        self.assertFalse(self.database.exists())
+
+    def test_valid_ledger_requires_a_pre_migrated_database(self):
+        first, _ = split_pages()
+        self.write_page(first)
+
+        with self.assertRaisesRegex(CandidateFeedImportError, "inbox"):
             self.import_once()
 
         self.assertFalse(self.database.exists())
@@ -296,7 +310,7 @@ class CandidateFeedShadowImportTests(unittest.TestCase):
     def test_database_refusal_preserves_only_the_committed_prefix(self):
         meeting = fixture("meeting-candidate-v1.json")
         inbox = CandidateInbox(self.database)
-        inbox.initialize()
+        migrate_database(inbox.database_path)
         self.assertTrue(inbox.import_document(meeting).accepted)
 
         base = fixture()
@@ -335,6 +349,7 @@ class CandidateFeedShadowImportTests(unittest.TestCase):
     def test_cli_outputs_only_aggregate_status_and_generic_failure(self):
         first, _ = split_pages()
         self.write_page(first)
+        migrate_database(self.database)
         environment = os.environ.copy()
         environment["PYTHONPATH"] = str(SOURCE_ROOT)
         environment["PYTHONDONTWRITEBYTECODE"] = "1"

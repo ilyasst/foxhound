@@ -23,6 +23,22 @@ selected SQLite database. It does not create active tasks or connect to a
 producer. Applications must keep that database in private host-local state,
 outside a repository checkout.
 
+Database creation and schema upgrades are explicit deployment operations. Run
+them only after stopping or draining every Foxhound process that uses the
+database:
+
+```sh
+foxhound-database inspect \
+  --database /srv/example/private-foxhound-state/foxhound.sqlite3
+foxhound-database migrate \
+  --database /srv/example/private-foxhound-state/foxhound.sqlite3
+```
+
+`inspect` never creates or changes the database. `migrate` is the only
+Foxhound command that may create or upgrade it. Importers, schedulers, runners,
+and card services require an already-compatible database and fail rather than
+changing it during normal operation.
+
 An ordered feed page carries a bounded, contiguous producer cursor range. The
 inbox atomically stores every candidate in the page, a replay receipt, and the
 new cursor. Exact page retries are accepted; gaps, overlaps, altered retries,

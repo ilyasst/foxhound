@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from foxhound import migrate_database
+
 import copy
 import hashlib
 import json
@@ -159,7 +161,7 @@ class TaskCardTests(unittest.TestCase):
         self.database = Path(self.temporary.name) / "foxhound.sqlite3"
         self.clock = Clock()
         inbox = CandidateInbox(self.database, clock=self.clock)
-        inbox.initialize()
+        migrate_database(inbox.database_path)
         items = [candidate(index) for index in range(1, 5)]
         for item in items:
             self.assertTrue(inbox.import_document(item).accepted)
@@ -285,7 +287,7 @@ class TaskCardTests(unittest.TestCase):
             connection.execute("DROP TABLE task_review_cards")
             connection.execute("PRAGMA user_version = 6")
 
-        CandidateInbox(self.database, clock=self.clock).initialize()
+        migrate_database(self.database)
 
         with closing(sqlite3.connect(self.database)) as connection:
             self.assertEqual(connection.execute(
@@ -311,7 +313,7 @@ class TaskCardTests(unittest.TestCase):
             connection.execute("PRAGMA user_version = 25")
             connection.commit()
 
-        CandidateInbox(self.database, clock=self.clock).initialize()
+        migrate_database(self.database)
 
         with closing(sqlite3.connect(self.database)) as connection:
             self.assertEqual(

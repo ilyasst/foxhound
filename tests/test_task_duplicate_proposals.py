@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from foxhound import migrate_database
+
 import sqlite3
 import tempfile
 import unittest
@@ -22,7 +24,7 @@ class DuplicateProposalTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.database = Path(self.directory.name) / "foxhound.sqlite3"
-        CandidateInbox(self.database).initialize()
+        migrate_database(self.database)
         self.connection = sqlite3.connect(self.database)
         self.connection.row_factory = sqlite3.Row
         self.addCleanup(self.connection.close)
@@ -221,7 +223,7 @@ class DuplicateProposalTests(unittest.TestCase):
             connection.execute("DROP TABLE task_duplicate_proposals")
             connection.execute("PRAGMA user_version = 26")
             connection.commit()
-        CandidateInbox(self.database).initialize()
+        migrate_database(self.database)
         with closing(sqlite3.connect(self.database)) as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
             rows = connection.execute(

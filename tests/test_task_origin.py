@@ -7,6 +7,8 @@ identifiers only.
 """
 from __future__ import annotations
 
+from foxhound import migrate_database
+
 import json
 import sqlite3
 import tempfile
@@ -40,7 +42,7 @@ class TaskOriginRead(unittest.TestCase):
         self.addCleanup(self._dir.cleanup)
         self.db = Path(self._dir.name) / "foxhound.sqlite3"
         ledger = TaskLedger(self.db)
-        ledger.initialize()
+        migrate_database(self.database)
         self.ledger = ledger
 
     def _bind(self, task_id: int, candidate: dict, relation: str = "accepted",
