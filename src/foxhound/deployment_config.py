@@ -36,7 +36,7 @@ from .task_execution import TaskExecutionService
 
 
 DEPLOYMENT_SCHEMA = "foxhound.deployment-config"
-DEPLOYMENT_SCHEMA_VERSION = 4
+DEPLOYMENT_SCHEMA_VERSION = 5
 MAX_CONFIG_BYTES = 64 * 1024
 
 
@@ -182,6 +182,7 @@ class DatabaseConsumersConfig:
     execution_card_requeue: int | None
     lifecycle_outcome_export: tuple[Path, str, int] | None
     fused_task_titles: str | None
+    duplicate_card_schedule: int | None
 
     def argv(self, component: str, database: Path) -> list[str]:
         if component == "candidate-feed-import":
@@ -231,6 +232,14 @@ class DatabaseConsumersConfig:
                 "foxhound-fused-task-titles",
                 "--database", str(database),
                 "--endpoint", self.fused_task_titles,
+            ]
+        if component == "duplicate-card-schedule":
+            if self.duplicate_card_schedule is None:
+                raise DeploymentConfigError("database consumer is disabled")
+            return [
+                "foxhound-task-duplicate-card-schedule",
+                "--database", str(database),
+                "--limit", str(self.duplicate_card_schedule),
             ]
         raise DeploymentConfigError("deployment component is unknown")
 
@@ -364,7 +373,7 @@ def _parse_document(document: object) -> DeploymentConfig:
     version = document.get("schema_version")
     if (
         document.get("schema") != DEPLOYMENT_SCHEMA
-        or version not in {1, 2, 3, DEPLOYMENT_SCHEMA_VERSION}
+        or version not in {1, 2, 3, 4, DEPLOYMENT_SCHEMA_VERSION}
         or isinstance(version, bool)
     ):
         raise DeploymentConfigError("deployment configuration version is invalid")
@@ -535,6 +544,8 @@ def _parse_database_consumers(
     }
     if version >= 4:
         fields.add("fused_task_titles")
+    if version >= 5:
+        fields.add("duplicate_card_schedule")
     document = _object(value, fields)
     candidate = _parse_candidate_feed_import(document["candidate_feed_import"])
     intake = _parse_native_intake_run(document["native_intake_run"])
@@ -544,7 +555,13 @@ def _parse_database_consumers(
         _parse_fused_task_titles(document["fused_task_titles"])
         if version >= 4 else None
     )
-    return DatabaseConsumersConfig(candidate, intake, requeue, lifecycle, titles)
+    duplicates = (
+        _parse_duplicate_card_schedule(document["duplicate_card_schedule"])
+        if version >= 5 else None
+    )
+    return DatabaseConsumersConfig(
+        candidate, intake, requeue, lifecycle, titles, duplicates,
+    )
 
 
 def _enabled_document(
@@ -625,6 +642,11 @@ def _parse_fused_task_titles(value: object) -> str | None:
     if not valid:
         raise DeploymentConfigError("database consumer configuration is invalid")
     return endpoint.rstrip("/")
+
+
+def _parse_duplicate_card_schedule(value: object) -> int | None:
+    document = _enabled_document(value, {"limit"})
+    return None if document is None else _positive_int(document["limit"])
 
 
 def _object(value: object, fields: set[str]) -> Mapping[str, object]:
