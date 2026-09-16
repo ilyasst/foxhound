@@ -20,7 +20,11 @@ from foxhound.deployment_config import (
 )
 from foxhound.execution_runner import _parser as runner_parser
 from foxhound.execution_schedule import _parser as schedule_parser
+from foxhound.candidate_feed_import import _parser as candidate_import_parser
+from foxhound.execution_card_requeue import _parser as requeue_parser
+from foxhound.native_intake import _parser as native_intake_parser
 from foxhound import task_card_server
+from foxhound.task_lifecycle_outcome_export import _parser as lifecycle_export_parser
 
 
 LOOPBACK = socket.inet_ntoa(bytes.fromhex("7f000001"))
@@ -49,7 +53,7 @@ class DeploymentConfigTests(unittest.TestCase):
     def _document(self) -> dict[str, object]:
         return {
             "schema": "foxhound.deployment-config",
-            "schema_version": 2,
+            "schema_version": 3,
             "database": str(self.database),
             "agent_profile_directory": None,
             "card_service": {
@@ -71,7 +75,7 @@ class DeploymentConfigTests(unittest.TestCase):
                 "plan_ready_cap": 10,
                 "awaiting_reader_cap": 20,
             },
-            "execution_runner": {
+            "execution_runners": [{
                 "enabled": True,
                 "run_root": str(self.root / "runs"),
                 "gw_endpoint": f"http://{LOOPBACK}:8787",
@@ -83,6 +87,38 @@ class DeploymentConfigTests(unittest.TestCase):
                 "knowledge_root": None,
                 "task_work_root": None,
                 "task_kb_root": None,
+            }, {
+                "enabled": True,
+                "run_root": str(self.root / "runs-secondary"),
+                "gw_endpoint": f"http://{LOOPBACK}:8787",
+                "gw_alias": "example-operator",
+                "gw_token_file": str(self.gateway_token),
+                "agent_command": "hermes",
+                "worker_command": "foxhound-task-worker",
+                "runner_slot": "secondary",
+                "knowledge_root": None,
+                "task_work_root": None,
+                "task_kb_root": None,
+            }],
+            "database_consumers": {
+                "candidate_feed_import": {
+                    "enabled": True,
+                    "outbox": str(self.root / "candidate-outbox"),
+                    "stream_id": "example-candidates",
+                },
+                "native_intake_run": {
+                    "enabled": True,
+                    "producer": "gw",
+                    "stream_id": "example-native",
+                    "limit": 100,
+                },
+                "execution_card_requeue": {"enabled": True, "limit": 100},
+                "lifecycle_outcome_export": {
+                    "enabled": True,
+                    "outbox": str(self.root / "lifecycle-outbox"),
+                    "stream_id": "example-lifecycle",
+                    "max_page_items": 100,
+                },
             },
         }
 
@@ -103,14 +139,39 @@ class DeploymentConfigTests(unittest.TestCase):
         schedule = config.argv("execution-schedule")
         self.assertEqual(schedule[0], "foxhound-execution-schedule")
         self.assertNotIn("--execution-slot-cap", schedule)
-        runner = config.argv("execution-runner")
+        runner = config.argv("execution-runner:primary")
         self.assertEqual(runner[0], "foxhound-execution-runner")
         self.assertIn("--execution-slot-cap", runner)
         self.assertIn("--plan-without-asking", runner)
+        self.assertEqual(
+            config.argv("candidate-feed-import")[0],
+            "foxhound-candidate-feed-import",
+        )
+        self.assertEqual(
+            config.argv("native-intake-run")[0], "foxhound-native-intake"
+        )
+        self.assertEqual(
+            config.argv("execution-card-requeue")[0],
+            "foxhound-execution-card-requeue",
+        )
+        self.assertEqual(
+            config.argv("lifecycle-outcome-export")[0],
+            "foxhound-task-lifecycle-outcome-export",
+        )
+        for component in (
+            "candidate-feed-import", "native-intake-run",
+            "execution-card-requeue", "lifecycle-outcome-export",
+        ):
+            command = config.argv(component)
+            self.assertEqual(
+                command[command.index("--database") + 1], str(self.database)
+            )
 
     def test_version_one_configuration_remains_valid_without_card_gw_settings(self) -> None:
         document = self._document()
         document["schema_version"] = 1
+        document["execution_runner"] = document.pop("execution_runners")[0]
+        document.pop("database_consumers")
         for key in ("gw_endpoint", "gw_alias", "gw_token_file"):
             del document["card_service"][key]  # type: ignore[index]
         self._write_config(document)
@@ -118,6 +179,19 @@ class DeploymentConfigTests(unittest.TestCase):
         config = load_deployment_config(self.config_path)
 
         self.assertNotIn("--gw-endpoint", config.argv("task-cards"))
+
+    def test_version_two_configuration_remains_valid(self) -> None:
+        document = self._document()
+        document["schema_version"] = 2
+        document["execution_runner"] = document.pop("execution_runners")[0]
+        document.pop("database_consumers")
+        self._write_config(document)
+
+        config = load_deployment_config(self.config_path)
+
+        self.assertEqual(
+            config.argv("execution-runner")[0], "foxhound-execution-runner"
+        )
 
     def test_partial_card_gw_settings_are_rejected(self) -> None:
         document = self._document()
@@ -139,7 +213,43 @@ class DeploymentConfigTests(unittest.TestCase):
             self.assertEqual(task_card_server.main(cards[1:]), 0)
         serve.assert_called_once()
         schedule_parser().parse_args(config.argv("execution-schedule")[1:])
-        runner_parser().parse_args(config.argv("execution-runner")[1:])
+        runner_parser().parse_args(config.argv("execution-runner:primary")[1:])
+        candidate_import_parser().parse_args(
+            config.argv("candidate-feed-import")[1:]
+        )
+        native_intake_parser().parse_args(config.argv("native-intake-run")[1:])
+        requeue_parser().parse_args(config.argv("execution-card-requeue")[1:])
+        lifecycle_export_parser().parse_args(
+            config.argv("lifecycle-outcome-export")[1:]
+        )
+
+    def test_rejects_duplicate_runner_slots(self) -> None:
+        document = self._document()
+        document["execution_runners"][1]["runner_slot"] = "primary"  # type: ignore[index]
+        self._write_config(document)
+
+        with self.assertRaises(DeploymentConfigError):
+            load_deployment_config(self.config_path)
+
+    def test_requires_complete_enabled_database_consumers(self) -> None:
+        document = self._document()
+        del document["database_consumers"]["native_intake_run"]["limit"]  # type: ignore[index]
+        self._write_config(document)
+
+        with self.assertRaises(DeploymentConfigError):
+            load_deployment_config(self.config_path)
+
+    def test_does_not_render_a_disabled_database_consumer(self) -> None:
+        document = self._document()
+        document["database_consumers"]["execution_card_requeue"] = {  # type: ignore[index]
+            "enabled": False
+        }
+        self._write_config(document)
+
+        config = load_deployment_config(self.config_path)
+
+        with self.assertRaises(DeploymentConfigError):
+            config.argv("execution-card-requeue")
 
     def test_execution_delivery_requires_the_drip_role(self) -> None:
         document = self._document()

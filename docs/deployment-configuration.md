@@ -6,15 +6,16 @@ make it owner-only (`0600`), and do not commit it, paste it into issues, or
 send its rendered command lines to logs. It contains paths but never token
 values.
 
-The first version covers the task-card service, one execution scheduler, and
-one execution runner. It is intentionally strict: every field below is
-required when that component is enabled, unknown fields are rejected, and all
-paths are absolute.
+Version 3 covers every enabled component that reads or writes the shared
+database: the task-card service, scheduler, one or more runners, feed import,
+native intake, execution-card requeue, and lifecycle-outcome export. It is
+intentionally strict: every field below is required when that component is
+enabled, unknown fields are rejected, and all paths are absolute.
 
 ```json
 {
   "schema": "foxhound.deployment-config",
-  "schema_version": 2,
+  "schema_version": 3,
   "database": "/srv/example/private-foxhound-state/foxhound.sqlite3",
   "agent_profile_directory": null,
   "card_service": {
@@ -40,7 +41,7 @@ paths are absolute.
     "plan_ready_cap": 10,
     "awaiting_reader_cap": 20
   },
-  "execution_runner": {
+  "execution_runners": [{
     "enabled": true,
     "run_root": "/srv/example/private-foxhound-runs",
     "gw_endpoint": "http://<canonical IPv4 loopback address>:8787",
@@ -52,6 +53,29 @@ paths are absolute.
     "knowledge_root": null,
     "task_work_root": null,
     "task_kb_root": null
+  }],
+  "database_consumers": {
+    "candidate_feed_import": {
+      "enabled": true,
+      "outbox": "/srv/example/private-foxhound-state/candidate-outbox",
+      "stream_id": "example-candidates"
+    },
+    "native_intake_run": {
+      "enabled": true,
+      "producer": "gw",
+      "stream_id": "example-native",
+      "limit": 100
+    },
+    "execution_card_requeue": {
+      "enabled": true,
+      "limit": 100
+    },
+    "lifecycle_outcome_export": {
+      "enabled": true,
+      "outbox": "/srv/example/private-foxhound-state/lifecycle-outbox",
+      "stream_id": "example-lifecycle",
+      "max_page_items": 100
+    }
   }
 }
 ```
@@ -59,9 +83,12 @@ paths are absolute.
 The two loopback placeholders in this public example must be replaced with
 the canonical IPv4 loopback address before private validation.
 
-Set a disabled `card_service` or `execution_runner` to exactly
-`{"enabled": false}`. The workflow section remains required because it owns
-the shared policy and limits.
+Set a disabled `card_service`, runner, or database consumer to exactly
+`{"enabled": false}`. The `execution_runners` list permits each running slot
+to be declared separately; enabled slots must have distinct names. The
+workflow section remains required because it owns the shared policy and
+limits. Versions 1 and 2 remain readable for a controlled transition, but
+only version 3 can declare the complete deployment boundary.
 
 Validate before changing a service definition or restarting anything:
 
@@ -86,7 +113,9 @@ foxhound-deployment-config \
   render --component task-cards
 ```
 
-Supported names are `task-cards`, `execution-schedule`, and
-`execution-runner`. Rendering reads no token contents. Its JSON output does
-contain private paths, so consume it only in the private deployment mechanism,
-never in a repository, issue, or shared log.
+Supported names are `task-cards`, `execution-schedule`,
+`execution-runner:<slot>`, `candidate-feed-import`, `native-intake-run`,
+`execution-card-requeue`, and `lifecycle-outcome-export`. Use the configured
+slot name when rendering a runner. Rendering reads no token contents. Its JSON
+output does contain private paths, so consume it only in the private deployment
+mechanism, never in a repository, issue, or shared log.
