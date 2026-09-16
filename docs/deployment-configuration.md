@@ -1,5 +1,11 @@
 # Private deployment configuration
 
+Deployed code and deployed configuration are separate concerns with the same
+discipline.  Units import a pinned release checkout, never a development tree;
+see [ADR 0043](architecture/0043-pinned-release-checkout.md) for what a deploy
+consists of and which units must be restarted.  The configuration file below is
+private host state and lives outside any checkout.
+
 `foxhound-deployment-config` makes the settings that belong to one deployment
 explicit. The JSON file is private host state: keep it outside the checkout,
 make it owner-only (`0600`), and do not commit it, paste it into issues, or
