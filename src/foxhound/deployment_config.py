@@ -35,7 +35,7 @@ from .task_execution import TaskExecutionService
 
 
 DEPLOYMENT_SCHEMA = "foxhound.deployment-config"
-DEPLOYMENT_SCHEMA_VERSION = 2
+DEPLOYMENT_SCHEMA_VERSION = 3
 MAX_CONFIG_BYTES = 64 * 1024
 
 
@@ -173,12 +173,66 @@ class ExecutionRunnerDeploymentConfig:
 
 
 @dataclass(frozen=True)
+class DatabaseConsumersConfig:
+    """One-shot database consumers that must share the selected database."""
+
+    candidate_feed_import: tuple[Path, str] | None
+    native_intake_run: tuple[str, str, int] | None
+    execution_card_requeue: int | None
+    lifecycle_outcome_export: tuple[Path, str, int] | None
+
+    def argv(self, component: str, database: Path) -> list[str]:
+        if component == "candidate-feed-import":
+            if self.candidate_feed_import is None:
+                raise DeploymentConfigError("database consumer is disabled")
+            outbox, stream_id = self.candidate_feed_import
+            return [
+                "foxhound-candidate-feed-import",
+                "--database", str(database),
+                "--outbox", str(outbox),
+                "--stream-id", stream_id,
+            ]
+        if component == "native-intake-run":
+            if self.native_intake_run is None:
+                raise DeploymentConfigError("database consumer is disabled")
+            producer, stream_id, limit = self.native_intake_run
+            return [
+                "foxhound-native-intake", "run",
+                "--database", str(database),
+                "--producer", producer,
+                "--stream-id", stream_id,
+                "--limit", str(limit),
+            ]
+        if component == "execution-card-requeue":
+            if self.execution_card_requeue is None:
+                raise DeploymentConfigError("database consumer is disabled")
+            return [
+                "foxhound-execution-card-requeue",
+                "--database", str(database),
+                "--limit", str(self.execution_card_requeue),
+            ]
+        if component == "lifecycle-outcome-export":
+            if self.lifecycle_outcome_export is None:
+                raise DeploymentConfigError("database consumer is disabled")
+            outbox, stream_id, max_page_items = self.lifecycle_outcome_export
+            return [
+                "foxhound-task-lifecycle-outcome-export",
+                "--database", str(database),
+                "--outbox", str(outbox),
+                "--stream-id", stream_id,
+                "--max-page-items", str(max_page_items),
+            ]
+        raise DeploymentConfigError("deployment component is unknown")
+
+
+@dataclass(frozen=True)
 class DeploymentConfig:
     database: Path
     agent_profile_directory: Path | None
     card_service: CardServiceConfig
     workflow: WorkflowConfig
-    execution_runner: ExecutionRunnerDeploymentConfig
+    execution_runners: tuple[ExecutionRunnerDeploymentConfig, ...]
+    database_consumers: DatabaseConsumersConfig | None = None
 
     def argv(self, component: str) -> list[str]:
         if component == "task-cards":
@@ -189,10 +243,20 @@ class DeploymentConfig:
             return self.workflow.schedule_argv(
                 self.database, self.agent_profile_directory
             )
-        if component == "execution-runner":
-            return self.execution_runner.argv(
+        if component == "execution-runner" and len(self.execution_runners) == 1:
+            return self.execution_runners[0].argv(
                 self.database, self.agent_profile_directory, self.workflow
             )
+        if component.startswith("execution-runner:"):
+            slot = component.removeprefix("execution-runner:")
+            for runner in self.execution_runners:
+                if runner.runner_slot == slot:
+                    return runner.argv(
+                        self.database, self.agent_profile_directory, self.workflow
+                    )
+            raise DeploymentConfigError("deployment component is unknown")
+        if self.database_consumers is not None:
+            return self.database_consumers.argv(component, self.database)
         raise DeploymentConfigError("deployment component is unknown")
 
 
@@ -267,26 +331,45 @@ def _strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def _parse_document(document: object) -> DeploymentConfig:
-    root = _object(document, {
-        "schema", "schema_version", "database", "agent_profile_directory",
-        "card_service", "workflow", "execution_runner",
-    })
+    if not isinstance(document, Mapping):
+        raise DeploymentConfigError("deployment configuration shape is invalid")
+    version = document.get("schema_version")
     if (
-        root["schema"] != DEPLOYMENT_SCHEMA
-        or root["schema_version"] not in {1, DEPLOYMENT_SCHEMA_VERSION}
-        or isinstance(root["schema_version"], bool)
+        document.get("schema") != DEPLOYMENT_SCHEMA
+        or version not in {1, 2, DEPLOYMENT_SCHEMA_VERSION}
+        or isinstance(version, bool)
     ):
         raise DeploymentConfigError("deployment configuration version is invalid")
+    root = _object(
+        document,
+        {
+            "schema", "schema_version", "database", "agent_profile_directory",
+            "card_service", "workflow", "execution_runners", "database_consumers",
+        }
+        if version == DEPLOYMENT_SCHEMA_VERSION else {
+            "schema", "schema_version", "database", "agent_profile_directory",
+            "card_service", "workflow", "execution_runner",
+        },
+    )
+    runners = (
+        _parse_execution_runners(root["execution_runners"])
+        if version == DEPLOYMENT_SCHEMA_VERSION
+        else (_parse_execution_runner(root["execution_runner"]),)
+    )
     return DeploymentConfig(
         database=_absolute_path(root["database"]),
         agent_profile_directory=_optional_absolute_path(
             root["agent_profile_directory"]
         ),
         card_service=_parse_card_service(
-            root["card_service"], version=int(root["schema_version"])
+            root["card_service"], version=int(version)
         ),
         workflow=_parse_workflow(root["workflow"]),
-        execution_runner=_parse_execution_runner(root["execution_runner"]),
+        execution_runners=runners,
+        database_consumers=(
+            _parse_database_consumers(root["database_consumers"])
+            if version == DEPLOYMENT_SCHEMA_VERSION else None
+        ),
     )
 
 
@@ -402,6 +485,85 @@ def _parse_execution_runner(value: object) -> ExecutionRunnerDeploymentConfig:
     )
 
 
+def _parse_execution_runners(
+    value: object,
+) -> tuple[ExecutionRunnerDeploymentConfig, ...]:
+    if not isinstance(value, list) or not value:
+        raise DeploymentConfigError("execution runner configuration is invalid")
+    runners = tuple(_parse_execution_runner(item) for item in value)
+    slots = [runner.runner_slot for runner in runners if runner.enabled]
+    if len(slots) != len(set(slots)):
+        raise DeploymentConfigError("execution runner configuration is invalid")
+    return runners
+
+
+def _parse_database_consumers(value: object) -> DatabaseConsumersConfig:
+    document = _object(value, {
+        "candidate_feed_import", "native_intake_run", "execution_card_requeue",
+        "lifecycle_outcome_export",
+    })
+    candidate = _parse_candidate_feed_import(document["candidate_feed_import"])
+    intake = _parse_native_intake_run(document["native_intake_run"])
+    requeue = _parse_execution_card_requeue(document["execution_card_requeue"])
+    lifecycle = _parse_lifecycle_outcome_export(document["lifecycle_outcome_export"])
+    return DatabaseConsumersConfig(candidate, intake, requeue, lifecycle)
+
+
+def _enabled_document(
+    value: object, fields: set[str]
+) -> Mapping[str, object] | None:
+    if not isinstance(value, Mapping) or not isinstance(value.get("enabled"), bool):
+        raise DeploymentConfigError("database consumer configuration is invalid")
+    if not value["enabled"]:
+        _object(value, {"enabled"})
+        return None
+    return _object(value, {"enabled", *fields})
+
+
+def _parse_candidate_feed_import(value: object) -> tuple[Path, str] | None:
+    document = _enabled_document(value, {"outbox", "stream_id"})
+    if document is None:
+        return None
+    return (
+        _absolute_path(document["outbox"]),
+        _nonempty_string(document["stream_id"]),
+    )
+
+
+def _parse_native_intake_run(value: object) -> tuple[str, str, int] | None:
+    document = _enabled_document(value, {"producer", "stream_id", "limit"})
+    if document is None:
+        return None
+    return (
+        _nonempty_string(document["producer"]),
+        _nonempty_string(document["stream_id"]),
+        _positive_int(document["limit"]),
+    )
+
+
+def _parse_execution_card_requeue(value: object) -> int | None:
+    document = _enabled_document(value, {"limit"})
+    return None if document is None else _positive_int(document["limit"])
+
+
+def _parse_lifecycle_outcome_export(
+    value: object,
+) -> tuple[Path, str, int] | None:
+    document = _enabled_document(
+        value, {"outbox", "stream_id", "max_page_items"}
+    )
+    if document is None:
+        return None
+    max_page_items = _positive_int(document["max_page_items"])
+    if max_page_items > 500:
+        raise DeploymentConfigError("database consumer configuration is invalid")
+    return (
+        _absolute_path(document["outbox"]),
+        _nonempty_string(document["stream_id"]),
+        max_page_items,
+    )
+
+
 def _object(value: object, fields: set[str]) -> Mapping[str, object]:
     if not isinstance(value, Mapping) or set(value) != fields:
         raise DeploymentConfigError("deployment configuration shape is invalid")
@@ -415,6 +577,18 @@ def _absolute_path(value: object) -> Path:
     if not path.is_absolute():
         raise DeploymentConfigError("deployment path is invalid")
     return path
+
+
+def _nonempty_string(value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise DeploymentConfigError("database consumer configuration is invalid")
+    return value
+
+
+def _positive_int(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise DeploymentConfigError("database consumer configuration is invalid")
+    return value
 
 
 def _optional_absolute_path(value: object) -> Path | None:
@@ -447,37 +621,37 @@ def _validate_runtime(config: DeploymentConfig) -> None:
         plan_ready_cap=config.workflow.plan_ready_cap,
         awaiting_reader_cap=config.workflow.awaiting_reader_cap,
     )
-    runner = config.execution_runner
-    if runner.enabled:
-        assert runner.run_root is not None
-        assert runner.gw_endpoint is not None
-        assert runner.gw_alias is not None
-        assert runner.gw_token_file is not None
-        assert runner.agent_command is not None
-        assert runner.worker_command is not None
-        assert runner.runner_slot is not None
-        load_knowledge_config(
-            runner.gw_endpoint, runner.gw_alias, runner.gw_token_file
-        )
-        ExecutionRunnerConfig(
-            database_path=config.database,
-            run_root=runner.run_root,
-            gw_endpoint=runner.gw_endpoint,
-            gw_alias=runner.gw_alias,
-            gw_token_file=runner.gw_token_file,
-            agent_command=runner.agent_command,
-            profile_registry=registry,
-            default_agent_profile=config.workflow.default_agent_profile,
-            worker_command=runner.worker_command,
-            runner_slot=runner.runner_slot,
-            planning_grants=config.workflow.plan_without_asking,
-            knowledge_root=runner.knowledge_root,
-            task_work_root=runner.task_work_root,
-            task_kb_root=runner.task_kb_root,
-            execution_slot_cap=config.workflow.execution_slot_cap,
-            plan_ready_cap=config.workflow.plan_ready_cap,
-            awaiting_reader_cap=config.workflow.awaiting_reader_cap,
-        )
+    for runner in config.execution_runners:
+        if runner.enabled:
+            assert runner.run_root is not None
+            assert runner.gw_endpoint is not None
+            assert runner.gw_alias is not None
+            assert runner.gw_token_file is not None
+            assert runner.agent_command is not None
+            assert runner.worker_command is not None
+            assert runner.runner_slot is not None
+            load_knowledge_config(
+                runner.gw_endpoint, runner.gw_alias, runner.gw_token_file
+            )
+            ExecutionRunnerConfig(
+                database_path=config.database,
+                run_root=runner.run_root,
+                gw_endpoint=runner.gw_endpoint,
+                gw_alias=runner.gw_alias,
+                gw_token_file=runner.gw_token_file,
+                agent_command=runner.agent_command,
+                profile_registry=registry,
+                default_agent_profile=config.workflow.default_agent_profile,
+                worker_command=runner.worker_command,
+                runner_slot=runner.runner_slot,
+                planning_grants=config.workflow.plan_without_asking,
+                knowledge_root=runner.knowledge_root,
+                task_work_root=runner.task_work_root,
+                task_kb_root=runner.task_kb_root,
+                execution_slot_cap=config.workflow.execution_slot_cap,
+                plan_ready_cap=config.workflow.plan_ready_cap,
+                awaiting_reader_cap=config.workflow.awaiting_reader_cap,
+            )
     cards = config.card_service
     if not cards.enabled:
         return
@@ -524,11 +698,7 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("validate")
     render = commands.add_parser("render")
-    render.add_argument(
-        "--component",
-        choices=("task-cards", "execution-schedule", "execution-runner"),
-        required=True,
-    )
+    render.add_argument("--component", required=True)
     return parser
 
 
