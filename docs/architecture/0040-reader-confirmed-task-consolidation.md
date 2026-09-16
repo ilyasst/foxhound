@@ -28,17 +28,19 @@ deliberate reconciliation; task revisions alone do not trigger a scan.
 ### Eligibility and freshness
 
 A pair is eligible when both tasks are open, or when one newly open task is
-compared with a task closed in the preceding 30 days, and both have the same
-durable, confirmed owner identity and owner scope.  Two unassigned tasks are
-not eligible, nor are provisional, group, or differently scoped owners.  The
-two tasks must have different source kinds.
+compared with a task closed in the preceding 30 days.  The two tasks must have
+different source kinds.  Owner identity raises confidence but does not gate a
+reader-only proposal: confirmed, unresolved, and differently scoped owners
+may all be reviewed, while no detector result can consolidate them itself.
+The detector requires at least two meaningful shared terms covering at least
+60 percent of the shorter task's meaningful-term set, and offers only the
+strongest match for each newly added task.
 
 The proposal records the task versions it compared.  Confirmation is refused
 without a write when either version has changed, the pair no longer has an
-open task and at most one closed task, ownership no longer matches, or an
-execution run is claimed, running, or awaiting a result review.  The caller
-must make or receive a fresh proposal; Foxhound never carries a similarity
-judgement over changed task state.
+open task and at most one closed task, or an execution run is claimed, running,
+or awaiting a result review.  The caller must make or receive a fresh proposal;
+Foxhound never carries a similarity judgement over changed task state.
 
 ### Canonical task and preserved history
 

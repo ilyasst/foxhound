@@ -63,7 +63,8 @@ class DetectionRun:
     proposals_refused: int = 0
 
 
-def scan(connection: sqlite3.Connection, *, now: str) -> DetectionRun:
+def scan(connection: sqlite3.Connection, *, now: str,
+         focus_task_ids: Iterable[int] | None = None) -> DetectionRun:
     """Scan current tasks and record reviewable, cross-source proposals.
 
     The scan is idempotent: the proposal ledger's unordered-pair identity
@@ -72,34 +73,52 @@ def scan(connection: sqlite3.Connection, *, now: str) -> DetectionRun:
     """
     now = _timestamp(now)
     candidates = tuple(_candidates(connection))
+    focus = None if focus_task_ids is None else frozenset(focus_task_ids)
     considered = signalled = recorded = unchanged = refused = 0
+    strongest: dict[int, tuple[float, int, DuplicateCandidate, DuplicateCandidate,
+                               tuple[str, ...]]] = {}
     for index, left in enumerate(candidates):
         for right in candidates[index + 1:]:
+            if focus is not None and left.task_id not in focus and right.task_id not in focus:
+                continue
             if left.source_kind == right.source_kind:
                 continue
             if not _eligible_status_pair(left, right, now=now):
                 continue
-            if not _same_confirmed_owner(left, right):
-                continue
             considered += 1
             shared = _shared_terms(left.task_text, right.task_text)
-            if not shared:
+            shorter = min(len(_terms(left.task_text)), len(_terms(right.task_text)))
+            coverage = 0 if shorter == 0 else len(shared) / shorter
+            if len(shared) < 2 or coverage < 0.6:
                 continue
             signalled += 1
-            result = proposals.propose(
-                connection,
-                task_id_a=left.task_id,
-                task_id_b=right.task_id,
-                basis=_basis(left, right, shared),
-                detector="cross-source-token-recall-v1",
-                now=now,
+            targets = (left, right) if focus is None else tuple(
+                candidate for candidate in (left, right)
+                if candidate.task_id in focus
             )
-            if result.disposition is proposals.ProposalDisposition.RECORDED:
-                recorded += 1
-            elif result.disposition is proposals.ProposalDisposition.UNCHANGED:
-                unchanged += 1
-            else:
-                refused += 1
+            for candidate in targets:
+                score = (coverage, len(shared), left, right, shared)
+                prior = strongest.get(candidate.task_id)
+                if prior is None or score[:2] > prior[:2]:
+                    strongest[candidate.task_id] = score
+    pairs = {(item[2].task_id, item[3].task_id, item[4])
+             for item in strongest.values()}
+    for left_id, right_id, shared in pairs:
+        left = next(candidate for candidate in candidates if candidate.task_id == left_id)
+        right = next(candidate for candidate in candidates if candidate.task_id == right_id)
+        result = proposals.propose(
+                connection,
+                task_id_a=left.task_id, task_id_b=right.task_id,
+                basis=_basis(left, right, shared),
+                detector="cross-source-overlap-review-v1", now=now,
+                allow_unconfirmed_owner=True,
+        )
+        if result.disposition is proposals.ProposalDisposition.RECORDED:
+            recorded += 1
+        elif result.disposition is proposals.ProposalDisposition.UNCHANGED:
+            unchanged += 1
+        else:
+            refused += 1
     return DetectionRun(considered, signalled, recorded, unchanged, refused)
 
 
