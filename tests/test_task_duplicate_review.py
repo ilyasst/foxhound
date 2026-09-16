@@ -6,7 +6,7 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from foxhound import task_duplicate_proposals as proposals
@@ -133,6 +133,37 @@ class DuplicateReviewCardTests(unittest.TestCase):
                 "SELECT status FROM tasks ORDER BY id")],
             [("open",), ("open",)],
         )
+
+    def test_recently_closed_comparison_uses_the_open_task_card(self) -> None:
+        self.connection.execute(
+            "UPDATE tasks SET status='done',closed_at=? WHERE id=1",
+            ((NOW - timedelta(days=1)).isoformat(),),
+        )
+        self.connection.commit()
+
+        self.assertEqual(self.cards.schedule().asked, 1)
+        claim = self.cards.claim_next(consumer_digest=CONSUMER)
+        self.assertIsNotNone(claim)
+        self.assertEqual(claim.card.task_id, 2)
+        self.assertEqual(claim.card.duplicate.other_task_id, 1)
+        text, keyboard = render_task_review_card(claim.card)
+        self.assertIn("recently closed task", text)
+        self.assertEqual(keyboard["inline_keyboard"][0][0]["text"], "✅ Already completed")
+
+        self.assertTrue(self.cards.complete_delivery(
+            claim.card.id, expected_version=claim.card.version,
+            claim_token=claim.token, transport="synthetic",
+            delivery_ref="message-1",
+        ).accepted)
+        result = self.cards.act(
+            claim.card.id, expected_version=claim.card.version,
+            action="duplicate_confirm",
+        )
+        self.assertTrue(result.accepted)
+        relation = self.connection.execute(
+            "SELECT subject_id,object_id FROM task_relations"
+        ).fetchone()
+        self.assertEqual(tuple(relation), (2, 1))
 
     def test_stale_right_task_refuses_confirmation(self) -> None:
         claim = self._deliver()

@@ -20,6 +20,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Callable
 
+from . import task_duplicate_detection
 from .candidate_inbox import CandidateInbox, InboxError, SCHEMA_VERSION
 from .contracts import (
     ContractError,
@@ -823,6 +824,14 @@ class TaskLedger:
                     candidates_unchanged=candidates_unchanged,
                     now=now,
                 )
+                # Intake is the durable task-addition boundary.  Scan the
+                # complete eligible queue only after this batch adds a task,
+                # so it can be compared with every earlier cross-source task
+                # and recently closed work.  The proposal ledger makes
+                # repeated scans idempotent, and the whole change remains one
+                # transaction: a failed scan cannot advance intake alone.
+                if tasks_created:
+                    task_duplicate_detection.scan(connection, now=now)
                 connection.commit()
                 return NativeIntakeResult(
                     NativeIntakeDisposition.APPLIED,

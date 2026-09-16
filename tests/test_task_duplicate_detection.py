@@ -28,16 +28,17 @@ class CrossSourceDetectionTests(unittest.TestCase):
         self.addCleanup(self.connection.close)
 
     def _task(self, task_id: int, *, kind: str, text: str,
-              owner: str = "A") -> None:
+              owner: str = "A", status: str = "open",
+              closed_at: str | None = None) -> None:
         candidate_id = f"candidate-{task_id}"
         revision = f"{task_id:064x}"
         self.connection.execute(
             "INSERT INTO tasks("
-            "id,status,text,version,created_at,updated_at,owner_ref_version,"
+            "id,status,text,version,created_at,updated_at,closed_at,owner_ref_version,"
             "owner_kind,owner_speaker_id,owner_canonical_speaker_id,"
             "owner_speaker_registry_id,owner_pinned,owner_provisional) "
-            "VALUES(?,'open',?,1,?,?,1,'person','SPK_1','SPK_1',?,0,0)",
-            (task_id, text, NOW, NOW, f"registry-{owner}"),
+            "VALUES(?,?,?,1,?,?,?,1,'person','SPK_1','SPK_1',?,0,0)",
+            (task_id, status, text, NOW, NOW, closed_at, f"registry-{owner}"),
         )
         self.connection.execute(
             "INSERT INTO candidate_inbox("
@@ -84,6 +85,24 @@ class CrossSourceDetectionTests(unittest.TestCase):
         result = detection.scan(self.connection, now=NOW)
         self.assertEqual((result.pairs_considered, result.pairs_signalled), (1, 0))
         self.assertIsNone(proposals.next_open(self.connection))
+
+    def test_recently_closed_task_is_compared_with_a_new_open_task(self):
+        self._task(
+            1, kind="email", text="Prepare the synthetic rollout checklist",
+            status="done", closed_at="2030-02-15T12:00:00+00:00",
+        )
+        self._task(2, kind="meeting", text="Draft the synthetic rollout checklist")
+        result = detection.scan(self.connection, now=NOW)
+        self.assertEqual((result.pairs_considered, result.proposals_recorded), (1, 1))
+
+    def test_long_closed_task_is_not_compared(self):
+        self._task(
+            1, kind="email", text="Prepare the synthetic rollout checklist",
+            status="done", closed_at="2030-01-01T12:00:00+00:00",
+        )
+        self._task(2, kind="meeting", text="Draft the synthetic rollout checklist")
+        result = detection.scan(self.connection, now=NOW)
+        self.assertEqual((result.pairs_considered, result.proposals_recorded), (0, 0))
 
     def test_repeat_scan_is_idempotent_and_preserves_reader_rejection(self):
         self._task(1, kind="email", text="Prepare the synthetic checklist")

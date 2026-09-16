@@ -144,6 +144,31 @@ def owner_candidate(
     return item
 
 
+def cross_source_owner_candidate(
+    index: int,
+    *,
+    kind: str,
+    text: str,
+) -> dict:
+    """A confirmed-owner candidate from one synthetic source kind."""
+    item = owner_candidate(index)
+    item["source"]["kind"] = kind
+    item["candidate_id"] = candidate_id_for(
+        system="gw",
+        kind=kind,
+        record_id=item["source"]["record_id"],
+        item_id=item["source"]["item_id"],
+    )
+    item["task"]["text"] = text
+    item["source"]["revision"] = hashlib.sha256(
+        json.dumps(
+            {"source": item["source"], "task": item["task"]},
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    return item
+
+
 def owner_provenance_candidate(index: int) -> dict:
     item = provenance_candidate(index)
     item["schema_version"] = 6
@@ -546,6 +571,76 @@ class NativeCandidateIntakeTests(unittest.TestCase):
         self.assertEqual(task.owner_speaker_registry_id, "registry-alpha")
         self.assertFalse(task.owner_pinned)
         self.assertFalse(task.owner_provisional)
+
+    def test_new_task_scans_the_existing_open_queue_for_duplicates(self):
+        self.activate()
+        first = cross_source_owner_candidate(
+            1, kind="meeting", text="Prepare the synthetic rollout checklist"
+        )
+        self.assertTrue(self.inbox.import_feed(feed(0, first)).accepted)
+        self.assertEqual(self.intake().tasks_created, 1)
+
+        second = cross_source_owner_candidate(
+            2, kind="email", text="Draft the synthetic rollout checklist"
+        )
+        self.assertTrue(self.inbox.import_feed(feed(1, second)).accepted)
+        self.assertEqual(self.intake().tasks_created, 1)
+
+        with closing(sqlite3.connect(self.database)) as connection:
+            proposal = connection.execute(
+                "SELECT left_task_id,right_task_id,state "
+                "FROM task_duplicate_proposals"
+            ).fetchone()
+        self.assertEqual(proposal, (1, 2, "proposed"))
+
+    def test_new_task_scans_a_recently_closed_task_for_duplicates(self):
+        self.activate()
+        closed = cross_source_owner_candidate(
+            1, kind="meeting", text="Prepare the synthetic rollout checklist"
+        )
+        self.assertTrue(self.inbox.import_feed(feed(0, closed)).accepted)
+        self.assertEqual(self.intake().tasks_created, 1)
+        self.assertTrue(
+            self.ledger.transition(1, expected_version=1, action="done").accepted
+        )
+
+        new = cross_source_owner_candidate(
+            2, kind="email", text="Draft the synthetic rollout checklist"
+        )
+        self.assertTrue(self.inbox.import_feed(feed(1, new)).accepted)
+        self.assertEqual(self.intake().tasks_created, 1)
+
+        with closing(sqlite3.connect(self.database)) as connection:
+            proposal = connection.execute(
+                "SELECT left_task_id,right_task_id,state "
+                "FROM task_duplicate_proposals"
+            ).fetchone()
+        self.assertEqual(proposal, (1, 2, "proposed"))
+
+    def test_task_revision_does_not_trigger_duplicate_scan(self):
+        self.activate()
+        first = cross_source_owner_candidate(
+            1, kind="meeting", text="Prepare the rollout checklist"
+        )
+        second = cross_source_owner_candidate(
+            2, kind="email", text="Review the agenda memorandum"
+        )
+        self.assertTrue(self.inbox.import_feed(feed(0, first)).accepted)
+        self.assertEqual(self.intake().tasks_created, 1)
+        self.assertTrue(self.inbox.import_feed(feed(1, second)).accepted)
+        self.assertEqual(self.intake().tasks_created, 1)
+
+        revised = cross_source_owner_candidate(
+            2, kind="email", text="Draft the rollout checklist"
+        )
+        self.assertTrue(self.inbox.import_feed(feed(2, revised)).accepted)
+        self.assertEqual(self.intake().tasks_revised, 1)
+
+        with closing(sqlite3.connect(self.database)) as connection:
+            proposal_count = connection.execute(
+                "SELECT count(*) FROM task_duplicate_proposals"
+            ).fetchone()[0]
+        self.assertEqual(proposal_count, 0)
 
     def test_pinned_owner_survives_a_later_candidate_revision(self):
         self.activate()
