@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from foxhound import migrate_database
+
 import json
 import sqlite3
 import tempfile
@@ -22,7 +24,7 @@ class ExecutionAuditTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.root.chmod(0o700)
         self.database = self.root / "foxhound.sqlite3"
-        CandidateInbox(self.database).initialize()
+        migrate_database(self.database)
         self.database.chmod(0o600)
 
     def _insert_result(

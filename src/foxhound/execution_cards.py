@@ -414,9 +414,6 @@ class ExecutionCardService:
             _normalized_owner(alias) for alias in aliases
         )
 
-    def initialize(self) -> None:
-        CandidateInbox(self.database_path, clock=self._clock).initialize()
-
     def schedule(self, *, limit: int = 100) -> ExecutionCardScheduleResult:
         if not _valid_limit(limit):
             return ExecutionCardScheduleResult(

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from foxhound import migrate_database
+
 import copy
 import json
 import sqlite3
@@ -50,7 +52,7 @@ class CandidateFeedInboxTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.database = Path(self.temporary.name) / "candidate-inbox.sqlite3"
         self.inbox = CandidateInbox(self.database, clock=lambda: NOW)
-        self.inbox.initialize()
+        migrate_database(self.database)
 
     def test_page_applies_candidates_receipt_and_cursor(self):
         result = self.inbox.import_feed(fixture())
@@ -196,7 +198,7 @@ class CandidateFeedInboxTests(unittest.TestCase):
         feed_path = FIXTURES / "candidate-feed-page-v1.json"
         script = (
             "from foxhound import CandidateInbox; import json,sys; "
-            "inbox=CandidateInbox(sys.argv[1]); inbox.initialize(); "
+            "inbox=CandidateInbox(sys.argv[1]); "
             "document=json.load(open(sys.argv[2], encoding='utf-8')); "
             "result=inbox.import_feed(document); "
             "print(result.disposition, inbox.feed_cursor('gw','primary'), "
@@ -256,7 +258,7 @@ class CandidateFeedInboxTests(unittest.TestCase):
             connection.execute("DROP TABLE candidate_feed_receipts")
             connection.execute("PRAGMA user_version = 1")
 
-        self.inbox.initialize()
+        migrate_database(self.database)
 
         self.assertEqual(self.inbox.count(), 1)
         self.assertIsNotNone(self.inbox.get(meeting["candidate_id"]))
@@ -310,7 +312,7 @@ class CandidateFeedInboxTests(unittest.TestCase):
             connection.execute("PRAGMA user_version = 1")
 
         with self.assertRaisesRegex(InboxError, "incomplete"):
-            self.inbox.initialize()
+            migrate_database(self.database)
 
         with closing(sqlite3.connect(self.database)) as connection, connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]

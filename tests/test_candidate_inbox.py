@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from foxhound import migrate_database
+
 import copy
 import json
 import os
@@ -35,7 +37,7 @@ class CandidateInboxTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.database = Path(self.temporary.name) / "candidate-inbox.sqlite3"
         self.inbox = CandidateInbox(self.database, clock=lambda: NOW)
-        self.inbox.initialize()
+        migrate_database(self.database)
 
     def test_initializes_private_versioned_database(self):
         self.assertEqual(os.stat(self.database).st_mode & 0o777, 0o600)
@@ -100,7 +102,7 @@ class CandidateInboxTests(unittest.TestCase):
             connection.execute("PRAGMA user_version = 17")
             connection.commit()
 
-        CandidateInbox(self.database, clock=lambda: NOW).initialize()
+        migrate_database(self.database)
 
         with closing(sqlite3.connect(self.database)) as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
@@ -153,7 +155,7 @@ class CandidateInboxTests(unittest.TestCase):
     def test_version_twenty_two_migration_adds_nullable_consumer_digest(self):
         self._predates_consumer_digest()
 
-        CandidateInbox(self.database, clock=lambda: NOW).initialize()
+        migrate_database(self.database)
 
         with closing(sqlite3.connect(self.database)) as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
@@ -174,8 +176,8 @@ class CandidateInboxTests(unittest.TestCase):
     def test_version_twenty_two_migration_is_idempotent(self):
         self._predates_consumer_digest()
 
-        CandidateInbox(self.database, clock=lambda: NOW).initialize()
-        CandidateInbox(self.database, clock=lambda: NOW).initialize()
+        migrate_database(self.database)
+        migrate_database(self.database)
 
         with closing(sqlite3.connect(self.database)) as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
@@ -195,10 +197,10 @@ class CandidateInboxTests(unittest.TestCase):
 
     def test_fresh_and_migrated_databases_end_up_in_the_same_shape(self):
         fresh_database = Path(self.temporary.name) / "fresh.sqlite3"
-        CandidateInbox(fresh_database, clock=lambda: NOW).initialize()
+        migrate_database(fresh_database)
 
         self._predates_consumer_digest()
-        CandidateInbox(self.database, clock=lambda: NOW).initialize()
+        migrate_database(self.database)
 
         with closing(sqlite3.connect(fresh_database)) as connection:
             fresh_columns = list(
@@ -313,7 +315,7 @@ class CandidateInboxTests(unittest.TestCase):
 
         script = (
             "from foxhound import CandidateInbox; import sys; "
-            "inbox=CandidateInbox(sys.argv[1]); inbox.initialize(); "
+            "inbox=CandidateInbox(sys.argv[1]); "
             "candidate=inbox.get(sys.argv[2]); "
             "print(inbox.count(), candidate.source.kind)"
         )
@@ -330,13 +332,13 @@ class CandidateInboxTests(unittest.TestCase):
         with closing(sqlite3.connect(self.database)) as connection, connection:
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
         with self.assertRaisesRegex(InboxError, "newer"):
-            self.inbox.initialize()
+            migrate_database(self.database)
 
     def test_missing_parent_directory_is_not_created(self):
         parent = Path(self.temporary.name) / "missing"
         inbox = CandidateInbox(parent / "inbox.sqlite3", clock=lambda: NOW)
         with self.assertRaisesRegex(InboxError, "parent"):
-            inbox.initialize()
+            migrate_database(inbox.database_path)
         self.assertFalse(parent.exists())
 
     def test_symbolic_link_database_is_refused(self):
@@ -346,14 +348,14 @@ class CandidateInboxTests(unittest.TestCase):
         link.symlink_to(target)
         inbox = CandidateInbox(link, clock=lambda: NOW)
         with self.assertRaisesRegex(InboxError, "symbolic link"):
-            inbox.initialize()
+            migrate_database(inbox.database_path)
 
     def test_incomplete_versioned_schema_is_refused(self):
         with closing(sqlite3.connect(self.database)) as connection, connection:
             connection.execute("DROP TABLE candidate_inbox")
             connection.execute("CREATE TABLE candidate_inbox(candidate_id TEXT)")
         with self.assertRaisesRegex(InboxError, "incomplete"):
-            self.inbox.initialize()
+            migrate_database(self.database)
 
     def _stored_row(self, candidate_id: str) -> tuple:
         with closing(sqlite3.connect(self.database)) as connection, connection:

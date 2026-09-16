@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from foxhound import migrate_database
+
 import sqlite3
 import tempfile
 import unittest
@@ -49,7 +51,7 @@ class CompletionEvidenceTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.database = Path(self.directory.name) / "foxhound.sqlite3"
-        CandidateInbox(self.database).initialize()
+        migrate_database(self.database)
         self.connection = sqlite3.connect(self.database)
         self.connection.row_factory = sqlite3.Row
         self.addCleanup(self.connection.close)
@@ -203,7 +205,7 @@ class DoneCheckCardTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.database = Path(self.directory.name) / "foxhound.sqlite3"
         self.clock = Clock()
-        CandidateInbox(self.database, clock=self.clock).initialize()
+        migrate_database(self.database)
         with closing(sqlite3.connect(self.database)) as connection:
             connection.execute(
                 "INSERT INTO tasks(id,status,text,owner,version,created_at,"

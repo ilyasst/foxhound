@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from foxhound import migrate_database
+
 import copy
 import json
 import sqlite3
@@ -49,7 +51,7 @@ class TaskShadowFeedInboxTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.database = Path(self.temporary.name) / "candidate-inbox.sqlite3"
         self.inbox = CandidateInbox(self.database, clock=lambda: NOW)
-        self.inbox.initialize()
+        migrate_database(self.database)
 
     def import_candidates(self):
         return self.inbox.import_feed(
@@ -286,7 +288,7 @@ class TaskShadowFeedInboxTests(unittest.TestCase):
             connection.execute("DROP TABLE candidate_revision_history")
             connection.execute("PRAGMA user_version = 2")
 
-        self.inbox.initialize()
+        migrate_database(self.database)
         feed = self.observation_feed()
         feed["to_cursor"] = 1
         feed["items"] = feed["items"][:1]

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from foxhound import migrate_database
+
 import copy
 import fcntl
 import hashlib
@@ -72,7 +74,7 @@ class TaskShadowFeedImportTests(unittest.TestCase):
 
     def seed_candidates(self, *, both: bool = True) -> CandidateInbox:
         inbox = CandidateInbox(self.database)
-        inbox.initialize()
+        migrate_database(inbox.database_path)
         if both:
             result = inbox.import_feed(
                 fixture("candidate-feed-page-v1.json")

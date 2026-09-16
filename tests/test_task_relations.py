@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from foxhound import migrate_database
+
 import sqlite3
 import tempfile
 import unittest
@@ -17,7 +19,7 @@ class TaskRelationTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         database = Path(self.directory.name) / "foxhound.sqlite3"
-        CandidateInbox(database).initialize()
+        migrate_database(database)
         self.connection = sqlite3.connect(database)
         self.connection.row_factory = sqlite3.Row
         self.addCleanup(self.connection.close)
