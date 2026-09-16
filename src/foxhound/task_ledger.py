@@ -550,6 +550,7 @@ class TaskLedger:
 
                 expected_sequence = previous_cursor + 1
                 tasks_created = tasks_revised = candidates_unchanged = 0
+                created_task_ids: list[int] = []
                 candidates_withdrawn = candidates_after_close = 0
                 for row in rows:
                     if int(row["sequence"]) != expected_sequence:
@@ -639,6 +640,7 @@ class TaskLedger:
                             now=now,
                         )
                         tasks_created += 1
+                        created_task_ids.append(task_id)
                         continue
 
                     if binding["source_revision"] == candidate.source.revision:
@@ -828,7 +830,9 @@ class TaskLedger:
                 # repeated scans idempotent, and the whole change remains one
                 # transaction: a failed scan cannot advance intake alone.
                 if tasks_created:
-                    task_duplicate_detection.scan(connection, now=now)
+                    task_duplicate_detection.scan(
+                        connection, now=now, focus_task_ids=created_task_ids
+                    )
                 connection.commit()
                 return NativeIntakeResult(
                     NativeIntakeDisposition.APPLIED,

@@ -99,6 +99,7 @@ def propose(
     basis: str,
     detector: str,
     now: str,
+    allow_unconfirmed_owner: bool = False,
 ) -> ProposalResult:
     """Record one unordered candidate pair for later reader review.
 
@@ -135,7 +136,7 @@ def propose(
             ProposalDisposition.REFUSED,
             refusal=ProposalRefusal.TASK_NOT_OPEN,
         )
-    if not _same_confirmed_owner(rows[0], rows[1]):
+    if not allow_unconfirmed_owner and not _same_confirmed_owner(rows[0], rows[1]):
         return ProposalResult(
             ProposalDisposition.REFUSED,
             refusal=ProposalRefusal.INCOMPATIBLE_OWNER,
