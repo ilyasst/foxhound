@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Synthetic tests for cross-source duplicate-task recall."""
+"""Synthetic tests for duplicate-task recall and its vetoes."""
 
 from __future__ import annotations
 
 from foxhound import migrate_database
 
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -19,7 +20,7 @@ from foxhound.candidate_inbox import CandidateInbox
 NOW = "2030-03-01T12:00:00+00:00"
 
 
-class CrossSourceDetectionTests(unittest.TestCase):
+class DetectionFixture(unittest.TestCase):
     def setUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
@@ -31,9 +32,14 @@ class CrossSourceDetectionTests(unittest.TestCase):
 
     def _task(self, task_id: int, *, kind: str, text: str,
               owner: str = "A", status: str = "open",
-              closed_at: str | None = None) -> None:
+              closed_at: str | None = None, record: str | None = None,
+              item: str | None = None, payload: str = "{}",
+              read_at: str | None = None) -> None:
         candidate_id = f"candidate-{task_id}"
         revision = f"{task_id:064x}"
+        record = record if record is not None else f"record-{task_id}"
+        item = item if item is not None else str(task_id)
+        read_at = read_at or NOW
         self.connection.execute(
             "INSERT INTO tasks("
             "id,status,text,version,created_at,updated_at,closed_at,owner_ref_version,"
@@ -46,9 +52,10 @@ class CrossSourceDetectionTests(unittest.TestCase):
             "INSERT INTO candidate_inbox("
             "candidate_id,source_system,source_kind,source_record_id,"
             "source_item_id,source_revision,payload_json,created_at,"
-            "first_imported_at,updated_at) VALUES(?,'gw',?,'record',?,?,'{}',"
+            "first_imported_at,updated_at) VALUES(?,'gw',?,?,?,?,?,"
             "?,?,?)",
-            (candidate_id, kind, str(task_id), revision, NOW, NOW, NOW),
+            (candidate_id, kind, record, item, revision, payload,
+             read_at, read_at, read_at),
         )
         self.connection.execute(
             "INSERT INTO task_candidate_bindings("
@@ -57,6 +64,8 @@ class CrossSourceDetectionTests(unittest.TestCase):
             (candidate_id, revision, task_id, NOW),
         )
 
+
+class CrossSourceDetectionTests(DetectionFixture):
     def test_distinct_sources_with_a_shared_deliverable_become_a_proposal(self):
         self._task(1, kind="email", text="Prepare the synthetic rollout checklist")
         self._task(2, kind="meeting", text="Draft the rollout checklist")
@@ -72,14 +81,14 @@ class CrossSourceDetectionTests(unittest.TestCase):
         self.assertEqual((proposal.left_task_id, proposal.right_task_id), (1, 2))
         self.assertIn("email and meeting", proposal.basis)
 
-    def test_same_source_pairs_are_not_signalled(self):
-        self._task(1, kind="email", text="Prepare the synthetic checklist")
-        self._task(2, kind="email", text="Draft the synthetic checklist")
-        self._task(3, kind="email", text="Draft the synthetic checklist",
-                   owner="B")
+    def test_same_source_kind_pairs_are_signalled(self):
+        """One ledger holding two copies of one commitment is the common case."""
+        self._task(1, kind="email", text="Prepare the synthetic rollout checklist",
+                   record="record-a")
+        self._task(2, kind="email", text="Draft the synthetic rollout checklist",
+                   record="record-b")
         result = detection.scan(self.connection, now=NOW)
-        self.assertEqual(result.pairs_considered, 0)
-        self.assertIsNone(proposals.next_open(self.connection))
+        self.assertEqual(result.proposals_recorded, 1)
 
     def test_unrelated_text_does_not_create_a_proposal(self):
         self._task(1, kind="email", text="Prepare the synthetic checklist")
@@ -141,3 +150,171 @@ class CrossSourceDetectionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IdentifierVetoTests(DetectionFixture):
+    """A different identifier of one class means a different commitment."""
+
+    def test_differing_order_numbers_are_never_proposed(self):
+        self._task(1, kind="email", record="record-a",
+                   text="Approve purchase document 400111-000 for Example Org")
+        self._task(2, kind="meeting", record="record-b",
+                   text="Approve purchase document 400222-000 for Example Org")
+        result = detection.scan(self.connection, now=NOW)
+        self.assertEqual(result.proposals_recorded, 0)
+        self.assertIsNone(proposals.next_open(self.connection))
+
+    def test_matching_order_numbers_still_pair(self):
+        self._task(1, kind="email", record="record-a",
+                   text="Approve purchase document 400111-000 for Example Org")
+        self._task(2, kind="meeting", record="record-b",
+                   text="Approve purchase order 400111-000 for Example Org")
+        result = detection.scan(self.connection, now=NOW)
+        self.assertEqual(result.proposals_recorded, 1)
+
+    def test_course_codes_compare_without_their_spacing(self):
+        """'AAA 111' and 'AAA111' name one course; the veto must not fire."""
+        self._task(1, kind="email", record="record-a",
+                   text="Submit the signed synthetic lab form for AAA 111")
+        self._task(2, kind="meeting", record="record-b",
+                   text="Submit the signed synthetic lab form for AAA111")
+        result = detection.scan(self.connection, now=NOW)
+        self.assertEqual(result.proposals_recorded, 1)
+
+    def test_differing_course_codes_are_vetoed(self):
+        self._task(1, kind="email", record="record-a",
+                   text="Instruct the students of the AAA 111 laboratory session")
+        self._task(2, kind="meeting", record="record-b",
+                   text="Instruct the students of the AAA 222 laboratory session")
+        result = detection.scan(self.connection, now=NOW)
+        self.assertEqual(result.proposals_recorded, 0)
+
+
+class OneReadingTests(DetectionFixture):
+    """Sharing a source record means two opposite things."""
+
+    def test_items_from_a_single_reading_are_not_duplicates(self):
+        """A protocol read once yields separate action items, seconds apart."""
+        self._task(1, kind="meeting", record="record-x", item="1",
+                   text="Prepare the synthetic rollout checklist",
+                   read_at="2030-03-01T12:00:00+00:00")
+        self._task(2, kind="meeting", record="record-x", item="2",
+                   text="Draft the synthetic rollout checklist",
+                   read_at="2030-03-01T12:00:30+00:00")
+        result = detection.scan(self.connection, now=NOW)
+        self.assertEqual(result.proposals_recorded, 0)
+
+    def test_a_record_read_again_later_is_a_duplicate(self):
+        """A thread re-read as it grows re-cards one commitment."""
+        self._task(1, kind="email", record="record-x", item="1",
+                   text="Reply with availability for the synthetic review",
+                   read_at="2030-03-01T09:00:00+00:00")
+        self._task(2, kind="email", record="record-x", item="2",
+                   text="Confirm a slot for the synthetic review",
+                   read_at="2030-03-01T12:00:00+00:00")
+        result = detection.scan(self.connection, now=NOW)
+        self.assertEqual(result.proposals_recorded, 1)
+        proposal = proposals.next_open(self.connection)
+        self.assertIn("later reading", proposal.basis)
+
+    def test_a_wide_record_is_treated_as_a_feed(self):
+        """A record shared by many tasks names a stream, not one item.
+
+        The texts share nothing, so only the re-read channel could pair them;
+        it must not, or every task on one ledger would pair with every other.
+        """
+        subjects = ("hose fittings", "lamp housings", "camera mounts",
+                    "floor sealant", "cable trays", "door magnets",
+                    "spare fuses", "label ribbon", "bench clamps",
+                    "filter media", "vent grilles", "torque keys",
+                    "resin pumps", "glass slides")
+        for offset, subject in enumerate(subjects):
+            self._task(offset + 1, kind="email", record="feed",
+                       item=str(offset + 1), text=f"Order the {subject}",
+                       read_at=f"2030-03-01T{offset + 1:02d}:00:00+00:00")
+        self.assertGreater(len(subjects), detection.MAX_RECORD_FANOUT)
+        result = detection.scan(self.connection, now=NOW)
+        self.assertEqual(result.proposals_recorded, 0)
+
+
+class ForgeLinkTests(DetectionFixture):
+    """A review names the issue it closes; read it instead of guessing."""
+
+    def _forge(self, task_id, *, kind, number, text, body=""):
+        self._task(task_id, kind=kind, record="forge/example", item=str(number),
+                   text=text, payload=json.dumps({"body": body}))
+
+    def test_review_is_paired_with_the_issue_it_closes(self):
+        self._forge(1, kind="issue", number=10, text="Add the synthetic widget")
+        self._forge(2, kind="issue", number=11,
+                    text="Add the synthetic widget renderer")
+        self._forge(3, kind="review_request", number=12,
+                    text="Review: add the synthetic widget renderer",
+                    body="Closes #10. Parent epic: #99.")
+        result = detection.scan(self.connection, now=NOW)
+        proposal = proposals.next_open(self.connection)
+        self.assertEqual(result.proposals_recorded, 1)
+        # Paired with #10 as stated, not with the closer-reading #11.
+        self.assertEqual((proposal.left_task_id, proposal.right_task_id), (1, 3))
+
+    def test_a_stated_closing_keyword_excludes_context_references(self):
+        """A body naming a parent epic must not propose merging the epic."""
+        self._forge(1, kind="issue", number=10, text="Add the synthetic widget")
+        self._forge(2, kind="issue", number=99, text="Epic: synthetic widgets")
+        self._forge(3, kind="review_request", number=12,
+                    text="Review: add the synthetic widget",
+                    body="Closes #10. Parent epic: #99.")
+        detection.scan(self.connection, now=NOW)
+        recorded = self.connection.execute(
+            "SELECT left_task_id,right_task_id FROM task_duplicate_proposals"
+        ).fetchall()
+        self.assertEqual([tuple(row) for row in recorded], [(1, 3)])
+
+    def test_forge_prose_is_not_compared_without_a_reference(self):
+        """Forge titles share a house grammar that scores high when unrelated."""
+        self._forge(1, kind="issue", number=10,
+                    text="Expose a bounded synthetic projection for readers")
+        self._forge(2, kind="issue", number=11,
+                    text="Expose a bounded synthetic projection for writers")
+        result = detection.scan(self.connection, now=NOW)
+        self.assertEqual(result.proposals_recorded, 0)
+
+    def test_identical_forge_text_is_still_a_duplicate(self):
+        """One review requested twice is a genuine double-carding."""
+        self._forge(1, kind="review_request", number=10,
+                    text="Review: explain the synthetic hold")
+        self._forge(2, kind="review_request", number=11,
+                    text="Review: explain the synthetic hold")
+        result = detection.scan(self.connection, now=NOW)
+        self.assertEqual(result.proposals_recorded, 1)
+
+    def test_a_forge_task_is_still_compared_with_a_meeting_task(self):
+        """One commitment can be tracked as an issue and stated in a meeting."""
+        self._forge(1, kind="issue", number=10,
+                    text="Install the synthetic mesh relay in the annex")
+        self._task(2, kind="meeting", record="record-m",
+                   text="Install the synthetic mesh relay in the annex")
+        result = detection.scan(self.connection, now=NOW)
+        self.assertEqual(result.proposals_recorded, 1)
+
+
+class AccentFoldingTests(DetectionFixture):
+    def test_accented_and_unaccented_terms_match(self):
+        self._task(1, kind="email", record="record-a",
+                   text="Préparer le résumé du séminaire synthétique")
+        self._task(2, kind="meeting", record="record-b",
+                   text="Preparer le resume du seminaire synthetique")
+        result = detection.scan(self.connection, now=NOW)
+        self.assertEqual(result.proposals_recorded, 1)
+
+
+class BasisTests(DetectionFixture):
+    def test_basis_does_not_claim_an_owner_check_that_did_not_run(self):
+        self._task(1, kind="email", record="record-a",
+                   text="Prepare the synthetic rollout checklist", owner="A")
+        self._task(2, kind="meeting", record="record-b",
+                   text="Draft the synthetic rollout checklist", owner="B")
+        detection.scan(self.connection, now=NOW)
+        proposal = proposals.next_open(self.connection)
+        self.assertNotIn("owner", proposal.basis)
+        self.assertIn("shared task terms", proposal.basis)

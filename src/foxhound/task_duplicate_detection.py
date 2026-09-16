@@ -1,19 +1,35 @@
-"""Recall-first discovery of cross-source duplicate tasks.
+"""Recall-first discovery of duplicate tasks.
 
 Native intake invokes this scan after adding tasks, and an operator can run it
 explicitly to reconcile an existing queue.  Candidate intake still creates a
 task for each source item; this module later asks whether two task descriptions
-with one confirmed owner may name one commitment.  The scan records a
-*proposal*, never a relation or task change.
+may name one commitment.  The scan records a *proposal*, never a relation or
+task change.
+
+Duplication is mostly not cross-source.  One mail thread re-read as it grows
+mints a fresh task each time, and one ledger can hold three copies of one
+commitment, so an earlier same-source-kind gate hid the common cases.  Recall
+comes from three independent channels, and precision from two vetoes that a
+lexical score cannot express:
+
+* a forge review names the issue it closes, which is an exact join;
+* one source record re-read at a later time is a re-carding of one commitment;
+* weighted term overlap, with rare terms counting for more than common ones.
+
+The vetoes: two tasks naming *different* identifiers of one class are different
+commitments however alike the prose, and two tasks lifted from a single reading
+of one document are its separate action items, never copies of each other.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sqlite3
-from dataclasses import dataclass
+import unicodedata
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
@@ -33,6 +49,41 @@ _STOP_WORDS = frozenset({
 })
 
 
+DETECTOR = "duplicate-review-v2"
+
+# Source kinds minted from a forge.  Two of these are paired by the exact
+# `Closes #N` join below, so comparing their prose adds noise and no recall:
+# forge titles share a house grammar ("Add ...", "Expose ...", "Review: ...")
+# that scores high between unrelated work.  A forge task is still compared with
+# mail, meeting and ledger tasks, because one commitment can be tracked both as
+# an issue and as something said in a meeting.
+FORGE_KINDS = frozenset({"issue", "review_request"})
+
+# A record id shared by more tasks than this is a FEED (a repository, a ledger),
+# not one source item.
+MAX_RECORD_FANOUT = 12
+
+# Items lifted from a single reading of one document land within seconds of
+# each other; a thread re-read later re-cards hours or days apart.
+SAME_READING_SECONDS = 120
+
+# Share of the lighter task's weighted terms the heavier one must repeat.
+MIN_WEIGHTED_COVERAGE = 0.45
+MIN_SHARED_TERMS = 2
+
+# Identifier classes whose disagreement is decisive.  Each pattern must expose
+# the bare identifier as group 1 so that "AAA 111" and "AAA111" compare equal.
+_IDENTIFIER_PATTERNS = (
+    ("order", re.compile(r"\b(\d{6}-\d{3})\b")),
+    ("article", re.compile(r"\b([A-Z]{3,}_\d{4,})\b")),
+    ("course", re.compile(r"\b[A-Z]{2,4}[\s-]?(\d{3})\b")),
+    ("grant", re.compile(r"\b([A-Z]{2}\d{5})\b")),
+)
+
+_CLOSES = re.compile(r"\b(?:closes|fixes|resolves)\s+#(\d+)\b", re.I)
+_ANY_REFERENCE = re.compile(r"#(\d+)\b")
+
+
 @dataclass(frozen=True)
 class DuplicateCandidate:
     """Private detector input; it must not be included in command output."""
@@ -44,12 +95,17 @@ class DuplicateCandidate:
     task_closed_at: str | None
     source_kind: str
     source_created_at: str
+    source_record_id: str
+    source_item_id: str
+    source_payload: str
     owner_ref_version: int
     owner_kind: str | None
     owner_speaker_id: str | None
     owner_canonical_speaker_id: str | None
     owner_speaker_registry_id: str | None
     owner_provisional: bool
+    terms: frozenset[str] = frozenset()
+    identifiers: tuple[tuple[str, frozenset[str]], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -65,53 +121,59 @@ class DetectionRun:
 
 def scan(connection: sqlite3.Connection, *, now: str,
          focus_task_ids: Iterable[int] | None = None) -> DetectionRun:
-    """Scan current tasks and record reviewable, cross-source proposals.
+    """Scan current tasks and record reviewable duplicate proposals.
 
     The scan is idempotent: the proposal ledger's unordered-pair identity
     returns an unchanged result for a proposal already awaiting or carrying a
-    reader decision.  No automatic decision is made from the lexical signal.
+    reader decision.  No automatic decision is made from any channel here; the
+    reader settles every pair on a later card.
     """
     now = _timestamp(now)
     candidates = tuple(_candidates(connection))
+    by_id = {candidate.task_id: candidate for candidate in candidates}
     focus = None if focus_task_ids is None else frozenset(focus_task_ids)
-    considered = signalled = recorded = unchanged = refused = 0
-    strongest: dict[int, tuple[float, int, DuplicateCandidate, DuplicateCandidate,
-                               tuple[str, ...]]] = {}
+    weights = _weights(candidates)
+
+    considered = signalled = 0
+    pairs: dict[tuple[int, int], str] = {}
+
+    def offer(left: DuplicateCandidate, right: DuplicateCandidate,
+              reason: str) -> None:
+        key = (left.task_id, right.task_id)
+        if key[0] > key[1]:
+            key = (key[1], key[0])
+        pairs.setdefault(key, reason)
+
     for index, left in enumerate(candidates):
         for right in candidates[index + 1:]:
-            if focus is not None and left.task_id not in focus and right.task_id not in focus:
+            if focus is not None and left.task_id not in focus \
+                    and right.task_id not in focus:
                 continue
-            if left.source_kind == right.source_kind:
-                continue
-            if not _eligible_status_pair(left, right, now=now):
+            if not _comparable(left, right, now=now):
                 continue
             considered += 1
-            shared = _shared_terms(left.task_text, right.task_text)
-            shorter = min(len(_terms(left.task_text)), len(_terms(right.task_text)))
-            coverage = 0 if shorter == 0 else len(shared) / shorter
-            if len(shared) < 2 or coverage < 0.6:
+            shared = left.terms & right.terms
+            coverage = _weighted_coverage(left, right, weights)
+            if len(shared) < MIN_SHARED_TERMS or coverage < MIN_WEIGHTED_COVERAGE:
                 continue
             signalled += 1
-            targets = (left, right) if focus is None else tuple(
-                candidate for candidate in (left, right)
-                if candidate.task_id in focus
-            )
-            for candidate in targets:
-                score = (coverage, len(shared), left, right, shared)
-                prior = strongest.get(candidate.task_id)
-                if prior is None or score[:2] > prior[:2]:
-                    strongest[candidate.task_id] = score
-    pairs = {(item[2].task_id, item[3].task_id, item[4])
-             for item in strongest.values()}
-    for left_id, right_id, shared in pairs:
-        left = next(candidate for candidate in candidates if candidate.task_id == left_id)
-        right = next(candidate for candidate in candidates if candidate.task_id == right_id)
+            offer(left, right, _overlap_basis(left, right, shared))
+
+    for left, right in _reread_pairs(candidates, focus=focus, now=now):
+        signalled += 1
+        offer(left, right, _reread_basis(left, right))
+
+    for left, right in _forge_links(candidates, focus=focus, now=now):
+        signalled += 1
+        offer(left, right, _forge_basis(left, right))
+
+    recorded = unchanged = refused = 0
+    for (left_id, right_id), basis in sorted(pairs.items()):
         result = proposals.propose(
-                connection,
-                task_id_a=left.task_id, task_id_b=right.task_id,
-                basis=_basis(left, right, shared),
-                detector="cross-source-overlap-review-v1", now=now,
-                allow_unconfirmed_owner=True,
+            connection,
+            task_id_a=left_id, task_id_b=right_id,
+            basis=basis, detector=DETECTOR, now=now,
+            allow_unconfirmed_owner=True,
         )
         if result.disposition is proposals.ProposalDisposition.RECORDED:
             recorded += 1
@@ -120,6 +182,168 @@ def scan(connection: sqlite3.Connection, *, now: str,
         else:
             refused += 1
     return DetectionRun(considered, signalled, recorded, unchanged, refused)
+
+
+def _comparable(left: DuplicateCandidate, right: DuplicateCandidate,
+                *, now: str) -> bool:
+    """Gates that apply to every channel."""
+    if not _eligible_status_pair(left, right, now=now):
+        return False
+    if _identifier_conflict(left, right):
+        return False
+    if _one_reading(left, right):
+        return False
+    if left.source_kind in FORGE_KINDS and right.source_kind in FORGE_KINDS:
+        # ...unless the text is effectively identical, which is one review
+        # requested twice rather than two pieces of work that read alike.
+        return _fold(left.task_text) == _fold(right.task_text)
+    return True
+
+
+def _identifier_conflict(left: DuplicateCandidate,
+                         right: DuplicateCandidate) -> bool:
+    """True when both name an identifier of one class and share none.
+
+    Two purchase orders, two course codes, two articles: different
+    commitments, whatever the surrounding words claim.
+    """
+    right_by_class = dict(right.identifiers)
+    for name, values in left.identifiers:
+        other = right_by_class.get(name)
+        if other and not (values & other):
+            return True
+    return False
+
+
+def _one_reading(left: DuplicateCandidate, right: DuplicateCandidate) -> bool:
+    """True when both were lifted from a single reading of one document.
+
+    Sharing a source record means one of two opposite things.  A meeting
+    protocol is read once and yields several distinct action items, seconds
+    apart.  A mail thread is re-read as it grows and re-cards one commitment,
+    hours or days apart.  The gap, not the record, tells them apart.
+    """
+    if not _own_record(left) or left.source_record_id != right.source_record_id:
+        return False
+    return _within(left.source_created_at, right.source_created_at,
+                   SAME_READING_SECONDS)
+
+
+def _reread_pairs(candidates: tuple[DuplicateCandidate, ...], *,
+                  focus: frozenset[int] | None, now: str):
+    """One source record carded again later: the strongest duplicate signal."""
+    grouped: dict[str, list[DuplicateCandidate]] = {}
+    for candidate in candidates:
+        if _own_record(candidate):
+            grouped.setdefault(candidate.source_record_id, []).append(candidate)
+    for group in grouped.values():
+        if len(group) > MAX_RECORD_FANOUT:
+            continue
+        group = sorted(group, key=lambda item: item.task_id)
+        for index, left in enumerate(group):
+            for right in group[index + 1:]:
+                if focus is not None and left.task_id not in focus \
+                        and right.task_id not in focus:
+                    continue
+                if not _comparable(left, right, now=now):
+                    continue
+                yield left, right
+
+
+def _forge_links(candidates: tuple[DuplicateCandidate, ...], *,
+                 focus: frozenset[int] | None, now: str):
+    """A review card names the issue it closes; that reference is the answer.
+
+    Reading the stored reference is exact where comparing two forge titles is
+    guesswork, and it attaches a review to the right issue when several read
+    alike.
+    """
+    issues: dict[tuple[str, str], DuplicateCandidate] = {}
+    reviews: list[DuplicateCandidate] = []
+    for candidate in candidates:
+        if candidate.source_kind == "issue":
+            issues[(candidate.source_record_id,
+                    _item_number(candidate.source_item_id))] = candidate
+        elif candidate.source_kind == "review_request":
+            reviews.append(candidate)
+    for review in reviews:
+        own = _item_number(review.source_item_id)
+        for number in _closed_issues(review.source_payload, own):
+            if number == own:
+                continue
+            issue = issues.get((review.source_record_id, number))
+            if issue is None:
+                continue
+            if focus is not None and issue.task_id not in focus \
+                    and review.task_id not in focus:
+                continue
+            # The forge reference stands on its own: the family gate in
+            # _comparable() exists only to suppress prose guessing.
+            if not _eligible_status_pair(issue, review, now=now):
+                continue
+            yield issue, review
+
+
+def _closed_issues(payload: str, own: str) -> set[str]:
+    """Issue numbers a review says it closes.
+
+    Prefer an explicit closing keyword.  A body that names one is precise, and
+    its other references are context -- a parent epic, a follow-up -- which are
+    related work rather than the same commitment.  Only when no keyword is
+    present does every reference become a candidate, because some bodies state
+    the link in prose ("required by #257").
+    """
+    stated = {match.group(1) for match in _CLOSES.finditer(payload)}
+    if not stated:
+        stated = {match.group(1) for match in _ANY_REFERENCE.finditer(payload)}
+    stated.discard(own)
+    return stated
+
+
+def _own_record(candidate: DuplicateCandidate) -> bool:
+    """False for feed identifiers, which name a stream rather than one item."""
+    record = candidate.source_record_id
+    return bool(record) and candidate.source_kind not in FORGE_KINDS
+
+
+def _item_number(value: str) -> str:
+    # A review item id can carry a revision suffix: "258/2030-01-01T00:00:00Z".
+    return str(value).split("/", 1)[0]
+
+
+def _within(left: str, right: str, seconds: int) -> bool:
+    try:
+        first = datetime.fromisoformat(str(left).replace("Z", "+00:00"))
+        second = datetime.fromisoformat(str(right).replace("Z", "+00:00"))
+    except ValueError:
+        return left == right
+    return abs((first - second).total_seconds()) <= seconds
+
+
+def _weights(candidates: tuple[DuplicateCandidate, ...]) -> dict[str, float]:
+    """Inverse document frequency: a rare term is evidence, a common one is not."""
+    total = len(candidates)
+    frequency: dict[str, int] = {}
+    for candidate in candidates:
+        for term in candidate.terms:
+            frequency[term] = frequency.get(term, 0) + 1
+    # Smoothed: an unsmoothed log(total/count) is exactly zero for a term
+    # present in every task, which erases the only shared evidence when the
+    # eligible set is small.  Smoothing keeps such a term near-zero without
+    # letting the whole comparison collapse.
+    return {term: math.log((total + 1) / count)
+            for term, count in frequency.items()}
+
+
+def _weighted_coverage(left: DuplicateCandidate, right: DuplicateCandidate,
+                       weights: dict[str, float]) -> float:
+    shared = left.terms & right.terms
+    if not shared:
+        return 0.0
+    mass = sum(weights.get(term, 0.0) for term in shared)
+    floor = min(sum(weights.get(term, 0.0) for term in left.terms),
+                sum(weights.get(term, 0.0) for term in right.terms))
+    return 0.0 if floor <= 0 else mass / floor
 
 
 def scan_database(database_path: str | Path, *, now: str | None = None) -> DetectionRun:
@@ -171,6 +395,7 @@ def _candidates(connection: sqlite3.Connection) -> Iterable[DuplicateCandidate]:
     # database through this scan.
     rows = connection.execute(
         "SELECT t.id,t.text,t.version,t.status,t.closed_at,c.source_kind,c.created_at,"
+        "c.source_record_id,c.source_item_id,c.payload_json,"
         "t.owner_ref_version,t.owner_kind,t.owner_speaker_id,"
         "t.owner_canonical_speaker_id,t.owner_speaker_registry_id,"
         "t.owner_provisional "
@@ -182,20 +407,26 @@ def _candidates(connection: sqlite3.Connection) -> Iterable[DuplicateCandidate]:
         "ORDER BY t.id"
     ).fetchall()
     for row in rows:
+        text = row["text"]
         yield DuplicateCandidate(
             task_id=int(row["id"]),
-            task_text=row["text"],
+            task_text=text,
             task_version=int(row["version"]),
             task_status=str(row["status"]),
             task_closed_at=row["closed_at"],
             source_kind=row["source_kind"],
             source_created_at=row["created_at"],
+            source_record_id=str(row["source_record_id"] or ""),
+            source_item_id=str(row["source_item_id"] or ""),
+            source_payload=str(row["payload_json"] or ""),
             owner_ref_version=int(row["owner_ref_version"]),
             owner_kind=row["owner_kind"],
             owner_speaker_id=row["owner_speaker_id"],
             owner_canonical_speaker_id=row["owner_canonical_speaker_id"],
             owner_speaker_registry_id=row["owner_speaker_registry_id"],
             owner_provisional=bool(row["owner_provisional"]),
+            terms=frozenset(_terms(text)),
+            identifiers=_identifiers(text),
         )
 
 
@@ -250,21 +481,52 @@ def _shared_terms(left: str, right: str) -> tuple[str, ...]:
 
 def _terms(value: str) -> set[str]:
     return {
-        term for term in re.findall(r"[a-z0-9]{3,}", value.casefold())
+        term for term in re.findall(r"[a-z0-9]{3,}", _fold(value))
         if term not in _STOP_WORDS
     }
 
 
-def _basis(left: DuplicateCandidate, right: DuplicateCandidate,
-           shared: tuple[str, ...]) -> str:
+def _fold(value: str) -> str:
+    """Case- and accent-insensitive form, so 'resume' matches 'résumé'."""
+    folded = unicodedata.normalize("NFKD", value.casefold())
+    return "".join(ch for ch in folded if not unicodedata.combining(ch))
+
+
+def _identifiers(value: str) -> tuple[tuple[str, frozenset[str]], ...]:
+    found = []
+    for name, pattern in _IDENTIFIER_PATTERNS:
+        hits = {match.group(1).casefold() for match in pattern.finditer(value)}
+        if hits:
+            found.append((name, frozenset(hits)))
+    return tuple(found)
+
+
+def _overlap_basis(left: DuplicateCandidate, right: DuplicateCandidate,
+                   shared: frozenset[str]) -> str:
     # Private detector evidence: the later card gives the reader the full
     # source extracts.  Bound it here so a long task name cannot make storing
     # a proposal fail after an otherwise successful scan.
-    terms = ", ".join(shared[:12])
-    text = (
-        "same confirmed owner; distinct source kinds "
-        f"{left.source_kind} and {right.source_kind}; shared task terms: {terms}"
+    terms = ", ".join(sorted(shared)[:12])
+    return _bounded(
+        f"shared task terms across {left.source_kind} and {right.source_kind}: "
+        f"{terms}"
     )
+
+
+def _reread_basis(left: DuplicateCandidate, right: DuplicateCandidate) -> str:
+    return _bounded(
+        f"one {left.source_kind} source record carded again at a later reading"
+    )
+
+
+def _forge_basis(issue: DuplicateCandidate, review: DuplicateCandidate) -> str:
+    return _bounded(
+        f"review {_item_number(review.source_item_id)} names issue "
+        f"{_item_number(issue.source_item_id)} as the work it closes"
+    )
+
+
+def _bounded(text: str) -> str:
     return text[:proposals.MAX_BASIS]
 
 
