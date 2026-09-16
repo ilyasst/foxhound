@@ -15,6 +15,7 @@ from unittest import mock
 from foxhound.database_lifecycle import migrate_database
 from foxhound.deployment_config import (
     DeploymentConfigError,
+    execute_component,
     load_deployment_config,
     main,
 )
@@ -250,6 +251,51 @@ class DeploymentConfigTests(unittest.TestCase):
 
         with self.assertRaises(DeploymentConfigError):
             config.argv("execution-card-requeue")
+
+    def test_exec_uses_the_sibling_script_from_the_selected_release(self) -> None:
+        self._write_config(self._document())
+        config = load_deployment_config(self.config_path)
+        release_bin = self.root / "release" / "bin"
+        release_bin.mkdir(parents=True)
+        executor = release_bin / "foxhound-deployment-config"
+        executor.write_text("#!/bin/sh\n", encoding="utf-8")
+        component = release_bin / "foxhound-execution-card-requeue"
+        component.write_text("#!/bin/sh\n", encoding="utf-8")
+        expected = config.argv("execution-card-requeue")
+
+        with mock.patch("foxhound.deployment_config.sys.argv", [str(executor)]):
+            with mock.patch("foxhound.deployment_config.os.execv") as execv:
+                execute_component(config, "execution-card-requeue")
+
+        execv.assert_called_once_with(str(component), expected)
+
+    def test_exec_refuses_a_missing_selected_release_script(self) -> None:
+        self._write_config(self._document())
+        config = load_deployment_config(self.config_path)
+        executor = self.root / "release" / "bin" / "foxhound-deployment-config"
+
+        with mock.patch("foxhound.deployment_config.sys.argv", [str(executor)]):
+            with self.assertRaises(DeploymentConfigError):
+                execute_component(config, "execution-card-requeue")
+
+    def test_exec_hides_selected_release_execution_errors(self) -> None:
+        self._write_config(self._document())
+        config = load_deployment_config(self.config_path)
+        release_bin = self.root / "release" / "bin"
+        release_bin.mkdir(parents=True)
+        executor = release_bin / "foxhound-deployment-config"
+        executor.write_text("#!/bin/sh\n", encoding="utf-8")
+        component = release_bin / "foxhound-execution-card-requeue"
+        component.write_text("#!/bin/sh\n", encoding="utf-8")
+
+        with mock.patch("foxhound.deployment_config.sys.argv", [str(executor)]):
+            with mock.patch(
+                "foxhound.deployment_config.os.execv", side_effect=OSError
+            ):
+                with self.assertRaisesRegex(
+                    DeploymentConfigError, "deployment executable is unavailable"
+                ):
+                    execute_component(config, "execution-card-requeue")
 
     def test_execution_delivery_requires_the_drip_role(self) -> None:
         document = self._document()

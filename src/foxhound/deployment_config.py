@@ -260,6 +260,24 @@ class DeploymentConfig:
         raise DeploymentConfigError("deployment component is unknown")
 
 
+def execute_component(config: DeploymentConfig, component: str) -> None:
+    """Replace this process with a declared component from this release.
+
+    An installed ``foxhound-deployment-config`` console script lives beside
+    the component scripts generated from the same package installation.  The
+    adjacent path is deliberate: consulting ``PATH`` could select a command
+    from a different checkout or release.
+    """
+    argv = config.argv(component)
+    try:
+        executable = Path(sys.argv[0]).resolve().parent / argv[0]
+        if not executable.is_file():
+            raise DeploymentConfigError("deployment executable is unavailable")
+        os.execv(str(executable), argv)
+    except OSError as exc:
+        raise DeploymentConfigError("deployment executable is unavailable") from exc
+
+
 def load_deployment_config(path: str | os.PathLike[str]) -> DeploymentConfig:
     """Load and validate an owner-only configuration document.
 
@@ -699,6 +717,8 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser("validate")
     render = commands.add_parser("render")
     render.add_argument("--component", required=True)
+    execute = commands.add_parser("exec")
+    execute.add_argument("--component", required=True)
     return parser
 
 
@@ -713,6 +733,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps({"ok": True}, sort_keys=True))
         return 0
     try:
+        if args.command == "exec":
+            execute_component(config, args.component)
+            return 0
         print(json.dumps({"argv": config.argv(args.component)}, sort_keys=True))
     except DeploymentConfigError:
         print("foxhound deployment configuration: unavailable", file=sys.stderr)
