@@ -47,6 +47,7 @@ from .task_cards import (
     render_task_review_card,
 )
 from .task_ledger import TaskLedgerError
+from .task_execution import TaskExecutionService, WorkflowOperationResult
 
 
 log = logging.getLogger("foxhound.task_card_server")
@@ -82,6 +83,8 @@ EXECUTION_AGENT_OPTIONS_SCHEMA = (
 EXECUTION_AGENT_SELECTION_SCHEMA = (
     "foxhound.execution-card-service.agent-selection"
 )
+EXECUTION_PRIORITY_SCHEMA = "foxhound.execution-workflow-service.priority"
+EXECUTION_PRIORITY_SCHEMA_VERSION = 1
 
 # ADR 0036 decision 1: every accepted bearer token is configured with
 # exactly one role from this closed set. A single legacy token with no
@@ -120,6 +123,7 @@ ROUTES = {
     "/v1/execution-cards/detail": "execution_detail",
     "/v1/execution-cards/queue": "execution_queue",
     "/v1/execution-cards/resolve": "execution_resolve",
+    "/v1/execution-workflows/priority": "execution_priority",
 }
 
 
@@ -207,6 +211,7 @@ class TaskCardApplication:
         token: str | Mapping[str, str],
         *,
         execution_cards: ExecutionCardService | None = None,
+        execution_workflows: TaskExecutionService | None = None,
         execution_tokens: str | Mapping[str, str] | None = None,
         limits: TaskCardServerLimits | None = None,
     ) -> None:
@@ -218,8 +223,15 @@ class TaskCardApplication:
             raise TaskCardServerConfigError(
                 "execution card service is invalid"
             )
+        if execution_workflows is not None and not isinstance(
+            execution_workflows, TaskExecutionService
+        ):
+            raise TaskCardServerConfigError(
+                "execution workflow service is invalid"
+            )
         self.cards = cards
         self.execution_cards = execution_cards
+        self.execution_workflows = execution_workflows
         # `tokens` maps role -> bearer token. A bare string is today's
         # single shared token, normalized to role `drip` -- this is what
         # keeps an existing single-token deployment behaving exactly as it
@@ -649,6 +661,36 @@ class TaskCardApplication:
                     "resolution": None,
                 }
             return _execution_resolve_document(result)
+        if operation == "execution_priority":
+            request = _strict_request(
+                payload,
+                required={"task_id", "workflow_version", "action"},
+                optional=set(),
+            )
+            identity = self.resolve_execution_consumer(authorization)
+            if identity is None or identity.role != QUEUE_VIEW_ROLE:
+                raise TaskCardServerRequestError(
+                    "role_forbidden",
+                    "execution workflow priority requires the queue_view role",
+                    HTTPStatus.FORBIDDEN,
+                )
+            action = request["action"]
+            if not isinstance(action, str) or action not in {
+                "raise", "lower", "clear"
+            }:
+                raise TaskCardServerRequestError(
+                    "invalid_request",
+                    "execution workflow priority action is invalid",
+                )
+            return _execution_priority_document(
+                self._execution_workflows().set_priority(
+                    _integer(request["task_id"], minimum=1),
+                    expected_version=_integer(
+                        request["workflow_version"], minimum=1
+                    ),
+                    action=action,
+                )
+            )
         if operation == "execution_claim":
             request = _request(payload, required={"lease_seconds"})
             lease = _integer(request["lease_seconds"], minimum=5, maximum=300)
@@ -871,6 +913,15 @@ class TaskCardApplication:
                 HTTPStatus.SERVICE_UNAVAILABLE,
             )
         return self.execution_cards
+
+    def _execution_workflows(self) -> TaskExecutionService:
+        if self.execution_workflows is None:
+            raise TaskCardServerRequestError(
+                "service_unavailable",
+                "execution workflow service is unavailable",
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+        return self.execution_workflows
 
 
 class _TaskCardHTTPServer(HTTPServer):
@@ -1483,6 +1534,26 @@ def _execution_detail_document(result: ExecutionCardDetail) -> dict[str, Any]:
     return document
 
 
+def _execution_priority_document(
+    result: WorkflowOperationResult,
+) -> dict[str, Any]:
+    """Serialize a content-free queue-priority acknowledgement."""
+    return {
+        "schema": EXECUTION_PRIORITY_SCHEMA,
+        "schema_version": EXECUTION_PRIORITY_SCHEMA_VERSION,
+        "ok": result.accepted,
+        "disposition": result.disposition.value,
+        "task_id": result.task_id,
+        "workflow_version": result.version,
+        "priority": (
+            None if result.priority is None else result.priority.value
+        ),
+        "refusal": (
+            None if result.refusal is None else result.refusal.value
+        ),
+    }
+
+
 def _execution_agent_options_document(
     result: ExecutionAgentSelectorResult,
 ) -> dict[str, Any]:
@@ -1713,10 +1784,16 @@ def main(argv: list[str] | None = None) -> int:
             reader_aliases=reader_aliases,
         )
         execution_cards.count()
+        execution_workflows = TaskExecutionService(
+            arguments.database,
+            profile_registry=registry,
+        )
+        execution_workflows.readiness()
         app = TaskCardApplication(
             cards,
             load_role_tokens(arguments.token_file),
             execution_cards=execution_cards,
+            execution_workflows=execution_workflows,
             execution_tokens=(
                 load_role_tokens(
                     arguments.execution_token_file,

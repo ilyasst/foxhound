@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 31
+SCHEMA_VERSION = 32
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -316,6 +316,7 @@ _SCHEMA_COLUMNS = {
         "completed_at",
         "agent_profile_id",
         "agent_profile_revision",
+        "queue_priority",
     ),
     "task_execution_results": (
         "result_id",
@@ -460,7 +461,8 @@ _SCHEMA_COLUMNS = {
 # subtractions, applied in version order: `source_revision` (task review
 # cards) arrives at v26, duplicate proposals arrive at v27, and their card
 # binding arrives at v28, `repository_references_json` arrives at v29,
-# `consumer_digest` arrives at v30, and `repository_impact` arrives at v31,
+# `consumer_digest` arrives at v30, `repository_impact` at v31, and
+# `queue_priority` at v32,
 # `task_completion_evidence` arrives at v25,
 # `consumer_digest` (task review cards, ADR 0036 decision 2) at v23,
 # `work_digest` at v22, and `task_relations` at v21 -- so the v24 state has
@@ -471,6 +473,9 @@ _SCHEMA_V30_COLUMNS = {
     name: tuple(column for column in columns if not (
         name == "task_execution_results"
         and column == "repository_impact"
+    ) and not (
+        name == "task_execution_workflows"
+        and column == "queue_priority"
     ))
     for name, columns in _SCHEMA_COLUMNS.items()
 }
@@ -2223,6 +2228,36 @@ _SCHEMA_V31 = (
 )
 
 
+# Queue priority is a deliberately closed, three-state reader preference.  It
+# is not a score and it does not carry reader-provided ordering data.
+_SCHEMA_V32_EXECUTION_EVENT_TABLE = _SCHEMA_V12_EXECUTION_EVENT_TABLE.replace(
+    "'task_completed','task_dropped','reassigned','agent_selected'",
+    "'task_completed','task_dropped','reassigned','agent_selected',"
+    "'priority_raised','priority_lowered','priority_cleared'",
+)
+_SCHEMA_V32 = (
+    "ALTER TABLE task_execution_workflows ADD COLUMN queue_priority "
+    "TEXT NOT NULL DEFAULT 'normal' CHECK(queue_priority IN "
+    "('raised','normal','lowered'));",
+    "CREATE INDEX task_execution_workflows_priority_ready "
+    "ON task_execution_workflows("
+    "status,next_attempt_at,queue_priority,failure_count,updated_at,task_id);",
+    "DROP TRIGGER task_execution_events_no_update;",
+    "DROP TRIGGER task_execution_events_no_delete;",
+    "ALTER TABLE task_execution_events RENAME TO task_execution_events_v31;",
+    _SCHEMA_V32_EXECUTION_EVENT_TABLE,
+    "INSERT INTO task_execution_events("
+    "sequence,task_id,kind,workflow_version,task_version,phase,status,"
+    "occurred_at,agent_profile_id,agent_profile_revision) "
+    "SELECT sequence,task_id,kind,workflow_version,task_version,phase,status,"
+    "occurred_at,agent_profile_id,agent_profile_revision "
+    "FROM task_execution_events_v31;",
+    "DROP TABLE task_execution_events_v31;",
+    _SCHEMA_V8[6],
+    _SCHEMA_V8[7],
+)
+
+
 _SCHEMA_V20 = (
     # SQLite cannot alter a CHECK in place, and three tables carry a foreign
     # key to this one. Renaming the card table would rewrite all three to
@@ -3108,6 +3143,26 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 31
+            if version == 31:
+                self._require_tables(
+                    connection,
+                    ("task_execution_workflows", "task_execution_events"),
+                )
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    columns = tuple(item["name"] for item in connection.execute(
+                        "PRAGMA table_info(task_execution_workflows)"
+                    ))
+                    if "queue_priority" not in columns:
+                        for statement in _SCHEMA_V32:
+                            connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 32")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 32
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:

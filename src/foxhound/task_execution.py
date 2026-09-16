@@ -183,6 +183,14 @@ class WorkflowRefusal(StrEnum):
     AGENT_PROFILE_UNAVAILABLE = "agent_profile_unavailable"
 
 
+class WorkflowPriority(StrEnum):
+    """The only reader-controlled ordering states for one ready workflow."""
+
+    RAISED = "raised"
+    NORMAL = "normal"
+    LOWERED = "lowered"
+
+
 @dataclass(frozen=True)
 class ExecutionWorkflow:
     task_id: int
@@ -202,6 +210,7 @@ class ExecutionWorkflow:
     completed_at: str | None
     agent_profile_id: str
     agent_profile_revision: str
+    priority: WorkflowPriority
 
 
 @dataclass(frozen=True)
@@ -260,6 +269,7 @@ class WorkflowOperationResult:
     refusal: WorkflowRefusal | None = None
     agent_profile_id: str | None = None
     agent_profile_revision: str | None = None
+    priority: WorkflowPriority | None = None
 
     @property
     def accepted(self) -> bool:
@@ -816,7 +826,9 @@ class TaskExecutionService:
                     "AND (w.next_attempt_at IS NULL OR w.next_attempt_at<=?) "
                     f"AND w.phase IN ({placeholders}) "
                     "AND t.status='open' AND t.version=w.task_version "
-                    "ORDER BY CASE WHEN w.failure_count=0 THEN 0 ELSE 1 END,"
+                    "ORDER BY CASE w.queue_priority "
+                    "WHEN 'raised' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END,"
+                    "CASE WHEN w.failure_count=0 THEN 0 ELSE 1 END,"
                     "w.updated_at,w.task_id LIMIT ?",
                     (now, *(phase.value for phase in phases),
                      MAX_CLAIM_SCAN),
@@ -867,7 +879,7 @@ class TaskExecutionService:
                     # The schema requires parked_at to exist exactly while
                     # the status is parked, so leaving it set here is a
                     # constraint failure rather than a stale field.
-                    "parked_at=NULL,next_attempt_at=NULL "
+                    "parked_at=NULL,next_attempt_at=NULL,queue_priority='normal' "
                     "WHERE task_id=? AND version=? "
                     "AND status IN ('queued','parked')",
                     (
@@ -897,6 +909,105 @@ class TaskExecutionService:
                     agent_profile_id=profile.profile_id,
                     agent_profile_revision=profile.revision,
                     lease_seconds=profile.claim_lease_seconds,
+                )
+            except Exception:
+                connection.rollback()
+                raise
+
+    def set_priority(
+        self,
+        task_id: int,
+        *,
+        expected_version: int,
+        action: str,
+    ) -> WorkflowOperationResult:
+        """Fence one queue-reader priority preference for one ready workflow.
+
+        The operation deliberately accepts a closed action vocabulary instead
+        of a number or an ordering position.  It applies only to a current,
+        immediately claimable queued workflow; snoozed, cooling, parked,
+        held, running, completed, and stale work keeps its existing lifecycle
+        semantics.  The preference is consumed atomically by a successful
+        claim, so it cannot silently steer a later phase.
+        """
+        if not _valid_identity(task_id, expected_version):
+            return _refused(task_id, WorkflowRefusal.INVALID_ARGUMENT)
+        priorities = {
+            "raise": WorkflowPriority.RAISED,
+            "lower": WorkflowPriority.LOWERED,
+            "clear": WorkflowPriority.NORMAL,
+        }
+        priority = priorities.get(action)
+        if priority is None:
+            return _refused(task_id, WorkflowRefusal.INVALID_ACTION)
+        now = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._cancel_stale(connection, now)
+                row = self._workflow_with_task(connection, task_id)
+                refusal = _workflow_guard(
+                    row, expected_version, {WorkflowStatus.QUEUED}
+                )
+                if refusal is None:
+                    refusal = _task_guard(row, int(row["task_version"]))
+                if (
+                    refusal is None
+                    and row is not None
+                    and row["next_attempt_at"] is not None
+                    and row["next_attempt_at"] > now
+                ):
+                    refusal = WorkflowRefusal.INVALID_STATE
+                if refusal is not None:
+                    connection.rollback()
+                    return _refused_row(task_id, row, refusal)
+                if row is None:  # Kept for type narrowing after the guard.
+                    connection.rollback()
+                    return _refused(task_id, WorkflowRefusal.NOT_FOUND)
+                current = WorkflowPriority(row["queue_priority"])
+                if current is priority:
+                    connection.rollback()
+                    return _operation(row, WorkflowDisposition.UNCHANGED)
+                version = expected_version + 1
+                updated = connection.execute(
+                    "UPDATE task_execution_workflows SET queue_priority=?,"
+                    "version=?,updated_at=? WHERE task_id=? AND version=? "
+                    "AND status='queued' AND (next_attempt_at IS NULL OR "
+                    "next_attempt_at<=?)",
+                    (priority, version, now, task_id, expected_version, now),
+                )
+                if updated.rowcount != 1:
+                    connection.rollback()
+                    return _refused_row(
+                        task_id, self._workflow_with_task(connection, task_id),
+                        WorkflowRefusal.STALE_WORKFLOW,
+                    )
+                event_kind = {
+                    "raise": "priority_raised",
+                    "lower": "priority_lowered",
+                    "clear": "priority_cleared",
+                }[action]
+                self._event(
+                    connection,
+                    task_id,
+                    event_kind,
+                    version,
+                    int(row["task_version"]),
+                    WorkflowPhase(row["phase"]),
+                    WorkflowStatus.QUEUED,
+                    now,
+                )
+                connection.commit()
+                return WorkflowOperationResult(
+                    WorkflowDisposition.APPLIED,
+                    task_id,
+                    version,
+                    WorkflowStatus.QUEUED,
+                    WorkflowPhase(row["phase"]),
+                    agent_profile_id=row["agent_profile_id"],
+                    agent_profile_revision=row["agent_profile_revision"],
+                    priority=priority,
                 )
             except Exception:
                 connection.rollback()
@@ -1991,6 +2102,7 @@ def _workflow(row: sqlite3.Row) -> ExecutionWorkflow:
             completed_at=row["completed_at"],
             agent_profile_id=profile_id,
             agent_profile_revision=profile_revision,
+            priority=WorkflowPriority(row["queue_priority"]),
         )
     except (IndexError, KeyError, TypeError, ValueError) as exc:
         raise TaskLedgerError("task execution state is invalid") from exc
@@ -2009,6 +2121,7 @@ def _operation(
         next_attempt_at=row["next_attempt_at"],
         agent_profile_id=row["agent_profile_id"],
         agent_profile_revision=row["agent_profile_revision"],
+        priority=WorkflowPriority(row["queue_priority"]),
     )
 
 
