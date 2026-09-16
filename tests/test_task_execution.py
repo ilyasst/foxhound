@@ -381,6 +381,16 @@ class TaskExecutionTests(unittest.TestCase):
                 "ALTER TABLE execution_review_cards DROP COLUMN "
                 "consumer_digest"
             )
+            # v35 added these; a database at an older version has not got
+            # them yet.
+            connection.execute(
+                "ALTER TABLE execution_review_cards DROP COLUMN "
+                "superseded_delivery_ref"
+            )
+            connection.execute(
+                "ALTER TABLE execution_review_cards DROP COLUMN "
+                "superseded_transport"
+            )
             connection.execute(
                 "ALTER TABLE task_review_cards DROP COLUMN source_revision"
             )

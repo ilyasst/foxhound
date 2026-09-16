@@ -731,6 +731,8 @@ class TaskCardApplication:
                         f"foxhound-execution-card-{claim.card.id}-"
                         f"v{claim.card.version}"
                     ),
+                    "superseded_delivery_ref": claim.superseded_delivery_ref,
+                    "superseded_transport": claim.superseded_transport,
                     "body": body,
                     "reply_markup": reply_markup,
                 },
