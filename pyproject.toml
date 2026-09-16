@@ -27,6 +27,7 @@ foxhound-delivery-health = "foxhound.delivery_health:main"
 foxhound-deployment-config = "foxhound.deployment_config:main"
 foxhound-fused-task-titles = "foxhound.fused_task_titles:main"
 foxhound-task-duplicate-card-schedule = "foxhound.task_duplicate_card_schedule:main"
+foxhound-task-duplicate-quality = "foxhound.task_duplicate_quality:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
