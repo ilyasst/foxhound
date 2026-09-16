@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from foxhound import execution_worker
 from foxhound import migrate_database
 
 import hashlib
@@ -10,6 +11,7 @@ import json
 import os
 import sqlite3
 import tempfile
+import types
 import threading
 import unittest
 from contextlib import closing, contextmanager, redirect_stderr, redirect_stdout
@@ -1015,6 +1017,93 @@ class ExecutionWorkerTests(unittest.TestCase):
                 code = main(["context"])
         self.assertEqual(code, 70)
         self.assertNotIn(private_value, output.getvalue() + errors.getvalue())
+
+
+class ResultLocationTests(unittest.TestCase):
+    """A result is authored where the reader will look for it."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        root = Path(self.temporary.name)
+        self.task = root / "task-folder"
+        self.run = root / "run-folder"
+        for directory in (self.task, self.run):
+            directory.mkdir(mode=0o700)
+        self.addCleanup(self.temporary.cleanup)
+
+    @staticmethod
+    def _state(task_folder):
+        return types.SimpleNamespace(task_work_directory=task_folder)
+
+    def _write(self, directory, name, text="Synthetic result."):
+        path = directory / name
+        path.write_text(text, encoding="utf-8")
+        path.chmod(0o600)
+        return path
+
+    def test_the_task_folder_is_searched_before_the_run_directory(self):
+        order = execution_worker._result_search_path(
+            self._state(str(self.task)), self.run)
+        self.assertEqual(order, (self.task, self.run))
+
+    def test_a_result_in_the_task_folder_is_found(self):
+        expected = self._write(self.task, "result-summary.txt")
+        order = execution_worker._result_search_path(
+            self._state(str(self.task)), self.run)
+
+        self.assertEqual(
+            execution_worker._locate_result(order, "result-summary.txt"),
+            expected,
+        )
+
+    def test_a_result_in_the_run_directory_still_records(self):
+        """Nothing that already records may stop recording."""
+        expected = self._write(self.run, "result-summary.txt")
+        order = execution_worker._result_search_path(
+            self._state(str(self.task)), self.run)
+
+        self.assertEqual(
+            execution_worker._locate_result(order, "result-summary.txt"),
+            expected,
+        )
+
+    def test_a_workflow_without_a_task_folder_uses_the_run_directory(self):
+        order = execution_worker._result_search_path(self._state(None), self.run)
+        self.assertEqual(order, (self.run,))
+
+    def test_a_relative_task_folder_is_refused_rather_than_guessed(self):
+        order = execution_worker._result_search_path(
+            self._state("relative/path"), self.run)
+        self.assertEqual(order, (self.run,))
+
+    def test_a_missing_result_names_the_path_it_looked_at(self):
+        """"invalid" sent an agent reading worker source; "not found" does not."""
+        missing = self.task / "result-summary.txt"
+        reason = execution_worker._result_read_failure(
+            missing, Exception("unavailable"))
+
+        self.assertIn("not found", reason)
+        self.assertIn(str(missing), reason)
+
+    def test_a_world_readable_result_says_so_and_says_how_to_fix_it(self):
+        exposed = self._write(self.task, "result-summary.txt")
+        exposed.chmod(0o644)
+
+        reason = execution_worker._result_read_failure(
+            exposed, Exception("not private"))
+
+        self.assertIn("readable by others", reason)
+        self.assertIn("600", reason)
+
+    def test_the_reported_path_prefers_where_the_reader_was_aiming(self):
+        """With nothing written anywhere, name the task folder, not scratch."""
+        order = execution_worker._result_search_path(
+            self._state(str(self.task)), self.run)
+
+        self.assertEqual(
+            execution_worker._locate_result(order, "result-summary.txt"),
+            self.task / "result-summary.txt",
+        )
 
 
 if __name__ == "__main__":
