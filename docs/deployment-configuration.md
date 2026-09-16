@@ -119,3 +119,18 @@ Supported names are `task-cards`, `execution-schedule`,
 slot name when rendering a runner. Rendering reads no token contents. Its JSON
 output does contain private paths, so consume it only in the private deployment
 mechanism, never in a repository, issue, or shared log.
+
+Private service units can use `exec` to start a declared component from the
+same installed release as the configuration command:
+
+```sh
+/srv/example/releases/current/bin/foxhound-deployment-config \
+  --config /srv/example/private-foxhound-state/deployment.json \
+  exec --component execution-runner:primary
+```
+
+`exec` replaces itself with the matching console script beside
+`foxhound-deployment-config`; it does not use a shell or search `PATH`. Keep
+the release selector and unit definitions private. A promotion changes that
+selector only after preflight succeeds, so every database component starts
+from one selected release with arguments rendered from the same document.
