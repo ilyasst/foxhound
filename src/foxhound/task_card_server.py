@@ -39,6 +39,7 @@ from .execution_worker import (
     load_knowledge_config,
 )
 from .knowledge_client import GwKnowledgeClient, KnowledgeClientError
+from .release_revision import describe
 from .task_cards import (
     ClaimAtCeiling,
     CardOperationResult,
@@ -1818,6 +1819,10 @@ def main(argv: list[str] | None = None) -> int:
                 request_timeout_seconds=arguments.request_timeout
             ),
         )
+        # Reported before the first request, so a process that has outlived
+        # its deploy is visible without being interrogated.
+        print(f"foxhound task-card-server: revision {describe(__file__)}",
+              flush=True)
         serve(arguments.bind, arguments.port, app)
     except (
         AgentProfileError,
