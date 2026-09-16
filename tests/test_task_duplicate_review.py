@@ -109,8 +109,33 @@ class DuplicateReviewCardTests(unittest.TestCase):
             "SELECT kind,asserted_by FROM task_relations"
         ).fetchone()
         self.assertEqual(tuple(relation), ("duplicate_of", "reader"))
+        job = self.connection.execute(
+            "SELECT state,title FROM task_fused_title_jobs WHERE task_id=1"
+        ).fetchone()
+        self.assertEqual(tuple(job), ("pending", None))
         self.cards.schedule()
         self.assertEqual([card.task_id for card in self.cards.due()], [1])
+
+    def test_completed_title_replaces_only_the_canonical_card_display_text(self) -> None:
+        claim = self._deliver()
+        self.assertTrue(self.cards.act(
+            claim.card.id, expected_version=claim.card.version,
+            action="duplicate_confirm",
+        ).accepted)
+        self.connection.execute(
+            "UPDATE task_fused_title_jobs SET state='ready',title=?,updated_at=? "
+            "WHERE task_id=1",
+            ("Synthetic rollout checklist", NOW.isoformat()),
+        )
+        self.connection.commit()
+        self.cards.schedule()
+        due = self.cards.due()
+        self.assertEqual([card.task_id for card in due], [1])
+        self.assertEqual(due[0].text, "Synthetic rollout checklist")
+        self.assertEqual(
+            self.connection.execute("SELECT text FROM tasks WHERE id=1").fetchone()[0],
+            "Prepare the synthetic rollout checklist",
+        )
 
     def test_rejection_is_durable_and_leaves_both_tasks_open(self) -> None:
         claim = self._deliver()
@@ -204,6 +229,12 @@ class DuplicateReviewCardTests(unittest.TestCase):
             claim.card.id, expected_version=claim.card.version,
             action="duplicate_confirm",
         ).accepted)
+        self.connection.execute(
+            "UPDATE task_fused_title_jobs SET state='ready',title=?,updated_at=? "
+            "WHERE task_id=1",
+            ("Synthetic rollout checklist", NOW.isoformat()),
+        )
+        self.connection.commit()
         relation_id = self.connection.execute(
             "SELECT id FROM task_relations"
         ).fetchone()[0]
@@ -220,6 +251,12 @@ class DuplicateReviewCardTests(unittest.TestCase):
                 (self.proposal.proposal_id,),
             ).fetchone()[0],
             "proposed",
+        )
+        self.assertEqual(
+            tuple(self.connection.execute(
+                "SELECT state,title FROM task_fused_title_jobs WHERE task_id=1"
+            ).fetchone()),
+            ("idle", None),
         )
 
 

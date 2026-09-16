@@ -17,6 +17,7 @@ from pathlib import Path
 import stat
 import sys
 from typing import Any
+from urllib.parse import urlsplit
 
 from .agent_profiles import AgentProfileError, load_registry
 from .execution_runner import ExecutionRunnerConfig
@@ -35,7 +36,7 @@ from .task_execution import TaskExecutionService
 
 
 DEPLOYMENT_SCHEMA = "foxhound.deployment-config"
-DEPLOYMENT_SCHEMA_VERSION = 3
+DEPLOYMENT_SCHEMA_VERSION = 4
 MAX_CONFIG_BYTES = 64 * 1024
 
 
@@ -180,6 +181,7 @@ class DatabaseConsumersConfig:
     native_intake_run: tuple[str, str, int] | None
     execution_card_requeue: int | None
     lifecycle_outcome_export: tuple[Path, str, int] | None
+    fused_task_titles: str | None
 
     def argv(self, component: str, database: Path) -> list[str]:
         if component == "candidate-feed-import":
@@ -221,6 +223,14 @@ class DatabaseConsumersConfig:
                 "--outbox", str(outbox),
                 "--stream-id", stream_id,
                 "--max-page-items", str(max_page_items),
+            ]
+        if component == "fused-task-titles":
+            if self.fused_task_titles is None:
+                raise DeploymentConfigError("database consumer is disabled")
+            return [
+                "foxhound-fused-task-titles",
+                "--database", str(database),
+                "--endpoint", self.fused_task_titles,
             ]
         raise DeploymentConfigError("deployment component is unknown")
 
@@ -354,7 +364,7 @@ def _parse_document(document: object) -> DeploymentConfig:
     version = document.get("schema_version")
     if (
         document.get("schema") != DEPLOYMENT_SCHEMA
-        or version not in {1, 2, DEPLOYMENT_SCHEMA_VERSION}
+        or version not in {1, 2, 3, DEPLOYMENT_SCHEMA_VERSION}
         or isinstance(version, bool)
     ):
         raise DeploymentConfigError("deployment configuration version is invalid")
@@ -364,14 +374,14 @@ def _parse_document(document: object) -> DeploymentConfig:
             "schema", "schema_version", "database", "agent_profile_directory",
             "card_service", "workflow", "execution_runners", "database_consumers",
         }
-        if version == DEPLOYMENT_SCHEMA_VERSION else {
+        if version >= 3 else {
             "schema", "schema_version", "database", "agent_profile_directory",
             "card_service", "workflow", "execution_runner",
         },
     )
     runners = (
         _parse_execution_runners(root["execution_runners"])
-        if version == DEPLOYMENT_SCHEMA_VERSION
+        if version >= 3
         else (_parse_execution_runner(root["execution_runner"]),)
     )
     return DeploymentConfig(
@@ -385,8 +395,9 @@ def _parse_document(document: object) -> DeploymentConfig:
         workflow=_parse_workflow(root["workflow"]),
         execution_runners=runners,
         database_consumers=(
-            _parse_database_consumers(root["database_consumers"])
-            if version == DEPLOYMENT_SCHEMA_VERSION else None
+            _parse_database_consumers(
+                root["database_consumers"], version=int(version)
+            ) if version >= 3 else None
         ),
     )
 
@@ -515,16 +526,25 @@ def _parse_execution_runners(
     return runners
 
 
-def _parse_database_consumers(value: object) -> DatabaseConsumersConfig:
-    document = _object(value, {
+def _parse_database_consumers(
+    value: object, *, version: int
+) -> DatabaseConsumersConfig:
+    fields = {
         "candidate_feed_import", "native_intake_run", "execution_card_requeue",
         "lifecycle_outcome_export",
-    })
+    }
+    if version >= 4:
+        fields.add("fused_task_titles")
+    document = _object(value, fields)
     candidate = _parse_candidate_feed_import(document["candidate_feed_import"])
     intake = _parse_native_intake_run(document["native_intake_run"])
     requeue = _parse_execution_card_requeue(document["execution_card_requeue"])
     lifecycle = _parse_lifecycle_outcome_export(document["lifecycle_outcome_export"])
-    return DatabaseConsumersConfig(candidate, intake, requeue, lifecycle)
+    titles = (
+        _parse_fused_task_titles(document["fused_task_titles"])
+        if version >= 4 else None
+    )
+    return DatabaseConsumersConfig(candidate, intake, requeue, lifecycle, titles)
 
 
 def _enabled_document(
@@ -580,6 +600,31 @@ def _parse_lifecycle_outcome_export(
         _nonempty_string(document["stream_id"]),
         max_page_items,
     )
+
+
+def _parse_fused_task_titles(value: object) -> str | None:
+    document = _enabled_document(value, {"endpoint"})
+    if document is None:
+        return None
+    endpoint = document["endpoint"]
+    if not isinstance(endpoint, str):
+        raise DeploymentConfigError("database consumer configuration is invalid")
+    try:
+        parsed = urlsplit(endpoint)
+        valid = (
+            parsed.scheme == "http"
+            and is_canonical_loopback(parsed.hostname)
+            and parsed.port is not None
+            and 1 <= parsed.port <= 65_535
+            and parsed.path in {"", "/"}
+            and not parsed.username and not parsed.password
+            and not parsed.query and not parsed.fragment
+        )
+    except ValueError:
+        valid = False
+    if not valid:
+        raise DeploymentConfigError("database consumer configuration is invalid")
+    return endpoint.rstrip("/")
 
 
 def _object(value: object, fields: set[str]) -> Mapping[str, object]:
