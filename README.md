@@ -256,6 +256,16 @@ allowlist, duplicate-role rejection, and duplicate-token rejection as
 `drip` role; omitting the option with a role-mapped task policy leaves
 execution routes fail-closed.
 
+Deployment settings must not be maintained independently in source files and
+service definitions. `foxhound-deployment-config` validates one private,
+owner-only JSON document before restart and renders the task-card service,
+execution scheduler, and execution-runner arguments from it. In particular,
+execution-card delivery requires the `drip` role in both its task-card and
+execution-card token maps. The validator never prints private paths or token
+contents on failure. See
+[Private deployment configuration](docs/deployment-configuration.md) for the
+strict document shape and synthetic example.
+
 Foxhound now also owns a transport-neutral execution workflow ledger. An
 explicitly scheduled open task stops at a reader start gate, then advances
 through separately approved plan, execution, and external-action phases under
