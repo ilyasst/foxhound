@@ -43,12 +43,18 @@ substituted, edited, or leftover bundle cannot be presented as this run's
 policy. There is no fallback to another profile and no ambient default. The
 file is removed when supervision ends, whatever the outcome.
 
-Hermes is launched with `--ignore-rules`, so ambient rule, memory, and skill
-injection cannot change what a recorded revision means. Provider and model
-configuration is untouched. Because repository instructions are no longer
-injected, the agent is told to read each checkout's own contributor
+Hermes is launched with `--safe-mode`, so ambient rule, memory, skill,
+user-configuration, plugin, and MCP-server injection cannot change what a
+recorded revision means. Because repository instructions are no
+longer injected, the agent is told to read each checkout's own contributor
 instructions after a worktree is prepared and to follow them; they constrain
 how it works there and never widen what the run may do.
+
+When the worker prepares a repository worktree, it enables that repository's
+checked-in `tools/hooks/pre-commit` guard when present. A fresh clone does not
+inherit local Git configuration, so this makes a repository-provided
+publication check effective before the agent can create a commit. Failure to
+enable a present guard refuses worktree preparation.
 
 Reusable Hermes prompt material is not copied into this repository and not
 inherited implicitly. An approved fragment is placed in the private store's
@@ -69,8 +75,10 @@ verbatim so their digests still resolve for workflows pinned to them.
   intended failure: it has no instructions.
 - Ambient host configuration can no longer silently redefine a recorded
   revision. Anything a profile actually needs, including material a deployment
-  previously got from an injected rule file or a preloaded skill, must be
-  published as one of its components.
+  previously got from an injected rule file, user configuration, plugin, MCP
+  server, or preloaded skill, must be published as one of its components.
+- A repository-provided pre-commit publication guard is active in each worker
+  worktree instead of relying on an agent to configure it manually.
 - Retaining a superseded built-in prompt means keeping its text in this
   repository alongside the current one.
 

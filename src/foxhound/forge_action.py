@@ -163,7 +163,30 @@ def prepare_worktree(
     if rc != 0:
         raise ForgeActionError(
             f"{repository}: the work branch could not be created ({_detail(err)})")
+    _configure_repository_hook(path, repository)
     return path, branch, base
+
+
+def _configure_repository_hook(path: Path, repository: str) -> None:
+    """Enable a repository-provided pre-commit guard in an agent worktree.
+
+    A contributor instruction can require a checked-in hook, but a fresh
+    clone does not inherit the local ``core.hooksPath`` setting that activates
+    it.  Honor that repository-owned guard when it is present; a failure to
+    activate it refuses the worktree before an agent can create a commit.
+    Repositories without such a hook retain their existing workflow.
+    """
+    hook = path / "tools" / "hooks" / "pre-commit"
+    if not hook.is_file():
+        return
+    rc, _out, err = _run(
+        "git", "-C", str(path), "config", "core.hooksPath", "tools/hooks"
+    )
+    if rc != 0:
+        raise ForgeActionError(
+            f"{repository}: the repository publication guard could not be "
+            f"enabled ({_detail(err)})"
+        )
 
 
 def push_branch(*, repository: str, path: Path, head_branch: str,
