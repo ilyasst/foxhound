@@ -189,6 +189,7 @@ class DatabaseConsumersConfig:
 
     candidate_feed_import: tuple[Path, str] | None
     native_intake_run: tuple[str, str, int] | None
+    task_card_requeue: int | None
     execution_card_requeue: int | None
     lifecycle_outcome_export: tuple[Path, str, int] | None
     fused_task_titles: str | None
@@ -223,6 +224,14 @@ class DatabaseConsumersConfig:
                 "foxhound-execution-card-requeue",
                 "--database", str(database),
                 "--limit", str(self.execution_card_requeue),
+            ]
+        if component == "task-card-requeue":
+            if self.task_card_requeue is None:
+                raise DeploymentConfigError("database consumer is disabled")
+            return [
+                "foxhound-task-card-requeue",
+                "--database", str(database),
+                "--limit", str(self.task_card_requeue),
             ]
         if component == "lifecycle-outcome-export":
             if self.lifecycle_outcome_export is None:
@@ -580,9 +589,19 @@ def _parse_database_consumers(
         fields.add("fused_task_titles")
     if version >= 5:
         fields.add("duplicate_card_schedule")
-    document = _object(value, fields)
+    optional_fields = {"task_card_requeue"} if version >= 5 else set()
+    if not isinstance(value, Mapping):
+        raise DeploymentConfigError("deployment configuration shape is invalid")
+    keys = set(value)
+    if keys != fields and keys != fields | optional_fields:
+        raise DeploymentConfigError("deployment configuration shape is invalid")
+    document = value
     candidate = _parse_candidate_feed_import(document["candidate_feed_import"])
     intake = _parse_native_intake_run(document["native_intake_run"])
+    task_requeue = (
+        _parse_task_card_requeue(document["task_card_requeue"])
+        if "task_card_requeue" in document else None
+    )
     requeue = _parse_execution_card_requeue(document["execution_card_requeue"])
     lifecycle = _parse_lifecycle_outcome_export(document["lifecycle_outcome_export"])
     titles = (
@@ -594,7 +613,13 @@ def _parse_database_consumers(
         if version >= 5 else None
     )
     return DatabaseConsumersConfig(
-        candidate, intake, requeue, lifecycle, titles, duplicates,
+        candidate_feed_import=candidate,
+        native_intake_run=intake,
+        task_card_requeue=task_requeue,
+        execution_card_requeue=requeue,
+        lifecycle_outcome_export=lifecycle,
+        fused_task_titles=titles,
+        duplicate_card_schedule=duplicates,
     )
 
 
@@ -631,6 +656,11 @@ def _parse_native_intake_run(value: object) -> tuple[str, str, int] | None:
 
 
 def _parse_execution_card_requeue(value: object) -> int | None:
+    document = _enabled_document(value, {"limit"})
+    return None if document is None else _positive_int(document["limit"])
+
+
+def _parse_task_card_requeue(value: object) -> int | None:
     document = _enabled_document(value, {"limit"})
     return None if document is None else _positive_int(document["limit"])
 
