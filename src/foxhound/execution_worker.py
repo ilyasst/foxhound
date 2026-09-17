@@ -25,6 +25,7 @@ from .knowledge_client import (
     KnowledgeClientError,
     KnowledgeSearchResult,
 )
+from .contracts import SourceSnapshotContractError
 from . import work_digest
 from .task_execution import (
     ExecutionResultEnvelope,
@@ -786,7 +787,7 @@ class ExecutionWorker:
             request = TaskLedger(state.database_path).source_snapshot_request(
                 state.task_id
             )
-        except ValueError:
+        except (SourceSnapshotContractError, ValueError):
             raise ExecutionWorkerClaimError("source freshness is unavailable") from None
         enabled = (self._freshness_phase_kinds if checkpoint == "phase"
                    else self._freshness_effect_kinds)

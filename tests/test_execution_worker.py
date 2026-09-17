@@ -24,6 +24,7 @@ from unittest import mock
 
 from foxhound.agent_profiles import general_profile
 from foxhound.candidate_inbox import CandidateInbox
+from foxhound.contracts import SourceSnapshotContractError
 from foxhound.execution_worker import (
     INSTRUCTIONS_NAME,
     ExecutionWorker,
@@ -39,7 +40,7 @@ from foxhound.execution_worker import (
     _repository_receipts,
     _worker_operations,
 )
-from foxhound.knowledge_client import KnowledgeClientConfig
+from foxhound.knowledge_client import KnowledgeClientConfig, KnowledgeClientError
 from foxhound.task_execution import (
     ExecutionResultEnvelope,
     TaskExecutionService,
@@ -548,6 +549,30 @@ class ExecutionWorkerTests(unittest.TestCase):
             ):
                 with self.assertRaises(ExecutionWorkerClaimError):
                     enabled._fresh_active("effect")
+
+    def test_freshness_refusals_are_controlled(self):
+        """A malformed request or unavailable source never escapes as a crash."""
+        with knowledge_server() as endpoint:
+            worker = self._worker(endpoint, freshness_effect_kinds=("issue",))
+            with self.assertRaises(ExecutionWorkerConfigError):
+                worker._fresh_active("unknown")
+            with mock.patch(
+                "foxhound.execution_worker.TaskLedger.source_snapshot_request",
+                side_effect=SourceSnapshotContractError("synthetic"),
+            ):
+                with self.assertRaises(ExecutionWorkerClaimError):
+                    worker._fresh_active("effect")
+            with mock.patch(
+                "foxhound.execution_worker.TaskLedger.source_snapshot_request",
+                return_value=SimpleNamespace(
+                    locator=SimpleNamespace(kind="issue"),
+                ),
+            ), mock.patch(
+                "foxhound.execution_worker.GwKnowledgeClient.refresh_source",
+                side_effect=KnowledgeClientError("synthetic"),
+            ):
+                with self.assertRaises(ExecutionWorkerClaimError):
+                    worker._fresh_active("effect")
 
     def test_a_task_about_nothing_addressable_says_so(self):
         # An ordinary state, not an error: a task may come from a meeting,
