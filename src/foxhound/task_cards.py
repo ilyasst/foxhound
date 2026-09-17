@@ -99,6 +99,14 @@ class ScheduleResult:
     refusal: CardRefusal | None = None
 
 
+#: A `delivering` row whose lease has run out. `claim_next` returns these to
+#: `pending` before it serves anyone, so nothing is on screen for them and
+#: nothing is being delivered. Shared so the reaper and the counts that
+#: promise a revival cannot drift apart. Takes the current time as its one
+#: bound parameter.
+EXPIRED_DELIVERING = "(status='delivering' AND claim_expires_at<=?)"
+
+
 @dataclass(frozen=True)
 class CardStats:
     """Consumer-scoped, aggregate-only queue state from one snapshot."""
@@ -416,8 +424,8 @@ class TaskCardService:
             try:
                 expired = connection.execute(
                     "SELECT id,task_id,task_version,version "
-                    "FROM task_review_cards WHERE status='delivering' "
-                    "AND claim_expires_at<=? ORDER BY id",
+                    f"FROM task_review_cards WHERE {EXPIRED_DELIVERING} "
+                    "ORDER BY id",
                     (now,),
                 ).fetchall()
                 for row in expired:
@@ -1050,25 +1058,50 @@ class TaskCardService:
             ).fetchone()[0])
 
     def stats(self, *, consumer_digest: str) -> CardStats:
+        """Report the queue as it IS, counting a dead lease as pending.
+
+        A `delivering` row whose lease has expired is not on anyone's
+        screen: the send either never happened or was never acknowledged,
+        and `claim_next` will return it to `pending` the moment it is asked
+        for another card. Reporting it as `delivering` claims a place on a
+        surface that is actually empty.
+
+        That is not cosmetic. A consumer sizes its next batch by subtracting
+        `delivering` and `delivered` from the depth it wants on screen, and
+        stops before claiming when the answer is zero. The reaper that
+        revives these rows lives inside `claim_next`, so once enough dead
+        leases accumulate to fill that depth, the consumer stops claiming,
+        the reaper stops running, and neither side ever recovers. The queue
+        deadlocks with every card waiting and nothing being delivered.
+
+        `EXPIRED_DELIVERING` is deliberately the same comparison the reaper
+        uses. If the two ever disagree, this count promises a revival that
+        does not happen.
+        """
         if not _valid_digest(consumer_digest):
             raise TaskLedgerError("task card consumer digest is invalid")
+        now = self._now()
         with closing(self._connect()) as connection:
             row = connection.execute(
                 "SELECT "
-                "SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,"
+                f"SUM(CASE WHEN status='pending' OR {EXPIRED_DELIVERING} "
+                "THEN 1 ELSE 0 END) AS pending,"
                 "SUM(CASE WHEN status='delivering' AND consumer_digest=? "
+                f"AND NOT {EXPIRED_DELIVERING} "
                 "THEN 1 ELSE 0 END) AS delivering,"
                 "SUM(CASE WHEN status='delivered' AND consumer_digest=? "
                 "THEN 1 ELSE 0 END) AS delivered,"
                 "SUM(CASE WHEN status='snoozed' THEN 1 ELSE 0 END) AS snoozed,"
-                "SUM(CASE WHEN status IN ('delivering','delivered') "
-                "AND consumer_digest IS NOT NULL AND consumer_digest<>? "
+                "SUM(CASE WHEN consumer_digest IS NOT NULL "
+                "AND consumer_digest<>? AND (status='delivered' OR "
+                f"(status='delivering' AND NOT {EXPIRED_DELIVERING})) "
                 "THEN 1 ELSE 0 END) AS elsewhere,"
                 "SUM(CASE WHEN status IN "
                 "('pending','delivering','delivered','snoozed') "
                 "THEN 1 ELSE 0 END) AS active "
                 "FROM task_review_cards",
-                (consumer_digest, consumer_digest, consumer_digest),
+                (now, consumer_digest, now, consumer_digest,
+                 consumer_digest, now),
             ).fetchone()
         return CardStats(*(
             int(row[name] or 0)
@@ -1079,18 +1112,27 @@ class TaskCardService:
         ))
 
     def stats_global(self) -> CardStats:
-        """Return the legacy unscoped queue snapshot for v1 clients."""
+        """Return the legacy unscoped queue snapshot for v1 clients.
+
+        A dead lease counts as pending here for the same reason it does in
+        `stats`: a v1 consumer sizes its batch the same way.
+        """
+        now = self._now()
         with closing(self._connect()) as connection:
             row = connection.execute(
                 "SELECT "
-                "SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,"
-                "SUM(CASE WHEN status='delivering' THEN 1 ELSE 0 END) AS delivering,"
+                f"SUM(CASE WHEN status='pending' OR {EXPIRED_DELIVERING} "
+                "THEN 1 ELSE 0 END) AS pending,"
+                "SUM(CASE WHEN status='delivering' "
+                f"AND NOT {EXPIRED_DELIVERING} "
+                "THEN 1 ELSE 0 END) AS delivering,"
                 "SUM(CASE WHEN status='delivered' THEN 1 ELSE 0 END) AS delivered,"
                 "SUM(CASE WHEN status='snoozed' THEN 1 ELSE 0 END) AS snoozed,"
                 "SUM(CASE WHEN status IN "
                 "('pending','delivering','delivered','snoozed') "
                 "THEN 1 ELSE 0 END) AS active "
-                "FROM task_review_cards"
+                "FROM task_review_cards",
+                (now, now),
             ).fetchone()
         return CardStats(
             pending=int(row["pending"] or 0),

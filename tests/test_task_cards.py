@@ -365,6 +365,67 @@ class TaskCardTests(unittest.TestCase):
             (2, 1, 0, 1, 0, 4),
         )
 
+    def test_a_dead_lease_counts_as_pending_rather_than_on_screen(self):
+        """A consumer must not be told a surface is full of abandoned rows.
+
+        The count feeds `keep - delivering - delivered`, and a consumer
+        stops before claiming when that reaches zero. Since the reaper runs
+        inside `claim_next`, counting dead leases as `delivering` lets the
+        queue wedge with every card waiting and nothing on screen.
+        """
+        self.cards.schedule()
+        held = self.cards.claim_next(consumer_digest=CONSUMER_A)
+        stale = self.cards.claim_next(consumer_digest=CONSUMER_B)
+        self.assertIsNotNone(held)
+        self.assertIsNotNone(stale)
+
+        live = self.cards.stats(consumer_digest=CONSUMER_A)
+        self.assertEqual(
+            (live.pending, live.delivering, live.elsewhere, live.active),
+            (2, 1, 1, 4),
+        )
+
+        self.clock.advance(timedelta(seconds=61))
+
+        expired = self.cards.stats(consumer_digest=CONSUMER_A)
+        # Both dead leases are pending again, whoever held them.
+        self.assertEqual(
+            (expired.pending, expired.delivering, expired.delivered,
+             expired.snoozed, expired.elsewhere, expired.active),
+            (4, 0, 0, 0, 0, 4),
+        )
+        # The invariant every consumer checks the response against.
+        self.assertEqual(
+            expired.active,
+            expired.pending + expired.delivering + expired.delivered
+            + expired.snoozed + expired.elsewhere,
+        )
+        # And the promise is real: the reaper agrees with the count, so a
+        # consumer that acts on it gets a card rather than an empty claim.
+        revived = self.cards.claim_next(consumer_digest=CONSUMER_A)
+        self.assertIsNotNone(revived)
+        self.assertEqual(
+            self.cards.stats_global().pending
+            + self.cards.stats_global().delivering,
+            4,
+        )
+
+    def test_a_full_surface_of_dead_leases_still_leaves_room_to_claim(self):
+        """The deadlock itself: depth 2, two dead leases, nothing on screen."""
+        self.cards.schedule()
+        for _ in range(2):
+            self.assertIsNotNone(
+                self.cards.claim_next(consumer_digest=CONSUMER_A))
+        keep = 2
+
+        before = self.cards.stats(consumer_digest=CONSUMER_A)
+        self.assertEqual(keep - before.delivering - before.delivered, 0)
+
+        self.clock.advance(timedelta(seconds=61))
+
+        after = self.cards.stats(consumer_digest=CONSUMER_A)
+        self.assertGreater(keep - after.delivering - after.delivered, 0)
+
     def test_claim_ceiling_is_distinct_and_scoped_to_role_and_consumer(self):
         self.cards.schedule()
         first = self.cards.claim_next(
