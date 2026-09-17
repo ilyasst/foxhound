@@ -70,7 +70,8 @@ from foxhound.task_card_server import (
     make_server,
     main,
 )
-from foxhound.task_cards import TaskCardService
+from foxhound import task_duplicate_proposals as proposals
+from foxhound.task_cards import CARD_ACTIONS, TaskCardService
 from foxhound.task_execution import (
     ExecutionOutcome,
     ExecutionResultEnvelope,
@@ -2087,6 +2088,175 @@ class TaskCardClaimConsumerIdentityTests(unittest.TestCase):
             )
         self.assertEqual(status, 200)
         self.assertEqual(claimed["status"], "claimed")
+
+
+class DuplicateActionRouteTests(unittest.TestCase):
+    """The action route must carry every answer a card can render.
+
+    The duplicate answers reached the domain layer and the callback parser
+    but not this route, so a delivered duplicate card was refused with
+    `invalid_request` before its card was ever looked up: tappable, never
+    resolvable. These drive both answers over HTTP so the route and the
+    card surface cannot drift apart again.
+    """
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.database = Path(self.temporary.name) / "foxhound.sqlite3"
+        migrate_database(self.database)
+        self.connection = sqlite3.connect(self.database)
+        self.connection.row_factory = sqlite3.Row
+        self.addCleanup(self.connection.close)
+        self._task(1, "email", "Prepare the synthetic rollout checklist")
+        self._task(2, "meeting", "Draft the synthetic rollout checklist")
+        self.proposal = proposals.propose(
+            self.connection, task_id_a=1, task_id_b=2,
+            basis="Same synthetic deliverable and confirmed owner.",
+            detector="synthetic-detector", now=NOW.isoformat(),
+        )
+        self.connection.commit()
+        self.cards = TaskCardService(
+            self.database, clock=Clock(), token_factory=lambda: CLAIM_TOKEN
+        )
+        self.app = TaskCardApplication(self.cards, TOKEN)
+
+    def _task(self, task_id: int, kind: str, text: str) -> None:
+        candidate_id = f"candidate-{task_id}"
+        revision = f"{task_id:064x}"
+        self.connection.execute(
+            "INSERT INTO tasks(id,status,text,version,created_at,updated_at,"
+            "owner_ref_version,owner_kind,owner_speaker_id,"
+            "owner_canonical_speaker_id,owner_speaker_registry_id,"
+            "owner_pinned,owner_provisional) VALUES(?, 'open', ?, 1, ?, ?,"
+            "1, 'person', 'SPK_1', 'SPK_1', 'registry-A', 0, 0)",
+            (task_id, text, NOW.isoformat(), NOW.isoformat()),
+        )
+        self.connection.execute(
+            "INSERT INTO candidate_inbox(candidate_id,source_system,source_kind,"
+            "source_record_id,source_item_id,source_revision,payload_json,"
+            "created_at,first_imported_at,updated_at) VALUES(?, 'gw', ?,"
+            "'record', ?, ?, '{}', ?, ?, ?)",
+            (candidate_id, kind, str(task_id), revision, NOW.isoformat(),
+             NOW.isoformat(), NOW.isoformat()),
+        )
+        self.connection.execute(
+            "INSERT INTO task_candidate_bindings(candidate_id,source_revision,"
+            "task_id,relation,decided_at) VALUES(?,?,?,'accepted',?)",
+            (candidate_id, revision, task_id, NOW.isoformat()),
+        )
+
+    def _delivered_claim(self, endpoint):
+        """Drive one duplicate card to `delivered` entirely over HTTP."""
+        status, _, scheduled = request(
+            endpoint, "/v1/task-cards/schedule", request_document(limit=10)
+        )
+        self.assertEqual((status, scheduled["created"]), (200, 1))
+        status, _, claimed = request(
+            endpoint, "/v1/task-cards/claim", request_document(lease_seconds=60)
+        )
+        self.assertEqual((status, claimed["status"]), (200, "claimed"))
+        claim = claimed["claim"]
+        self.assertIn("Same task?", claim["body"])
+        status, _, delivered = request(
+            endpoint,
+            "/v1/task-cards/delivered",
+            request_document(
+                card_id=claim["card_id"],
+                card_version=claim["card_version"],
+                claim_token=claim["claim_token"],
+                transport="synthetic",
+                delivery_ref="message-alpha",
+            ),
+        )
+        self.assertEqual((status, delivered["card_status"]),
+                         (200, "delivered"))
+        return claim
+
+    def _act(self, endpoint, claim, action):
+        return request(
+            endpoint,
+            "/v1/task-cards/action",
+            request_document(
+                card_id=claim["card_id"],
+                card_version=claim["card_version"],
+                action=action,
+            ),
+        )
+
+    def _proposal_state(self):
+        return self.connection.execute(
+            "SELECT state FROM task_duplicate_proposals WHERE id=?",
+            (self.proposal.proposal_id,),
+        ).fetchone()[0]
+
+    def test_route_offers_every_action_the_card_can_render(self):
+        """The keyboard and the route are answerable from the same set."""
+        with running_server(self.app) as endpoint:
+            claim = self._delivered_claim(endpoint)
+        offered = {
+            button["callback_data"].rsplit("|", 1)[-1]
+            for row in claim["reply_markup"]["inline_keyboard"]
+            for button in row
+        }
+        self.assertEqual(offered,
+                         {"duplicate_confirm", "duplicate_reject"})
+        self.assertLessEqual(offered, set(CARD_ACTIONS))
+
+    def test_confirm_is_accepted_and_settles_the_proposal(self):
+        with running_server(self.app) as endpoint:
+            claim = self._delivered_claim(endpoint)
+            status, _, body = self._act(endpoint, claim, "duplicate_confirm")
+
+            self.assertEqual((status, body["schema"]), (200, OPERATION_SCHEMA))
+            self.assertTrue(body["ok"])
+            self.assertEqual(body["disposition"], "applied")
+            self.assertIsNone(body["refusal"])
+            # Both sources survive the answer: the reader merged the
+            # question, not the tasks.
+            self.assertEqual((body["card_status"], body["task_status"]),
+                             ("cancelled", "open"))
+            self.assertEqual(self._proposal_state(), "confirmed")
+            self.assertEqual(
+                [row["status"] for row in self.connection.execute(
+                    "SELECT status FROM tasks ORDER BY id")],
+                ["open", "open"],
+            )
+
+            # A replayed tap is stale, not invalid: the card moved on.
+            status, _, replay = self._act(
+                endpoint, claim, "duplicate_confirm")
+            self.assertEqual(status, 200)
+            self.assertEqual((replay["ok"], replay["refusal"]),
+                             (False, "stale_version"))
+
+    def test_reject_is_accepted_and_settles_the_proposal(self):
+        with running_server(self.app) as endpoint:
+            claim = self._delivered_claim(endpoint)
+            status, _, body = self._act(endpoint, claim, "duplicate_reject")
+
+            self.assertEqual((status, body["schema"]), (200, OPERATION_SCHEMA))
+            self.assertTrue(body["ok"])
+            self.assertEqual(body["disposition"], "applied")
+            self.assertEqual((body["card_status"], body["task_status"]),
+                             ("cancelled", "open"))
+            self.assertEqual(self._proposal_state(), "rejected")
+            self.assertEqual(
+                self.connection.execute(
+                    "SELECT COUNT(*) FROM task_relations").fetchone()[0],
+                0,
+            )
+
+    def test_unknown_action_is_still_an_invalid_request(self):
+        with running_server(self.app) as endpoint:
+            claim = self._delivered_claim(endpoint)
+            status, _, body = self._act(endpoint, claim, "duplicate_maybe")
+
+            self.assertEqual((status, body["schema"]), (400, ERROR_SCHEMA))
+            self.assertEqual(body["error"]["code"], "invalid_request")
+            # Refused before the card was read, so nothing settled.
+            self.assertEqual(self._proposal_state(), "proposed")
+
 
 
 if __name__ == "__main__":

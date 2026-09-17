@@ -41,6 +41,7 @@ from .execution_worker import (
 from .knowledge_client import GwKnowledgeClient, KnowledgeClientError
 from .release_revision import describe
 from .task_cards import (
+    CARD_ACTIONS,
     ClaimAtCeiling,
     CardOperationResult,
     ScheduleResult,
@@ -552,10 +553,7 @@ class TaskCardApplication:
                 required={"card_id", "card_version", "action"},
             )
             action = request["action"]
-            if (
-                not isinstance(action, str)
-                or action not in {"done", "keep_open", "drop", "snooze"}
-            ):
+            if not isinstance(action, str) or action not in CARD_ACTIONS:
                 raise TaskCardServerRequestError(
                     "invalid_request", "task card action is invalid"
                 )

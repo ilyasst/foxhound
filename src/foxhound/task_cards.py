@@ -46,6 +46,15 @@ _ANSWERS = {
     "drop": completion.Outcome.SUPERSEDED,
 }
 
+#: Every answer a review card can carry. The service route, the callback
+#: parser, and `act` all gate on this one set: it lived as three inline
+#: copies, and the duplicate-review answers reached two of them, so a
+#: delivered duplicate card could be tapped but never resolved.
+CARD_ACTIONS = frozenset({
+    "done", "keep_open", "drop", "snooze",
+    "duplicate_confirm", "duplicate_reject",
+})
+
 SNOOZE_INTERVAL = timedelta(days=3)
 OPEN_REVIEW_INTERVAL = timedelta(days=7)
 CALLBACK_PREFIX = "fhc"
@@ -869,10 +878,7 @@ class TaskCardService:
     ) -> CardOperationResult:
         if not _valid_identity(card_id, expected_version):
             return _refused(card_id, CardRefusal.INVALID_ARGUMENT)
-        if action not in {
-            "done", "keep_open", "drop", "snooze",
-            "duplicate_confirm", "duplicate_reject",
-        }:
+        if action not in CARD_ACTIONS:
             return _refused(card_id, CardRefusal.INVALID_ACTION)
         now_dt = self._clock_value()
         now = now_dt.isoformat(timespec="seconds")
@@ -1905,11 +1911,7 @@ def parse_task_review_callback(value: object) -> tuple[int, int, str] | None:
     except ValueError:
         return None
     action = parts[3]
-    if (not _valid_identity(card_id, version)
-            or action not in {
-                "done", "keep_open", "drop", "snooze",
-                "duplicate_confirm", "duplicate_reject",
-            }):
+    if not _valid_identity(card_id, version) or action not in CARD_ACTIONS:
         return None
     return card_id, version, action
 
