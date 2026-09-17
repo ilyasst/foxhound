@@ -5,6 +5,7 @@ import unittest
 from foxhound.source_policy import (
     SOURCE_POLICIES,
     SourcePolicy,
+    action_grants,
     execution_grants,
     planning_grants,
     provenance_roles_for,
@@ -149,6 +150,27 @@ class ExecutionGrantTests(unittest.TestCase):
         """Separate values, so granting one says nothing about the other."""
         self.assertEqual(planning_grants(["issue"]), frozenset({"issue"}))
         self.assertEqual(execution_grants(None), frozenset())
+
+
+class ActionGrantTests(unittest.TestCase):
+    def test_a_machine_that_declares_nothing_acts_on_nothing_unasked(self):
+        self.assertEqual(action_grants(None), frozenset())
+        self.assertEqual(action_grants([]), frozenset())
+
+    def test_a_declared_kind_is_granted(self):
+        self.assertEqual(
+            action_grants(["review_request"]), frozenset({"review_request"})
+        )
+
+    def test_an_unknown_kind_is_refused_rather_than_ignored(self):
+        with self.assertRaises(ValueError):
+            action_grants(["review-request"])
+
+    def test_each_gate_holds_its_own_authority(self):
+        """Three grants, three answers; none is derived from another."""
+        self.assertEqual(planning_grants(["issue"]), frozenset({"issue"}))
+        self.assertEqual(execution_grants(["issue"]), frozenset({"issue"}))
+        self.assertEqual(action_grants(None), frozenset())
 
 
 if __name__ == "__main__":
