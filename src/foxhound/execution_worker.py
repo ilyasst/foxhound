@@ -248,7 +248,8 @@ class ExecutionWorker:
                 "local_research_clients": _local_research_clients(),
                 "worker_operations": _worker_operations(state.phase),
                 "external_effects_allowed": (
-                    state.phase is WorkflowPhase.EXTERNAL_ACTION
+                    state.phase
+                    in (WorkflowPhase.EXECUTE, WorkflowPhase.EXTERNAL_ACTION)
                 ),
             },
             "task": {
