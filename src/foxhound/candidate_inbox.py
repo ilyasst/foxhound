@@ -2413,15 +2413,26 @@ _SCHEMA_V37 = (
 # Binding writes also acknowledge evidence-only and reader-conflict updates.
 # A work revision instead records a source state actually folded into work, so
 # it is appended explicitly by the ledger rather than by a broad UPDATE trigger.
-_SCHEMA_V38 = (
+#
+# Split into three parts because this migration has to be replayable, and the
+# rebuild is the one piece that is not. Replaying v37 re-creates the broad
+# update trigger this version exists to remove, so the drops must run every
+# time; and the rebuild relabels every row it copies as 'accepted', so running
+# it over an already-converted table would silently erase the
+# 'source_advance' distinction it was written to introduce.
+_SCHEMA_V38_DROP = (
     "DROP TRIGGER IF EXISTS work_revision_on_accepted_binding;",
     "DROP TRIGGER IF EXISTS work_revision_on_source_update;",
+)
+_SCHEMA_V38_REBUILD = (
     "DROP INDEX IF EXISTS work_revisions_current;",
     "ALTER TABLE work_revisions RENAME TO work_revisions_v37;",
     "CREATE TABLE work_revisions (id INTEGER PRIMARY KEY,work_item_id INTEGER NOT NULL REFERENCES work_items(id),candidate_id TEXT NOT NULL,source_revision TEXT NOT NULL,task_version INTEGER NOT NULL,kind TEXT NOT NULL CHECK(kind IN ('accepted','source_advance')),created_at TEXT NOT NULL);",
     "INSERT INTO work_revisions(id,work_item_id,candidate_id,source_revision,task_version,kind,created_at) SELECT id,work_item_id,candidate_id,source_revision,task_version,'accepted',created_at FROM work_revisions_v37;",
     "DROP TABLE work_revisions_v37;",
     "CREATE INDEX work_revisions_current ON work_revisions(work_item_id,id DESC);",
+)
+_SCHEMA_V38_TRIGGER = (
     "CREATE TRIGGER work_revision_on_accepted_binding AFTER INSERT ON task_candidate_bindings WHEN NEW.relation='accepted' BEGIN INSERT OR IGNORE INTO work_items(task_id,created_at,updated_at) SELECT NEW.task_id,NEW.decided_at,NEW.decided_at; INSERT INTO work_revisions(work_item_id,candidate_id,source_revision,task_version,kind,created_at) SELECT id,NEW.candidate_id,NEW.source_revision,(SELECT version FROM tasks WHERE id=NEW.task_id),'accepted',NEW.decided_at FROM work_items WHERE task_id=NEW.task_id; END;",
 )
 
@@ -3440,7 +3451,15 @@ class CandidateInbox:
                 connection.execute("PRAGMA foreign_keys = OFF")
                 connection.execute("BEGIN IMMEDIATE")
                 try:
-                    for statement in _SCHEMA_V38:
+                    for statement in _SCHEMA_V38_DROP:
+                        connection.execute(statement)
+                    columns = tuple(item["name"] for item in connection.execute(
+                        "PRAGMA table_info(work_revisions)"
+                    ))
+                    if "kind" not in columns:
+                        for statement in _SCHEMA_V38_REBUILD:
+                            connection.execute(statement)
+                    for statement in _SCHEMA_V38_TRIGGER:
                         connection.execute(statement)
                     connection.execute("PRAGMA user_version = 38")
                     connection.commit()

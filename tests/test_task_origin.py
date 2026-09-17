@@ -153,6 +153,35 @@ class TaskOriginRead(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(total, 1)
 
+    def test_replaying_the_migration_keeps_work_advances_distinct(self) -> None:
+        # The v38 rebuild relabels every row it copies as 'accepted', and
+        # replaying v37 re-creates the broad update trigger v38 removes. Both
+        # have to be skipped when the conversion has already happened, or a
+        # replay quietly erases the distinction this schema exists to record.
+        self._bind(1, _issue_candidate(42))
+        with closing(sqlite3.connect(self.db)) as connection:
+            connection.row_factory = sqlite3.Row
+            TaskLedger._append_work_revision(
+                connection, task_id=1,
+                candidate_id=_issue_candidate(42)["candidate_id"],
+                source_revision="c" * 64, task_version=2,
+                now="2030-01-02T12:00:00Z",
+            )
+            connection.execute("PRAGMA user_version = 37")
+            connection.commit()
+
+        migrate_database(self.db)
+
+        with closing(sqlite3.connect(self.db)) as connection:
+            kinds = [row[0] for row in connection.execute(
+                "SELECT kind FROM work_revisions ORDER BY id"
+            )]
+            triggers = {row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger'"
+            )}
+        self.assertEqual(kinds, ["accepted", "source_advance"])
+        self.assertNotIn("work_revision_on_source_update", triggers)
+
     def test_a_task_bound_to_nothing_has_no_origin(self) -> None:
         # An ordinary state, not an error: a task may predate binding.
         with closing(sqlite3.connect(self.db)) as conn, conn:
