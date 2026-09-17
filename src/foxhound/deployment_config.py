@@ -590,12 +590,7 @@ def _parse_database_consumers(
     if version >= 5:
         fields.add("duplicate_card_schedule")
     optional_fields = {"task_card_requeue"} if version >= 5 else set()
-    if not isinstance(value, Mapping):
-        raise DeploymentConfigError("deployment configuration shape is invalid")
-    keys = set(value)
-    if keys != fields and keys != fields | optional_fields:
-        raise DeploymentConfigError("deployment configuration shape is invalid")
-    document = value
+    document = _object(value, fields, optional_fields)
     candidate = _parse_candidate_feed_import(document["candidate_feed_import"])
     intake = _parse_native_intake_run(document["native_intake_run"])
     task_requeue = (
@@ -713,8 +708,20 @@ def _parse_duplicate_card_schedule(value: object) -> int | None:
     return None if document is None else _positive_int(document["limit"])
 
 
-def _object(value: object, fields: set[str]) -> Mapping[str, object]:
-    if not isinstance(value, Mapping) or set(value) != fields:
+def _object(value: object, fields: set[str],
+            optional: set[str] | None = None) -> Mapping[str, object]:
+    """One shape check for every section of the document.
+
+    `optional` is a range rather than a second exact shape: a field in it may
+    be present or absent independently of the others.  A section that declares
+    one optional field and not another is still a valid section, and treating
+    the optional set as all-or-nothing would refuse it while reporting only
+    that the shape was wrong.
+    """
+    if not isinstance(value, Mapping):
+        raise DeploymentConfigError("deployment configuration shape is invalid")
+    keys = set(value)
+    if not fields <= keys <= fields | (optional or set()):
         raise DeploymentConfigError("deployment configuration shape is invalid")
     return value
 

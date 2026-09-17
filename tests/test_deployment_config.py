@@ -13,6 +13,7 @@ import unittest
 from unittest import mock
 
 from foxhound.database_lifecycle import migrate_database
+from foxhound import deployment_config
 from foxhound.deployment_config import (
     DeploymentConfigError,
     execute_component,
@@ -544,6 +545,60 @@ class DeploymentConfigTests(unittest.TestCase):
 
         with self.assertRaises(DeploymentConfigError):
             load_deployment_config(self.config_path)
+
+
+class ObjectShapeTests(unittest.TestCase):
+    """The one shape check every section of the document goes through.
+
+    Exercised directly because the document declares a single optional field
+    today, and the behaviour worth pinning is what happens with more than one:
+    an optional set is a range, not a second exact shape.
+    """
+
+    REQUIRED = {"alpha", "beta"}
+    OPTIONAL = {"gamma", "delta"}
+
+    def _check(self, document):
+        return deployment_config._object(document, set(self.REQUIRED),
+                                         set(self.OPTIONAL))
+
+    def test_required_only_is_valid(self) -> None:
+        document = {"alpha": 1, "beta": 2}
+        self.assertEqual(self._check(document), document)
+
+    def test_every_optional_field_is_valid(self) -> None:
+        document = {"alpha": 1, "beta": 2, "gamma": 3, "delta": 4}
+        self.assertEqual(self._check(document), document)
+
+    def test_a_partial_optional_subset_is_valid(self) -> None:
+        """All-or-nothing handling refused this while reporting only 'invalid'."""
+        for optional in sorted(self.OPTIONAL):
+            document = {"alpha": 1, "beta": 2, optional: 3}
+            with self.subTest(optional=optional):
+                self.assertEqual(self._check(document), document)
+
+    def test_a_missing_required_field_is_refused(self) -> None:
+        with self.assertRaises(DeploymentConfigError):
+            self._check({"alpha": 1, "gamma": 3})
+
+    def test_an_unknown_field_is_refused(self) -> None:
+        with self.assertRaises(DeploymentConfigError):
+            self._check({"alpha": 1, "beta": 2, "epsilon": 5})
+
+    def test_an_unknown_field_beside_an_optional_one_is_refused(self) -> None:
+        with self.assertRaises(DeploymentConfigError):
+            self._check({"alpha": 1, "beta": 2, "gamma": 3, "epsilon": 5})
+
+    def test_a_non_mapping_is_refused(self) -> None:
+        for value in ([], "alpha", 7, None):
+            with self.subTest(value=value):
+                with self.assertRaises(DeploymentConfigError):
+                    self._check(value)
+
+    def test_no_optional_set_means_an_exact_shape(self) -> None:
+        with self.assertRaises(DeploymentConfigError):
+            deployment_config._object({"alpha": 1, "beta": 2, "gamma": 3},
+                                      set(self.REQUIRED))
 
 
 if __name__ == "__main__":
