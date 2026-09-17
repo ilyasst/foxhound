@@ -797,6 +797,53 @@ class ExecutionWorkerTests(unittest.TestCase):
         self.assertEqual(document["external_actions"], [])
         self.assertEqual(document["deliverables"], [])
 
+    def test_draft_uses_this_claims_run_inputs_over_stale_task_inputs(self):
+        """A durable task folder cannot make a later run replay old work."""
+        paths = self._enable_archive()
+        stale = {
+            "result-summary.txt": "Earlier synthetic summary.\n",
+            "result-work.md": "# Earlier synthetic work\n",
+        }
+        for name, text in stale.items():
+            path = paths.working_directory / name
+            path.write_text(text, encoding="utf-8")
+            path.chmod(0o600)
+            # The task folder outlives runs.  Make these files explicitly
+            # older than this claim's private run-state anchor.
+            anchor = self.state_path.stat().st_mtime_ns
+            os.utime(path, ns=(anchor - 1_000_000, anchor - 1_000_000))
+
+        self._write_result_inputs()
+        with knowledge_server() as endpoint:
+            ready = self._worker(endpoint).draft(outcome="awaiting_plan")
+
+        document = json.loads(
+            (self.run_directory / ready["draft"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(document["summary"], "Synthetic result summary")
+        self.assertEqual(document["work_markdown"],
+                         "# Synthetic work\n\nNo private evidence.")
+
+    def test_draft_still_accepts_task_inputs_written_during_this_claim(self):
+        paths = self._enable_archive()
+        for name, text in (
+            ("result-summary.txt", "Task-folder synthetic summary.\n"),
+            ("result-work.md", "# Task-folder synthetic work\n"),
+        ):
+            path = paths.working_directory / name
+            path.write_text(text, encoding="utf-8")
+            path.chmod(0o600)
+
+        with knowledge_server() as endpoint:
+            ready = self._worker(endpoint).draft(outcome="awaiting_plan")
+
+        document = json.loads(
+            (self.run_directory / ready["draft"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(document["summary"], "Task-folder synthetic summary.")
+        self.assertEqual(document["work_markdown"],
+                         "# Task-folder synthetic work")
+
     def test_repository_receipt_is_private_and_deduplicated(self):
         receipt = {
             "kind": "issue-comment",

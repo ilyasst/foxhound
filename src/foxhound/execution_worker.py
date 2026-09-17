@@ -673,35 +673,57 @@ class ExecutionWorker:
         # records keeps working by accident, but the task folder is tried
         # first because that is the intended home.
         search_directories = _result_search_path(state, run_directory)
+        task_folder_not_before = _claim_started_at(self._state_path)
         result_id = state.run_id
         draft = _repository_result(state, {
             "outcome": outcome,
             "summary": _read_result_text(
-                _locate_result(search_directories, "result-summary.txt"),
+                _locate_result(
+                    search_directories, "result-summary.txt",
+                    task_folder_not_before=task_folder_not_before,
+                ),
                 label="execution result summary",
             ),
             "work_markdown": _read_result_text(
-                _locate_result(search_directories, "result-work.md"),
+                _locate_result(
+                    search_directories, "result-work.md",
+                    task_folder_not_before=task_folder_not_before,
+                ),
                 label="execution result work",
             ),
             "questions": _read_optional_string_array(
-                _locate_result(search_directories, "result-questions.json"),
+                _locate_result(
+                    search_directories, "result-questions.json",
+                    task_folder_not_before=task_folder_not_before,
+                ),
                 label="execution result questions",
             ),
             "external_actions": _read_optional_string_array(
-                _locate_result(search_directories, "result-external-actions.json"),
+                _locate_result(
+                    search_directories, "result-external-actions.json",
+                    task_folder_not_before=task_folder_not_before,
+                ),
                 label="execution result external actions",
             ),
             "deliverables": _read_optional_string_array(
-                _locate_result(search_directories, "result-deliverables.json"),
+                _locate_result(
+                    search_directories, "result-deliverables.json",
+                    task_folder_not_before=task_folder_not_before,
+                ),
                 label="execution result deliverables",
             ),
             "repository_references": _read_optional_repository_references(
-                _locate_result(search_directories, "result-repository-references.json"),
+                _locate_result(
+                    search_directories, "result-repository-references.json",
+                    task_folder_not_before=task_folder_not_before,
+                ),
                 label="execution result repository references",
             ),
             "repository_impact": _read_optional_repository_impact(
-                _locate_result(search_directories, "result-repository-impact.json"),
+                _locate_result(
+                    search_directories, "result-repository-impact.json",
+                    task_folder_not_before=task_folder_not_before,
+                ),
                 label="execution result repository impact",
             ),
         }, run_directory)
@@ -1141,17 +1163,50 @@ def _result_search_path(state, run_directory: Path) -> tuple[Path, ...]:
     return tuple(directories)
 
 
-def _locate_result(directories: tuple[Path, ...], name: str) -> Path:
+def _claim_started_at(state_path: Path) -> int | None:
+    """The private run-state mtime, used to fence shared result inputs.
+
+    The runner writes this file after it creates the task archive and before
+    it launches the worker.  It is therefore the durable start marker for the
+    claim.  If it cannot be read, accepting a task-folder file would risk
+    harvesting a prior claim, so callers deliberately fall through to private
+    run inputs instead.
+    """
+    try:
+        return state_path.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def _locate_result(
+    directories: tuple[Path, ...],
+    name: str,
+    *,
+    task_folder_not_before: int | None = None,
+) -> Path:
     """The first directory that actually holds `name`.
 
     When none does, the first candidate is returned so the caller reports the
     location the reader was most likely aiming at, rather than the private
     scratch directory they never chose.
     """
-    for directory in directories:
+    for index, directory in enumerate(directories):
         candidate = directory / name
         try:
             if candidate.is_file():
+                # The task folder is deliberately durable and shared between
+                # runs.  It can be a source for this claim only when this
+                # exact file was written after the run-state anchor.  A stale
+                # file must never outrank the current run's private input.
+                if (
+                    index == 0
+                    and len(directories) > 1
+                    and (
+                        task_folder_not_before is None
+                        or candidate.stat().st_mtime_ns < task_folder_not_before
+                    )
+                ):
+                    continue
                 return candidate
         except OSError:
             continue
