@@ -5,6 +5,7 @@ import unittest
 from foxhound.source_policy import (
     SOURCE_POLICIES,
     SourcePolicy,
+    execution_grants,
     planning_grants,
     provenance_roles_for,
     source_kinds_accepting,
@@ -125,6 +126,29 @@ class SourcePolicyTests(unittest.TestCase):
     def test_unknown_capability_fails_closed(self):
         with self.assertRaisesRegex(ValueError, "unknown source-policy"):
             source_kinds_accepting("unknown")
+
+
+class ExecutionGrantTests(unittest.TestCase):
+    def test_a_machine_that_declares_nothing_executes_nothing_unasked(self):
+        self.assertEqual(execution_grants(None), frozenset())
+        self.assertEqual(execution_grants([]), frozenset())
+
+    def test_a_declared_kind_is_granted(self):
+        self.assertEqual(execution_grants(["issue"]), frozenset({"issue"}))
+
+    def test_an_unknown_kind_is_refused_rather_than_ignored(self):
+        """A typo must not silently widen or narrow authority."""
+        with self.assertRaises(ValueError):
+            execution_grants(["issu"])
+
+    def test_a_bare_string_is_not_a_list_of_kinds(self):
+        with self.assertRaises(ValueError):
+            execution_grants("issue")
+
+    def test_execution_authority_is_not_planning_authority(self):
+        """Separate values, so granting one says nothing about the other."""
+        self.assertEqual(planning_grants(["issue"]), frozenset({"issue"}))
+        self.assertEqual(execution_grants(None), frozenset())
 
 
 if __name__ == "__main__":
