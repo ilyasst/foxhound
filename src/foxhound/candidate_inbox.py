@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 38
+SCHEMA_VERSION = 39
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -385,6 +385,9 @@ _SCHEMA_COLUMNS = {
         "consumer_digest",
         "superseded_delivery_ref",
         "superseded_transport",
+        # Appended by v39. Declared last because the check below compares the
+        # column tuple in order, and ALTER TABLE adds to the end.
+        "work_revision_id",
     ),
     "execution_review_card_events": (
         "sequence",
@@ -482,12 +485,22 @@ _SCHEMA_COLUMNS = {
 # the new table removed, the v22 state also has the card column removed but
 # keeps `work_digest`, the v21 state has neither column but keeps
 # `task_relations`, and the v20 state has none of the five.
+#: Every historical checkpoint derives from the current map by removing what
+#: was added after it, so a column added now has to be stripped here or the
+#: mid-migration checks demand it from a database that predates it.
+_SCHEMA_V38_COLUMNS = {
+    name: tuple(column for column in columns if not (
+        name == "execution_review_cards" and column == "work_revision_id"
+    ))
+    for name, columns in _SCHEMA_COLUMNS.items()
+}
+
 _SCHEMA_V34_COLUMNS = {
     name: tuple(column for column in columns if not (
         name == "execution_review_cards"
         and column in {"superseded_delivery_ref", "superseded_transport"}
     ))
-    for name, columns in _SCHEMA_COLUMNS.items()
+    for name, columns in _SCHEMA_V38_COLUMNS.items()
 }
 
 _SCHEMA_V33_COLUMNS = {
@@ -2437,6 +2450,19 @@ _SCHEMA_V38_TRIGGER = (
 )
 
 
+# An execution approval says a reader agreed to an action. It recorded which
+# task version and workflow version were in force, but not which source state
+# the reader was actually looking at, so afterwards nothing could say what was
+# approved. The work revision names exactly that.
+#
+# Nullable and not backfilled on purpose: cards raised before this column
+# existed were approved against a source state nobody recorded, and inventing
+# one now would be a worse answer than admitting it is unknown.
+_SCHEMA_V39 = (
+    "CREATE INDEX IF NOT EXISTS execution_review_cards_work_revision ON execution_review_cards(work_revision_id);",
+)
+
+
 _SCHEMA_V20 = (
     # SQLite cannot alter a CHECK in place, and three tables carry a foreign
     # key to this one. Renaming the card table would rewrite all three to
@@ -3469,6 +3495,25 @@ class CandidateInbox:
                 finally:
                     connection.execute("PRAGMA foreign_keys = ON")
                 version = 38
+            if version == 38:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    columns = tuple(item["name"] for item in connection.execute(
+                        "PRAGMA table_info(execution_review_cards)"
+                    ))
+                    if "work_revision_id" not in columns:
+                        connection.execute(
+                            "ALTER TABLE execution_review_cards ADD COLUMN "
+                            "work_revision_id INTEGER REFERENCES "
+                            "work_revisions(id);"
+                        )
+                    connection.execute("PRAGMA user_version = 39")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 39
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:
