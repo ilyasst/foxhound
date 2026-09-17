@@ -57,6 +57,7 @@ from .task_archive import (
     publish_deliverables,
 )
 from .task_ledger import TaskLedger, TaskLedgerError
+from .source_policy import execution_grants as _execution_grants
 from .source_policy import planning_grants as _planning_grants
 
 
@@ -101,6 +102,7 @@ class ExecutionRunnerConfig:
     task_kb_root: Path | None = field(default=None, repr=False)
     allowed_phases: tuple[WorkflowPhase, ...] = tuple(WorkflowPhase)
     planning_grants: tuple[str, ...] = ()
+    execution_grants: tuple[str, ...] = ()
     runner_slot: str = "default"
     poll_seconds: float = 0.1
     execution_slot_cap: int | None = None
@@ -149,6 +151,12 @@ class ExecutionRunnerConfig:
             _planning_grants(self.planning_grants)
         except ValueError as exc:
             raise ValueError("execution planning grants are invalid") from exc
+        if not isinstance(self.execution_grants, tuple):
+            raise ValueError("execution grants are invalid")
+        try:
+            _execution_grants(self.execution_grants)
+        except ValueError as exc:
+            raise ValueError("execution grants are invalid") from exc
         if (
             isinstance(self.poll_seconds, bool)
             or not isinstance(self.poll_seconds, (int, float))
@@ -288,6 +296,7 @@ def run_once(
         profile_registry=config.profile_registry,
         default_profile_id=config.default_agent_profile,
         planning_grants=config.planning_grants,
+        execution_grants=config.execution_grants,
         execution_slot_cap=config.execution_slot_cap,
         plan_ready_cap=config.plan_ready_cap,
         awaiting_reader_cap=config.awaiting_reader_cap,
@@ -922,6 +931,10 @@ def _parser() -> argparse.ArgumentParser:
         help="refill the ready plan reserve for this source kind",
     )
     parser.add_argument(
+        "--execute-without-asking", action="append", metavar="SOURCE_KIND",
+        help="run a recorded plan for this source kind without a card",
+    )
+    parser.add_argument(
         "--knowledge-root",
         type=Path,
         help=(
@@ -1020,6 +1033,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             worker_command=args.worker_command,
             runner_slot=args.runner_slot,
             planning_grants=tuple(args.plan_without_asking or ()),
+            execution_grants=tuple(args.execute_without_asking or ()),
             knowledge_root=args.knowledge_root,
             task_work_root=args.task_work_root,
             task_kb_root=args.task_kb_root,

@@ -28,6 +28,7 @@ from .agent_profiles import (
 )
 from .candidate_inbox import CandidateInbox, InboxError, SCHEMA_VERSION
 from .source_policy import (
+    execution_grants as _execution_grants,
     planning_grants as _planning_grants,
     source_kinds_accepting,
 )
@@ -336,6 +337,7 @@ class TaskExecutionService:
         profile_registry: AgentProfileRegistry | None = None,
         default_profile_id: str = "general",
         planning_grants: object = None,
+        execution_grants: object = None,
         execution_slot_cap: int | None = None,
         plan_ready_cap: int | None = None,
         awaiting_reader_cap: int | None = None,
@@ -373,6 +375,9 @@ class TaskExecutionService:
         # decided is asked, rather than having the decision made for them
         # by whichever machine edited a shared file first.
         self._planning_grants = _planning_grants(planning_grants)
+        # Independent of planning authority above. A machine that has
+        # said a kind may be planned has not said its plan may be run.
+        self._execution_grants = _execution_grants(execution_grants)
         self._default_profile = profile
 
     def _profile_for(self, origin_kind: object) -> AgentProfile:
@@ -1258,6 +1263,16 @@ class TaskExecutionService:
                         result["task_id"], row,
                         WorkflowRefusal.INVALID_STATE,
                     )
+                recorded_phase = WorkflowPhase(result["phase"])
+                advance = _granted_advance(
+                    recorded_phase,
+                    ExecutionOutcome(result["outcome"]),
+                    row["origin_kind"],
+                    self._execution_grants,
+                )
+                phase = recorded_phase if advance is None else advance
+                if advance is not None:
+                    target = WorkflowStatus.QUEUED
                 connection.execute(
                     "INSERT INTO task_execution_results("
                     "result_id,task_id,workflow_version,task_version,phase,"
@@ -1289,8 +1304,8 @@ class TaskExecutionService:
                     now if target is WorkflowStatus.COMPLETED else None
                 )
                 connection.execute(
-                    "UPDATE task_execution_workflows SET status=?,version=?,"
-                    "claim_token_digest=NULL,claimed_at=NULL,"
+                    "UPDATE task_execution_workflows SET status=?,phase=?,"
+                    "version=?,claim_token_digest=NULL,claimed_at=NULL,"
                     "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
                     "failure_count=0,last_failure_reason=NULL,"
                     "last_failure_exit_code=NULL,last_failure_run_id=NULL,"
@@ -1298,22 +1313,32 @@ class TaskExecutionService:
                     "last_result_id=?,updated_at=?,completed_at=? "
                     "WHERE task_id=? AND version=? AND status='running'",
                     (
-                        target, version, result["result_id"], now, completed,
-                        result["task_id"], result["workflow_version"],
+                        target, phase, version, result["result_id"], now,
+                        completed, result["task_id"],
+                        result["workflow_version"],
                     ),
                 )
+                # Recorded against the phase that produced it, whatever
+                # happens next: the result belongs to the work that made it.
                 self._event(
                     connection, result["task_id"], "result_recorded",
                     version, result["task_version"],
-                    WorkflowPhase(result["phase"]), target, now,
+                    recorded_phase, target, now,
                 )
+                if advance is not None:
+                    # Named apart from `phase_approved` so the ledger never
+                    # says a reader approved a phase nobody was asked about.
+                    self._event(
+                        connection, result["task_id"], "phase_granted",
+                        version, result["task_version"], phase, target, now,
+                    )
                 connection.commit()
                 return WorkflowOperationResult(
                     WorkflowDisposition.APPLIED,
                     result["task_id"],
                     version,
                     target,
-                    WorkflowPhase(result["phase"]),
+                    phase,
                     agent_profile_id=row["agent_profile_id"],
                     agent_profile_revision=row["agent_profile_revision"],
                 )
@@ -1661,7 +1686,11 @@ class TaskExecutionService:
     ) -> sqlite3.Row | None:
         return connection.execute(
             "SELECT w.*,t.status AS task_status,t.version AS "
-            "current_task_version FROM task_execution_workflows AS w "
+            "current_task_version,("
+            " SELECT o.source_kind FROM task_candidate_bindings AS b "
+            " JOIN candidate_inbox AS o ON o.candidate_id=b.candidate_id "
+            " WHERE b.task_id=t.id AND b.relation='accepted'"
+            ") AS origin_kind FROM task_execution_workflows AS w "
             "JOIN tasks AS t ON t.id=w.task_id WHERE w.task_id=?",
             (task_id,),
         ).fetchone()
@@ -2278,6 +2307,33 @@ def _result_target(
     if outcome not in allowed[phase]:
         return None
     return WorkflowStatus.AWAITING_REVIEW
+
+
+def _granted_advance(
+    phase: WorkflowPhase,
+    outcome: ExecutionOutcome,
+    origin_kind: object,
+    granted: frozenset[str],
+) -> WorkflowPhase | None:
+    """The phase a standing grant moves this result to, or None to ask.
+
+    A recorded plan asks for approval by returning `awaiting_plan`. For a
+    source whose enrolment already settled that question, the card it would
+    raise has one plausible answer, and a queue of such cards costs the
+    reader the attention that the cards needing a decision were meant to
+    get.
+
+    Only that one transition is granted here. `completed`, `declined` and
+    `ineligible` end the work and are the reader's to see; nothing about a
+    grant should hide a result.
+    """
+    if phase is not WorkflowPhase.PLAN:
+        return None
+    if outcome is not ExecutionOutcome.AWAITING_PLAN:
+        return None
+    if not isinstance(origin_kind, str) or origin_kind not in granted:
+        return None
+    return WorkflowPhase.EXECUTE
 
 
 def _validated_result(envelope: ExecutionResultEnvelope) -> dict[str, object]:

@@ -1470,6 +1470,116 @@ class TaskExecutionTests(unittest.TestCase):
         self.assertGreater(rescheduled.version, cancelled.version)
         self.assertIsNone(self.service.get(1).completed_at)
 
+    def _grant_service(self, *kinds: str) -> TaskExecutionService:
+        """The same service this suite builds, with execution granted."""
+        return TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: TOKEN,
+            max_attempts=3,
+            profile_registry=AgentProfileRegistry((
+                general_profile(),
+                _profile(
+                    "sigint", phases=("plan", "execute", "external_action")
+                ),
+            )),
+            execution_grants=list(kinds),
+        )
+
+    def _events(self, task_id: int) -> list[str]:
+        with closing(sqlite3.connect(self.database)) as connection:
+            return [
+                row[0] for row in connection.execute(
+                    "SELECT kind FROM task_execution_events WHERE task_id=? "
+                    "ORDER BY sequence",
+                    (task_id,),
+                )
+            ]
+
+    def test_a_granted_kind_runs_its_plan_without_a_card(self):
+        self._bind_origin(1, "issue")
+        service = self._grant_service("issue")
+        scheduled = service.schedule(1, expected_task_version=1)
+        service.start_action(
+            1, expected_version=scheduled.version, action="start")
+        claim = service.claim_next()
+        recorded = service.record_result(self._result(claim))
+
+        self.assertEqual(recorded.status, WorkflowStatus.QUEUED)
+        self.assertEqual(recorded.phase, WorkflowPhase.EXECUTE)
+        workflow = service.get(1)
+        self.assertEqual(workflow.status, WorkflowStatus.QUEUED)
+        self.assertEqual(workflow.phase, WorkflowPhase.EXECUTE)
+
+    def test_an_ungranted_kind_still_waits_for_a_reader(self):
+        self._bind_origin(1, "issue")
+        service = self._grant_service("review_request")
+        scheduled = service.schedule(1, expected_task_version=1)
+        service.start_action(
+            1, expected_version=scheduled.version, action="start")
+        claim = service.claim_next()
+        recorded = service.record_result(self._result(claim))
+
+        self.assertEqual(recorded.status, WorkflowStatus.AWAITING_REVIEW)
+        self.assertEqual(recorded.phase, WorkflowPhase.PLAN)
+
+    def test_a_task_with_no_origin_is_never_granted(self):
+        """A task carrying no accepted candidate has no kind to match."""
+        service = self._grant_service("issue")
+        scheduled = service.schedule(1, expected_task_version=1)
+        service.start_action(
+            1, expected_version=scheduled.version, action="start")
+        claim = service.claim_next()
+        recorded = service.record_result(self._result(claim))
+
+        self.assertEqual(recorded.status, WorkflowStatus.AWAITING_REVIEW)
+
+    def test_a_grant_is_not_recorded_as_a_reader_approval(self):
+        """The ledger must not claim someone approved what nobody saw."""
+        self._bind_origin(1, "issue")
+        service = self._grant_service("issue")
+        scheduled = service.schedule(1, expected_task_version=1)
+        service.start_action(
+            1, expected_version=scheduled.version, action="start")
+        claim = service.claim_next()
+        service.record_result(self._result(claim))
+
+        events = self._events(1)
+        self.assertIn("phase_granted", events)
+        self.assertNotIn("phase_approved", events)
+        self.assertEqual(events[-2], "result_recorded")
+        self.assertEqual(events[-1], "phase_granted")
+
+    def test_granting_execution_does_not_grant_a_completed_result(self):
+        """Only the plan-approval gate is granted; an ending still lands."""
+        self._bind_origin(1, "issue")
+        service = self._grant_service("issue")
+        scheduled = service.schedule(1, expected_task_version=1)
+        service.start_action(
+            1, expected_version=scheduled.version, action="start")
+        claim = service.claim_next()
+        recorded = service.record_result(
+            self._result(claim, outcome=ExecutionOutcome.COMPLETED)
+        )
+
+        self.assertEqual(recorded.status, WorkflowStatus.AWAITING_REVIEW)
+        self.assertEqual(recorded.phase, WorkflowPhase.PLAN)
+        self.assertNotIn("phase_granted", self._events(1))
+
+    def test_an_unknown_granted_kind_is_refused_at_construction(self):
+        with self.assertRaises(ValueError):
+            self._grant_service("not-a-source-kind")
+
+    def test_declaring_nothing_grants_nothing(self):
+        self._bind_origin(1, "issue")
+        scheduled = self.service.schedule(1, expected_task_version=1)
+        self.service.start_action(
+            1, expected_version=scheduled.version, action="start")
+        claim = self._claim()
+        recorded = self.service.record_result(self._result(claim))
+
+        self.assertEqual(recorded.status, WorkflowStatus.AWAITING_REVIEW)
+
     def test_result_progression_is_strict_private_and_idempotent(self):
         self._schedule_and_start()
         plan_claim = self._claim()
