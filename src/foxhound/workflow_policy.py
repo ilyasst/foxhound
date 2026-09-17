@@ -7,7 +7,7 @@ import json
 from dataclasses import dataclass
 from typing import Mapping
 
-from .source_policy import SOURCE_POLICIES, source_kind_grants
+from .source_policy import source_kind_grants
 
 
 STAGES = ("plan", "execute", "external_action")
@@ -15,7 +15,7 @@ FRESHNESS = ("none", "before_phase", "before_effect")
 
 
 class WorkflowPolicyError(ValueError):
-    pass
+    """A workflow policy document is outside the supported contract."""
 
 
 @dataclass(frozen=True)
@@ -43,18 +43,38 @@ def policy_from_legacy(
         "external_action": source_kind_grants(
             external_action, label="action grants"),
     }
-    payload = {
-        "policy_id": "legacy-source-grants", "grants": {
-            stage: sorted(values) for stage, values in grants.items()
-        },
-        "freshness": "none", "effects": [], "final_decision": True,
-    }
-    canonical = json.dumps(payload, separators=(",", ":"), sort_keys=True)
     return WorkflowPolicy(
         policy_id="legacy-source-grants",
-        revision=hashlib.sha256(canonical.encode()).hexdigest(),
+        revision=_revision(
+            policy_id="legacy-source-grants", grants=grants,
+            freshness="none", effects=frozenset(), final_decision=True,
+        ),
         grants=grants, freshness="none", effects=frozenset(), final_decision=True,
     )
+
+
+def _revision(
+    *, policy_id: str, grants: Mapping[str, frozenset[str]], freshness: str,
+    effects: frozenset[str], final_decision: bool,
+) -> str:
+    """Hash the normalized policy, so equal policies share one revision.
+
+    Grant order, repeated entries, and document key order are not part of a
+    policy's identity.  Hashing the caller's document as written would give
+    one policy several revisions, and the version fence a decision or a final
+    outcome carries would then mismatch for no policy change at all.
+    """
+    canonical = json.dumps(
+        {
+            "policy_id": policy_id,
+            "grants": {stage: sorted(grants[stage]) for stage in STAGES},
+            "freshness": freshness,
+            "effects": sorted(effects),
+            "final_decision": final_decision,
+        },
+        separators=(",", ":"), sort_keys=True,
+    )
+    return hashlib.sha256(canonical.encode()).hexdigest()
 
 
 def parse_workflow_policy(value: object) -> WorkflowPolicy:
@@ -82,6 +102,11 @@ def parse_workflow_policy(value: object) -> WorkflowPolicy:
     final_decision = value["final_decision"]
     if not isinstance(final_decision, bool):
         raise WorkflowPolicyError("workflow policy final decision is invalid")
-    canonical = json.dumps(value, separators=(",", ":"), sort_keys=True)
-    return WorkflowPolicy(policy_id, hashlib.sha256(canonical.encode()).hexdigest(),
-                          grants, freshness, frozenset(effects), final_decision)
+    return WorkflowPolicy(
+        policy_id,
+        _revision(
+            policy_id=policy_id, grants=grants, freshness=freshness,
+            effects=frozenset(effects), final_decision=final_decision,
+        ),
+        grants, freshness, frozenset(effects), final_decision,
+    )
