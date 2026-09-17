@@ -92,6 +92,14 @@ class TaskOriginRead(unittest.TestCase):
         self.assertEqual(
             set(vars(origin)), {"system", "kind", "record_id", "item_id"})
 
+    def test_source_snapshot_request_is_bound_to_accepted_revision(self) -> None:
+        candidate = _issue_candidate(42)
+        self._bind(1, candidate)
+        request = self.ledger.source_snapshot_request(1)
+        self.assertIsNotNone(request)
+        self.assertEqual(request.locator.record_id, "forge.example/acme/widget")
+        self.assertEqual(request.expected_revision, "b" * 64)
+
     def test_a_task_bound_to_nothing_has_no_origin(self) -> None:
         # An ordinary state, not an error: a task may predate binding.
         with closing(sqlite3.connect(self.db)) as conn, conn:
