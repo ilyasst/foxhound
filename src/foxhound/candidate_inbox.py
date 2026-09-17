@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 42
+SCHEMA_VERSION = 43
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -254,6 +254,16 @@ _SCHEMA_COLUMNS = {
         "kind",
         "actor",
         "occurred_at",
+    ),
+    "task_duplicate_assessments": (
+        "left_task_id",
+        "right_task_id",
+        "detector",
+        "verdict",
+        "latency_ms",
+        "prompt_tokens",
+        "completion_tokens",
+        "assessed_at",
     ),
     "task_fused_title_jobs": (
         "task_id",
@@ -515,14 +525,21 @@ _SCHEMA_COLUMNS = {
 #: Every historical checkpoint derives from the current map by removing what
 #: was added after it, so a table or column added now has to be stripped here
 #: or the mid-migration checks demand it from a database that predates it.
-#: The delivery record and the result column that names it both arrive at
-#: v42, so every checkpoint at or below v41 has to be without them.
+#: Semantic assessments arrive at v43, and the delivery record and the result
+#: column that names it both arrive at v42. Every earlier checkpoint excludes
+#: the fields it has not yet introduced.
+_SCHEMA_V42_COLUMNS = {
+    name: columns
+    for name, columns in _SCHEMA_COLUMNS.items()
+    if name != "task_duplicate_assessments"
+}
+
 _SCHEMA_V41_COLUMNS = {
     name: tuple(column for column in columns if not (
         name == "task_execution_results"
         and column == "reader_instruction_sequence"
     ))
-    for name, columns in _SCHEMA_COLUMNS.items()
+    for name, columns in _SCHEMA_V42_COLUMNS.items()
     if name != "execution_reader_instruction_deliveries"
 }
 
@@ -723,6 +740,9 @@ _SCHEMA_OBJECTS = {
     "task_duplicate_proposal_events_no_delete": "trigger",
     "task_duplicate_proposals_no_delete": "trigger",
     "task_duplicate_proposals_settle_only": "trigger",
+    "task_duplicate_assessments_pair": "index",
+    "task_duplicate_assessments_no_update": "trigger",
+    "task_duplicate_assessments_no_delete": "trigger",
     "task_fused_title_jobs_pending": "index",
     "task_fused_title_jobs_no_delete": "trigger",
     "task_owner_equivalences_no_update": "trigger",
@@ -2588,6 +2608,46 @@ _SCHEMA_V42 = (
 )
 
 
+# A local semantic evaluator records only opaque pair identities, its closed
+# verdict, and aggregate-cost inputs. It never stores a prompt, model reply,
+# or task-derived explanation. The reader's proposal ledger remains the source
+# of truth for labels.
+_SCHEMA_V43 = (
+    """
+CREATE TABLE IF NOT EXISTS task_duplicate_assessments (
+    left_task_id      INTEGER NOT NULL REFERENCES tasks(id),
+    right_task_id     INTEGER NOT NULL REFERENCES tasks(id),
+    detector          TEXT NOT NULL CHECK(length(detector) BETWEEN 1 AND 64),
+    verdict           TEXT NOT NULL CHECK(verdict IN (
+                          'redundant','intersecting','interconnected'
+                      )),
+    latency_ms        INTEGER NOT NULL CHECK(latency_ms >= 0),
+    prompt_tokens     INTEGER NOT NULL CHECK(prompt_tokens >= 0),
+    completion_tokens INTEGER NOT NULL CHECK(completion_tokens >= 0),
+    assessed_at       TEXT NOT NULL,
+    PRIMARY KEY(left_task_id,right_task_id,detector),
+    CHECK(left_task_id < right_task_id)
+);
+""",
+    "CREATE INDEX IF NOT EXISTS task_duplicate_assessments_pair "
+    "ON task_duplicate_assessments(left_task_id,right_task_id);",
+    """
+CREATE TRIGGER IF NOT EXISTS task_duplicate_assessments_no_update
+BEFORE UPDATE ON task_duplicate_assessments
+BEGIN
+    SELECT RAISE(ABORT, 'task duplicate assessments are immutable');
+END;
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS task_duplicate_assessments_no_delete
+BEFORE DELETE ON task_duplicate_assessments
+BEGIN
+    SELECT RAISE(ABORT, 'task duplicate assessments are retained');
+END;
+""",
+)
+
+
 _SCHEMA_V20 = (
     # SQLite cannot alter a CHECK in place, and three tables carry a foreign
     # key to this one. Renaming the card table would rewrite all three to
@@ -3703,6 +3763,18 @@ class CandidateInbox:
                 finally:
                     connection.execute("PRAGMA foreign_keys = ON")
                 version = 42
+            if version == 42:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V43:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 43")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 43
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:
