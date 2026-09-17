@@ -36,7 +36,13 @@ from .task_execution import (
     _validated_result,
 )
 from . import forge_action
-from .source_policy import source_kind_grants
+from .workflow_policy import (
+    CHECKPOINTS,
+    WorkflowPolicy,
+    WorkflowPolicyError,
+    parse_workflow_policy,
+    policy_from_legacy,
+)
 from .agent_profiles import (
     MAX_MANIFEST_BYTES,
     AgentProfileError,
@@ -69,8 +75,11 @@ STATE_ENV = "FOXHOUND_EXECUTION_STATE"
 GW_ENDPOINT_ENV = "FOXHOUND_GW_ENDPOINT"
 GW_ALIAS_ENV = "FOXHOUND_GW_ALIAS"
 GW_TOKEN_FILE_ENV = "FOXHOUND_GW_TOKEN_FILE"
-FRESHNESS_PHASE_KINDS_ENV = "FOXHOUND_FRESHNESS_PHASE_KINDS"
-FRESHNESS_EFFECT_KINDS_ENV = "FOXHOUND_FRESHNESS_EFFECT_KINDS"
+#: The whole workflow policy, as one versioned document.  It replaced a pair
+#: of comma-separated source-kind lists: those said what to check without
+#: saying under which policy, so a run could not name the policy it was
+#: fenced by and enabling a check was a per-host edit with no revision.
+WORKFLOW_POLICY_ENV = "FOXHOUND_WORKFLOW_POLICY"
 
 MAX_STATE_BYTES = 16 * 1024
 MAX_INSTRUCTIONS_BYTES = MAX_MANIFEST_BYTES
@@ -208,8 +217,7 @@ class ExecutionWorker:
         state_path: str | os.PathLike[str],
         knowledge_config: KnowledgeClientConfig,
         *,
-        freshness_phase_kinds: object = None,
-        freshness_effect_kinds: object = None,
+        policy: WorkflowPolicy | None = None,
     ) -> None:
         if not isinstance(knowledge_config, KnowledgeClientConfig):
             raise ExecutionWorkerConfigError(
@@ -217,10 +225,15 @@ class ExecutionWorker:
             )
         self._state_path = Path(state_path)
         self._knowledge_config = knowledge_config
-        self._freshness_phase_kinds = source_kind_grants(
-            freshness_phase_kinds, label="freshness phase kinds")
-        self._freshness_effect_kinds = source_kind_grants(
-            freshness_effect_kinds, label="freshness effect kinds")
+        if policy is None:
+            # No policy configured is the same answer as a policy that grants
+            # nothing and checks nothing: today's behaviour, with a revision.
+            policy = policy_from_legacy()
+        if not isinstance(policy, WorkflowPolicy):
+            raise ExecutionWorkerConfigError(
+                "execution worker policy is invalid"
+            )
+        self._policy = policy
 
     def context(self) -> dict[str, Any]:
         state, service = self._fresh_active("phase")
@@ -244,6 +257,12 @@ class ExecutionWorker:
                 # date for deadlines, drafts, and proposed actions.
                 **_local_calendar(),
                 "toolsets": instructions["toolsets"],
+                # Which policy this run is fenced by.  A decision or a final
+                # outcome is recorded against a policy revision, so the run
+                # has to be able to say which one was in force; an
+                # environment variable could not answer that.
+                "policy_id": self._policy.policy_id,
+                "policy_revision": self._policy.revision,
             },
             "capabilities": {
                 # This is descriptive evidence from the worker, not authority
@@ -780,8 +799,13 @@ class ExecutionWorker:
         deliberately separate: a long-running agent must not publish against
         a source that changed after it started.
         """
-        if checkpoint not in {"phase", "effect"}:
-            raise ExecutionWorkerConfigError("source freshness checkpoint is invalid")
+        # Checked before anything else and regardless of what is bound: a
+        # caller naming a checkpoint that does not exist is a mistake in this
+        # file, and it must not depend on whether a task happens to have a
+        # source for it to be noticed.
+        if checkpoint not in CHECKPOINTS:
+            raise ExecutionWorkerConfigError(
+                "source freshness checkpoint is invalid")
         state, service = self._active()
         try:
             request = TaskLedger(state.database_path).source_snapshot_request(
@@ -789,9 +813,13 @@ class ExecutionWorker:
             )
         except (SourceSnapshotContractError, ValueError):
             raise ExecutionWorkerClaimError("source freshness is unavailable") from None
-        enabled = (self._freshness_phase_kinds if checkpoint == "phase"
-                   else self._freshness_effect_kinds)
-        if request is None or request.locator.kind not in enabled:
+        try:
+            required = request is not None and self._policy.checks_freshness(
+                checkpoint, request.locator.kind)
+        except WorkflowPolicyError:
+            raise ExecutionWorkerConfigError(
+                "source freshness checkpoint is invalid") from None
+        if not required:
             return state, service
         try:
             result = GwKnowledgeClient(self._knowledge_config).refresh_source(
@@ -1014,15 +1042,24 @@ def load_worker_from_environment(
     config = load_knowledge_config(endpoint, alias, token_path)
     return ExecutionWorker(
         state, config,
-        freshness_phase_kinds=_source_kinds(values.get(FRESHNESS_PHASE_KINDS_ENV, "")),
-        freshness_effect_kinds=_source_kinds(values.get(FRESHNESS_EFFECT_KINDS_ENV, "")),
+        policy=_workflow_policy(values.get(WORKFLOW_POLICY_ENV, "")),
     )
 
 
-def _source_kinds(value: object) -> tuple[str, ...]:
+def _workflow_policy(value: object) -> WorkflowPolicy | None:
+    """Parse the deployed policy, or fall back to the compatibility one."""
     if not isinstance(value, str):
-        raise ExecutionWorkerConfigError("source freshness configuration is invalid")
-    return tuple(item for item in value.split(",") if item)
+        raise ExecutionWorkerConfigError("workflow policy configuration is invalid")
+    if not value.strip():
+        return None
+    try:
+        return parse_workflow_policy(json.loads(value))
+    except (ValueError, TypeError):
+        # Failing closed on an unreadable policy would stop every run; failing
+        # open would silently drop a check a deployment asked for. Refuse to
+        # start instead, which is loud and happens once.
+        raise ExecutionWorkerConfigError(
+            "workflow policy configuration is invalid") from None
 
 
 def load_knowledge_config(
