@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
-from foxhound import CandidateInbox
+from foxhound import CandidateInbox, task_duplicate_proposals
 from foxhound.agent_profiles import (
     AgentProfileRegistry,
     general_profile,
@@ -632,6 +632,81 @@ class TaskCardServerTests(unittest.TestCase):
             )
             self.assertEqual((status, headers["Allow"]), (405, "GET, POST"))
             self.assertEqual(body["error"]["code"], "method_not_allowed")
+
+    def test_duplicate_actions_are_accepted_through_http_boundary(self):
+        for action, expected_state, expected_relations in (
+            ("duplicate_confirm", "confirmed", 1),
+            ("duplicate_reject", "rejected", 0),
+        ):
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as root:
+                database = Path(root) / "foxhound.sqlite3"
+                migrate_database(database)
+                with closing(sqlite3.connect(database)) as connection, connection:
+                    connection.row_factory = sqlite3.Row
+                    for text in (
+                        "Prepare the synthetic rollout checklist",
+                        "Draft the synthetic rollout checklist",
+                    ):
+                        connection.execute(
+                            "INSERT INTO tasks(status,text,owner,version,created_at,"
+                            "updated_at,owner_ref_version,owner_kind,"
+                            "owner_speaker_id,owner_canonical_speaker_id,"
+                            "owner_speaker_registry_id,owner_pinned,"
+                            "owner_provisional) VALUES('open',?,'Person A',1,"
+                            "?,?,1,'person','SPK_1','SPK_1','registry-A',0,0)",
+                            (text, NOW.isoformat(), NOW.isoformat()),
+                        )
+                    proposal = task_duplicate_proposals.propose(
+                        connection,
+                        task_id_a=1,
+                        task_id_b=2,
+                        basis="Same synthetic deliverable and confirmed owner.",
+                        detector="synthetic-detector",
+                        now=NOW.isoformat(),
+                    )
+
+                cards = TaskCardService(
+                    database,
+                    clock=self.clock,
+                    token_factory=lambda: CLAIM_TOKEN,
+                )
+                cards.schedule_duplicate_proposals()
+                claim = cards.claim_next(
+                    consumer_digest=hashlib.sha256(TOKEN.encode()).hexdigest()
+                )
+                self.assertIsNotNone(claim)
+                self.assertTrue(cards.complete_delivery(
+                    claim.card.id,
+                    expected_version=claim.card.version,
+                    claim_token=claim.token,
+                    transport="synthetic",
+                    delivery_ref="message-alpha",
+                ).accepted)
+
+                with running_server(TaskCardApplication(cards, TOKEN)) as endpoint:
+                    status, _, body = request(
+                        endpoint,
+                        "/v1/task-cards/action",
+                        request_document(
+                            card_id=claim.card.id,
+                            card_version=claim.card.version,
+                            action=action,
+                        ),
+                    )
+
+                self.assertEqual(status, 200)
+                self.assertEqual(body["disposition"], "applied")
+                self.assertEqual(body["card_status"], "cancelled")
+                with closing(sqlite3.connect(database)) as connection:
+                    state = connection.execute(
+                        "SELECT state FROM task_duplicate_proposals WHERE id=?",
+                        (proposal.proposal_id,),
+                    ).fetchone()[0]
+                    relation_count = connection.execute(
+                        "SELECT count(*) FROM task_relations"
+                    ).fetchone()[0]
+                self.assertEqual(state, expected_state)
+                self.assertEqual(relation_count, expected_relations)
 
     def test_authenticated_stats_are_exact_and_do_not_write(self):
         before = (self.cards.count(), self.cards.event_count())

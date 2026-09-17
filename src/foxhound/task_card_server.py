@@ -44,6 +44,7 @@ from .task_cards import (
     ClaimAtCeiling,
     CardOperationResult,
     ScheduleResult,
+    TASK_CARD_ACTIONS,
     TaskCardService,
     render_task_review_card,
 )
@@ -554,7 +555,7 @@ class TaskCardApplication:
             action = request["action"]
             if (
                 not isinstance(action, str)
-                or action not in {"done", "keep_open", "drop", "snooze"}
+                or action not in TASK_CARD_ACTIONS
             ):
                 raise TaskCardServerRequestError(
                     "invalid_request", "task card action is invalid"
