@@ -100,7 +100,10 @@ class TaskOriginRead(unittest.TestCase):
         self.assertEqual(request.locator.record_id, "forge.example/acme/widget")
         self.assertEqual(request.expected_revision, "b" * 64)
 
-    def test_source_update_advances_one_work_item_revision(self) -> None:
+    def test_binding_updates_do_not_themselves_advance_work(self) -> None:
+        # Bindings move for provenance, withdrawals, and reader-conflict
+        # acknowledgement.  Those transitions are not necessarily work the
+        # ledger accepted, so a broad binding trigger must not mint a revision.
         self._bind(1, _issue_candidate(42))
         with closing(sqlite3.connect(self.db)) as connection:
             connection.execute(
@@ -112,7 +115,29 @@ class TaskOriginRead(unittest.TestCase):
                 "JOIN work_revisions AS r ON r.work_item_id=w.id "
                 "ORDER BY r.id"
             ).fetchall()
-        self.assertEqual(rows, [(1, "b" * 64), (1, "c" * 64)])
+        self.assertEqual(rows, [(1, "b" * 64)])
+
+    def test_a_repeated_source_digest_is_still_an_auditable_advance(self) -> None:
+        self._bind(1, _issue_candidate(42))
+        with closing(sqlite3.connect(self.db)) as connection:
+            connection.row_factory = sqlite3.Row
+            TaskLedger._append_work_revision(
+                connection,
+                task_id=1,
+                candidate_id=_issue_candidate(42)["candidate_id"],
+                source_revision="b" * 64,
+                task_version=2,
+                now="2030-01-02T12:00:00Z",
+            )
+            rows = connection.execute(
+                "SELECT source_revision,task_version,kind FROM work_revisions "
+                "ORDER BY id"
+            ).fetchall()
+        rows = [tuple(row) for row in rows]
+        self.assertEqual(
+            rows,
+            [("b" * 64, 1, "accepted"), ("b" * 64, 2, "source_advance")],
+        )
 
     def test_the_work_item_migration_can_be_replayed(self) -> None:
         # A migration may run again over a database that already carries

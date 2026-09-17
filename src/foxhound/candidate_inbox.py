@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 37
+SCHEMA_VERSION = 38
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -2410,6 +2410,21 @@ _SCHEMA_V37 = (
     "CREATE TRIGGER IF NOT EXISTS work_revision_on_source_update AFTER UPDATE OF source_revision ON task_candidate_bindings WHEN NEW.relation='accepted' BEGIN INSERT OR IGNORE INTO work_revisions(work_item_id,candidate_id,source_revision,task_version,created_at) SELECT id,NEW.candidate_id,NEW.source_revision,(SELECT version FROM tasks WHERE id=NEW.task_id),NEW.decided_at FROM work_items WHERE task_id=NEW.task_id; END;",
 )
 
+# Binding writes also acknowledge evidence-only and reader-conflict updates.
+# A work revision instead records a source state actually folded into work, so
+# it is appended explicitly by the ledger rather than by a broad UPDATE trigger.
+_SCHEMA_V38 = (
+    "DROP TRIGGER IF EXISTS work_revision_on_accepted_binding;",
+    "DROP TRIGGER IF EXISTS work_revision_on_source_update;",
+    "DROP INDEX IF EXISTS work_revisions_current;",
+    "ALTER TABLE work_revisions RENAME TO work_revisions_v37;",
+    "CREATE TABLE work_revisions (id INTEGER PRIMARY KEY,work_item_id INTEGER NOT NULL REFERENCES work_items(id),candidate_id TEXT NOT NULL,source_revision TEXT NOT NULL,task_version INTEGER NOT NULL,kind TEXT NOT NULL CHECK(kind IN ('accepted','source_advance')),created_at TEXT NOT NULL);",
+    "INSERT INTO work_revisions(id,work_item_id,candidate_id,source_revision,task_version,kind,created_at) SELECT id,work_item_id,candidate_id,source_revision,task_version,'accepted',created_at FROM work_revisions_v37;",
+    "DROP TABLE work_revisions_v37;",
+    "CREATE INDEX work_revisions_current ON work_revisions(work_item_id,id DESC);",
+    "CREATE TRIGGER work_revision_on_accepted_binding AFTER INSERT ON task_candidate_bindings WHEN NEW.relation='accepted' BEGIN INSERT OR IGNORE INTO work_items(task_id,created_at,updated_at) SELECT NEW.task_id,NEW.decided_at,NEW.decided_at; INSERT INTO work_revisions(work_item_id,candidate_id,source_revision,task_version,kind,created_at) SELECT id,NEW.candidate_id,NEW.source_revision,(SELECT version FROM tasks WHERE id=NEW.task_id),'accepted',NEW.decided_at FROM work_items WHERE task_id=NEW.task_id; END;",
+)
+
 
 _SCHEMA_V20 = (
     # SQLite cannot alter a CHECK in place, and three tables carry a foreign
@@ -3421,6 +3436,20 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 37
+            if version == 37:
+                connection.execute("PRAGMA foreign_keys = OFF")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V38:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 38")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                finally:
+                    connection.execute("PRAGMA foreign_keys = ON")
+                version = 38
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:
