@@ -212,7 +212,7 @@ def hermes_argv(
         str(max_turns),
         "--source",
         "tool",
-        "--ignore-rules",
+        "--safe-mode",
     ]
     if toolsets:
         if not isinstance(toolsets, str) or "\0" in toolsets:
@@ -248,7 +248,7 @@ def profile_argv(
         str(profile.max_turns),
         "--source",
         "tool",
-        "--ignore-rules",
+        "--safe-mode",
         "--toolsets",
         ",".join(profile.toolsets),
     )

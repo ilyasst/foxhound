@@ -185,6 +185,48 @@ class PreparedWorktree(unittest.TestCase):
             self.assertEqual(base, "main")
             self.assertEqual(path.name, "repo-widget-2")
 
+    def test_a_repository_publication_hook_is_enabled_in_the_new_worktree(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "repo-widget-2"
+            runner = _gh([OK_DEFAULT_BRANCH,
+                          (("gh", "repo", "clone"), (0, "", "")),
+                          (("git",), (0, "", ""))])
+            with (mock.patch.object(forge_action, "_run", runner),
+                  mock.patch.object(forge_action, "_configure_repository_hook") as configure):
+                forge_action.prepare_worktree(
+                    repository="github.com/acme/widget", issue="2",
+                    parent=Path(td))
+            configure.assert_called_once_with(path, "github.com/acme/widget")
+
+    def test_failure_to_enable_a_repository_publication_hook_refuses_worktree(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "repo"
+            hook = path / "tools" / "hooks" / "pre-commit"
+            hook.parent.mkdir(parents=True)
+            hook.write_text("#!/bin/sh\n", encoding="utf-8")
+            runner = _gh([(("git", "-C", str(path), "config", "core.hooksPath"),
+                           (1, "", "refused"))])
+            with mock.patch.object(forge_action, "_run", runner):
+                with self.assertRaisesRegex(ForgeActionError, "guard could not be enabled"):
+                    forge_action._configure_repository_hook(
+                        path, "github.com/acme/widget")
+
+    def test_a_repository_hook_configuration_uses_the_checked_in_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "repo"
+            hook = path / "tools" / "hooks" / "pre-commit"
+            hook.parent.mkdir(parents=True)
+            hook.write_text("#!/bin/sh\n", encoding="utf-8")
+            runner = _gh([(("git", "-C", str(path), "config", "core.hooksPath"),
+                           (0, "", ""))])
+            with mock.patch.object(forge_action, "_run", runner):
+                forge_action._configure_repository_hook(
+                    path, "github.com/acme/widget")
+            self.assertEqual(
+                runner.calls,
+                [("git", "-C", str(path), "config", "core.hooksPath", "tools/hooks")],
+            )
+
 
 class ReviewIsBounded(unittest.TestCase):
     def test_the_review_lands_on_the_task_s_own_pull_request(self):
