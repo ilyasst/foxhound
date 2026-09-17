@@ -190,6 +190,54 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertTrue(result.accepted)
         return result
 
+    def _work_revision(self, task_id: int, kind: str = "accepted") -> int:
+        """Give a task a work item and one revision, as intake would."""
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO work_items(task_id,created_at,"
+                "updated_at) VALUES(?,?,?)",
+                (task_id, NOW.isoformat(timespec="seconds"),
+                 NOW.isoformat(timespec="seconds")),
+            )
+            item = connection.execute(
+                "SELECT id FROM work_items WHERE task_id=?", (task_id,)
+            ).fetchone()[0]
+            cursor = connection.execute(
+                "INSERT INTO work_revisions(work_item_id,candidate_id,"
+                "source_revision,task_version,kind,created_at) "
+                "VALUES(?,?,?,1,?,?)",
+                (item, "tc_" + "0" * 64, "a" * 64, kind,
+                 NOW.isoformat(timespec="seconds")),
+            )
+            return int(cursor.lastrowid)
+
+    def _card_work_revision(self, task_id: int):
+        with closing(sqlite3.connect(self.database)) as connection:
+            return connection.execute(
+                "SELECT work_revision_id FROM execution_review_cards "
+                "WHERE task_id=? ORDER BY id DESC LIMIT 1", (task_id,)
+            ).fetchone()[0]
+
+    def test_an_approval_records_the_work_revision_it_was_raised_against(self):
+        """So a later outcome can name the source state the reader saw."""
+        revision = self._work_revision(1)
+        self._schedule_workflow(1)
+        self.assertEqual(self.cards.schedule().created, 1)
+        self.assertEqual(self._card_work_revision(1), revision)
+
+    def test_an_approval_records_the_newest_revision_not_the_first(self):
+        self._work_revision(2)
+        newer = self._work_revision(2, kind="source_advance")
+        self._schedule_workflow(2)
+        self.assertEqual(self.cards.schedule().created, 1)
+        self.assertEqual(self._card_work_revision(2), newer)
+
+    def test_a_task_with_no_work_revision_still_raises_a_card(self):
+        """Cards predate work items; an unknown revision is not an error."""
+        self._schedule_workflow(3)
+        self.assertEqual(self.cards.schedule().created, 1)
+        self.assertIsNone(self._card_work_revision(3))
+
     def _set_structured_owner(
         self,
         task_id: int,

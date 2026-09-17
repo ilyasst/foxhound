@@ -511,10 +511,18 @@ class ExecutionCardService:
                         else row["last_result_id"]
                     )
                     cursor = connection.execute(
+                        # The work revision is the source state this approval
+                        # is being asked about. Recorded so a later outcome
+                        # can name what the reader was actually shown; it is
+                        # not a staleness check, which _current_card owns.
                         "INSERT INTO execution_review_cards("
                         "task_id,task_version,workflow_version,kind,phase,"
-                        "result_id,status,version,created_at,updated_at) "
-                        "VALUES(?,?,?,?,?,?,'pending',1,?,?)",
+                        "result_id,status,version,created_at,updated_at,"
+                        "work_revision_id) "
+                        "VALUES(?,?,?,?,?,?,'pending',1,?,?,"
+                        "(SELECT r.id FROM work_revisions AS r "
+                        " JOIN work_items AS w ON w.id=r.work_item_id "
+                        " WHERE w.task_id=? ORDER BY r.id DESC LIMIT 1))",
                         (
                             int(row["task_id"]),
                             int(row["task_version"]),
@@ -524,6 +532,7 @@ class ExecutionCardService:
                             result_id,
                             now,
                             now,
+                            int(row["task_id"]),
                         ),
                     )
                     self._event(
