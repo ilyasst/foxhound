@@ -31,6 +31,8 @@ from .execution_worker import (
     GW_ALIAS_ENV,
     GW_ENDPOINT_ENV,
     GW_TOKEN_FILE_ENV,
+    FRESHNESS_EFFECT_KINDS_ENV,
+    FRESHNESS_PHASE_KINDS_ENV,
     INSTRUCTIONS_NAME,
     RUN_STATE_SCHEMA,
     RUN_STATE_SCHEMA_VERSION,
@@ -105,6 +107,8 @@ class ExecutionRunnerConfig:
     planning_grants: tuple[str, ...] = ()
     execution_grants: tuple[str, ...] = ()
     action_grants: tuple[str, ...] = ()
+    freshness_phase_kinds: tuple[str, ...] = ()
+    freshness_effect_kinds: tuple[str, ...] = ()
     runner_slot: str = "default"
     poll_seconds: float = 0.1
     execution_slot_cap: int | None = None
@@ -165,6 +169,11 @@ class ExecutionRunnerConfig:
             _action_grants(self.action_grants)
         except ValueError as exc:
             raise ValueError("execution action grants are invalid") from exc
+        try:
+            _planning_grants(self.freshness_phase_kinds)
+            _planning_grants(self.freshness_effect_kinds)
+        except ValueError as exc:
+            raise ValueError("execution freshness kinds are invalid") from exc
         if (
             isinstance(self.poll_seconds, bool)
             or not isinstance(self.poll_seconds, (int, float))
@@ -408,6 +417,8 @@ def _run_claim(
         GW_ENDPOINT_ENV: config.gw_endpoint,
         GW_ALIAS_ENV: config.gw_alias,
         GW_TOKEN_FILE_ENV: str(config.gw_token_file),
+        FRESHNESS_PHASE_KINDS_ENV: ",".join(config.freshness_phase_kinds),
+        FRESHNESS_EFFECT_KINDS_ENV: ",".join(config.freshness_effect_kinds),
         "HERMES_CRON_SESSION": "1",
     })
     process: subprocess.Popen | None = None
@@ -948,6 +959,8 @@ def _parser() -> argparse.ArgumentParser:
         help="perform a reviewed external action for this source kind "
              "without a card",
     )
+    parser.add_argument("--freshness-phase-kind", action="append", metavar="SOURCE_KIND")
+    parser.add_argument("--freshness-effect-kind", action="append", metavar="SOURCE_KIND")
     parser.add_argument(
         "--knowledge-root",
         type=Path,
@@ -1049,6 +1062,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             planning_grants=tuple(args.plan_without_asking or ()),
             execution_grants=tuple(args.execute_without_asking or ()),
             action_grants=tuple(args.act_without_asking or ()),
+            freshness_phase_kinds=tuple(args.freshness_phase_kind or ()),
+            freshness_effect_kinds=tuple(args.freshness_effect_kind or ()),
             knowledge_root=args.knowledge_root,
             task_work_root=args.task_work_root,
             task_kb_root=args.task_kb_root,
