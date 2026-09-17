@@ -23,6 +23,7 @@ from foxhound.execution_runner import _parser as runner_parser
 from foxhound.execution_schedule import _parser as schedule_parser
 from foxhound.candidate_feed_import import _parser as candidate_import_parser
 from foxhound.execution_card_requeue import _parser as requeue_parser
+from foxhound.task_card_requeue import _parser as task_requeue_parser
 from foxhound.fused_task_titles import _parser as fused_titles_parser
 from foxhound.native_intake import _parser as native_intake_parser
 from foxhound.task_duplicate_card_schedule import (
@@ -120,6 +121,7 @@ class DeploymentConfigTests(unittest.TestCase):
                     "limit": 100,
                 },
                 "execution_card_requeue": {"enabled": True, "limit": 100},
+                "task_card_requeue": {"enabled": True, "limit": 100},
                 "lifecycle_outcome_export": {
                     "enabled": True,
                     "outbox": str(self.root / "lifecycle-outbox"),
@@ -167,6 +169,10 @@ class DeploymentConfigTests(unittest.TestCase):
             "foxhound-execution-card-requeue",
         )
         self.assertEqual(
+            config.argv("task-card-requeue")[0],
+            "foxhound-task-card-requeue",
+        )
+        self.assertEqual(
             config.argv("lifecycle-outcome-export")[0],
             "foxhound-task-lifecycle-outcome-export",
         )
@@ -181,6 +187,7 @@ class DeploymentConfigTests(unittest.TestCase):
         for component in (
             "candidate-feed-import", "native-intake-run",
             "execution-card-requeue", "lifecycle-outcome-export",
+            "task-card-requeue",
             "fused-task-titles",
             "duplicate-card-schedule",
         ):
@@ -226,6 +233,7 @@ class DeploymentConfigTests(unittest.TestCase):
         del document["workflow"]["execute_without_asking"]  # type: ignore[index]
         del document["database_consumers"]["fused_task_titles"]  # type: ignore[index]
         del document["database_consumers"]["duplicate_card_schedule"]  # type: ignore[index]
+        del document["database_consumers"]["task_card_requeue"]  # type: ignore[index]
         self._write_config(document)
 
         config = load_deployment_config(self.config_path)
@@ -241,6 +249,7 @@ class DeploymentConfigTests(unittest.TestCase):
         del document["workflow"]["act_without_asking"]  # type: ignore[index]
         del document["workflow"]["execute_without_asking"]  # type: ignore[index]
         del document["database_consumers"]["duplicate_card_schedule"]  # type: ignore[index]
+        del document["database_consumers"]["task_card_requeue"]  # type: ignore[index]
         self._write_config(document)
 
         config = load_deployment_config(self.config_path)
@@ -376,6 +385,7 @@ class DeploymentConfigTests(unittest.TestCase):
         )
         native_intake_parser().parse_args(config.argv("native-intake-run")[1:])
         requeue_parser().parse_args(config.argv("execution-card-requeue")[1:])
+        task_requeue_parser().parse_args(config.argv("task-card-requeue")[1:])
         lifecycle_export_parser().parse_args(
             config.argv("lifecycle-outcome-export")[1:]
         )
@@ -421,6 +431,28 @@ class DeploymentConfigTests(unittest.TestCase):
 
         with self.assertRaises(DeploymentConfigError):
             config.argv("execution-card-requeue")
+
+    def test_omitted_task_card_requeue_remains_valid_and_refuses_rendering(
+        self,
+    ) -> None:
+        document = self._document()
+        del document["database_consumers"]["task_card_requeue"]  # type: ignore[index]
+        self._write_config(document)
+
+        config = load_deployment_config(self.config_path)
+
+        with self.assertRaises(DeploymentConfigError):
+            config.argv("task-card-requeue")
+
+    def test_task_card_requeue_requires_a_positive_limit(self) -> None:
+        document = self._document()
+        document["database_consumers"]["task_card_requeue"] = {  # type: ignore[index]
+            "enabled": True, "limit": 0,
+        }
+        self._write_config(document)
+
+        with self.assertRaises(DeploymentConfigError):
+            load_deployment_config(self.config_path)
 
     def test_exec_uses_the_sibling_script_from_the_selected_release(self) -> None:
         self._write_config(self._document())
