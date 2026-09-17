@@ -134,6 +134,23 @@ def execution_grants(
     return source_kind_grants(requested, label=label)
 
 
+def action_grants(
+    requested: object, *, label: str = "action grants"
+) -> frozenset[str]:
+    """Kinds whose reviewed external action may run without asking a reader.
+
+    The strongest of the three, and the only one whose subject is an effect
+    other people can see. It is safe to grant exactly where the reach of the
+    action is bounded by construction rather than by the agent's judgement:
+    `forge_action` reads the target repository from the task's accepted
+    candidate binding rather than from an argument, and offers opening a
+    pull request, commenting, and reviewing — there is no merge and no push
+    to a default branch. Whoever merges the resulting pull request remains
+    the decision this does not touch.
+    """
+    return source_kind_grants(requested, label=label)
+
+
 def source_kinds_accepting(capability: str) -> frozenset[str]:
     """Return kinds explicitly granted ``capability``.
 

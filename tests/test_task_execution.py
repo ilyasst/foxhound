@@ -1470,8 +1470,10 @@ class TaskExecutionTests(unittest.TestCase):
         self.assertGreater(rescheduled.version, cancelled.version)
         self.assertIsNone(self.service.get(1).completed_at)
 
-    def _grant_service(self, *kinds: str) -> TaskExecutionService:
-        """The same service this suite builds, with execution granted."""
+    def _grant_service(
+        self, *kinds: str, acting: tuple[str, ...] = ()
+    ) -> TaskExecutionService:
+        """The same service this suite builds, with gates granted."""
         return TaskExecutionService(
             self.database,
             clock=self.clock,
@@ -1484,6 +1486,7 @@ class TaskExecutionTests(unittest.TestCase):
                 ),
             )),
             execution_grants=list(kinds),
+            action_grants=list(acting),
         )
 
     def _events(self, task_id: int) -> list[str]:
@@ -1579,6 +1582,110 @@ class TaskExecutionTests(unittest.TestCase):
         recorded = self.service.record_result(self._result(claim))
 
         self.assertEqual(recorded.status, WorkflowStatus.AWAITING_REVIEW)
+
+    def _reach_execute_phase(self, service):
+        """Plan and approve, leaving the workflow queued to execute."""
+        scheduled = service.schedule(1, expected_task_version=1)
+        service.start_action(
+            1, expected_version=scheduled.version, action="start")
+        plan_claim = service.claim_next()
+        recorded = service.record_result(self._result(plan_claim))
+        if recorded.status is WorkflowStatus.AWAITING_REVIEW:
+            recorded = service.review_action(
+                1, expected_version=recorded.version, action="approve"
+            )
+        self.assertEqual(recorded.phase, WorkflowPhase.EXECUTE)
+        return service.claim_next()
+
+    def test_a_granted_kind_acts_without_a_second_card(self):
+        self._bind_origin(1, "issue")
+        service = self._grant_service("issue", acting=("issue",))
+        claim = self._reach_execute_phase(service)
+        recorded = service.record_result(self._result(
+            claim,
+            result_id="result-002",
+            outcome=ExecutionOutcome.AWAITING_EXTERNAL,
+        ))
+
+        self.assertEqual(recorded.status, WorkflowStatus.QUEUED)
+        self.assertEqual(recorded.phase, WorkflowPhase.EXTERNAL_ACTION)
+
+    def test_granting_execution_does_not_grant_action(self):
+        """The dangerous knob is not reached by turning the safe one."""
+        self._bind_origin(1, "issue")
+        service = self._grant_service("issue")
+        claim = self._reach_execute_phase(service)
+        recorded = service.record_result(self._result(
+            claim,
+            result_id="result-002",
+            outcome=ExecutionOutcome.AWAITING_EXTERNAL,
+        ))
+
+        self.assertEqual(recorded.status, WorkflowStatus.AWAITING_REVIEW)
+        self.assertEqual(recorded.phase, WorkflowPhase.EXECUTE)
+
+    def test_granting_action_does_not_grant_execution(self):
+        """And not the other way round either."""
+        self._bind_origin(1, "issue")
+        service = self._grant_service(acting=("issue",))
+        scheduled = service.schedule(1, expected_task_version=1)
+        service.start_action(
+            1, expected_version=scheduled.version, action="start")
+        claim = service.claim_next()
+        recorded = service.record_result(self._result(claim))
+
+        self.assertEqual(recorded.status, WorkflowStatus.AWAITING_REVIEW)
+        self.assertEqual(recorded.phase, WorkflowPhase.PLAN)
+
+    def test_an_ungranted_kind_still_waits_before_acting(self):
+        self._bind_origin(1, "issue")
+        service = self._grant_service("issue", acting=("review_request",))
+        claim = self._reach_execute_phase(service)
+        recorded = service.record_result(self._result(
+            claim,
+            result_id="result-002",
+            outcome=ExecutionOutcome.AWAITING_EXTERNAL,
+        ))
+
+        self.assertEqual(recorded.status, WorkflowStatus.AWAITING_REVIEW)
+
+    def test_a_granted_action_is_not_recorded_as_a_reader_approval(self):
+        self._bind_origin(1, "issue")
+        service = self._grant_service("issue", acting=("issue",))
+        claim = self._reach_execute_phase(service)
+        service.record_result(self._result(
+            claim,
+            result_id="result-002",
+            outcome=ExecutionOutcome.AWAITING_EXTERNAL,
+        ))
+
+        events = self._events(1)
+        self.assertNotIn("phase_approved", events)
+        self.assertEqual(events.count("phase_granted"), 2)
+
+    def test_a_completed_action_still_reaches_the_reader(self):
+        """Neither knob hides the end of the work."""
+        self._bind_origin(1, "issue")
+        service = self._grant_service("issue", acting=("issue",))
+        claim = self._reach_execute_phase(service)
+        service.record_result(self._result(
+            claim,
+            result_id="result-002",
+            outcome=ExecutionOutcome.AWAITING_EXTERNAL,
+        ))
+        action_claim = service.claim_next()
+        recorded = service.record_result(self._result(
+            action_claim,
+            result_id="result-003",
+            outcome=ExecutionOutcome.COMPLETED,
+        ))
+
+        self.assertEqual(recorded.status, WorkflowStatus.AWAITING_REVIEW)
+        self.assertEqual(recorded.phase, WorkflowPhase.EXTERNAL_ACTION)
+
+    def test_an_unknown_action_kind_is_refused_at_construction(self):
+        with self.assertRaises(ValueError):
+            self._grant_service(acting=("not-a-source-kind",))
 
     def test_result_progression_is_strict_private_and_idempotent(self):
         self._schedule_and_start()

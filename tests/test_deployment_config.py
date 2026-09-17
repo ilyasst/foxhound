@@ -58,7 +58,7 @@ class DeploymentConfigTests(unittest.TestCase):
     def _document(self) -> dict[str, object]:
         return {
             "schema": "foxhound.deployment-config",
-            "schema_version": 6,
+            "schema_version": 7,
             "database": str(self.database),
             "agent_profile_directory": None,
             "card_service": {
@@ -77,6 +77,7 @@ class DeploymentConfigTests(unittest.TestCase):
                 "default_agent_profile": "general",
                 "plan_without_asking": ["issue"],
                 "execute_without_asking": ["issue"],
+                "act_without_asking": ["issue"],
                 "execution_slot_cap": 2,
                 "plan_ready_cap": 10,
                 "awaiting_reader_cap": 20,
@@ -191,6 +192,7 @@ class DeploymentConfigTests(unittest.TestCase):
     def test_version_one_configuration_remains_valid_without_card_gw_settings(self) -> None:
         document = self._document()
         document["schema_version"] = 1
+        del document["workflow"]["act_without_asking"]  # type: ignore[index]
         del document["workflow"]["execute_without_asking"]  # type: ignore[index]
         document["execution_runner"] = document.pop("execution_runners")[0]
         document.pop("database_consumers")
@@ -205,6 +207,7 @@ class DeploymentConfigTests(unittest.TestCase):
     def test_version_two_configuration_remains_valid(self) -> None:
         document = self._document()
         document["schema_version"] = 2
+        del document["workflow"]["act_without_asking"]  # type: ignore[index]
         del document["workflow"]["execute_without_asking"]  # type: ignore[index]
         document["execution_runner"] = document.pop("execution_runners")[0]
         document.pop("database_consumers")
@@ -219,6 +222,7 @@ class DeploymentConfigTests(unittest.TestCase):
     def test_version_three_configuration_remains_valid_without_title_worker(self) -> None:
         document = self._document()
         document["schema_version"] = 3
+        del document["workflow"]["act_without_asking"]  # type: ignore[index]
         del document["workflow"]["execute_without_asking"]  # type: ignore[index]
         del document["database_consumers"]["fused_task_titles"]  # type: ignore[index]
         del document["database_consumers"]["duplicate_card_schedule"]  # type: ignore[index]
@@ -234,6 +238,7 @@ class DeploymentConfigTests(unittest.TestCase):
     ) -> None:
         document = self._document()
         document["schema_version"] = 4
+        del document["workflow"]["act_without_asking"]  # type: ignore[index]
         del document["workflow"]["execute_without_asking"]  # type: ignore[index]
         del document["database_consumers"]["duplicate_card_schedule"]  # type: ignore[index]
         self._write_config(document)
@@ -247,6 +252,7 @@ class DeploymentConfigTests(unittest.TestCase):
         """A file written before the key existed keeps asking, silently."""
         document = self._document()
         document["schema_version"] = 5
+        del document["workflow"]["act_without_asking"]  # type: ignore[index]
         del document["workflow"]["execute_without_asking"]  # type: ignore[index]
         self._write_config(document)
 
@@ -297,6 +303,52 @@ class DeploymentConfigTests(unittest.TestCase):
 
         self.assertEqual(config.workflow.plan_without_asking, ())
         self.assertEqual(config.workflow.execute_without_asking, ("issue",))
+
+    def test_version_six_configuration_grants_no_action(self) -> None:
+        """A file written for the previous key keeps asking about actions."""
+        document = self._document()
+        document["schema_version"] = 6
+        del document["workflow"]["act_without_asking"]  # type: ignore[index]
+        self._write_config(document)
+
+        config = load_deployment_config(self.config_path)
+
+        self.assertEqual(config.workflow.execute_without_asking, ("issue",))
+        self.assertEqual(config.workflow.act_without_asking, ())
+        self.assertNotIn(
+            "--act-without-asking", config.argv("execution-runner:primary")
+        )
+
+    def test_the_action_grant_reaches_the_runner(self) -> None:
+        self._write_config(self._document())
+
+        config = load_deployment_config(self.config_path)
+        argv = config.argv("execution-runner:primary")
+
+        self.assertEqual(
+            argv[argv.index("--act-without-asking") + 1], "issue"
+        )
+
+    def test_an_unknown_action_kind_is_refused(self) -> None:
+        document = self._document()
+        document["workflow"]["act_without_asking"] = [  # type: ignore[index]
+            "not-a-source-kind"
+        ]
+        self._write_config(document)
+
+        with self.assertRaises(DeploymentConfigError):
+            load_deployment_config(self.config_path)
+
+    def test_acting_may_be_granted_without_executing(self) -> None:
+        """Either knob alone, in either direction."""
+        document = self._document()
+        document["workflow"]["execute_without_asking"] = []  # type: ignore[index]
+        self._write_config(document)
+
+        config = load_deployment_config(self.config_path)
+
+        self.assertEqual(config.workflow.execute_without_asking, ())
+        self.assertEqual(config.workflow.act_without_asking, ("issue",))
 
     def test_partial_card_gw_settings_are_rejected(self) -> None:
         document = self._document()

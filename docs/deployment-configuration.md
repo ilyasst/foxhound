@@ -22,7 +22,7 @@ and all paths are absolute.
 ```json
 {
   "schema": "foxhound.deployment-config",
-  "schema_version": 6,
+  "schema_version": 7,
   "database": "/srv/example/private-foxhound-state/foxhound.sqlite3",
   "agent_profile_directory": null,
   "card_service": {
@@ -45,6 +45,7 @@ and all paths are absolute.
     "default_agent_profile": "general",
     "plan_without_asking": ["issue"],
     "execute_without_asking": ["issue"],
+    "act_without_asking": ["issue"],
     "execution_slot_cap": 2,
     "plan_ready_cap": 10,
     "awaiting_reader_cap": 20
@@ -104,7 +105,7 @@ Set a disabled `card_service`, runner, or database consumer to exactly
 to be declared separately; enabled slots must have distinct names. The
 workflow section remains required because it owns the shared policy and
 limits. Earlier versions remain readable for a controlled transition, but
-only version 6 can declare the complete deployment boundary.
+only version 7 can declare the complete deployment boundary.
 
 Validate before changing a service definition or restarting anything:
 
@@ -168,9 +169,26 @@ instead of waiting for a card. Grant it for a source where the decision to
 work every task was already made when the source was enrolled, and where a
 plan card would therefore have one plausible answer.
 
-The two are independent and neither implies the other. Granting planning
-spends agent time on work nobody has judged; granting execution performs the
-work that plan described. An operator may reasonably want the first alone.
+`act_without_asking` skips the external-action gate. A reviewed external
+action runs instead of waiting for a second card. This is the strongest of
+the three and the only one whose subject is an effect other people can see,
+so grant it only where the reach of the action is bounded by construction
+rather than by the agent's judgement.
+
+For forge work it is: `forge_action` reads the target repository from the
+task's accepted candidate binding rather than from an argument, so acting on
+the wrong repository is not a mistake an agent can make, and the operations
+offered are opening a pull request, commenting, and reviewing. There is no
+merge and no push to a default branch - no such capability exists to grant.
+Whoever merges the resulting pull request remains the decision this does not
+touch, and protecting the default branch at the forge is what makes that
+enforcement rather than policy.
+
+The three are independent and none implies another, in any direction.
+Granting planning spends agent time on work nobody has judged; granting
+execution performs the work that plan described; granting action lets the
+result leave the machine. An operator may reasonably want the first alone,
+or the first two.
 
 A granted advance is recorded as `phase_granted`, never as `phase_approved`:
 the event log must not say a reader approved a phase nobody was asked about.
