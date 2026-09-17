@@ -21,6 +21,7 @@ from foxhound import (
     KnowledgeTransportError,
     OwnerUpcomingMeeting,
 )
+from foxhound.contracts.source_snapshot import source_snapshot_request
 
 
 TOKEN = "synthetic-knowledge-token-with-sufficient-length"
@@ -109,6 +110,18 @@ def owner_meeting_response(_request: dict) -> dict:
     }
 
 
+def source_snapshot_response(request: dict) -> dict:
+    return {
+        "schema": "foxhound.source-snapshot", "schema_version": 1,
+        "ok": True, "system": request["system"], "kind": request["kind"],
+        "record_id": request["record_id"], "item_id": request["item_id"],
+        "expected_revision": request["expected_revision"], "status": "current",
+        "snapshot": {"revision": request["expected_revision"],
+                     "observed_at": "2030-04-05T12:00:00+00:00",
+                     "lifecycle": "active", "actionability": "actionable"},
+    }
+
+
 @contextmanager
 def server(
     *,
@@ -144,6 +157,8 @@ def server(
                 response = execution_context_response(request)
             elif self.path == "/v1/owner-upcoming-meeting":
                 response = owner_meeting_response(request)
+            elif self.path == "/v1/source-snapshot":
+                response = source_snapshot_response(request)
             else:
                 response = search_response(request)
             if transform is not None:
@@ -185,6 +200,17 @@ def client(endpoint: str, **changes) -> GwKnowledgeClient:
 
 
 class KnowledgeClientTests(unittest.TestCase):
+    def test_source_snapshot_is_a_fixed_bounded_route(self):
+        request = source_snapshot_request(
+            system="gw", kind="issue", record_id="forge.example/acme/widget",
+            item_id="7", expected_revision="b" * 64,
+        )
+        with server() as (endpoint, requests):
+            result = client(endpoint).refresh_source(request)
+        self.assertTrue(result.usable)
+        self.assertEqual(requests[0]["path"], "/v1/source-snapshot")
+        self.assertEqual(requests[0]["document"]["expected_revision"], "b" * 64)
+
     def test_owner_meeting_condition_is_exact_and_content_free(self):
         reference = {
             "kind": "person",
@@ -547,7 +573,7 @@ class KnowledgeClientTests(unittest.TestCase):
                     },
                     {
                         "execution_context", "owner_upcoming_meeting",
-                        "resolve_task_owner", "search",
+                        "refresh_source", "resolve_task_owner", "search",
                     },
                 )
                 instance.search("synthetic query")
