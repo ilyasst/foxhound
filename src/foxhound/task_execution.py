@@ -524,6 +524,10 @@ class TaskExecutionService:
                     )
                     promoted += 1
 
+                granted = self._reconcile_granted_review_gates(
+                    connection, now
+                )
+
                 rows = connection.execute(
                     "SELECT t.id,t.version,("
                     " SELECT o.source_kind FROM task_candidate_bindings AS b "
@@ -586,7 +590,7 @@ class TaskExecutionService:
                     scheduled += 1
                 connection.commit()
                 return ExecutionScheduleResult(
-                    scheduled=promoted + scheduled,
+                    scheduled=promoted + granted + scheduled,
                     remaining=eligible - scheduled,
                 )
             except Exception:
@@ -1550,6 +1554,79 @@ class TaskExecutionService:
             raise TaskLedgerError(
                 "execution agent profile is unavailable"
             ) from exc
+
+    def _reconcile_granted_review_gates(
+        self, connection: sqlite3.Connection, now: str
+    ) -> int:
+        """Advance old review gates now covered by configured grants.
+
+        A policy change is a machine decision, not a reader approval.  Each
+        update therefore increments the workflow version and emits
+        ``phase_granted``.  Existing cards retain their old version and are
+        retired by the card scheduler's ordinary stale-card pass.
+        """
+        rows = connection.execute(
+            "SELECT w.*,r.outcome,("
+            " SELECT o.source_kind FROM task_candidate_bindings AS b "
+            " JOIN candidate_inbox AS o ON o.candidate_id=b.candidate_id "
+            " WHERE b.task_id=t.id AND b.relation='accepted'"
+            ") AS origin_kind FROM task_execution_workflows AS w "
+            "JOIN tasks AS t ON t.id=w.task_id "
+            "JOIN task_execution_results AS r "
+            "ON r.result_id=w.last_result_id AND r.task_id=w.task_id "
+            "WHERE w.status='awaiting_review' "
+            "AND w.phase IN ('plan','execute') "
+            "AND t.status='open' AND t.version=w.task_version "
+            "AND NOT EXISTS("
+            " SELECT 1 FROM task_candidate_bindings AS blocked JOIN "
+            " task_candidate_lifecycle AS l "
+            " ON l.candidate_id=blocked.candidate_id "
+            " WHERE blocked.task_id=t.id AND blocked.relation='accepted' "
+            " AND l.state='withdrawn' "
+            " AND l.resolution='preserved_open'"
+            f") ORDER BY {_SOURCE_QUEUE_ORDER_SQL}w.task_id"
+        ).fetchall()
+        granted = 0
+        for row in rows:
+            phase = WorkflowPhase(row["phase"])
+            target = _granted_advance(
+                phase,
+                ExecutionOutcome(row["outcome"]),
+                row["origin_kind"],
+                self._execution_grants,
+                self._action_grants,
+            )
+            if target is None:
+                continue
+            version = int(row["version"]) + 1
+            profile = self._profile_for(row["origin_kind"])
+            updated = connection.execute(
+                "UPDATE task_execution_workflows SET status='queued',"
+                "phase=?,version=?,due_at=NULL,claim_token_digest=NULL,"
+                "claimed_at=NULL,claim_heartbeat_at=NULL,"
+                "claim_expires_at=NULL,failure_count=0,"
+                "last_failure_reason=NULL,last_failure_exit_code=NULL,"
+                "last_failure_run_id=NULL,last_failure_at=NULL,"
+                "next_attempt_at=NULL,parked_at=NULL,agent_profile_id=?,"
+                "agent_profile_revision=?,updated_at=?,completed_at=NULL "
+                "WHERE task_id=? AND task_version=? AND version=? "
+                "AND status='awaiting_review' AND phase=?",
+                (
+                    target.value, version, profile.profile_id,
+                    profile.revision, now, int(row["task_id"]),
+                    int(row["task_version"]), int(row["version"]),
+                    phase.value,
+                ),
+            )
+            if updated.rowcount != 1:
+                continue
+            self._event(
+                connection, int(row["task_id"]), "phase_granted", version,
+                int(row["task_version"]), target, WorkflowStatus.QUEUED,
+                now,
+            )
+            granted += 1
+        return granted
 
     def _cancel_stale(
         self, connection: sqlite3.Connection, now: str
