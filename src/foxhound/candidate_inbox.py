@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 36
+SCHEMA_VERSION = 38
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -2391,6 +2391,51 @@ _SCHEMA_V36 = (
     _SCHEMA_V8[7],
 )
 
+# A continuing ask has one durable identity even as its accepted source
+# revision advances.  The task remains the compatibility projection; these
+# rows preserve why a new revision superseded prior runnable work.
+#
+# Every statement here is replayable: a migration may be re-run against a
+# database that already carries these rows, and one task may hold several
+# accepted bindings that share a source revision.  The backfill therefore
+# ignores conflicts rather than failing the whole migration on the
+# UNIQUE(work_item_id,source_revision) constraint.
+_SCHEMA_V37 = (
+    "CREATE TABLE IF NOT EXISTS work_items (id INTEGER PRIMARY KEY,task_id INTEGER NOT NULL UNIQUE REFERENCES tasks(id),state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active','withdrawn','closed')),created_at TEXT NOT NULL,updated_at TEXT NOT NULL);",
+    "CREATE TABLE IF NOT EXISTS work_revisions (id INTEGER PRIMARY KEY,work_item_id INTEGER NOT NULL REFERENCES work_items(id),candidate_id TEXT NOT NULL,source_revision TEXT NOT NULL,task_version INTEGER NOT NULL,created_at TEXT NOT NULL,UNIQUE(work_item_id,source_revision));",
+    "CREATE INDEX IF NOT EXISTS work_revisions_current ON work_revisions(work_item_id,id DESC);",
+    "INSERT OR IGNORE INTO work_items(task_id,created_at,updated_at) SELECT id,created_at,updated_at FROM tasks;",
+    "INSERT OR IGNORE INTO work_revisions(work_item_id,candidate_id,source_revision,task_version,created_at) SELECT w.id,b.candidate_id,b.source_revision,t.version,b.decided_at FROM task_candidate_bindings b JOIN work_items w ON w.task_id=b.task_id JOIN tasks t ON t.id=b.task_id WHERE b.relation='accepted';",
+    "CREATE TRIGGER IF NOT EXISTS work_revision_on_accepted_binding AFTER INSERT ON task_candidate_bindings WHEN NEW.relation='accepted' BEGIN INSERT OR IGNORE INTO work_items(task_id,created_at,updated_at) SELECT NEW.task_id,NEW.decided_at,NEW.decided_at; INSERT OR IGNORE INTO work_revisions(work_item_id,candidate_id,source_revision,task_version,created_at) SELECT id,NEW.candidate_id,NEW.source_revision,(SELECT version FROM tasks WHERE id=NEW.task_id),NEW.decided_at FROM work_items WHERE task_id=NEW.task_id; END;",
+    "CREATE TRIGGER IF NOT EXISTS work_revision_on_source_update AFTER UPDATE OF source_revision ON task_candidate_bindings WHEN NEW.relation='accepted' BEGIN INSERT OR IGNORE INTO work_revisions(work_item_id,candidate_id,source_revision,task_version,created_at) SELECT id,NEW.candidate_id,NEW.source_revision,(SELECT version FROM tasks WHERE id=NEW.task_id),NEW.decided_at FROM work_items WHERE task_id=NEW.task_id; END;",
+)
+
+# Binding writes also acknowledge evidence-only and reader-conflict updates.
+# A work revision instead records a source state actually folded into work, so
+# it is appended explicitly by the ledger rather than by a broad UPDATE trigger.
+#
+# Split into three parts because this migration has to be replayable, and the
+# rebuild is the one piece that is not. Replaying v37 re-creates the broad
+# update trigger this version exists to remove, so the drops must run every
+# time; and the rebuild relabels every row it copies as 'accepted', so running
+# it over an already-converted table would silently erase the
+# 'source_advance' distinction it was written to introduce.
+_SCHEMA_V38_DROP = (
+    "DROP TRIGGER IF EXISTS work_revision_on_accepted_binding;",
+    "DROP TRIGGER IF EXISTS work_revision_on_source_update;",
+)
+_SCHEMA_V38_REBUILD = (
+    "DROP INDEX IF EXISTS work_revisions_current;",
+    "ALTER TABLE work_revisions RENAME TO work_revisions_v37;",
+    "CREATE TABLE work_revisions (id INTEGER PRIMARY KEY,work_item_id INTEGER NOT NULL REFERENCES work_items(id),candidate_id TEXT NOT NULL,source_revision TEXT NOT NULL,task_version INTEGER NOT NULL,kind TEXT NOT NULL CHECK(kind IN ('accepted','source_advance')),created_at TEXT NOT NULL);",
+    "INSERT INTO work_revisions(id,work_item_id,candidate_id,source_revision,task_version,kind,created_at) SELECT id,work_item_id,candidate_id,source_revision,task_version,'accepted',created_at FROM work_revisions_v37;",
+    "DROP TABLE work_revisions_v37;",
+    "CREATE INDEX work_revisions_current ON work_revisions(work_item_id,id DESC);",
+)
+_SCHEMA_V38_TRIGGER = (
+    "CREATE TRIGGER work_revision_on_accepted_binding AFTER INSERT ON task_candidate_bindings WHEN NEW.relation='accepted' BEGIN INSERT OR IGNORE INTO work_items(task_id,created_at,updated_at) SELECT NEW.task_id,NEW.decided_at,NEW.decided_at; INSERT INTO work_revisions(work_item_id,candidate_id,source_revision,task_version,kind,created_at) SELECT id,NEW.candidate_id,NEW.source_revision,(SELECT version FROM tasks WHERE id=NEW.task_id),'accepted',NEW.decided_at FROM work_items WHERE task_id=NEW.task_id; END;",
+)
+
 
 _SCHEMA_V20 = (
     # SQLite cannot alter a CHECK in place, and three tables carry a foreign
@@ -3391,6 +3436,39 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 36
+            if version == 36:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V37:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 37")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 37
+            if version == 37:
+                connection.execute("PRAGMA foreign_keys = OFF")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V38_DROP:
+                        connection.execute(statement)
+                    columns = tuple(item["name"] for item in connection.execute(
+                        "PRAGMA table_info(work_revisions)"
+                    ))
+                    if "kind" not in columns:
+                        for statement in _SCHEMA_V38_REBUILD:
+                            connection.execute(statement)
+                    for statement in _SCHEMA_V38_TRIGGER:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 38")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                finally:
+                    connection.execute("PRAGMA foreign_keys = ON")
+                version = 38
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:

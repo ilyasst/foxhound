@@ -774,12 +774,23 @@ class NativeCandidateIntakeTests(unittest.TestCase):
             binding = connection.execute(
                 "SELECT source_revision FROM task_candidate_bindings"
             ).fetchone()[0]
+            revisions = connection.execute(
+                "SELECT source_revision,task_version,kind FROM work_revisions "
+                "ORDER BY id"
+            ).fetchall()
             event = connection.execute(
                 "SELECT kind,task_version,source_revision FROM task_events "
                 "ORDER BY sequence DESC LIMIT 1"
             ).fetchone()
         self.assertEqual(binding, revised["source"]["revision"])
         self.assertEqual(event, ("candidate_revised", 2, binding))
+        self.assertEqual(
+            revisions,
+            [
+                (initial["source"]["revision"], 1, "accepted"),
+                (revised["source"]["revision"], 2, "source_advance"),
+            ],
+        )
 
     def test_provenance_only_revision_preserves_an_active_workflow(self):
         self.activate()
@@ -814,8 +825,12 @@ class NativeCandidateIntakeTests(unittest.TestCase):
                 "SELECT kind,task_version FROM task_events "
                 "ORDER BY sequence DESC LIMIT 1"
             ).fetchone()
+            revisions = connection.execute(
+                "SELECT source_revision FROM work_revisions ORDER BY id"
+            ).fetchall()
         self.assertEqual(binding, enriched["source"]["revision"])
         self.assertEqual(event, ("candidate_revised", 1))
+        self.assertEqual(revisions, [(initial["source"]["revision"],)])
 
     def test_cumulative_provenance_revision_never_versions_the_task(self):
         self.activate()
@@ -878,11 +893,15 @@ class NativeCandidateIntakeTests(unittest.TestCase):
                 "SELECT state,resolution,task_version FROM "
                 "task_candidate_lifecycle"
             ).fetchone()
+            work_state = connection.execute(
+                "SELECT state FROM work_items WHERE task_id=1"
+            ).fetchone()[0]
             event = connection.execute(
                 "SELECT kind,task_version FROM task_events "
                 "ORDER BY sequence DESC LIMIT 1"
             ).fetchone()
         self.assertEqual(lifecycle, ("withdrawn", "preserved_open", 2))
+        self.assertEqual(work_state, "withdrawn")
         self.assertEqual(event, ("candidate_withdrawn", 2))
 
     def test_reader_decision_wins_when_candidate_is_withdrawn(self):
@@ -1049,7 +1068,11 @@ class NativeCandidateIntakeTests(unittest.TestCase):
             event = connection.execute(
                 "SELECT kind FROM task_events ORDER BY sequence DESC LIMIT 1"
             ).fetchone()[0]
+            work_state = connection.execute(
+                "SELECT state FROM work_items WHERE task_id=1"
+            ).fetchone()[0]
         self.assertEqual(event, "candidate_reactivated")
+        self.assertEqual(work_state, "active")
 
     def test_withdrawal_cancels_stale_cards_without_dropping_task(self):
         self.activate()
