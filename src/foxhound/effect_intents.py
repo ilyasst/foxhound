@@ -14,7 +14,18 @@ ATTEMPT_STATES = frozenset({"prepared", "running", "completed", "failed", "cance
 
 
 class EffectIntentError(ValueError):
-    pass
+    """An effect intent or receipt is outside the supported contract."""
+
+
+def _row_id(value: object) -> bool:
+    """Whether a value is a usable positive row identity.
+
+    ``bool`` is an ``int`` subclass, so a bare ``isinstance`` check accepts
+    ``True`` as the row id ``1``. A work item and a work revision are the
+    identities every external effect is fenced on; silently binding one to a
+    boolean is how an effect lands against the wrong revision.
+    """
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
 
 
 @dataclass(frozen=True)
@@ -30,9 +41,10 @@ class EffectIntent:
 
     def __post_init__(self) -> None:
         if (not _ID.fullmatch(self.intent_id) or self.kind not in EFFECT_KINDS
-                or not isinstance(self.work_item_id, int) or self.work_item_id < 1
-                or not isinstance(self.work_revision_id, int) or self.work_revision_id < 1
-                or not isinstance(self.target, str) or not self.target or len(self.target) > 500
+                or not _row_id(self.work_item_id)
+                or not _row_id(self.work_revision_id)
+                or not isinstance(self.target, str) or not self.target
+                or len(self.target) > 500
                 or not _DIGEST.fullmatch(self.payload_digest)
                 or not _DIGEST.fullmatch(self.idempotency_key)
                 or not isinstance(self.freshness_required, bool)):

@@ -10,3 +10,16 @@ class EffectIntentTests(unittest.TestCase):
         self.assertEqual(EffectReceipt("forge-comment", "completed", "receipt-1", False).state, "completed")
         with self.assertRaises(EffectIntentError):
             EffectIntent("bad", 0, 2, "forge", "x", "a" * 64, "b" * 64, True)
+
+    def test_a_boolean_is_not_a_row_identity(self):
+        """bool subclasses int, so True must not pass as work item 1."""
+        with self.assertRaises(EffectIntentError):
+            EffectIntent(
+                "forge-comment", True, 2, "forge", "x", "a" * 64, "b" * 64,
+                True,
+            )
+        with self.assertRaises(EffectIntentError):
+            EffectIntent(
+                "forge-comment", 1, True, "forge", "x", "a" * 64, "b" * 64,
+                True,
+            )
