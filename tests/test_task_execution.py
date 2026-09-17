@@ -394,6 +394,11 @@ class TaskExecutionTests(unittest.TestCase):
             connection.execute(
                 "ALTER TABLE task_review_cards DROP COLUMN source_revision"
             )
+            # v39 added this; a database at an older version has not got it.
+            connection.execute(
+                "ALTER TABLE execution_review_cards DROP COLUMN "
+                "work_revision_id"
+            )
             connection.execute("PRAGMA user_version = 11")
             connection.commit()
 
