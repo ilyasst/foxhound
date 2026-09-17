@@ -114,6 +114,20 @@ class TaskOriginRead(unittest.TestCase):
             ).fetchall()
         self.assertEqual(rows, [(1, "b" * 64), (1, "c" * 64)])
 
+    def test_the_work_item_migration_can_be_replayed(self) -> None:
+        # A migration may run again over a database that already carries
+        # these rows. Re-running must be passive, not an integrity error.
+        self._bind(1, _issue_candidate(42))
+        with closing(sqlite3.connect(self.db)) as connection:
+            connection.execute("PRAGMA user_version = 36")
+            connection.commit()
+        CandidateInbox(self.db)._migrate()
+        with closing(sqlite3.connect(self.db)) as connection:
+            total = connection.execute(
+                "SELECT COUNT(*) FROM work_revisions"
+            ).fetchone()[0]
+        self.assertEqual(total, 1)
+
     def test_a_task_bound_to_nothing_has_no_origin(self) -> None:
         # An ordinary state, not an error: a task may predate binding.
         with closing(sqlite3.connect(self.db)) as conn, conn:
