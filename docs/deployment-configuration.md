@@ -77,6 +77,10 @@ and all paths are absolute.
       "enabled": true,
       "limit": 100
     },
+    "task_card_requeue": {
+      "enabled": true,
+      "limit": 100
+    },
     "lifecycle_outcome_export": {
       "enabled": true,
       "outbox": "/srv/example/private-foxhound-state/lifecycle-outbox",
@@ -105,6 +109,10 @@ workflow section remains required because it owns the shared policy and
 limits. Versions 1 through 4 remain readable for a controlled transition, but
 only version 5 can declare the complete deployment boundary.
 
+`task_card_requeue` may be omitted from an existing version 5 document during
+the transition. Rendering `task-card-requeue` then refuses safely; add it with
+an enabled or disabled declaration before using that component.
+
 Validate before changing a service definition or restarting anything:
 
 ```sh
@@ -130,7 +138,8 @@ foxhound-deployment-config \
 
 Supported names are `task-cards`, `execution-schedule`,
 `execution-runner:<slot>`, `candidate-feed-import`, `native-intake-run`,
-`execution-card-requeue`, `lifecycle-outcome-export`, and `fused-task-titles`.
+`execution-card-requeue`, `task-card-requeue`, `lifecycle-outcome-export`, and
+`fused-task-titles`.
 `duplicate-card-schedule` is also available. Use the configured slot name when
 rendering a runner. Rendering reads no token contents. Its JSON output does
 contain private paths, so consume it only in the private deployment mechanism,
