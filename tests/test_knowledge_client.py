@@ -210,6 +210,7 @@ class KnowledgeClientTests(unittest.TestCase):
         self.assertTrue(result.usable)
         self.assertEqual(requests[0]["path"], "/v1/source-snapshot")
         self.assertEqual(requests[0]["document"]["expected_revision"], "b" * 64)
+
     def test_owner_meeting_condition_is_exact_and_content_free(self):
         reference = {
             "kind": "person",
