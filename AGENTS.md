@@ -98,6 +98,20 @@ workflow after bootstrap.
   publication-safety review is complete, and the issue/branch/worktree cleanup
   has been performed.
 
+## Deploying
+
+`main` moving does not move production.  Units import a pinned release, and
+advancing one is a separate, named operation.
+
+Before deploying anything, read
+[ADR 0043](docs/architecture/0043-pinned-release-checkout.md).  In particular,
+a release that changes the database schema does **not** follow the ordinary
+procedure: deployed code refuses a database newer than itself, so the units
+are stopped across the migration.  Ask the candidate release whether this
+applies before you start —
+`<release>/venv/bin/foxhound-database inspect --database <db>` answers it, and
+answering it afterwards means answering it during an outage.
+
 ## Publication-safety tooling
 
 Install the pre-commit hook once per checkout (each worktree needs its own):
