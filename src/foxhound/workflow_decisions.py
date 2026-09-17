@@ -1,0 +1,75 @@
+"""Domain decision and final-outcome records, independent of card transport."""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+
+from .contracts.validation import (
+    is_external_receipt_reference,
+    is_positive_row_id,
+    is_sha256_digest,
+)
+
+
+_ID = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
+DECISION_KINDS = frozenset({"start", "continue", "send"})
+RESPONSES = frozenset({"approve", "revise", "discard", "snooze"})
+DISPOSITIONS = frozenset({"completed", "declined", "ineligible", "cancelled"})
+
+
+class WorkflowDecisionError(ValueError):
+    """A decision or final outcome is outside the supported contract."""
+
+
+@dataclass(frozen=True)
+class DecisionRequest:
+    decision_id: str
+    work_item_id: int
+    work_revision_id: int
+    workflow_version: int
+    policy_revision: str
+    kind: str
+    allowed_responses: frozenset[str]
+
+    def __post_init__(self) -> None:
+        if (not _ID.fullmatch(self.decision_id)
+                or self.kind not in DECISION_KINDS
+                or not is_positive_row_id(self.work_item_id)
+                or not is_positive_row_id(self.work_revision_id)
+                or not is_positive_row_id(self.workflow_version)
+                or not is_sha256_digest(self.policy_revision)
+                or not self.allowed_responses
+                or not self.allowed_responses <= RESPONSES):
+            raise WorkflowDecisionError("decision request is invalid")
+
+
+@dataclass(frozen=True)
+class DecisionResponse:
+    decision_id: str
+    expected_workflow_version: int
+    response: str
+
+    def __post_init__(self) -> None:
+        if (not _ID.fullmatch(self.decision_id)
+                or not is_positive_row_id(self.expected_workflow_version)
+                or self.response not in RESPONSES):
+            raise WorkflowDecisionError("decision response is invalid")
+
+
+@dataclass(frozen=True)
+class FinalOutcome:
+    work_item_id: int
+    work_revision_id: int
+    policy_revision: str
+    disposition: str
+    receipt_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if (not is_positive_row_id(self.work_item_id)
+                or not is_positive_row_id(self.work_revision_id)
+                or not is_sha256_digest(self.policy_revision)
+                or self.disposition not in DISPOSITIONS
+                or any(not is_external_receipt_reference(value)
+                       for value in self.receipt_ids)):
+            raise WorkflowDecisionError("final outcome is invalid")
