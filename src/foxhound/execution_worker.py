@@ -212,7 +212,7 @@ class ExecutionWorker:
         self._knowledge_config = knowledge_config
 
     def context(self) -> dict[str, Any]:
-        state, service = self._active()
+        state, service = self._fresh_active()
         instructions = self._instructions(state)
         context = GwKnowledgeClient(self._knowledge_config).execution_context()
         self._renew(service, state)
@@ -346,7 +346,7 @@ class ExecutionWorker:
         max_matches_per_document: int | None = None,
         max_results_per_layer: int = 10,
     ) -> dict[str, Any]:
-        state, service = self._active()
+        state, service = self._fresh_active()
         result = GwKnowledgeClient(self._knowledge_config).search(
             query,
             layers=layers,
@@ -363,7 +363,7 @@ class ExecutionWorker:
         Available from `execute` onward: the change has to be written before
         it can be proposed. Nothing is pushed here.
         """
-        state, service = self._active()
+        state, service = self._fresh_active()
         if state.phase is WorkflowPhase.PLAN:
             raise ExecutionWorkerClaimError(
                 "a working tree is not prepared while planning"
@@ -404,7 +404,7 @@ class ExecutionWorker:
         before the state: a review of Thursday's state is still a review of
         pull request 7.
         """
-        state, service = self._active()
+        state, service = self._fresh_active()
         if state.phase is not WorkflowPhase.EXTERNAL_ACTION:
             raise ExecutionWorkerClaimError(
                 "an external action is only available in the external_action "
@@ -450,7 +450,7 @@ class ExecutionWorker:
         choose the reviewed body but never redirect this external write to a
         similarly named record.
         """
-        state, service = self._active()
+        state, service = self._fresh_active()
         if state.phase is not WorkflowPhase.EXTERNAL_ACTION:
             raise ExecutionWorkerClaimError(
                 "an external action is only available in the external_action "
@@ -490,7 +490,7 @@ class ExecutionWorker:
         planning or executing would bypass the gate that makes the approval
         mean anything.
         """
-        state, service = self._active()
+        state, service = self._fresh_active()
         if state.phase is not WorkflowPhase.EXTERNAL_ACTION:
             raise ExecutionWorkerClaimError(
                 "an external action is only available in the external_action "
@@ -758,6 +758,31 @@ class ExecutionWorker:
         state = load_run_state(self._state_path)
         service = TaskExecutionService(state.database_path)
         self._renew(service, state)
+        return state, service
+
+    def _fresh_active(self) -> tuple[ExecutionRunState, TaskExecutionService]:
+        """Fail closed when a bound source no longer matches this claim.
+
+        Calls at phase entry and immediately before each forge effect are
+        deliberately separate: a long-running agent must not publish against
+        a source that changed after it started.
+        """
+        state, service = self._active()
+        request = TaskLedger(state.database_path).source_snapshot_request(
+            state.task_id
+        )
+        if request is None:
+            return state, service
+        try:
+            result = GwKnowledgeClient(self._knowledge_config).refresh_source(
+                request
+            )
+        except KnowledgeClientError:
+            raise ExecutionWorkerClaimError("source freshness is unavailable") from None
+        if not result.usable:
+            raise ExecutionWorkerClaimError(
+                "source freshness no longer matches this execution claim"
+            )
         return state, service
 
     @staticmethod

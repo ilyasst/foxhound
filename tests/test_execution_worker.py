@@ -80,6 +80,19 @@ def knowledge_server() -> Iterator[str]:
                     "revision": hashlib.sha256(canonical).hexdigest(),
                     "variables": variables,
                 }
+            elif self.path == "/v1/source-snapshot":
+                response = {
+                    "schema": "foxhound.source-snapshot", "schema_version": 1,
+                    "ok": True, "system": request["system"],
+                    "kind": request["kind"], "record_id": request["record_id"],
+                    "item_id": request["item_id"],
+                    "expected_revision": request["expected_revision"],
+                    "status": "current", "snapshot": {
+                        "revision": request["expected_revision"],
+                        "observed_at": "2030-01-02T03:04:05+00:00",
+                        "lifecycle": "active", "actionability": "actionable",
+                    },
+                }
             else:
                 response = {
                     "schema": "gw.search",
