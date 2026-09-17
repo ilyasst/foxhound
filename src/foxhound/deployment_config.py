@@ -22,7 +22,7 @@ from urllib.parse import urlsplit
 from .agent_profiles import AgentProfileError, load_registry
 from .execution_runner import ExecutionRunnerConfig
 from .execution_worker import ExecutionWorkerConfigError, load_knowledge_config
-from .source_policy import execution_grants, planning_grants
+from .source_policy import action_grants, execution_grants, planning_grants
 from .task_bootstrap import TaskBootstrapConfigError, _private_database
 from .task_card_server import (
     DRIP_ROLE,
@@ -36,7 +36,7 @@ from .task_execution import TaskExecutionService
 
 
 DEPLOYMENT_SCHEMA = "foxhound.deployment-config"
-DEPLOYMENT_SCHEMA_VERSION = 6
+DEPLOYMENT_SCHEMA_VERSION = 7
 MAX_CONFIG_BYTES = 64 * 1024
 
 
@@ -100,6 +100,9 @@ class WorkflowConfig:
     #: Kinds whose recorded plan runs without a card. Defaults to empty so a
     #: configuration written before this key existed keeps asking.
     execute_without_asking: tuple[str, ...] = ()
+    #: Kinds whose reviewed external action runs without a card. Separate
+    #: from the key above, and defaulting to empty for the same reason.
+    act_without_asking: tuple[str, ...] = ()
 
     def schedule_argv(
         self, database: Path, profile_directory: Path | None
@@ -175,6 +178,8 @@ class ExecutionRunnerDeploymentConfig:
             result.extend(("--plan-without-asking", kind))
         for kind in workflow.execute_without_asking:
             result.extend(("--execute-without-asking", kind))
+        for kind in workflow.act_without_asking:
+            result.extend(("--act-without-asking", kind))
         return result
 
 
@@ -378,7 +383,7 @@ def _parse_document(document: object) -> DeploymentConfig:
     version = document.get("schema_version")
     if (
         document.get("schema") != DEPLOYMENT_SCHEMA
-        or version not in {1, 2, 3, 4, 5, DEPLOYMENT_SCHEMA_VERSION}
+        or version not in {1, 2, 3, 4, 5, 6, DEPLOYMENT_SCHEMA_VERSION}
         or isinstance(version, bool)
     ):
         raise DeploymentConfigError("deployment configuration version is invalid")
@@ -478,14 +483,17 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
         "default_agent_profile", "plan_without_asking", "execution_slot_cap",
         "plan_ready_cap", "awaiting_reader_cap",
     }
-    document = _object(
-        value, fields | {"execute_without_asking"} if version >= 6 else fields
-    )
+    if version >= 7:
+        fields = fields | {"execute_without_asking", "act_without_asking"}
+    elif version >= 6:
+        fields = fields | {"execute_without_asking"}
+    document = _object(value, fields)
     profile = document["default_agent_profile"]
     grants = document["plan_without_asking"]
     execute_grants = (
         document["execute_without_asking"] if version >= 6 else []
     )
+    act_grants = document["act_without_asking"] if version >= 7 else []
     caps = tuple(document[key] for key in (
         "execution_slot_cap", "plan_ready_cap", "awaiting_reader_cap"
     ))
@@ -493,13 +501,16 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
         not isinstance(profile, str)
         or not _grant_list(grants)
         or not _grant_list(execute_grants)
+        or not _grant_list(act_grants)
         or any(isinstance(cap, bool) or not isinstance(cap, int) for cap in caps)
     ):
         raise DeploymentConfigError("workflow configuration is invalid")
     return WorkflowConfig(
-        profile, tuple(grants), *caps, execute_without_asking=tuple(
-            execute_grants
-        )
+        profile,
+        tuple(grants),
+        *caps,
+        execute_without_asking=tuple(execute_grants),
+        act_without_asking=tuple(act_grants),
     )
 
 
@@ -721,12 +732,14 @@ def _validate_runtime(config: DeploymentConfig) -> None:
     registry = load_registry(config.agent_profile_directory)
     planning_grants(config.workflow.plan_without_asking)
     execution_grants(config.workflow.execute_without_asking)
+    action_grants(config.workflow.act_without_asking)
     TaskExecutionService(
         config.database,
         profile_registry=registry,
         default_profile_id=config.workflow.default_agent_profile,
         planning_grants=config.workflow.plan_without_asking,
         execution_grants=config.workflow.execute_without_asking,
+        action_grants=config.workflow.act_without_asking,
         execution_slot_cap=config.workflow.execution_slot_cap,
         plan_ready_cap=config.workflow.plan_ready_cap,
         awaiting_reader_cap=config.workflow.awaiting_reader_cap,
@@ -756,6 +769,7 @@ def _validate_runtime(config: DeploymentConfig) -> None:
                 runner_slot=runner.runner_slot,
                 planning_grants=config.workflow.plan_without_asking,
                 execution_grants=config.workflow.execute_without_asking,
+                action_grants=config.workflow.act_without_asking,
                 knowledge_root=runner.knowledge_root,
                 task_work_root=runner.task_work_root,
                 task_kb_root=runner.task_kb_root,

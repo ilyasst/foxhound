@@ -28,6 +28,7 @@ from .agent_profiles import (
 )
 from .candidate_inbox import CandidateInbox, InboxError, SCHEMA_VERSION
 from .source_policy import (
+    action_grants as _action_grants,
     execution_grants as _execution_grants,
     planning_grants as _planning_grants,
     source_kinds_accepting,
@@ -338,6 +339,7 @@ class TaskExecutionService:
         default_profile_id: str = "general",
         planning_grants: object = None,
         execution_grants: object = None,
+        action_grants: object = None,
         execution_slot_cap: int | None = None,
         plan_ready_cap: int | None = None,
         awaiting_reader_cap: int | None = None,
@@ -378,6 +380,9 @@ class TaskExecutionService:
         # Independent of planning authority above. A machine that has
         # said a kind may be planned has not said its plan may be run.
         self._execution_grants = _execution_grants(execution_grants)
+        # Independent again. Executing a plan and performing an effect
+        # other people can see are not the same permission.
+        self._action_grants = _action_grants(action_grants)
         self._default_profile = profile
 
     def _profile_for(self, origin_kind: object) -> AgentProfile:
@@ -1269,6 +1274,7 @@ class TaskExecutionService:
                     ExecutionOutcome(result["outcome"]),
                     row["origin_kind"],
                     self._execution_grants,
+                    self._action_grants,
                 )
                 phase = recorded_phase if advance is None else advance
                 if advance is not None:
@@ -2309,31 +2315,49 @@ def _result_target(
     return WorkflowStatus.AWAITING_REVIEW
 
 
+#: Each gate a machine may stand down: the result that asks for approval,
+#: and the phase approving it would open. Held as data so adding a gate is a
+#: row rather than another branch, and so the two grants stay visibly
+#: parallel — neither is a special case of the other.
+_GRANTED_ADVANCES = {
+    (WorkflowPhase.PLAN, ExecutionOutcome.AWAITING_PLAN):
+        WorkflowPhase.EXECUTE,
+    (WorkflowPhase.EXECUTE, ExecutionOutcome.AWAITING_EXTERNAL):
+        WorkflowPhase.EXTERNAL_ACTION,
+}
+
+
 def _granted_advance(
     phase: WorkflowPhase,
     outcome: ExecutionOutcome,
     origin_kind: object,
-    granted: frozenset[str],
+    execution_granted: frozenset[str],
+    action_granted: frozenset[str],
 ) -> WorkflowPhase | None:
     """The phase a standing grant moves this result to, or None to ask.
 
-    A recorded plan asks for approval by returning `awaiting_plan`. For a
-    source whose enrolment already settled that question, the card it would
-    raise has one plausible answer, and a queue of such cards costs the
-    reader the attention that the cards needing a decision were meant to
-    get.
+    A result asks for approval by returning `awaiting_plan` or
+    `awaiting_external`. For a source whose enrolment already settled that
+    question, the card it would raise has one plausible answer, and a queue
+    of such cards costs the reader the attention that the cards needing a
+    decision were meant to get.
 
-    Only that one transition is granted here. `completed`, `declined` and
+    Only those two transitions are granted. `completed`, `declined` and
     `ineligible` end the work and are the reader's to see; nothing about a
     grant should hide a result.
+
+    Each gate reads its own grant, so granting one never implies the other
+    in either direction.
     """
-    if phase is not WorkflowPhase.PLAN:
+    target = _GRANTED_ADVANCES.get((phase, outcome))
+    if target is None:
         return None
-    if outcome is not ExecutionOutcome.AWAITING_PLAN:
-        return None
+    granted = (
+        execution_granted if phase is WorkflowPhase.PLAN else action_granted
+    )
     if not isinstance(origin_kind, str) or origin_kind not in granted:
         return None
-    return WorkflowPhase.EXECUTE
+    return target
 
 
 def _validated_result(envelope: ExecutionResultEnvelope) -> dict[str, object]:
