@@ -31,12 +31,30 @@ def describe(module_file: str | Path) -> str:
     root = Path(module_file).resolve().parent.parent.parent
     revision = _git(root, "rev-parse", "--short=12", "HEAD")
     if not revision:
-        return UNKNOWN
+        # A promoted release is a copy without git metadata, and its revision
+        # is the directory it was installed into.  Reporting `unknown` there
+        # would withhold the answer on exactly the layout this line exists to
+        # describe.
+        named = _named_release(root)
+        return f"{named} (release)" if named else UNKNOWN
     branch = _git(root, "rev-parse", "--abbrev-ref", "HEAD")
     where = "detached" if branch == "HEAD" else (branch or UNKNOWN)
     status = _git(root, "status", "--porcelain")
     state = "modified" if status else "clean"
     return f"{revision} ({where}) {state}"
+
+
+def _named_release(root: Path) -> str:
+    """The revision a release directory is named for, if it is named for one."""
+    for parent in (root, *root.parents):
+        if parent.parent.name == "releases" and _looks_like_revision(parent.name):
+            return parent.name
+    return ""
+
+
+def _looks_like_revision(name: str) -> bool:
+    return (7 <= len(name) <= 40
+            and all(character in "0123456789abcdef" for character in name))
 
 
 def _git(root: Path, *arguments: str) -> str:

@@ -66,3 +66,33 @@ class DescribeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PromotedReleaseTests(unittest.TestCase):
+    """A promoted release is a copy without git metadata."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+
+    def _module(self, *parts: str) -> Path:
+        module = self.root.joinpath(*parts) / "src" / "package" / "module.py"
+        module.parent.mkdir(parents=True)
+        module.write_text("", encoding="utf-8")
+        return module
+
+    def test_the_release_directory_name_is_the_revision(self) -> None:
+        module = self._module("releases", "abc123def456")
+        self.assertEqual(release_revision.describe(module),
+                         "abc123def456 (release)")
+
+    def test_a_directory_not_named_for_a_revision_is_unknown(self) -> None:
+        module = self._module("releases", "staging-copy")
+        self.assertEqual(release_revision.describe(module),
+                         release_revision.UNKNOWN)
+
+    def test_a_copy_outside_a_releases_directory_is_unknown(self) -> None:
+        module = self._module("somewhere", "abc123def456")
+        self.assertEqual(release_revision.describe(module),
+                         release_revision.UNKNOWN)
