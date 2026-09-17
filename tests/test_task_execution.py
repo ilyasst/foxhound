@@ -1587,7 +1587,7 @@ class TaskExecutionTests(unittest.TestCase):
     def test_reconciliation_is_idempotent(self):
         self._bind_origin(1, "issue")
         self._schedule_and_start()
-        recorded = self.service.record_result(self._result(self._claim()))
+        self.service.record_result(self._result(self._claim()))
         granted = self._grant_service("issue")
 
         first = granted.schedule_new()
