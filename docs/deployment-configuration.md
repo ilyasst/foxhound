@@ -22,7 +22,7 @@ and all paths are absolute.
 ```json
 {
   "schema": "foxhound.deployment-config",
-  "schema_version": 5,
+  "schema_version": 6,
   "database": "/srv/example/private-foxhound-state/foxhound.sqlite3",
   "agent_profile_directory": null,
   "card_service": {
@@ -44,6 +44,7 @@ and all paths are absolute.
   "workflow": {
     "default_agent_profile": "general",
     "plan_without_asking": ["issue"],
+    "execute_without_asking": ["issue"],
     "execution_slot_cap": 2,
     "plan_ready_cap": 10,
     "awaiting_reader_cap": 20
@@ -102,8 +103,8 @@ Set a disabled `card_service`, runner, or database consumer to exactly
 `{"enabled": false}`. The `execution_runners` list permits each running slot
 to be declared separately; enabled slots must have distinct names. The
 workflow section remains required because it owns the shared policy and
-limits. Versions 1 through 4 remain readable for a controlled transition, but
-only version 5 can declare the complete deployment boundary.
+limits. Earlier versions remain readable for a controlled transition, but
+only version 6 can declare the complete deployment boundary.
 
 Validate before changing a service definition or restarting anything:
 
@@ -150,6 +151,31 @@ same installed release as the configuration command:
 the release selector and unit definitions private. A promotion changes that
 selector only after preflight succeeds, so every database component starts
 from one selected release with arguments rendered from the same document.
+
+## Gates a machine may stand down
+
+A task passes reader gates on its way through a workflow. Two of them are
+declared per machine, as lists of source kinds, and both default to empty: a
+machine that says nothing is asked about everything.
+
+`plan_without_asking` skips the Start gate. Enrolling a source is the
+permission to plan its tasks, so the card that would ask again can only show
+a title — nothing has looked at the work yet. Planning is read-only and
+produces no external effect.
+
+`execute_without_asking` skips the plan-approval gate. A recorded plan runs
+instead of waiting for a card. Grant it for a source where the decision to
+work every task was already made when the source was enrolled, and where a
+plan card would therefore have one plausible answer.
+
+The two are independent and neither implies the other. Granting planning
+spends agent time on work nobody has judged; granting execution performs the
+work that plan described. An operator may reasonably want the first alone.
+
+A granted advance is recorded as `phase_granted`, never as `phase_approved`:
+the event log must not say a reader approved a phase nobody was asked about.
+Results that end the work — `completed`, `declined`, `ineligible` — are never
+granted past, so a task still produces its completion card.
 
 ## Fused task titles
 

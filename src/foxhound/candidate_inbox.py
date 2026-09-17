@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 35
+SCHEMA_VERSION = 36
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -2366,6 +2366,32 @@ _SCHEMA_V35 = (
 )
 
 
+# `phase_granted` records that a machine's standing grant advanced a
+# workflow, and exists so the ledger never claims a reader approved a phase
+# nobody was asked about. The distinction matters for the same reason
+# `candidate_revision_conflict` is not `candidate_revised`: an event log that
+# overstates human involvement cannot be used to audit it.
+_SCHEMA_V36_EXECUTION_EVENT_TABLE = _SCHEMA_V32_EXECUTION_EVENT_TABLE.replace(
+    "'phase_approved','revision_requested'",
+    "'phase_approved','phase_granted','revision_requested'",
+)
+_SCHEMA_V36 = (
+    "DROP TRIGGER task_execution_events_no_update;",
+    "DROP TRIGGER task_execution_events_no_delete;",
+    "ALTER TABLE task_execution_events RENAME TO task_execution_events_v35;",
+    _SCHEMA_V36_EXECUTION_EVENT_TABLE,
+    "INSERT INTO task_execution_events("
+    "sequence,task_id,kind,workflow_version,task_version,phase,status,"
+    "occurred_at,agent_profile_id,agent_profile_revision) "
+    "SELECT sequence,task_id,kind,workflow_version,task_version,phase,status,"
+    "occurred_at,agent_profile_id,agent_profile_revision "
+    "FROM task_execution_events_v35;",
+    "DROP TABLE task_execution_events_v35;",
+    _SCHEMA_V8[6],
+    _SCHEMA_V8[7],
+)
+
+
 _SCHEMA_V20 = (
     # SQLite cannot alter a CHECK in place, and three tables carry a foreign
     # key to this one. Renaming the card table would rewrite all three to
@@ -3345,6 +3371,26 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 35
+            if version == 35:
+                self._require_tables(connection, ("task_execution_events",))
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    definition = connection.execute(
+                        "SELECT sql FROM sqlite_master WHERE type='table' "
+                        "AND name='task_execution_events'"
+                    ).fetchone()
+                    if definition is None:
+                        raise InboxError(
+                            "candidate inbox schema is incomplete")
+                    if "'phase_granted'" not in definition["sql"]:
+                        for statement in _SCHEMA_V36:
+                            connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 36")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 36
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:

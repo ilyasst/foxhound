@@ -22,7 +22,7 @@ from urllib.parse import urlsplit
 from .agent_profiles import AgentProfileError, load_registry
 from .execution_runner import ExecutionRunnerConfig
 from .execution_worker import ExecutionWorkerConfigError, load_knowledge_config
-from .source_policy import planning_grants
+from .source_policy import execution_grants, planning_grants
 from .task_bootstrap import TaskBootstrapConfigError, _private_database
 from .task_card_server import (
     DRIP_ROLE,
@@ -36,7 +36,7 @@ from .task_execution import TaskExecutionService
 
 
 DEPLOYMENT_SCHEMA = "foxhound.deployment-config"
-DEPLOYMENT_SCHEMA_VERSION = 5
+DEPLOYMENT_SCHEMA_VERSION = 6
 MAX_CONFIG_BYTES = 64 * 1024
 
 
@@ -97,6 +97,9 @@ class WorkflowConfig:
     execution_slot_cap: int
     plan_ready_cap: int
     awaiting_reader_cap: int
+    #: Kinds whose recorded plan runs without a card. Defaults to empty so a
+    #: configuration written before this key existed keeps asking.
+    execute_without_asking: tuple[str, ...] = ()
 
     def schedule_argv(
         self, database: Path, profile_directory: Path | None
@@ -170,6 +173,8 @@ class ExecutionRunnerDeploymentConfig:
                 result.extend((option, str(path)))
         for kind in workflow.plan_without_asking:
             result.extend(("--plan-without-asking", kind))
+        for kind in workflow.execute_without_asking:
+            result.extend(("--execute-without-asking", kind))
         return result
 
 
@@ -373,7 +378,7 @@ def _parse_document(document: object) -> DeploymentConfig:
     version = document.get("schema_version")
     if (
         document.get("schema") != DEPLOYMENT_SCHEMA
-        or version not in {1, 2, 3, 4, DEPLOYMENT_SCHEMA_VERSION}
+        or version not in {1, 2, 3, 4, 5, DEPLOYMENT_SCHEMA_VERSION}
         or isinstance(version, bool)
     ):
         raise DeploymentConfigError("deployment configuration version is invalid")
@@ -401,7 +406,7 @@ def _parse_document(document: object) -> DeploymentConfig:
         card_service=_parse_card_service(
             root["card_service"], version=int(version)
         ),
-        workflow=_parse_workflow(root["workflow"]),
+        workflow=_parse_workflow(root["workflow"], version=int(version)),
         execution_runners=runners,
         database_consumers=(
             _parse_database_consumers(
@@ -468,25 +473,43 @@ def _parse_card_service(value: object, *, version: int) -> CardServiceConfig:
     )
 
 
-def _parse_workflow(value: object) -> WorkflowConfig:
-    document = _object(value, {
+def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
+    fields = {
         "default_agent_profile", "plan_without_asking", "execution_slot_cap",
         "plan_ready_cap", "awaiting_reader_cap",
-    })
+    }
+    document = _object(
+        value, fields | {"execute_without_asking"} if version >= 6 else fields
+    )
     profile = document["default_agent_profile"]
     grants = document["plan_without_asking"]
+    execute_grants = (
+        document["execute_without_asking"] if version >= 6 else []
+    )
     caps = tuple(document[key] for key in (
         "execution_slot_cap", "plan_ready_cap", "awaiting_reader_cap"
     ))
     if (
         not isinstance(profile, str)
-        or not isinstance(grants, list)
-        or any(not isinstance(kind, str) for kind in grants)
-        or len(set(grants)) != len(grants)
+        or not _grant_list(grants)
+        or not _grant_list(execute_grants)
         or any(isinstance(cap, bool) or not isinstance(cap, int) for cap in caps)
     ):
         raise DeploymentConfigError("workflow configuration is invalid")
-    return WorkflowConfig(profile, tuple(grants), *caps)
+    return WorkflowConfig(
+        profile, tuple(grants), *caps, execute_without_asking=tuple(
+            execute_grants
+        )
+    )
+
+
+def _grant_list(value: object) -> bool:
+    """One declared grant list: strings, no duplicates, order irrelevant."""
+    return (
+        isinstance(value, list)
+        and all(isinstance(kind, str) for kind in value)
+        and len(set(value)) == len(value)
+    )
 
 
 def _parse_execution_runner(value: object) -> ExecutionRunnerDeploymentConfig:
@@ -697,11 +720,13 @@ def _validate_runtime(config: DeploymentConfig) -> None:
     _private_database(config.database)
     registry = load_registry(config.agent_profile_directory)
     planning_grants(config.workflow.plan_without_asking)
+    execution_grants(config.workflow.execute_without_asking)
     TaskExecutionService(
         config.database,
         profile_registry=registry,
         default_profile_id=config.workflow.default_agent_profile,
         planning_grants=config.workflow.plan_without_asking,
+        execution_grants=config.workflow.execute_without_asking,
         execution_slot_cap=config.workflow.execution_slot_cap,
         plan_ready_cap=config.workflow.plan_ready_cap,
         awaiting_reader_cap=config.workflow.awaiting_reader_cap,
@@ -730,6 +755,7 @@ def _validate_runtime(config: DeploymentConfig) -> None:
                 worker_command=runner.worker_command,
                 runner_slot=runner.runner_slot,
                 planning_grants=config.workflow.plan_without_asking,
+                execution_grants=config.workflow.execute_without_asking,
                 knowledge_root=runner.knowledge_root,
                 task_work_root=runner.task_work_root,
                 task_kb_root=runner.task_kb_root,

@@ -87,15 +87,19 @@ SOURCE_POLICIES = {
 
 
 
-def planning_grants(
-    requested: object, *, label: str = "planning grants"
+def source_kind_grants(
+    requested: object, *, label: str
 ) -> frozenset[str]:
-    """Validate one machine's declared planning authority.
+    """Validate one machine's declared authority over a set of source kinds.
 
     Empty is the default and the cautious answer: a machine that declares
-    nothing asks before planning anything. A machine cannot grant a kind
+    nothing asks before acting on anything. A machine cannot grant a kind
     the code does not permit, nor one it has never heard of — a typo must
     not silently widen authority, and must not silently narrow it either.
+
+    The same shape serves each gate, but the grants are deliberately
+    separate values rather than one: the gates guard different risks, and a
+    machine that has answered for one has said nothing about the others.
     """
     if requested is None:
         return frozenset()
@@ -108,6 +112,26 @@ def planning_grants(
     if unknown:
         raise ValueError(f"{label} name unknown source kinds")
     return grants
+
+
+def planning_grants(
+    requested: object, *, label: str = "planning grants"
+) -> frozenset[str]:
+    """Kinds this machine may plan without asking a reader first."""
+    return source_kind_grants(requested, label=label)
+
+
+def execution_grants(
+    requested: object, *, label: str = "execution grants"
+) -> frozenset[str]:
+    """Kinds whose recorded plan may be executed without asking a reader.
+
+    Held apart from planning authority because the two answer different
+    questions. Planning spends agent time on a task nobody has judged;
+    execution performs the work that plan described. An operator may well
+    want the first without the second.
+    """
+    return source_kind_grants(requested, label=label)
 
 
 def source_kinds_accepting(capability: str) -> frozenset[str]:
