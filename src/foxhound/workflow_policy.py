@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Mapping
 
 from .source_policy import source_kind_grants
+from .contracts.validation import is_bounded_text
 
 
 STAGES = ("plan", "execute", "external_action")
@@ -83,7 +84,7 @@ def parse_workflow_policy(value: object) -> WorkflowPolicy:
     }:
         raise WorkflowPolicyError("workflow policy is invalid")
     policy_id = value["policy_id"]
-    if not isinstance(policy_id, str) or not policy_id or len(policy_id) > 64:
+    if not is_bounded_text(policy_id, maximum=64):
         raise WorkflowPolicyError("workflow policy identity is invalid")
     raw_grants = value["grants"]
     if not isinstance(raw_grants, Mapping) or set(raw_grants) != set(STAGES):

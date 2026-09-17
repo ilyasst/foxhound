@@ -47,3 +47,10 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertEqual(policy.effects, frozenset({"forge"}))
         with self.assertRaises(WorkflowPolicyError):
             parse_workflow_policy({"policy_id": "bad"})
+        with self.assertRaises(WorkflowPolicyError):
+            parse_workflow_policy({
+                "policy_id": " policy ", "grants": {
+                    "plan": [], "execute": [], "external_action": [],
+                }, "freshness": "none", "effects": [],
+                "final_decision": True,
+            })
