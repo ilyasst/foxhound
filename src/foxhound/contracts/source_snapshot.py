@@ -8,12 +8,16 @@ revision and exposes two bounded source-owned state fields for later policy.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Mapping, Protocol
 
 from .task_candidate import SOURCE_KINDS, SOURCE_SYSTEMS
+from .validation import (
+    is_bounded_text,
+    is_opaque_identifier,
+    is_sha256_digest,
+)
 
 
 REQUEST_SCHEMA = "foxhound.source-snapshot-request"
@@ -26,10 +30,6 @@ LIFECYCLE_STATES = frozenset({"active", "withdrawn"})
 ACTIONABILITY_STATES = frozenset({
     "actionable", "not_actionable", "unknown",
 })
-
-_OPAQUE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$")
-_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
-
 
 class SourceSnapshotContractError(ValueError):
     """A source-snapshot request or response is outside the contract."""
@@ -272,9 +272,7 @@ def _exact_fields(value: Mapping[str, Any], expected: set[str]) -> None:
 
 
 def _text(value: object, field: str, *, maximum: int) -> str:
-    if (not isinstance(value, str) or not value or value != value.strip()
-            or len(value) > maximum
-            or any(ord(char) < 32 or ord(char) == 127 for char in value)):
+    if not is_bounded_text(value, maximum=maximum):
         raise SourceSnapshotContractError(f"{field} is invalid")
     return value
 
@@ -288,14 +286,14 @@ def _choice(value: object, field: str, choices: frozenset[str]) -> str:
 
 def _opaque_id(value: object, field: str) -> str:
     text = _text(value, field, maximum=200)
-    if _OPAQUE_ID_RE.fullmatch(text) is None:
+    if not is_opaque_identifier(text):
         raise SourceSnapshotContractError(f"{field} is invalid")
     return text
 
 
 def _digest(value: object, field: str) -> str:
     text = _text(value, field, maximum=64)
-    if _DIGEST_RE.fullmatch(text) is None:
+    if not is_sha256_digest(text):
         raise SourceSnapshotContractError(f"{field} is invalid")
     return text
 
