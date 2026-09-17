@@ -25,6 +25,7 @@ from .knowledge_client import (
     KnowledgeClientError,
     KnowledgeSearchResult,
 )
+from .contracts import SourceSnapshotContractError
 from . import work_digest
 from .task_execution import (
     ExecutionResultEnvelope,
@@ -35,6 +36,7 @@ from .task_execution import (
     _validated_result,
 )
 from . import forge_action
+from .source_policy import source_kind_grants
 from .agent_profiles import (
     MAX_MANIFEST_BYTES,
     AgentProfileError,
@@ -67,6 +69,8 @@ STATE_ENV = "FOXHOUND_EXECUTION_STATE"
 GW_ENDPOINT_ENV = "FOXHOUND_GW_ENDPOINT"
 GW_ALIAS_ENV = "FOXHOUND_GW_ALIAS"
 GW_TOKEN_FILE_ENV = "FOXHOUND_GW_TOKEN_FILE"
+FRESHNESS_PHASE_KINDS_ENV = "FOXHOUND_FRESHNESS_PHASE_KINDS"
+FRESHNESS_EFFECT_KINDS_ENV = "FOXHOUND_FRESHNESS_EFFECT_KINDS"
 
 MAX_STATE_BYTES = 16 * 1024
 MAX_INSTRUCTIONS_BYTES = MAX_MANIFEST_BYTES
@@ -203,6 +207,9 @@ class ExecutionWorker:
         self,
         state_path: str | os.PathLike[str],
         knowledge_config: KnowledgeClientConfig,
+        *,
+        freshness_phase_kinds: object = None,
+        freshness_effect_kinds: object = None,
     ) -> None:
         if not isinstance(knowledge_config, KnowledgeClientConfig):
             raise ExecutionWorkerConfigError(
@@ -210,9 +217,13 @@ class ExecutionWorker:
             )
         self._state_path = Path(state_path)
         self._knowledge_config = knowledge_config
+        self._freshness_phase_kinds = source_kind_grants(
+            freshness_phase_kinds, label="freshness phase kinds")
+        self._freshness_effect_kinds = source_kind_grants(
+            freshness_effect_kinds, label="freshness effect kinds")
 
     def context(self) -> dict[str, Any]:
-        state, service = self._active()
+        state, service = self._fresh_active("phase")
         instructions = self._instructions(state)
         context = GwKnowledgeClient(self._knowledge_config).execution_context()
         self._renew(service, state)
@@ -404,7 +415,7 @@ class ExecutionWorker:
         before the state: a review of Thursday's state is still a review of
         pull request 7.
         """
-        state, service = self._active()
+        state, service = self._fresh_active("effect")
         if state.phase is not WorkflowPhase.EXTERNAL_ACTION:
             raise ExecutionWorkerClaimError(
                 "an external action is only available in the external_action "
@@ -450,7 +461,7 @@ class ExecutionWorker:
         choose the reviewed body but never redirect this external write to a
         similarly named record.
         """
-        state, service = self._active()
+        state, service = self._fresh_active("effect")
         if state.phase is not WorkflowPhase.EXTERNAL_ACTION:
             raise ExecutionWorkerClaimError(
                 "an external action is only available in the external_action "
@@ -490,7 +501,7 @@ class ExecutionWorker:
         planning or executing would bypass the gate that makes the approval
         mean anything.
         """
-        state, service = self._active()
+        state, service = self._fresh_active("effect")
         if state.phase is not WorkflowPhase.EXTERNAL_ACTION:
             raise ExecutionWorkerClaimError(
                 "an external action is only available in the external_action "
@@ -760,6 +771,40 @@ class ExecutionWorker:
         self._renew(service, state)
         return state, service
 
+    def _fresh_active(
+        self, checkpoint: str
+    ) -> tuple[ExecutionRunState, TaskExecutionService]:
+        """Fail closed when a bound source no longer matches this claim.
+
+        Calls at phase entry and immediately before each forge effect are
+        deliberately separate: a long-running agent must not publish against
+        a source that changed after it started.
+        """
+        if checkpoint not in {"phase", "effect"}:
+            raise ExecutionWorkerConfigError("source freshness checkpoint is invalid")
+        state, service = self._active()
+        try:
+            request = TaskLedger(state.database_path).source_snapshot_request(
+                state.task_id
+            )
+        except (SourceSnapshotContractError, ValueError):
+            raise ExecutionWorkerClaimError("source freshness is unavailable") from None
+        enabled = (self._freshness_phase_kinds if checkpoint == "phase"
+                   else self._freshness_effect_kinds)
+        if request is None or request.locator.kind not in enabled:
+            return state, service
+        try:
+            result = GwKnowledgeClient(self._knowledge_config).refresh_source(
+                request
+            )
+        except KnowledgeClientError:
+            raise ExecutionWorkerClaimError("source freshness is unavailable") from None
+        if not result.usable:
+            raise ExecutionWorkerClaimError(
+                "source freshness no longer matches this execution claim"
+            )
+        return state, service
+
     @staticmethod
     def _renew(
         service: TaskExecutionService, state: ExecutionRunState
@@ -967,7 +1012,17 @@ def load_worker_from_environment(
             "execution worker configuration is unavailable"
         )
     config = load_knowledge_config(endpoint, alias, token_path)
-    return ExecutionWorker(state, config)
+    return ExecutionWorker(
+        state, config,
+        freshness_phase_kinds=_source_kinds(values.get(FRESHNESS_PHASE_KINDS_ENV, "")),
+        freshness_effect_kinds=_source_kinds(values.get(FRESHNESS_EFFECT_KINDS_ENV, "")),
+    )
+
+
+def _source_kinds(value: object) -> tuple[str, ...]:
+    if not isinstance(value, str):
+        raise ExecutionWorkerConfigError("source freshness configuration is invalid")
+    return tuple(item for item in value.split(",") if item)
 
 
 def load_knowledge_config(
