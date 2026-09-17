@@ -298,12 +298,33 @@ def publish(
     profile_ids: Sequence[str] = (),
     *,
     all_active: bool = False,
+    databases: Sequence[Path] = (),
 ) -> dict[str, Any]:
-    """Compile the selected drafts and advance the catalog atomically."""
+    """Compile the selected drafts and advance the catalog atomically.
+
+    When ``databases`` is non-empty, ``publish`` refuses to create a new
+    revision for any profile that has active (non-terminal) workflows still
+    bound to it.  A terminal status is ``completed`` or ``cancelled``; all
+    other statuses block the retune.
+    """
     root = _store_root(source)
     catalog = _load_catalog(root)
     drafts = load_drafts(root)
     selected = _publication_targets(catalog, drafts, profile_ids, all_active)
+
+    # Guard: refuse to retune a profile whose revision is still needed
+    # by active workflows.
+    if databases:
+        for profile_id in selected:
+            references = sum(
+                _active_workflow_references(db, profile_id)
+                for db in databases
+            )
+            if references:
+                raise ProfileStoreError(
+                    "agent profile is bound to active workflows"
+                )
+
     published: list[dict[str, Any]] = []
     unchanged: list[str] = []
     updated = dict(catalog)
@@ -539,6 +560,52 @@ def _database_references(database: Path, profile_id: str) -> int:
                 continue
             row = connection.execute(
                 f"SELECT COUNT(*) FROM {quoted} WHERE agent_profile_id = ?",
+                (profile_id,),
+            ).fetchone()
+            total += int(row[0])
+        return total
+    except (sqlite3.Error, OSError) as exc:
+        raise ProfileStoreError("workflow evidence is unavailable") from exc
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _active_workflow_references(database: Path, profile_id: str) -> int:
+    """Count non-terminal workflows bound to a profile in one database.
+
+    Terminal statuses (completed, cancelled) do not count.  Active statuses
+    such as awaiting_start, snoozed, queued, running, awaiting_review, and
+    parked all block a retune because the workflow still depends on its
+    pinned revision.
+    """
+    if not isinstance(database, Path) or not database.is_absolute():
+        raise ProfileStoreError("workflow evidence is invalid")
+    uri = f"file:{urllib.parse.quote(str(database))}?mode=ro"
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(uri, uri=True, timeout=5.0)
+        tables = [
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        ]
+        total = 0
+        for table in tables:
+            quoted = '"' + table.replace('"', '""') + '"'
+            columns = {
+                str(row[1])
+                for row in connection.execute(f"PRAGMA table_info({quoted})")
+            }
+            if not set(_PROFILE_COLUMNS) <= columns:
+                continue
+            if "status" not in columns:
+                continue
+            row = connection.execute(
+                f"SELECT COUNT(*) FROM {quoted} "
+                f"WHERE agent_profile_id = ? "
+                f"AND status NOT IN ('completed', 'cancelled')",
                 (profile_id,),
             ).fetchone()
             total += int(row[0])
@@ -804,6 +871,9 @@ def _parser() -> argparse.ArgumentParser:
     publication = commands.add_parser("publish")
     publication.add_argument("--profile", action="append", default=[])
     publication.add_argument("--all-active", action="store_true")
+    publication.add_argument(
+        "--database", type=Path, action="append", default=[]
+    )
     for name in ("disable", "enable"):
         state = commands.add_parser(name)
         state.add_argument("--profile", required=True)
@@ -829,7 +899,9 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         return list_profiles(args.source)
     if args.command == "publish":
         return publish(
-            args.source, args.profile, all_active=args.all_active
+            args.source, args.profile,
+            all_active=args.all_active,
+            databases=args.database,
         )
     if args.command in {"disable", "enable"}:
         return set_state(

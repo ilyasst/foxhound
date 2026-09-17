@@ -642,6 +642,127 @@ class ProfileStoreTests(unittest.TestCase):
         self.assertIn("Project Alpha", profile.prompt_template)
         self.assertEqual(validate(source)["pending"], [])
 
+    def test_publish_refuses_profile_with_active_workflows(self):
+        publish(self.source, ["example-scout"])
+        revision = self.published_revision()
+        database = self.root / "evidence.sqlite3"
+        connection = sqlite3.connect(database)
+        connection.execute(
+            "CREATE TABLE task_execution_workflows (task_id INTEGER, "
+            "agent_profile_id TEXT, agent_profile_revision TEXT, "
+            "status TEXT, version INTEGER)"
+        )
+        connection.execute(
+            "INSERT INTO task_execution_workflows VALUES (1, ?, ?, ?, 1)",
+            ("example-scout", revision, "running"),
+        )
+        connection.commit()
+        connection.close()
+
+        self.write_shared("hermes.md", SHARED_TEXT + "Revised.\n")
+        with self.assertRaises(ProfileStoreError):
+            publish(self.source, ["example-scout"], databases=[database])
+
+    def test_publish_allows_profile_with_only_completed_workflows(self):
+        publish(self.source, ["example-scout"])
+        first_revision = self.published_revision()
+        database = self.root / "evidence.sqlite3"
+        connection = sqlite3.connect(database)
+        connection.execute(
+            "CREATE TABLE task_execution_workflows (task_id INTEGER, "
+            "agent_profile_id TEXT, agent_profile_revision TEXT, "
+            "status TEXT, version INTEGER)"
+        )
+        connection.execute(
+            "INSERT INTO task_execution_workflows VALUES (1, ?, ?, ?, 1)",
+            ("example-scout", first_revision, "completed"),
+        )
+        connection.execute(
+            "INSERT INTO task_execution_workflows VALUES (2, ?, ?, ?, 1)",
+            ("example-scout", first_revision, "cancelled"),
+        )
+        connection.commit()
+        connection.close()
+
+        self.write_shared("hermes.md", SHARED_TEXT + "Revised.\n")
+        report = publish(self.source, ["example-scout"], databases=[database])
+
+        self.assertEqual(len(report["published"]), 1)
+        self.assertNotEqual(report["published"][0]["revision"], first_revision)
+
+    def test_publish_ignores_databases_with_no_matching_workflows(self):
+        publish(self.source, ["example-scout"])
+        first_revision = self.published_revision()
+        database = self.root / "evidence.sqlite3"
+        connection = sqlite3.connect(database)
+        connection.execute(
+            "CREATE TABLE task_execution_workflows (task_id INTEGER, "
+            "agent_profile_id TEXT, agent_profile_revision TEXT, "
+            "status TEXT, version INTEGER)"
+        )
+        connection.execute(
+            "INSERT INTO task_execution_workflows VALUES (1, ?, ?, ?, 1)",
+            ("other-profile", first_revision, "running"),
+        )
+        connection.commit()
+        connection.close()
+
+        self.write_shared("hermes.md", SHARED_TEXT + "Revised.\n")
+        report = publish(self.source, ["example-scout"], databases=[database])
+
+        self.assertEqual(len(report["published"]), 1)
+
+    def test_publish_all_active_blocks_only_bound_profile(self):
+        self.write_draft("example-clerk", display_name="Example Clerk")
+        publish(self.source, ["example-scout", "example-clerk"])
+        scout_revision = self.published_revision("example-scout")
+        database = self.root / "evidence.sqlite3"
+        connection = sqlite3.connect(database)
+        connection.execute(
+            "CREATE TABLE task_execution_workflows (task_id INTEGER, "
+            "agent_profile_id TEXT, agent_profile_revision TEXT, "
+            "status TEXT, version INTEGER)"
+        )
+        connection.execute(
+            "INSERT INTO task_execution_workflows VALUES (1, ?, ?, ?, 1)",
+            ("example-scout", scout_revision, "running"),
+        )
+        connection.commit()
+        connection.close()
+
+        self.write_shared("hermes.md", SHARED_TEXT + "Revised.\n")
+        with self.assertRaises(ProfileStoreError):
+            publish(self.source, all_active=True, databases=[database])
+
+    def test_publish_cli_database_flag(self):
+        publish(self.source, ["example-scout"])
+        revision = self.published_revision()
+        database = self.root / "evidence.sqlite3"
+        connection = sqlite3.connect(database)
+        connection.execute(
+            "CREATE TABLE task_execution_workflows (task_id INTEGER, "
+            "agent_profile_id TEXT, agent_profile_revision TEXT, "
+            "status TEXT, version INTEGER)"
+        )
+        connection.execute(
+            "INSERT INTO task_execution_workflows VALUES (1, ?, ?, ?, 1)",
+            ("example-scout", revision, "running"),
+        )
+        connection.commit()
+        connection.close()
+
+        self.write_shared("hermes.md", SHARED_TEXT + "Revised.\n")
+        rendered = self.capture(
+            [
+                "--source", str(self.source),
+                "publish", "--all-active",
+                "--database", str(database),
+            ],
+            expected=os.EX_CONFIG,
+        )
+        self.assertIn("bound to active workflows", rendered)
+        self.assertNotIn(str(self.source), rendered)
+
     def capture(self, arguments: list[str], *, expected: int) -> str:
         output = StringIO()
         errors = StringIO()
