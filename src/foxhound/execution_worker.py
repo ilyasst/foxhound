@@ -784,7 +784,10 @@ class ExecutionWorker:
 
     def release(self) -> dict[str, Any]:
         state, service = self._active()
-        if _result_inputs_present(self._state_path.parent):
+        if _result_inputs_present(
+            _result_search_path(state, self._state_path.parent),
+            task_folder_not_before=_claim_started_at(self._state_path),
+        ):
             if state.phase is WorkflowPhase.PLAN:
                 ready = self.draft(outcome="awaiting_plan")
                 return self.record(ready["draft"])
@@ -1178,6 +1181,28 @@ def _claim_started_at(state_path: Path) -> int | None:
         return None
 
 
+def _fenced_out(
+    index: int,
+    directories: tuple[Path, ...],
+    candidate: Path,
+    task_folder_not_before: int | None,
+) -> bool:
+    """Whether a shared task-folder file predates this claim.
+
+    Only the task folder is fenced, and only when a private run directory
+    exists to fall back to.  A claim that cannot read its own anchor fences
+    everything shared, because harvesting a prior claim is the worse failure.
+    """
+    if index != 0 or len(directories) <= 1:
+        return False
+    if task_folder_not_before is None:
+        return True
+    try:
+        return candidate.stat().st_mtime_ns < task_folder_not_before
+    except OSError:
+        return True
+
+
 def _locate_result(
     directories: tuple[Path, ...],
     name: str,
@@ -1190,6 +1215,7 @@ def _locate_result(
     location the reader was most likely aiming at, rather than the private
     scratch directory they never chose.
     """
+    fenced_out = False
     for index, directory in enumerate(directories):
         candidate = directory / name
         try:
@@ -1198,19 +1224,20 @@ def _locate_result(
                 # runs.  It can be a source for this claim only when this
                 # exact file was written after the run-state anchor.  A stale
                 # file must never outrank the current run's private input.
-                if (
-                    index == 0
-                    and len(directories) > 1
-                    and (
-                        task_folder_not_before is None
-                        or candidate.stat().st_mtime_ns < task_folder_not_before
-                    )
+                if _fenced_out(
+                    index, directories, candidate, task_folder_not_before
                 ):
+                    fenced_out = True
                     continue
                 return candidate
         except OSError:
             continue
-    return directories[0] / name
+    # Nothing matched.  Naming the task folder is the friendlier report when
+    # the agent simply never wrote the file -- but not when a file IS there
+    # and was rejected as stale.  Returning it then hands the caller the very
+    # path the fence just refused, and the readers read it happily, which
+    # restores the whole defect for any name this run did not author itself.
+    return (directories[-1] if fenced_out else directories[0]) / name
 
 
 def _result_read_failure(path: Path, exc: Exception) -> str:
@@ -1720,16 +1747,37 @@ def _remove_result_inputs(run_directory: Path) -> None:
             pass
 
 
-def _result_inputs_present(run_directory: Path) -> bool:
-    """Fail closed when this run has any agent-authored result artifact."""
-    for name in _RESULT_INPUTS:
-        try:
-            (run_directory / name).lstat()
-        except FileNotFoundError:
-            continue
-        except OSError:
+def _result_inputs_present(
+    directories: tuple[Path, ...],
+    *,
+    task_folder_not_before: int | None = None,
+) -> bool:
+    """Fail closed when this claim has any agent-authored result artifact.
+
+    Searches everywhere a result may legitimately be authored, under the same
+    fence `_locate_result` applies.  Looking only at the private run directory
+    meant an agent that authored into the task folder -- the intended,
+    documented location -- was released as though it had produced nothing, and
+    its work was dropped without a draft and without a refusal.
+
+    A stale task-folder file is NOT an artifact of this claim, so the fence
+    has to apply here too; otherwise every release on a task whose folder
+    holds an older result would refuse or auto-draft forever.
+    """
+    for index, directory in enumerate(directories):
+        for name in _RESULT_INPUTS:
+            candidate = directory / name
+            try:
+                candidate.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return True
+            if _fenced_out(
+                index, directories, candidate, task_folder_not_before
+            ):
+                continue
             return True
-        return True
     return False
 
 
