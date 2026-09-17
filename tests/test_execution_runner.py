@@ -202,6 +202,9 @@ class ExecutionRunnerTests(unittest.TestCase):
         def popen(argv, **kwargs):
             launched.update(argv=argv, kwargs=kwargs)
             state_path = Path(kwargs["env"]["FOXHOUND_EXECUTION_STATE"])
+            state_document = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state_document["execution_grants"], [])
+            self.assertEqual(state_document["action_grants"], [])
 
             def record():
                 state = load_run_state(state_path)

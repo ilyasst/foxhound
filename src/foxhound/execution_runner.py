@@ -788,6 +788,11 @@ def _write_state(
             None if archive is None else str(archive.run_directory)
         ),
         "worker_command": config.worker_command,
+        # These are private run authority, not runner-only switches: the
+        # worker records the result and therefore decides whether its phase
+        # advances without a reader card.
+        "execution_grants": list(config.execution_grants),
+        "action_grants": list(config.action_grants),
     }
     payload = (
         json.dumps(

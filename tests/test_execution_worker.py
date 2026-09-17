@@ -165,10 +165,16 @@ class ExecutionWorkerTests(unittest.TestCase):
         self._write_state()
         self._write_instructions()
 
-    def _write_state(self) -> None:
-        self.state_path.write_text(json.dumps({
+    def _write_state(
+        self,
+        *,
+        schema_version: int = 3,
+        execution_grants: tuple[str, ...] = (),
+        action_grants: tuple[str, ...] = (),
+    ) -> None:
+        document = {
             "schema": "foxhound.execution-run-state",
-            "schema_version": 3,
+            "schema_version": schema_version,
             "run_id": RUN_ID,
             "database_path": str(self.database),
             "task_id": 1,
@@ -181,8 +187,39 @@ class ExecutionWorkerTests(unittest.TestCase):
             "agent_profile_revision": self.claim.agent_profile_revision,
             "knowledge_root": str(self.knowledge_root),
             "worker_command": WORKER_COMMAND,
-        }), encoding="utf-8")
+        }
+        if schema_version >= 4:
+            document.update({
+                "task_work_directory": None,
+                "task_kb_file": None,
+                "task_run_directory": None,
+            })
+        if schema_version >= 5:
+            document.update({
+                "execution_grants": list(execution_grants),
+                "action_grants": list(action_grants),
+            })
+        self.state_path.write_text(json.dumps(document), encoding="utf-8")
         self.state_path.chmod(0o600)
+
+    def _bind_origin(self, kind: str) -> None:
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "INSERT INTO candidate_inbox(candidate_id,source_system,"
+                "source_kind,source_record_id,source_item_id,source_revision,"
+                "payload_json,created_at,first_imported_at,updated_at) "
+                "VALUES('candidate-1','gw',?,'record-1','item-1',?,'{}',"
+                "'2030-01-02T03:04:05+00:00','2030-01-02T03:04:05+00:00',"
+                "'2030-01-02T03:04:05+00:00')",
+                (kind, "a" * 64),
+            )
+            connection.execute(
+                "INSERT INTO task_candidate_bindings(candidate_id,"
+                "source_revision,task_id,relation,decided_at) "
+                "VALUES('candidate-1',?,1,'accepted',?)",
+                ("a" * 64, "2030-01-02T03:04:05+00:00"),
+            )
+            connection.commit()
 
     def _write_instructions(self, document: object | None = None) -> Path:
         path = self.run_directory / INSTRUCTIONS_NAME
@@ -531,6 +568,41 @@ class ExecutionWorkerTests(unittest.TestCase):
         self.assertNotIn(CLAIM_TOKEN, scrubbed)
         self.assertNotIn("Synthetic result summary", scrubbed)
         self.assertNotIn("work_markdown", scrubbed)
+
+    def test_record_applies_execution_grants_carried_by_run_state(self):
+        self._bind_origin("issue")
+        self._write_state(schema_version=5, execution_grants=("issue",))
+        draft = self._write_draft()
+
+        with knowledge_server() as endpoint:
+            receipt = self._worker(endpoint).record(str(draft))
+
+        workflow = TaskExecutionService(self.database).get(1)
+        self.assertEqual(receipt["status"], "queued")
+        self.assertEqual(workflow.status, WorkflowStatus.QUEUED)
+        self.assertEqual(workflow.phase, WorkflowPhase.EXECUTE)
+        with closing(sqlite3.connect(self.database)) as connection:
+            events = [
+                row[0] for row in connection.execute(
+                    "SELECT kind FROM task_execution_events WHERE task_id=1 "
+                    "ORDER BY sequence"
+                )
+            ]
+        self.assertEqual(events[-1], "phase_granted")
+
+    def test_schema_four_state_defaults_automation_grants_to_empty(self):
+        self._write_state(schema_version=4)
+
+        state = load_run_state(self.state_path)
+
+        self.assertEqual(state.execution_grants, frozenset())
+        self.assertEqual(state.action_grants, frozenset())
+
+    def test_schema_five_state_rejects_unknown_automation_grants(self):
+        self._write_state(schema_version=5, execution_grants=("unknown",))
+
+        with self.assertRaises(ExecutionWorkerConfigError):
+            load_run_state(self.state_path)
 
     def test_result_path_is_confined_to_the_immediate_run_directory(self):
         draft = self._write_draft()
