@@ -100,6 +100,20 @@ class TaskOriginRead(unittest.TestCase):
         self.assertEqual(request.locator.record_id, "forge.example/acme/widget")
         self.assertEqual(request.expected_revision, "b" * 64)
 
+    def test_source_update_advances_one_work_item_revision(self) -> None:
+        self._bind(1, _issue_candidate(42))
+        with closing(sqlite3.connect(self.db)) as connection:
+            connection.execute(
+                "UPDATE task_candidate_bindings SET source_revision=? "
+                "WHERE task_id=1", ("c" * 64,)
+            )
+            rows = connection.execute(
+                "SELECT w.task_id,r.source_revision FROM work_items AS w "
+                "JOIN work_revisions AS r ON r.work_item_id=w.id "
+                "ORDER BY r.id"
+            ).fetchall()
+        self.assertEqual(rows, [(1, "b" * 64), (1, "c" * 64)])
+
     def test_a_task_bound_to_nothing_has_no_origin(self) -> None:
         # An ordinary state, not an error: a task may predate binding.
         with closing(sqlite3.connect(self.db)) as conn, conn:

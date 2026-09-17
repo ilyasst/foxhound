@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 36
+SCHEMA_VERSION = 37
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -2391,6 +2391,19 @@ _SCHEMA_V36 = (
     _SCHEMA_V8[7],
 )
 
+# A continuing ask has one durable identity even as its accepted source
+# revision advances.  The task remains the compatibility projection; these
+# rows preserve why a new revision superseded prior runnable work.
+_SCHEMA_V37 = (
+    "CREATE TABLE IF NOT EXISTS work_items (id INTEGER PRIMARY KEY,task_id INTEGER NOT NULL UNIQUE REFERENCES tasks(id),state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active','withdrawn','closed')),created_at TEXT NOT NULL,updated_at TEXT NOT NULL);",
+    "CREATE TABLE IF NOT EXISTS work_revisions (id INTEGER PRIMARY KEY,work_item_id INTEGER NOT NULL REFERENCES work_items(id),candidate_id TEXT NOT NULL,source_revision TEXT NOT NULL,task_version INTEGER NOT NULL,created_at TEXT NOT NULL,UNIQUE(work_item_id,source_revision));",
+    "CREATE INDEX IF NOT EXISTS work_revisions_current ON work_revisions(work_item_id,id DESC);",
+    "INSERT OR IGNORE INTO work_items(task_id,created_at,updated_at) SELECT id,created_at,updated_at FROM tasks;",
+    "INSERT INTO work_revisions(work_item_id,candidate_id,source_revision,task_version,created_at) SELECT w.id,b.candidate_id,b.source_revision,t.version,b.decided_at FROM task_candidate_bindings b JOIN work_items w ON w.task_id=b.task_id JOIN tasks t ON t.id=b.task_id WHERE b.relation='accepted';",
+    "CREATE TRIGGER IF NOT EXISTS work_revision_on_accepted_binding AFTER INSERT ON task_candidate_bindings WHEN NEW.relation='accepted' BEGIN INSERT OR IGNORE INTO work_items(task_id,created_at,updated_at) SELECT NEW.task_id,NEW.decided_at,NEW.decided_at; INSERT OR IGNORE INTO work_revisions(work_item_id,candidate_id,source_revision,task_version,created_at) SELECT id,NEW.candidate_id,NEW.source_revision,(SELECT version FROM tasks WHERE id=NEW.task_id),NEW.decided_at FROM work_items WHERE task_id=NEW.task_id; END;",
+    "CREATE TRIGGER IF NOT EXISTS work_revision_on_source_update AFTER UPDATE OF source_revision ON task_candidate_bindings WHEN NEW.relation='accepted' BEGIN INSERT OR IGNORE INTO work_revisions(work_item_id,candidate_id,source_revision,task_version,created_at) SELECT id,NEW.candidate_id,NEW.source_revision,(SELECT version FROM tasks WHERE id=NEW.task_id),NEW.decided_at FROM work_items WHERE task_id=NEW.task_id; END;",
+)
+
 
 _SCHEMA_V20 = (
     # SQLite cannot alter a CHECK in place, and three tables carry a foreign
@@ -3391,6 +3404,17 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 36
+            if version == 36:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V37:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 37")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 37
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:
