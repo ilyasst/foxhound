@@ -105,7 +105,7 @@ Set a disabled `card_service`, runner, or database consumer to exactly
 to be declared separately; enabled slots must have distinct names. The
 workflow section remains required because it owns the shared policy and
 limits. Earlier versions remain readable for a controlled transition, but
-only version 6 can declare the complete deployment boundary.
+only version 7 can declare the complete deployment boundary.
 
 Validate before changing a service definition or restarting anything:
 
