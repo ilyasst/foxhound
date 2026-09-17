@@ -24,9 +24,11 @@ from unittest import mock
 
 from foxhound.agent_profiles import general_profile
 from foxhound.candidate_inbox import CandidateInbox
+from foxhound.contracts import SourceSnapshotContractError
 from foxhound.execution_worker import (
     INSTRUCTIONS_NAME,
     ExecutionWorker,
+    ExecutionWorkerClaimError,
     ExecutionWorkerConfigError,
     ExecutionWorkerDraftError,
     load_result_draft,
@@ -38,7 +40,7 @@ from foxhound.execution_worker import (
     _repository_receipts,
     _worker_operations,
 )
-from foxhound.knowledge_client import KnowledgeClientConfig
+from foxhound.knowledge_client import KnowledgeClientConfig, KnowledgeClientError
 from foxhound.task_execution import (
     ExecutionResultEnvelope,
     TaskExecutionService,
@@ -79,6 +81,19 @@ def knowledge_server() -> Iterator[str]:
                     "alias": request["alias"],
                     "revision": hashlib.sha256(canonical).hexdigest(),
                     "variables": variables,
+                }
+            elif self.path == "/v1/source-snapshot":
+                response = {
+                    "schema": "foxhound.source-snapshot", "schema_version": 1,
+                    "ok": True, "system": request["system"],
+                    "kind": request["kind"], "record_id": request["record_id"],
+                    "item_id": request["item_id"],
+                    "expected_revision": request["expected_revision"],
+                    "status": "current", "snapshot": {
+                        "revision": request["expected_revision"],
+                        "observed_at": "2030-01-02T03:04:05+00:00",
+                        "lifecycle": "active", "actionability": "actionable",
+                    },
                 }
             else:
                 response = {
@@ -192,10 +207,10 @@ class ExecutionWorkerTests(unittest.TestCase):
         path.chmod(0o600)
         return path
 
-    def _worker(self, endpoint: str) -> ExecutionWorker:
+    def _worker(self, endpoint: str, **changes) -> ExecutionWorker:
         return ExecutionWorker(self.state_path, KnowledgeClientConfig(
             endpoint=endpoint, alias="primary", token=TOKEN
-        ))
+        ), **changes)
 
     def _write_draft(self, **changes) -> Path:
         document = {
@@ -509,6 +524,55 @@ class ExecutionWorkerTests(unittest.TestCase):
             {"system": "gw", "kind": "issue",
              "record_id": "forge.example/acme/widget", "item_id": "42"},
         )
+
+    def test_freshness_is_opt_in_and_refuses_noncurrent_effects(self):
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "INSERT INTO candidate_inbox(candidate_id,source_system,"
+                "source_kind,source_record_id,source_item_id,source_revision,"
+                "payload_json,created_at,first_imported_at,updated_at) "
+                "VALUES('fresh-1','gw','issue','forge.example/acme/widget',"
+                "'42',?,'{}','2030-01-01T00:00:00Z','2030-01-01T00:00:00Z',"
+                "'2030-01-01T00:00:00Z')", ("b" * 64,))
+            connection.execute(
+                "INSERT INTO task_candidate_bindings(candidate_id,source_revision,"
+                "task_id,relation,decided_at) VALUES('fresh-1',?,1,'accepted',?)",
+                ("b" * 64, "2030-01-01T00:00:00Z"))
+            connection.commit()
+        with knowledge_server() as endpoint:
+            disabled = self._worker(endpoint)
+            disabled._fresh_active("effect")
+            enabled = self._worker(endpoint, freshness_effect_kinds=("issue",))
+            with mock.patch(
+                "foxhound.execution_worker.GwKnowledgeClient.refresh_source",
+                return_value=type("Result", (), {"usable": False})(),
+            ):
+                with self.assertRaises(ExecutionWorkerClaimError):
+                    enabled._fresh_active("effect")
+
+    def test_freshness_refusals_are_controlled(self):
+        """A malformed request or unavailable source never escapes as a crash."""
+        with knowledge_server() as endpoint:
+            worker = self._worker(endpoint, freshness_effect_kinds=("issue",))
+            with self.assertRaises(ExecutionWorkerConfigError):
+                worker._fresh_active("unknown")
+            with mock.patch(
+                "foxhound.execution_worker.TaskLedger.source_snapshot_request",
+                side_effect=SourceSnapshotContractError("synthetic"),
+            ):
+                with self.assertRaises(ExecutionWorkerClaimError):
+                    worker._fresh_active("effect")
+            with mock.patch(
+                "foxhound.execution_worker.TaskLedger.source_snapshot_request",
+                return_value=SimpleNamespace(
+                    locator=SimpleNamespace(kind="issue"),
+                ),
+            ), mock.patch(
+                "foxhound.execution_worker.GwKnowledgeClient.refresh_source",
+                side_effect=KnowledgeClientError("synthetic"),
+            ):
+                with self.assertRaises(ExecutionWorkerClaimError):
+                    worker._fresh_active("effect")
 
     def test_a_task_about_nothing_addressable_says_so(self):
         # An ordinary state, not an error: a task may come from a meeting,
