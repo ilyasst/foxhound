@@ -41,6 +41,8 @@ from foxhound.execution_worker import (
     _worker_operations,
 )
 from foxhound.knowledge_client import KnowledgeClientConfig, KnowledgeClientError
+from foxhound.workflow_policy import parse_workflow_policy
+from foxhound.execution_worker import _workflow_policy
 from foxhound.task_execution import (
     ExecutionResultEnvelope,
     TaskExecutionService,
@@ -144,6 +146,16 @@ def knowledge_server() -> Iterator[str]:
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def _policy(freshness="before_effect", kinds=("issue",)):
+    """One synthetic policy, fencing the named kinds at the named strictness."""
+    return parse_workflow_policy({
+        "policy_id": "synthetic-fence", "grants": {
+            "plan": [], "execute": [], "external_action": [],
+        }, "freshness": freshness, "freshness_kinds": list(kinds),
+        "effects": [], "final_decision": True,
+    })
 
 
 class ExecutionWorkerTests(unittest.TestCase):
@@ -542,7 +554,7 @@ class ExecutionWorkerTests(unittest.TestCase):
         with knowledge_server() as endpoint:
             disabled = self._worker(endpoint)
             disabled._fresh_active("effect")
-            enabled = self._worker(endpoint, freshness_effect_kinds=("issue",))
+            enabled = self._worker(endpoint, policy=_policy())
             with mock.patch(
                 "foxhound.execution_worker.GwKnowledgeClient.refresh_source",
                 return_value=type("Result", (), {"usable": False})(),
@@ -550,10 +562,50 @@ class ExecutionWorkerTests(unittest.TestCase):
                 with self.assertRaises(ExecutionWorkerClaimError):
                     enabled._fresh_active("effect")
 
+    def test_an_unconfigured_worker_checks_no_freshness(self):
+        """The default is the behaviour before any of this existed."""
+        with knowledge_server() as endpoint:
+            worker = self._worker(endpoint)
+            with mock.patch(
+                "foxhound.execution_worker.GwKnowledgeClient.refresh_source",
+                side_effect=AssertionError("must not be called"),
+            ):
+                worker._fresh_active("phase")
+                worker._fresh_active("effect")
+
+    def test_a_phase_only_policy_does_not_fence_an_effect(self):
+        with knowledge_server() as endpoint:
+            worker = self._worker(
+                endpoint, policy=_policy(freshness="before_phase"))
+            with mock.patch(
+                "foxhound.execution_worker.GwKnowledgeClient.refresh_source",
+                side_effect=AssertionError("must not be called"),
+            ), mock.patch(
+                "foxhound.execution_worker.TaskLedger.source_snapshot_request",
+                return_value=SimpleNamespace(
+                    locator=SimpleNamespace(kind="issue")),
+            ):
+                worker._fresh_active("effect")
+
+    def test_the_policy_in_force_is_recoverable_from_the_environment(self):
+        """An absent policy is the compatibility one; a broken one refuses."""
+        self.assertIsNone(_workflow_policy(""))
+        self.assertIsNone(_workflow_policy("   "))
+        parsed = _workflow_policy(json.dumps({
+            "policy_id": "synthetic-fence", "grants": {
+                "plan": [], "execute": [], "external_action": [],
+            }, "freshness": "before_effect", "freshness_kinds": ["issue"],
+            "effects": [], "final_decision": True,
+        }))
+        self.assertEqual(parsed.revision, _policy().revision)
+        for broken in ("{", "null", json.dumps({"policy_id": "x"})):
+            with self.assertRaises(ExecutionWorkerConfigError):
+                _workflow_policy(broken)
+
     def test_freshness_refusals_are_controlled(self):
         """A malformed request or unavailable source never escapes as a crash."""
         with knowledge_server() as endpoint:
-            worker = self._worker(endpoint, freshness_effect_kinds=("issue",))
+            worker = self._worker(endpoint, policy=_policy())
             with self.assertRaises(ExecutionWorkerConfigError):
                 worker._fresh_active("unknown")
             with mock.patch(
