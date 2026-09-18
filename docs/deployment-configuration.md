@@ -204,6 +204,32 @@ the event log must not say a reader approved a phase nobody was asked about.
 Results that end the work — `completed`, `declined`, `ineligible` — are never
 granted past, so a task still produces its completion card.
 
+## Workflow capacity caps
+
+The `workflow` section declares three capacity caps that bound how many tasks
+advance through each stage of the execution pipeline:
+
+- **`execution_slot_cap`** (default: 2): Maximum concurrent execution runs.
+  Enforced at claim time — when `running >= cap`, no new claim is made and
+  no additional agent process starts. Both runners in a multi-runner
+  deployment share the same atomic cap.
+
+- **`plan_ready_cap`** (default: 10): Maximum tasks queued in the plan phase,
+  waiting for the next execution slot. Enforced at scheduling time — when the
+  buffer is full, the scheduler stops promoting tasks from `awaiting_start` to
+  `queued` + `plan`. As slots free, the runner claims from the buffer and the
+  scheduler refills it.
+
+- **`awaiting_reader_cap`** (default: 20): Maximum tasks queued awaiting
+  reader review. Same mechanism as `plan_ready_cap`.
+
+Set any cap to `-1` to disable it entirely (unbounded). The deployment
+configuration overrides the code defaults, so omitting a cap from the
+`workflow` section falls back to the hard-coded default. If the deployment
+sets `plan_ready_cap` to `-1`, the scheduler will queue every candidate task
+into the plan phase without limit, consuming runner capacity on plan runs
+that may never reach execution.
+
 ## Fused task titles
 
 `fused-task-titles` is a one-shot database consumer. Run its private timer
