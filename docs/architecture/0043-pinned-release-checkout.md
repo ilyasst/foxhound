@@ -2,8 +2,14 @@
 
 Status: accepted.
 
-Deployed units import a release checkout of this repository, held in detached
-HEAD at a named commit.  They never import a development tree.
+Deployed units import a release of this repository: an export of the tracked
+tree at a named commit, in a directory named for that commit, with its own
+environment.  A symlink selects which one is deployed.  They never import a
+development tree.
+
+A release has no git metadata.  It is not a checkout and cannot be fetched or
+checked out in place; advancing production moves the selector to a different
+release, and building one is the separate procedure below.
 
 That held for every unit but one: the worker is run by the agent, not by
 the runner, and was located through the agent's `PATH` rather than from the
@@ -27,8 +33,12 @@ commit.
 
 Advancing and rolling back are one operation with a different commit:
 
-1. Fetch in the release checkout.
-2. Check out the chosen commit, still detached.
+1. Build the release you are advancing to, if it does not already exist, by
+   the procedure in "How a release is built".  Nothing running is touched
+   until step 2, so this is safe to do at any time.
+2. Repoint the selector symlink at it, replacing it atomically with a rename
+   rather than deleting and recreating it.  **This is the step that deploys.**
+   Everything else restarts processes or confirms the result.
 3. Restart the long-running units.  One-shot units started by a timer pick up
    the new code on their next run and do not need restarting.
 4. Read back the revision each restarted service reports.
@@ -36,6 +46,14 @@ Advancing and rolling back are one operation with a different commit:
 Step 4 is part of the deploy, not a check afterwards.  A restart that fails
 leaves the previous process running and serving the previous code, which is
 indistinguishable from a successful deploy unless the revision is read.
+
+A one-shot that was already in flight when the selector moved keeps running the
+previous release and finishes there.  So a run claimed shortly after a
+promotion can show the previous behaviour from a perfectly correct deploy, and
+the only way to tell that apart from a deploy that did not take is to compare
+when that process started against when the selector moved.  Read back a
+restarted service, which cannot be ambiguous, before reading anything into a
+run.
 
 Those four steps are the whole procedure only when the release changes code
 alone.  A release that also changes the database schema needs the longer one
@@ -80,8 +98,9 @@ live database without touching it, and says whether it needs an upgrade:
 5. Back up the database, with the SQLite backup API rather than a file copy:
    a copy taken beside a live write-ahead log is not necessarily a database.
 6. Migrate, using the new release's environment.
-7. Repoint the release symlink, replacing it atomically rather than deleting
-   and recreating it.
+7. Repoint the selector symlink, replacing it atomically with a rename rather
+   than deleting and recreating it.  As in the short procedure, this is the
+   step that deploys.
 8. Start the long-running units, then the timers.
 9. Read back both the reported revision and the schema state.
 
