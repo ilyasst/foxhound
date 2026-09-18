@@ -32,6 +32,28 @@ from .candidate_inbox import CandidateInbox, InboxError
 
 
 DETECTOR = "local-semantic-v1"
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse to follow a redirect away from the validated endpoint.
+
+    The endpoint is checked to be a loopback address before the request is
+    sent, but that guarantee ends at the first response unless redirects are
+    refused: a local service answering 302 with a public address would have
+    the task text followed off the machine, which is the one thing this
+    module is arranged to prevent.  `knowledge_client` refuses redirects the
+    same way and for the same reason.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+#: Built once. The empty ProxyHandler matters as much as the redirect
+#: refusal: without it, `http_proxy` in the environment would route a
+#: request to a validated loopback address through a proxy instead.
+_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}), _NoRedirect()
+)
+
 LOOPBACK_ADDRESS = "127.0.0.1"
 DEFAULT_ENDPOINT = f"http://{LOOPBACK_ADDRESS}:11434"
 MAX_CANDIDATES = 4
@@ -301,7 +323,7 @@ def _classify(
         headers={"Content-Type": "application/json", "Accept": "application/json"},
         method="POST",
     )
-    open_request = (opener or urllib.request).urlopen
+    open_request = (opener or _OPENER).open
     try:
         with open_request(request, timeout=TIMEOUT_SECONDS) as response:
             raw = response.read(MAX_RESPONSE_BYTES + 1)
