@@ -48,12 +48,14 @@ The grant applies at the moment of recording, so no card is created and
 none has to be retired. Reconciling workflows that were already waiting when
 policy changed is a separate concern, and stays in scheduling.
 
-The runner and the worker must be the same build. `worker_command` is a bare
-command name rendered into the agent's prompt and resolved through `PATH` by
-the agent itself, not invoked by the runner, so the two can diverge. A newer
-runner writing schema 5 to an older worker fails the run at startup — loudly,
-which is the intended direction, but it means a partial promotion stops work
-rather than degrading it.
+The runner and the worker must be the same build. This paragraph once noted
+that `worker_command` was a bare name resolved through `PATH` by the agent,
+so the two could diverge, and judged the resulting failure loud. It was not
+loud: it surfaced as an exit code from a subprocess nobody was watching, once
+per claimed run, with no result recorded and the claim consumed. The worker is
+now resolved from the running release and checked before anything is claimed —
+see [ADR 0046](0046-worker-resolved-from-the-running-release.md). A partial
+promotion still stops work rather than degrading it, which remains intended.
 
 ## Failure and rollback
 

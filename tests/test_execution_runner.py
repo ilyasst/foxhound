@@ -37,6 +37,7 @@ from foxhound.execution_runner import (
     run_once,
 )
 from foxhound.execution_worker import INSTRUCTIONS_NAME, load_run_state
+from foxhound.worker_resolution import WorkerMismatch
 from foxhound.task_execution import (
     ExecutionOutcome,
     ExecutionResultEnvelope,
@@ -922,12 +923,40 @@ class ExecutionRunnerTests(unittest.TestCase):
         ]
         with redirect_stdout(output), redirect_stderr(errors):
             with mock.patch(
+                "foxhound.execution_runner.verify_worker"
+            ), mock.patch(
                 "foxhound.execution_runner.run_once",
                 side_effect=OSError(private_value),
             ):
                 code = main(arguments)
         self.assertEqual(code, 70)
         self.assertNotIn(private_value, output.getvalue() + errors.getvalue())
+
+    def test_cli_refuses_to_claim_when_the_worker_cannot_read_run_state(self):
+        # The failure this prevents: the runner writes run state at its own
+        # schema, the worker an agent reaches refuses a schema it does not
+        # know, and every claimed run dies at the agent's first tool call
+        # having produced nothing. One refusal costs a single poll; the
+        # alternative costs every workflow in the queue.
+        output = StringIO()
+        errors = StringIO()
+        arguments = [
+            "--database", str(self.database),
+            "--run-root", str(self.run_root),
+            "--gw-endpoint", "http://127.0.0.1:8787",
+            "--gw-alias", "primary",
+            "--gw-token-file", str(self.token_file),
+        ]
+        with redirect_stdout(output), redirect_stderr(errors), mock.patch(
+            "foxhound.execution_runner.verify_worker",
+            side_effect=WorkerMismatch(
+                "execution worker speaks run-state schema 4, runner writes 5"
+            ),
+        ), mock.patch("foxhound.execution_runner.run_once") as run:
+            code = main(arguments)
+        self.assertEqual(code, 78)
+        run.assert_not_called()
+        self.assertIn("refusing to claim", errors.getvalue())
 
     def test_cli_passes_an_explicit_phase_allowlist(self):
         output = StringIO()
@@ -952,6 +981,8 @@ class ExecutionRunnerTests(unittest.TestCase):
             "--allowed-phase", "plan",
         ]
         with redirect_stdout(output), mock.patch(
+            "foxhound.execution_runner.verify_worker"
+        ), mock.patch(
             "foxhound.execution_runner.run_once",
             return_value=ExecutionRunResult("idle", 0),
         ) as run:
