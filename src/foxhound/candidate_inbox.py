@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 39
+SCHEMA_VERSION = 40
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -2463,6 +2463,31 @@ _SCHEMA_V39 = (
 )
 
 
+# A refused repeat is still something that happened to the workflow. Without
+# an event, the only trace of a pass that answered nothing is its absence from
+# the result table -- which reads exactly like a pass that never ran.
+_SCHEMA_V40_EXECUTION_EVENT_TABLE = _SCHEMA_V36_EXECUTION_EVENT_TABLE.replace(
+    "'phase_approved','phase_granted','revision_requested'",
+    "'phase_approved','phase_granted','revision_requested',"
+    "'result_unchanged'",
+)
+_SCHEMA_V40 = (
+    "DROP TRIGGER task_execution_events_no_update;",
+    "DROP TRIGGER task_execution_events_no_delete;",
+    "ALTER TABLE task_execution_events RENAME TO task_execution_events_v39;",
+    _SCHEMA_V40_EXECUTION_EVENT_TABLE,
+    "INSERT INTO task_execution_events("
+    "sequence,task_id,kind,workflow_version,task_version,phase,status,"
+    "occurred_at,agent_profile_id,agent_profile_revision) "
+    "SELECT sequence,task_id,kind,workflow_version,task_version,phase,status,"
+    "occurred_at,agent_profile_id,agent_profile_revision "
+    "FROM task_execution_events_v39;",
+    "DROP TABLE task_execution_events_v39;",
+    _SCHEMA_V8[6],
+    _SCHEMA_V8[7],
+)
+
+
 _SCHEMA_V20 = (
     # SQLite cannot alter a CHECK in place, and three tables carry a foreign
     # key to this one. Renaming the card table would rewrite all three to
@@ -3514,6 +3539,26 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 39
+            if version == 39:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    definition = connection.execute(
+                        "SELECT sql FROM sqlite_master WHERE type='table' "
+                        "AND name='task_execution_events'"
+                    ).fetchone()
+                    if definition is None:
+                        raise InboxError("candidate inbox schema is incomplete")
+                    # Replayable: a database already carrying the widened
+                    # CHECK must not be rebuilt a second time.
+                    if "'result_unchanged'" not in definition["sql"]:
+                        for statement in _SCHEMA_V40:
+                            connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 40")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 40
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:

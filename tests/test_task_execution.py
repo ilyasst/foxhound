@@ -1833,6 +1833,112 @@ class TaskExecutionTests(unittest.TestCase):
             with self.assertRaises(sqlite3.IntegrityError):
                 connection.execute("DELETE FROM task_execution_events")
 
+    def _revise_and_reclaim(self, version):
+        self.service.review_action(1, expected_version=version, action="revise")
+        return self._claim()
+
+    def test_unchanged_answer_is_refused_even_when_questions_change(self):
+        """A changing question list cannot make stale work a new answer."""
+        self._schedule_and_start()
+        first_claim = self._claim()
+        first = self.service.record_result(self._result(first_claim))
+        second_claim = self._revise_and_reclaim(first.version)
+
+        repeated = replace(
+            self._result(second_claim, result_id="result-002"),
+            questions=("A different synthetic question?",),
+        )
+        refused = self.service.record_result(repeated)
+
+        self.assertEqual(refused.disposition, WorkflowDisposition.REFUSED)
+        self.assertEqual(refused.refusal, WorkflowRefusal.RESULT_UNCHANGED)
+        self.assertEqual(self.service.result_count(), 1)
+        self.assertEqual(self.service.get(1).status, WorkflowStatus.RUNNING)
+        self.assertEqual(self.service.get(1).version,
+                         second_claim.workflow_version)
+        self.assertEqual(self._events(1)[-1], "result_unchanged")
+
+        changed = replace(repeated, summary="Revised synthetic summary")
+        recorded = self.service.record_result(changed)
+        self.assertEqual(recorded.disposition, WorkflowDisposition.APPLIED)
+        self.assertEqual(self.service.result_count(), 2)
+
+    def test_an_answer_repeated_from_two_passes_ago_is_refused(self):
+        """Comparing only the newest result let an X, Y, X sequence through."""
+        self._schedule_and_start()
+        claim = self._claim()
+        first = self.service.record_result(self._result(claim))
+
+        claim = self._revise_and_reclaim(first.version)
+        second = self.service.record_result(replace(
+            self._result(claim, result_id="result-002"),
+            summary="A different synthetic summary",
+        ))
+        self.assertEqual(second.disposition, WorkflowDisposition.APPLIED)
+
+        claim = self._revise_and_reclaim(second.version)
+        refused = self.service.record_result(
+            self._result(claim, result_id="result-003"))
+
+        self.assertEqual(refused.refusal, WorkflowRefusal.RESULT_UNCHANGED)
+        self.assertEqual(self.service.result_count(), 2)
+
+    def test_attaching_a_missing_deliverable_is_a_changed_answer(self):
+        """The guard must not teach an agent to pad its prose."""
+        self._schedule_and_start()
+        claim = self._claim()
+        first = self.service.record_result(self._result(claim))
+        claim = self._revise_and_reclaim(first.version)
+
+        corrected = replace(
+            self._result(claim, result_id="result-002"),
+            deliverables=("Synthetic deliverable", "The one it forgot"),
+        )
+        recorded = self.service.record_result(corrected)
+
+        self.assertEqual(recorded.disposition, WorkflowDisposition.APPLIED)
+        self.assertEqual(self.service.result_count(), 2)
+
+    def test_the_same_prose_under_a_new_outcome_is_a_changed_answer(self):
+        """Proposing something and declaring it done are different answers."""
+        self._schedule_and_start()
+        claim = self._claim()
+        first = self.service.record_result(self._result(claim))
+        claim = self._revise_and_reclaim(first.version)
+
+        terminal = self._result(
+            claim, result_id="result-002",
+            outcome=ExecutionOutcome.INELIGIBLE,
+        )
+        recorded = self.service.record_result(terminal)
+
+        self.assertEqual(recorded.disposition, WorkflowDisposition.APPLIED)
+
+    def test_a_rescheduled_task_may_open_with_its_previous_answer(self):
+        """A new cycle must never be refused for matching the closed one.
+
+        Nothing recovers from this: the identical result is all the agent has,
+        every retry is refused the same way, and the claim expires into a
+        parked workflow.
+        """
+        self._schedule_and_start()
+        claim = self._claim()
+        first = self.service.record_result(self._result(claim))
+        cancelled = self.service.review_action(
+            1, expected_version=first.version, action="cancel")
+        self.assertEqual(cancelled.status, WorkflowStatus.CANCELLED)
+
+        rescheduled = self.service.schedule(1, expected_task_version=1)
+        self.service.start_action(
+            1, expected_version=rescheduled.version, action="start")
+        claim = self._claim()
+
+        repeated = self._result(claim, result_id="result-002")
+        recorded = self.service.record_result(repeated)
+
+        self.assertEqual(recorded.disposition, WorkflowDisposition.APPLIED)
+        self.assertEqual(self.service.result_count(), 2)
+
     def test_invalid_result_cannot_change_a_running_claim(self):
         self._schedule_and_start()
         claim = self._claim()
