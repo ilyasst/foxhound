@@ -26,6 +26,7 @@ PROVENANCE_SCHEMA_VERSION = 4
 OWNER_SCHEMA_VERSION = 5
 OWNER_PROVENANCE_SCHEMA_VERSION = 6
 CUMULATIVE_SCHEMA_VERSION = 7
+STRUCTURED_TASK_SCHEMA_VERSION = 8
 SUPPORTED_SCHEMA_VERSIONS = frozenset({
     SCHEMA_VERSION,
     PROJECTLESS_SCHEMA_VERSION,
@@ -34,6 +35,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset({
     OWNER_SCHEMA_VERSION,
     OWNER_PROVENANCE_SCHEMA_VERSION,
     CUMULATIVE_SCHEMA_VERSION,
+    STRUCTURED_TASK_SCHEMA_VERSION,
 })
 LIFECYCLE_STATES = frozenset({"active", "withdrawn"})
 SOURCE_SYSTEMS = frozenset({"gw"})
@@ -63,6 +65,10 @@ _OPAQUE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$")
 _REVISION_RE = re.compile(r"^[0-9a-f]{64}$")
 _CANDIDATE_ID_RE = re.compile(r"^tc_[0-9a-f]{64}$")
 OWNER_KINDS = frozenset({"person", "unresolved", "external", "group"})
+TASK_ACTIONS = frozenset({
+    "arrange", "complete", "create", "decide", "deliver", "investigate",
+    "request", "review", "schedule", "send", "update",
+})
 UNRESOLVED_OWNER_DISPLAY = "(unassigned)"
 _SPEAKER_ID_RE = re.compile(r"^SPK_\d+$")
 _SPEAKER_ID_IN_DISPLAY_RE = re.compile(r"(?<![A-Za-z0-9_])SPK_\d+(?!\d)")
@@ -91,6 +97,10 @@ class CandidateTask:
     owner: str | None
     due: str | None
     owner_ref: CandidateOwnerRef | None = None
+    object: str | None = None
+    action: str | None = None
+    participants: tuple[CandidateSpeakerRef, ...] = ()
+    confidence: float | None = None
 
 
 @dataclass(frozen=True)
@@ -103,6 +113,16 @@ class CandidateOwnerRef:
     speaker_registry_id: str | None
     pinned: bool
     provisional: bool
+
+
+@dataclass(frozen=True)
+class CandidateSpeakerRef:
+    """A registry-scoped person reference, never a stored display name."""
+
+    kind: str
+    speaker_id: str | None
+    canonical_speaker_id: str | None
+    speaker_registry_id: str | None
 
 
 @dataclass(frozen=True)
@@ -148,7 +168,7 @@ def task_candidate_document(candidate: TaskCandidate) -> dict[str, Any]:
     if candidate.schema_version == SCHEMA_VERSION or (
         candidate.schema_version in {
             PROVENANCE_SCHEMA_VERSION, OWNER_PROVENANCE_SCHEMA_VERSION,
-            CUMULATIVE_SCHEMA_VERSION,
+            CUMULATIVE_SCHEMA_VERSION, STRUCTURED_TASK_SCHEMA_VERSION,
         }
         and candidate.task.project is not None
     ) or (
@@ -158,7 +178,7 @@ def task_candidate_document(candidate: TaskCandidate) -> dict[str, Any]:
         task["project"] = candidate.task.project
     if candidate.schema_version in {
         OWNER_SCHEMA_VERSION, OWNER_PROVENANCE_SCHEMA_VERSION,
-        CUMULATIVE_SCHEMA_VERSION,
+        CUMULATIVE_SCHEMA_VERSION, STRUCTURED_TASK_SCHEMA_VERSION,
     }:
         owner_ref = candidate.task.owner_ref
         task["owner_ref"] = None if owner_ref is None else {
@@ -169,6 +189,17 @@ def task_candidate_document(candidate: TaskCandidate) -> dict[str, Any]:
             "pinned": owner_ref.pinned,
             "provisional": owner_ref.provisional,
         }
+    if candidate.schema_version == STRUCTURED_TASK_SCHEMA_VERSION:
+        task.update({
+            "object": candidate.task.object,
+            "action": candidate.task.action,
+            "confidence": candidate.task.confidence,
+        })
+        if candidate.task.participants:
+            task["participants"] = [
+                _speaker_ref_document(reference)
+                for reference in candidate.task.participants
+            ]
     document = {
         "schema": candidate.schema,
         "schema_version": candidate.schema_version,
@@ -203,6 +234,7 @@ def task_candidate_document(candidate: TaskCandidate) -> dict[str, Any]:
         ]
     if candidate.schema_version in {
         LIFECYCLE_SCHEMA_VERSION, CUMULATIVE_SCHEMA_VERSION,
+        STRUCTURED_TASK_SCHEMA_VERSION,
     }:
         document["lifecycle"] = {
             "state": candidate.lifecycle.state,
@@ -250,6 +282,7 @@ def parse_task_candidate(document: object) -> TaskCandidate:
         "candidate",
         base_fields | ({"lifecycle"} if version in {
             LIFECYCLE_SCHEMA_VERSION, CUMULATIVE_SCHEMA_VERSION,
+            STRUCTURED_TASK_SCHEMA_VERSION,
         } else set()),
     )
 
@@ -283,7 +316,16 @@ def parse_task_candidate(document: object) -> TaskCandidate:
 
     task_doc = _object(root["task"], "candidate.task")
     base_task_fields = {"text", "owner", "due"}
-    if version in {
+    if version == STRUCTURED_TASK_SCHEMA_VERSION:
+        _required_and_allowed_fields(
+            task_doc,
+            "candidate.task",
+            {"text", "owner", "owner_ref", "due", "object", "action",
+             "confidence"},
+            {"text", "owner", "owner_ref", "due", "project", "object",
+             "action", "participants", "confidence"},
+        )
+    elif version in {
         PROVENANCE_SCHEMA_VERSION,
         OWNER_SCHEMA_VERSION,
         OWNER_PROVENANCE_SCHEMA_VERSION,
@@ -320,7 +362,7 @@ def parse_task_candidate(document: object) -> TaskCandidate:
         _owner_ref(task_doc["owner_ref"], owner, source_kind=source.kind)
         if version in {
             OWNER_SCHEMA_VERSION, OWNER_PROVENANCE_SCHEMA_VERSION,
-            CUMULATIVE_SCHEMA_VERSION,
+            CUMULATIVE_SCHEMA_VERSION, STRUCTURED_TASK_SCHEMA_VERSION,
         }
         else None
     )
@@ -336,6 +378,7 @@ def parse_task_candidate(document: object) -> TaskCandidate:
                     OWNER_SCHEMA_VERSION,
                     OWNER_PROVENANCE_SCHEMA_VERSION,
                     CUMULATIVE_SCHEMA_VERSION,
+                    STRUCTURED_TASK_SCHEMA_VERSION,
                 }
                 and "project" in task_doc
             ) else None
@@ -343,15 +386,33 @@ def parse_task_candidate(document: object) -> TaskCandidate:
         owner=owner,
         due=_optional_date(task_doc["due"], "candidate.task.due"),
         owner_ref=owner_ref,
+        object=(
+            _bounded_text(task_doc["object"], "candidate.task.object", 1, 200)
+            if version == STRUCTURED_TASK_SCHEMA_VERSION else None
+        ),
+        action=(
+            _choice(task_doc["action"], "candidate.task.action", TASK_ACTIONS)
+            if version == STRUCTURED_TASK_SCHEMA_VERSION else None
+        ),
+        participants=(
+            _participant_refs(task_doc["participants"])
+            if version == STRUCTURED_TASK_SCHEMA_VERSION
+            and "participants" in task_doc else ()
+        ),
+        confidence=(
+            _confidence(task_doc["confidence"])
+            if version == STRUCTURED_TASK_SCHEMA_VERSION else None
+        ),
     )
 
     evidence_doc = _object(root["evidence"], "candidate.evidence")
     evidence_fields = {"document_id", "locator"}
     if version in {
         PROVENANCE_SCHEMA_VERSION, OWNER_PROVENANCE_SCHEMA_VERSION,
-    } or (version == CUMULATIVE_SCHEMA_VERSION and "sources" in evidence_doc):
+    } or (version in {CUMULATIVE_SCHEMA_VERSION, STRUCTURED_TASK_SCHEMA_VERSION}
+          and "sources" in evidence_doc):
         evidence_fields.add("sources")
-    if version == CUMULATIVE_SCHEMA_VERSION:
+    if version in {CUMULATIVE_SCHEMA_VERSION, STRUCTURED_TASK_SCHEMA_VERSION}:
         _required_and_allowed_fields(
             evidence_doc,
             "candidate.evidence",
@@ -371,7 +432,8 @@ def parse_task_candidate(document: object) -> TaskCandidate:
         sources = _evidence_sources(
             evidence_doc["sources"], provenance_roles_for("meeting")
         )
-    elif version == CUMULATIVE_SCHEMA_VERSION and "sources" in evidence_doc:
+    elif version in {CUMULATIVE_SCHEMA_VERSION, STRUCTURED_TASK_SCHEMA_VERSION} \
+            and "sources" in evidence_doc:
         sources = _evidence_sources(
             evidence_doc["sources"], provenance_roles_for(source.kind)
         )
@@ -385,7 +447,10 @@ def parse_task_candidate(document: object) -> TaskCandidate:
 
     created_at = _aware_timestamp(root["created_at"], "candidate.created_at")
     lifecycle = CandidateLifecycle("active", 0, None)
-    if version in {LIFECYCLE_SCHEMA_VERSION, CUMULATIVE_SCHEMA_VERSION}:
+    if version in {
+        LIFECYCLE_SCHEMA_VERSION, CUMULATIVE_SCHEMA_VERSION,
+        STRUCTURED_TASK_SCHEMA_VERSION,
+    }:
         lifecycle_doc = _object(root["lifecycle"], "candidate.lifecycle")
         _exact_fields(
             lifecycle_doc,
@@ -573,6 +638,73 @@ def _owner_ref(
         pinned=pinned,
         provisional=provisional,
     )
+
+
+def _speaker_ref(value: object, field: str) -> CandidateSpeakerRef:
+    reference = _object(value, field)
+    _exact_fields(
+        reference, field,
+        {"kind", "speaker_id", "canonical_speaker_id", "speaker_registry_id"},
+    )
+    kind = _choice(reference["kind"], f"{field}.kind", OWNER_KINDS)
+    speaker_id = _optional_pattern_text(
+        reference["speaker_id"], f"{field}.speaker_id", _SPEAKER_ID_RE
+    )
+    canonical_speaker_id = _optional_pattern_text(
+        reference["canonical_speaker_id"], f"{field}.canonical_speaker_id",
+        _SPEAKER_ID_RE,
+    )
+    registry_id = (
+        _opaque_id(reference["speaker_registry_id"], f"{field}.speaker_registry_id")
+        if reference["speaker_registry_id"] is not None else None
+    )
+    if (speaker_id is None) != (registry_id is None):
+        raise ContractError(f"{field} speaker identity must be scoped")
+    if canonical_speaker_id is not None and speaker_id is None:
+        raise ContractError(f"{field} canonical identity must be scoped")
+    if kind in {"external", "group"} and any(
+        value is not None for value in (speaker_id, canonical_speaker_id, registry_id)
+    ):
+        raise ContractError(f"{field} kind cannot carry speaker identity")
+    if kind == "unresolved" and canonical_speaker_id is not None:
+        raise ContractError(f"{field} unresolved identity cannot be canonical")
+    return CandidateSpeakerRef(
+        kind, speaker_id, canonical_speaker_id, registry_id
+    )
+
+
+def _participant_refs(value: object) -> tuple[CandidateSpeakerRef, ...]:
+    if not isinstance(value, list) or len(value) > 20:
+        raise ContractError("candidate.task.participants has invalid length")
+    references = tuple(
+        _speaker_ref(item, "candidate.task.participants entry") for item in value
+    )
+    identities = {
+        (item.kind, item.speaker_id, item.canonical_speaker_id,
+         item.speaker_registry_id)
+        for item in references
+    }
+    if len(identities) != len(references):
+        raise ContractError("candidate.task.participants contains a duplicate")
+    return references
+
+
+def _speaker_ref_document(reference: CandidateSpeakerRef) -> dict[str, object]:
+    return {
+        "kind": reference.kind,
+        "speaker_id": reference.speaker_id,
+        "canonical_speaker_id": reference.canonical_speaker_id,
+        "speaker_registry_id": reference.speaker_registry_id,
+    }
+
+
+def _confidence(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ContractError("candidate.task.confidence must be a number")
+    confidence = float(value)
+    if not 0 <= confidence <= 1:
+        raise ContractError("candidate.task.confidence must be between zero and one")
+    return confidence
 
 
 def _source_name(value: object, field: str) -> str:

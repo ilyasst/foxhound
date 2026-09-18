@@ -31,6 +31,7 @@ from foxhound.task_cards import (
     render_task_review_card,
 )
 from foxhound.task_ledger import TaskLedger, TaskLedgerError, TaskStatus
+from review_card_fixture import raise_review_cards
 
 
 NOW = datetime(2030, 3, 1, 12, 0, tzinfo=timezone.utc)
@@ -156,6 +157,9 @@ def observation(item: dict, legacy_task_id: int) -> dict:
 
 
 class TaskCardTests(unittest.TestCase):
+    def _raise_review_cards(self, *, limit: int = 100) -> int:
+        return raise_review_cards(self.database, self.clock(), limit=limit)
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -302,7 +306,7 @@ class TaskCardTests(unittest.TestCase):
             ).fetchone()[0], 0)
 
     def test_schema_twenty_six_snapshots_current_source_revisions(self):
-        self.cards.schedule(limit=1)
+        self._raise_review_cards(limit=1)
         with closing(sqlite3.connect(self.database)) as connection:
             expected = connection.execute(
                 "SELECT b.source_revision FROM task_candidate_bindings AS b "
@@ -378,42 +382,6 @@ class TaskCardTests(unittest.TestCase):
                 )
             ]
 
-    def test_schedule_leaves_a_task_the_execution_workflow_holds(self):
-        """Execution answers for a task it still holds.
-
-        The backlog card would ask the same task a second question, and two
-        of its four answers close the task -- which cancels the workflow
-        underneath it, without the card ever saying so.
-        """
-        for status in ("awaiting_start", "snoozed", "queued", "running",
-                       "awaiting_review", "parked"):
-            with self.subTest(status=status):
-                self.set_workflow(1, status)
-                self.cards.schedule()
-                self.assertNotIn(1, self.carded_task_ids())
-        # Every task execution is NOT holding is carded as before.
-        self.assertEqual(self.carded_task_ids(), [2, 3, 4])
-
-    def test_schedule_waits_a_review_interval_after_a_workflow_ends(self):
-        """A finished workflow raises its own end card.
-
-        Carding the task the moment execution lets go would put the same
-        question on two surfaces at once, so the backlog treats a task as
-        dormant only one review interval after the workflow ended.
-        """
-        for status in ("completed", "cancelled"):
-            with self.subTest(status=status):
-                self.set_workflow(
-                    1, status,
-                    completed_at=self.clock().isoformat(timespec="seconds"),
-                )
-                self.cards.schedule()
-                self.assertNotIn(1, self.carded_task_ids())
-
-        self.clock.advance(OPEN_REVIEW_INTERVAL + timedelta(seconds=1))
-        self.cards.schedule()
-        self.assertIn(1, self.carded_task_ids())
-
     def test_a_scheduled_card_is_retracted_when_a_workflow_takes_the_task(self):
         """The window between scheduling and answering is not safe either.
 
@@ -421,7 +389,7 @@ class TaskCardTests(unittest.TestCase):
         path, so the completion question it carried goes back to the queue
         rather than down with the card.
         """
-        self.cards.schedule()
+        self._raise_review_cards()
         self.assertIn(1, self.carded_task_ids())
 
         self.set_workflow(1, "queued")
@@ -437,20 +405,6 @@ class TaskCardTests(unittest.TestCase):
                 "cancelled",
             )
 
-    def test_explicit_schedule_is_bounded_ordered_and_idempotent(self):
-        first = self.cards.schedule(limit=2)
-        self.assertEqual(first.disposition, CardDisposition.APPLIED)
-        self.assertEqual((first.created, first.cancelled), (2, 0))
-        self.assertEqual([card.task_id for card in self.cards.due(limit=20)], [1, 2])
-
-        second = self.cards.schedule(limit=2)
-        self.assertEqual(second.created, 2)
-        self.assertEqual([card.task_id for card in self.cards.due(limit=20)],
-                         [1, 2, 3, 4])
-        replay = self.cards.schedule()
-        self.assertEqual(replay.disposition, CardDisposition.UNCHANGED)
-        self.assertEqual(self.cards.count(), 4)
-
     def test_stats_are_aggregate_and_from_one_queue_snapshot(self):
         empty = self.cards.stats(consumer_digest=CONSUMER_A)
         self.assertEqual(
@@ -458,7 +412,7 @@ class TaskCardTests(unittest.TestCase):
              empty.snoozed, empty.elsewhere, empty.active),
             (0, 0, 0, 0, 0, 0),
         )
-        self.cards.schedule()
+        self._raise_review_cards()
         first = self.claim_and_deliver()
         self.cards.act(
             first.card.id,
@@ -483,7 +437,7 @@ class TaskCardTests(unittest.TestCase):
         inside `claim_next`, counting dead leases as `delivering` lets the
         queue wedge with every card waiting and nothing on screen.
         """
-        self.cards.schedule()
+        self._raise_review_cards()
         held = self.cards.claim_next(consumer_digest=CONSUMER_A)
         stale = self.cards.claim_next(consumer_digest=CONSUMER_B)
         self.assertIsNotNone(held)
@@ -522,7 +476,7 @@ class TaskCardTests(unittest.TestCase):
 
     def test_a_full_surface_of_dead_leases_still_leaves_room_to_claim(self):
         """The deadlock itself: depth 2, two dead leases, nothing on screen."""
-        self.cards.schedule()
+        self._raise_review_cards()
         for _ in range(2):
             self.assertIsNotNone(
                 self.cards.claim_next(consumer_digest=CONSUMER_A))
@@ -537,7 +491,7 @@ class TaskCardTests(unittest.TestCase):
         self.assertGreater(keep - after.delivering - after.delivered, 0)
 
     def test_claim_ceiling_is_distinct_and_scoped_to_role_and_consumer(self):
-        self.cards.schedule()
+        self._raise_review_cards()
         first = self.cards.claim_next(
             consumer_digest=CONSUMER_A, consumer_role="queue_view"
         )
@@ -558,7 +512,7 @@ class TaskCardTests(unittest.TestCase):
         self.assertIsNotNone(other)
 
     def test_stats_scope_claimed_cards_and_hide_legacy_consumer_rows(self):
-        self.cards.schedule()
+        self._raise_review_cards()
         mine = self.claim_and_deliver(consumer_digest=CONSUMER_A)
         other = self.cards.claim_next(consumer_digest=CONSUMER_B)
         self.assertIsNotNone(other)
@@ -587,7 +541,7 @@ class TaskCardTests(unittest.TestCase):
         self.assertEqual((a.delivered, a.elsewhere, a.active), (0, 1, 4))
 
     def test_delivery_claim_render_ack_and_replay_are_fenced(self):
-        self.cards.schedule()
+        self._raise_review_cards()
         claim = self.cards.claim_next(
             lease_seconds=60, consumer_digest=CONSUMER_A
         )
@@ -679,7 +633,7 @@ class TaskCardTests(unittest.TestCase):
         self.assertEqual(self.cards.event_count(), before + 1)
 
     def test_delivered_card_can_be_repaired_by_local_operator(self):
-        self.cards.schedule(limit=1)
+        self._raise_review_cards(limit=1)
         claim = self.claim_and_deliver()
         before_events = self.cards.event_count()
 
@@ -711,7 +665,7 @@ class TaskCardTests(unittest.TestCase):
         self.assertEqual(self.cards.event_count(), before_events + 1)
 
     def test_unanswered_delivered_card_is_represented_after_one_hour(self):
-        self.cards.schedule(limit=1)
+        self._raise_review_cards(limit=1)
         claim = self.claim_and_deliver()
 
         self.clock.advance(timedelta(hours=1) - timedelta(seconds=1))
@@ -736,7 +690,7 @@ class TaskCardTests(unittest.TestCase):
             )
 
     def test_represent_only_requeues_current_delivered_cards(self):
-        self.cards.schedule(limit=2)
+        self._raise_review_cards(limit=2)
         first = self.claim_and_deliver()
         self.claim_and_deliver()
         self.cards.act(
@@ -751,7 +705,7 @@ class TaskCardTests(unittest.TestCase):
         )
 
     def test_delivered_card_repair_refuses_stale_or_noncurrent_cards(self):
-        self.cards.schedule(limit=1)
+        self._raise_review_cards(limit=1)
         claim = self.claim_and_deliver()
         before_events = self.cards.event_count()
         stale = self.cards.retry_delivery(
@@ -779,7 +733,7 @@ class TaskCardTests(unittest.TestCase):
         self.assertEqual(self.cards.event_count(), before_events)
 
     def test_actions_are_atomic_and_stale_replays_write_nothing(self):
-        self.cards.schedule()
+        self._raise_review_cards()
         actions = ("done", "keep_open", "drop", "snooze")
         claims = []
         for action in actions:
@@ -826,12 +780,15 @@ class TaskCardTests(unittest.TestCase):
 
         self.clock.advance(timedelta(days=3))
         self.assertEqual([card.task_id for card in self.cards.due()], [4])
+        # A snoozed card still comes back -- that is a card-level promise the
+        # reader made. A `keep_open` one does not: task 2 used to return a
+        # review interval later, and that periodic rhythm is what was retired.
         self.clock.advance(timedelta(days=4))
-        self.assertEqual(self.cards.schedule().created, 1)
-        self.assertEqual([card.task_id for card in self.cards.due()], [4, 2])
+        self.assertEqual(self.cards.schedule().created, 0)
+        self.assertEqual([card.task_id for card in self.cards.due()], [4])
 
     def test_failed_and_expired_delivery_claims_can_be_retried(self):
-        self.cards.schedule(limit=1)
+        self._raise_review_cards(limit=1)
         first = self.cards.claim_next(
             lease_seconds=60, consumer_digest=CONSUMER_A
         )
@@ -879,7 +836,7 @@ class TaskCardTests(unittest.TestCase):
         ).refusal, CardRefusal.STALE_VERSION)
 
     def test_external_task_change_invalidates_active_card(self):
-        self.cards.schedule(limit=1)
+        self._raise_review_cards(limit=1)
         claim = self.claim_and_deliver()
         self.assertEqual(self._consumer_digest(claim.card.id), CONSUMER_A)
         self.assertTrue(self.ledger.transition(
@@ -904,12 +861,19 @@ class TaskCardTests(unittest.TestCase):
         # consumer affinity afterward (ADR 0036 invariant 6).
         self.assertIsNone(self._consumer_digest(claim.card.id))
 
-    def test_source_update_resurfaces_once_and_fences_the_old_card(self):
-        self.cards.schedule(limit=1)
+    def test_a_source_update_fences_the_card_already_in_flight(self):
+        """The fence survives; the re-surface it used to trigger does not.
+
+        Editing a task's source still invalidates a card a reader is holding
+        -- answering it would answer about text that has since changed. What
+        no longer follows is a fresh card: raising one was part of the
+        periodic review rhythm, and that rhythm is gone.
+        """
+        self._raise_review_cards(limit=1)
         first = self.claim_and_deliver()
         task_id = first.card.task_id
 
-        first_revision = self.revise_source_without_task_change(task_id)
+        self.revise_source_without_task_change(task_id)
         stale = self.cards.act(
             first.card.id,
             expected_version=first.card.version,
@@ -917,32 +881,15 @@ class TaskCardTests(unittest.TestCase):
         )
         self.assertEqual(stale.refusal, CardRefusal.STALE_VERSION)
 
-        raised = self.cards.schedule(limit=1)
-        self.assertEqual((raised.cancelled, raised.created), (1, 1))
-        replay = self.cards.schedule(limit=1)
-        self.assertEqual(replay.cancelled, 0)
+        # `schedule()` retracts the fenced card and raises nothing to replace
+        # it, so the reader is left with one fewer question, not a new one.
+        raised = self.cards.schedule()
+        self.assertEqual((raised.cancelled, raised.created), (1, 0))
         self.assertEqual(
-            len([card for card in self.cards.due(limit=20)
-                 if card.task_id == task_id]),
-            1,
+            [card for card in self.cards.due(limit=20)
+             if card.task_id == task_id],
+            [],
         )
-
-        # A second change before this re-surface is delivered does not put a
-        # second question in front of the reader: the old pending card is
-        # cancelled and exactly one current card remains due.
-        second_revision = self.revise_source_without_task_change(task_id)
-        self.assertNotEqual(first_revision, second_revision)
-        coalesced = self.cards.schedule(limit=1)
-        self.assertEqual((coalesced.cancelled, coalesced.created), (1, 1))
-        latest = next(
-            card for card in self.cards.due(limit=20) if card.task_id == task_id
-        )
-        self.assertTrue(latest.source_changed)
-        body, _ = render_task_review_card(
-            replace(latest, status=CardStatus.DELIVERING)
-        )
-        self.assertIn("Source updated since you last saw this task", body)
-
     def test_invalid_inputs_and_append_only_history_fail_closed(self):
         self.assertEqual(self.cards.schedule(limit=0).refusal,
                          CardRefusal.INVALID_ARGUMENT)
@@ -959,7 +906,7 @@ class TaskCardTests(unittest.TestCase):
                 self.cards.claim_next(
                     lease_seconds=60, consumer_digest=bad_digest
                 )
-        self.cards.schedule(limit=1)
+        self._raise_review_cards(limit=1)
         before = self.cards.event_count()
         with self.assertRaises(sqlite3.IntegrityError):
             with closing(sqlite3.connect(self.database)) as connection:
@@ -970,6 +917,41 @@ class TaskCardTests(unittest.TestCase):
             with closing(sqlite3.connect(self.database)) as connection:
                 connection.execute("DELETE FROM task_review_card_events")
         self.assertEqual(self.cards.event_count(), before)
+
+    def test_card_renders_live_participants_and_advisory_confidence(self):
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "UPDATE tasks SET confidence=0.75 WHERE id=1"
+            )
+            connection.execute(
+                "INSERT INTO task_participants("
+                "task_id,position,kind,speaker_id,canonical_speaker_id,"
+                "speaker_registry_id) VALUES(1,0,'person','SPK_002','SPK_002',"
+                "'registry-synthetic')"
+            )
+            connection.execute(
+                "INSERT INTO speaker_registry_entries("
+                "speaker_registry_id,speaker_id,canonical_speaker_id,"
+                "display_name,updated_at) VALUES('registry-synthetic','SPK_002',"
+                "'SPK_002','Person B','2030-03-01T00:00:00Z')"
+            )
+            connection.commit()
+        self._raise_review_cards(limit=1)
+        card = next(card for card in self.cards.due(limit=20) if card.task_id == 1)
+        body, _ = render_task_review_card(replace(card, status=CardStatus.DELIVERING))
+        self.assertIn("Participants:</b> Person B", body)
+        self.assertIn("Extraction confidence:</b> 75%", body)
+
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "UPDATE speaker_registry_entries SET display_name='Person C' "
+                "WHERE speaker_registry_id='registry-synthetic' AND speaker_id='SPK_002'"
+            )
+            connection.commit()
+        refreshed = next(
+            card for card in self.cards.due(limit=20) if card.task_id == 1
+        )
+        self.assertEqual(refreshed.participants, ("Person C",))
 
 
 if __name__ == "__main__":

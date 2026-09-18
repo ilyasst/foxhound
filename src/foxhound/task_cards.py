@@ -60,6 +60,25 @@ TASK_CARD_ACTIONS = frozenset({
     "duplicate_reject",
 })
 
+#: Wire tokens for the controls that read a card instead of answering it.
+#: Kept apart from `TASK_CARD_ACTIONS` because the separation is the
+#: guarantee: a read reaches a route that writes nothing, and no list a
+#: client validates against can let it arrive at `act` by accident.
+DUPLICATE_EXPAND = "duplicate_expand"
+DUPLICATE_COLLAPSE = "duplicate_collapse"
+
+TASK_CARD_READS = frozenset({DUPLICATE_EXPAND, DUPLICATE_COLLAPSE})
+
+#: What the expansion may spend on source extracts, per side, in bytes.
+#:
+#: The compact card is bounded by what it drops. The expansion is not bounded
+#: by anything, and the transport's own ceiling is a hard one -- a body over
+#: it is not shortened, it is refused, and the reader loses the card rather
+#: than the evidence. So the expansion stops adding extracts and says how
+#: many it left out. Whole extracts are dropped rather than the body being
+#: cut to length: a body cut mid-tag renders as nothing at all.
+EXPANDED_EVIDENCE_BUDGET_BYTES = 1_400
+
 #: Workflow statuses that mean execution is finished with a task. Everything
 #: else counts as execution still holding it.
 #:
@@ -126,15 +145,13 @@ def _duplicate_execution_holds(task_id: str) -> str:
         f" AND workflow.status NOT IN ({_UNHELD_WORKFLOW_SQL}))"
     )
 
-#: A task whose workflow finished recently. Execution raises its own end card
-#: on completion, so carding the task the moment the workflow lets go asks the
-#: same question from two surfaces at once. The backlog waits one review
-#: interval before treating the task as dormant.
-_EXECUTION_JUST_RELEASED = (
-    "EXISTS(SELECT 1 FROM task_execution_workflows AS workflow "
-    " WHERE workflow.task_id=t.id "
-    f" AND workflow.status IN ({_FINISHED_WORKFLOW_SQL}) "
-    " AND COALESCE(workflow.completed_at,workflow.updated_at)>?)"
+
+#: The hold that governs one card, according to the question it asks.
+_CARD_EXECUTION_HOLDS = (
+    "CASE WHEN EXISTS(SELECT 1 FROM task_duplicate_proposals AS proposal "
+    " WHERE proposal.card_id=c.id AND proposal.state='proposed') THEN "
+    + _duplicate_execution_holds("t.id")
+    + " ELSE " + _EXECUTION_HOLDS + " END"
 )
 
 
@@ -260,6 +277,8 @@ class TaskReviewCard:
     text: str = field(repr=False)
     owner: str | None = field(repr=False)
     due: str | None = field(repr=False)
+    participants: tuple[str, ...] = field(default=(), repr=False)
+    confidence: float | None = field(default=None, repr=False)
     first_raised: str | None = field(default=None, repr=False)
     task_created: str | None = field(default=None, repr=False)
     last_mentioned: str | None = field(default=None, repr=False)
@@ -321,6 +340,26 @@ class CardOperationResult:
         return self.disposition is not CardDisposition.REFUSED
 
 
+@dataclass(frozen=True)
+class CardPresentation:
+    """One delivered card rendered again, or the refusal instead.
+
+    `card` is absent rather than partial on a refusal: a caller that cannot
+    show the card must not be handed something that looks like it could be.
+    """
+
+    disposition: CardDisposition
+    card_id: int
+    card_version: int | None = None
+    card: TaskReviewCard | None = field(default=None, repr=False)
+    expanded: bool = False
+    refusal: CardRefusal | None = None
+
+    @property
+    def accepted(self) -> bool:
+        return self.disposition is not CardDisposition.REFUSED
+
+
 class TaskCardService:
     """Durable scheduling and actions for Foxhound task review cards."""
 
@@ -336,83 +375,42 @@ class TaskCardService:
         self._token_factory = token_factory or (lambda: secrets.token_urlsafe(32))
 
     def schedule(self, *, limit: int = 100) -> ScheduleResult:
+        """Raise the cards that have something to say, and nothing else.
+
+        This used to also raise a periodic "☑️ Task done?" card for every
+        open task on a seven-day rhythm. That card asked a question the
+        ledger could not answer and the reader had no new information to
+        answer either: it started no work, and answering "still open" only
+        moved the same question a week out.
+
+        Worse, it was loudest exactly when it was least useful. A task with
+        no execution workflow is not held by `_execution_holds`, so whenever
+        admission stalled -- a saturated `plan_ready_cap`, see the sibling
+        scheduler -- every task the system had refused to start became
+        card-eligible and stayed that way. One deployment answered 69 of
+        them in a day against a baseline of 5, each one asking whether work
+        was finished that had never been allowed to begin. A failure in
+        admission was being reported to the reader as a question about
+        completion.
+
+        What remains are the two cards that carry information the reader
+        does not already have: a done-check, raised only when evidence
+        suggests the task is finished, and a duplicate check, raised only
+        when intake has proposed one. Both are answers to something, not
+        a rhythm.
+        """
         if not _valid_limit(limit):
             return ScheduleResult(
                 CardDisposition.REFUSED,
                 refusal=CardRefusal.INVALID_ARGUMENT,
             )
         now = self._now()
-        # Anything execution finished before this is treated as dormant and
-        # may be carded again; anything after it is still execution's to
-        # answer. See `_EXECUTION_JUST_RELEASED`.
-        dormant_after = (
-            self._clock_value() - OPEN_REVIEW_INTERVAL
-        ).isoformat(timespec="seconds")
         with closing(self._connect()) as connection:
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("BEGIN IMMEDIATE")
             try:
                 cancelled = self._cancel_stale(connection, now)
-                rows = connection.execute(
-                    "SELECT t.id,t.version,"
-                    + _bound_source_revision("t.id") + " AS source_revision "
-                    "FROM tasks AS t "
-                    "WHERE t.status='open' "
-                    "AND NOT " + _EXECUTION_HOLDS + " "
-                    "AND NOT " + _EXECUTION_JUST_RELEASED + " "
-                    "AND NOT EXISTS(SELECT 1 FROM task_relations AS relation "
-                    " WHERE relation.subject_id=t.id AND relation.kind='duplicate_of' "
-                    " AND relation.withdrawn_at IS NULL) "
-                    "AND NOT EXISTS(SELECT 1 FROM task_duplicate_proposals AS proposal "
-                    " WHERE proposal.state='proposed' "
-                    " AND (proposal.left_task_id=t.id OR proposal.right_task_id=t.id)) "
-                    "AND NOT EXISTS("
-                    " SELECT 1 FROM task_candidate_bindings AS b JOIN "
-                    " task_candidate_lifecycle AS l ON l.candidate_id=b.candidate_id "
-                    " WHERE b.task_id=t.id AND b.relation='accepted' "
-                    " AND l.state='withdrawn' "
-                    " AND l.resolution='preserved_open'"
-                    ") "
-                    "AND NOT EXISTS("
-                    " SELECT 1 FROM task_review_cards AS active "
-                    " WHERE active.task_id=t.id AND active.status IN "
-                    " ('pending','delivering','delivered','snoozed')"
-                    ") "
-                    "AND (COALESCE(("
-                    " SELECT prior.review_after FROM task_review_cards AS prior "
-                    " WHERE prior.task_id=t.id ORDER BY prior.id DESC LIMIT 1"
-                    "),'')<=? OR EXISTS("
-                    " SELECT 1 FROM task_candidate_bindings AS b "
-                    " WHERE b.task_id=t.id AND b.relation='accepted' "
-                    " AND NOT EXISTS("
-                    "  SELECT 1 FROM task_review_cards AS seen "
-                    "  WHERE seen.task_id=t.id "
-                    "  AND seen.source_revision=b.source_revision "
-                    "  AND EXISTS(SELECT 1 FROM task_review_card_events AS event "
-                    "             WHERE event.card_id=seen.id "
-                    "             AND event.kind='delivered')"
-                    " )) ) "
-                    "ORDER BY t.created_at,t.id LIMIT ?",
-                    (dormant_after, now, limit),
-                ).fetchall()
-                for row in rows:
-                    cursor = connection.execute(
-                        "INSERT INTO task_review_cards("
-                        "task_id,task_version,source_revision,status,version,"
-                        "due_at,created_at,updated_at) VALUES(?,?,?,'pending',1,?,?,?)",
-                        (int(row["id"]), int(row["version"]),
-                         row["source_revision"], now, now, now),
-                    )
-                    self._event(
-                        connection,
-                        card_id=int(cursor.lastrowid),
-                        task_id=int(row["id"]),
-                        kind="scheduled",
-                        card_version=1,
-                        task_version=int(row["version"]),
-                        now=now,
-                    )
-                created = len(rows)
+                created = 0
                 asked, raised = self._ask_completion_questions(
                     connection, now, limit=limit
                 )
@@ -471,6 +469,53 @@ class TaskCardService:
             except Exception:
                 connection.rollback()
                 raise
+
+    def view(
+        self, card_id: int, *, expected_version: int, expanded: bool
+    ) -> CardPresentation:
+        """One delivered duplicate card, rendered again at another detail.
+
+        A read. Nothing is written and no version moves, so the answers on
+        the keyboard it returns still address the card the reader was looking
+        at -- a restored keyboard whose taps all answer "stale" would be the
+        same dead end reached more slowly.
+
+        Delivered and current are both required. A card that was never
+        delivered has no presentation to reopen, and one already answered or
+        superseded must not be handed back looking answerable.
+
+        Only a duplicate card has a second detail to show. Every other card
+        already shows everything it holds, so asking to expand one is a
+        caller error rather than an empty result.
+        """
+        if not _valid_identity(card_id, expected_version) or not isinstance(
+                expanded, bool):
+            return _view_refused(
+                card_id if isinstance(card_id, int)
+                and not isinstance(card_id, bool) else 0,
+                None, CardRefusal.INVALID_ARGUMENT,
+            )
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                self._card_select() + " WHERE c.id=?", (card_id,)
+            ).fetchone()
+            refusal = _card_guard(row, expected_version)
+            if refusal is None and row["status"] != CardStatus.DELIVERED:
+                refusal = CardRefusal.INVALID_STATE
+            if refusal is None and not _card_is_current(connection, row):
+                refusal = CardRefusal.STALE_VERSION
+            if refusal is not None:
+                return _view_refused(card_id, row, refusal)
+            card = _card(row)
+        if card.duplicate is None:
+            return _view_refused(card_id, row, CardRefusal.INVALID_STATE)
+        return CardPresentation(
+            CardDisposition.UNCHANGED,
+            card_id,
+            card_version=expected_version,
+            card=card,
+            expanded=expanded,
+        )
 
     def due(self, *, limit: int = 20) -> tuple[TaskReviewCard, ...]:
         if not _valid_limit(limit):
@@ -1589,7 +1634,7 @@ class TaskCardService:
             "FROM task_review_cards AS c JOIN tasks AS t ON t.id=c.task_id "
             "WHERE c.status IN ('pending','delivering','delivered','snoozed') "
             "AND (t.status!='open' OR t.version!=c.task_version "
-            "OR " + _EXECUTION_HOLDS + " "
+            "OR " + _CARD_EXECUTION_HOLDS + " "
             "OR COALESCE(c.source_revision,'')!=COALESCE("
             + _bound_source_revision("t.id") + ",'') OR EXISTS("
             " SELECT 1 FROM task_relations AS relation "
@@ -1653,7 +1698,25 @@ class TaskCardService:
             "c.source_revision,"
             "COALESCE((SELECT job.title FROM task_fused_title_jobs AS job "
             "WHERE job.task_id=c.task_id AND job.state='ready'),t.text) AS text,"
-            "t.owner,t.owner_kind,t.due,t.created_at AS task_created,"
+            "t.owner,t.owner_kind,t.due,t.confidence,t.created_at AS task_created,"
+            "COALESCE((SELECT entry.display_name FROM speaker_registry_entries AS entry "
+            " WHERE entry.speaker_registry_id=t.owner_speaker_registry_id "
+            " AND entry.speaker_id=COALESCE(t.owner_canonical_speaker_id,"
+            " t.owner_speaker_id)),CASE WHEN t.owner_kind='unresolved' "
+            " OR (t.owner_kind='person' AND t.owner_speaker_id IS NOT NULL) "
+            " THEN '(unresolved speaker)' ELSE t.owner END) AS owner_display,"
+            "(SELECT group_concat(CASE participant.kind "
+            " WHEN 'unresolved' THEN '(unresolved speaker)' "
+            " WHEN 'external' THEN '(external participant)' "
+            " WHEN 'group' THEN '(group participant)' "
+            " ELSE COALESCE((SELECT entry.display_name "
+            " FROM speaker_registry_entries AS entry "
+            " WHERE entry.speaker_registry_id=participant.speaker_registry_id "
+            " AND entry.speaker_id=COALESCE(participant.canonical_speaker_id,"
+            " participant.speaker_id)),'(unresolved speaker)') END,char(30)) "
+            " FROM task_participants AS participant "
+            " WHERE participant.task_id=t.id ORDER BY participant.position) "
+            " AS participants_display,"
             "(SELECT min(h.created_at) FROM task_candidate_bindings AS b "
             " JOIN candidate_revision_history AS h "
             " ON h.candidate_id=b.candidate_id WHERE b.task_id=c.task_id) "
@@ -1778,7 +1841,17 @@ class TaskCardService:
 
 
 def render_task_review_card(card: TaskReviewCard) -> tuple[str, dict]:
-    """Render one claimed card without performing I/O."""
+    """Render one claimed card without performing I/O.
+
+    The plain "☑️ Task done?" branch below is no longer reachable for any
+    card raised after `schedule()` stopped creating them. It stays because
+    a deployment upgrading mid-flight can still be holding one that was
+    raised before, and a reader who has it on screen must be able to answer
+    it rather than watch it fail to render. Once no such row remains
+    anywhere -- `SELECT COUNT(*) FROM task_review_cards WHERE status IN
+    ('pending','delivering','delivered','snoozed') AND duplicate/completion
+    are both absent` -- this branch and its buttons can go.
+    """
     if card.status is not CardStatus.DELIVERING:
         raise ValueError("task review card is not claimed for delivery")
     text = html.escape(card.text, quote=False)
@@ -1794,8 +1867,15 @@ def render_task_review_card(card: TaskReviewCard) -> tuple[str, dict]:
         ))
     if card.owner:
         lines.extend(("", f"👤 <b>Owner:</b> {html.escape(card.owner, quote=False)}"))
+    if card.participants:
+        lines.append(
+            "👥 <b>Participants:</b> "
+            + html.escape(", ".join(card.participants), quote=False)
+        )
     if card.due:
         lines.append(f"📅 <b>Due:</b> {html.escape(card.due, quote=False)}")
+    if card.confidence is not None:
+        lines.append(f"📊 <b>Extraction confidence:</b> {card.confidence:.0%}")
     first = "" if not card.first_raised else str(card.first_raised)[:10]
     if first:
         lines.append(f"📌 <b>First raised:</b> {html.escape(first, quote=False)}")
@@ -1899,7 +1979,27 @@ def _render_done_check(card: TaskReviewCard, text: str) -> tuple[str, dict]:
     return "\n".join(lines), keyboard
 
 
-def _render_duplicate_check(card: TaskReviewCard, text: str) -> tuple[str, dict]:
+def render_duplicate_view(
+    card: TaskReviewCard, *, expanded: bool
+) -> tuple[str, dict]:
+    """Render a delivered duplicate card again, at the asked-for detail.
+
+    Separate from `render_task_review_card` on its status guard alone: that
+    one renders a card claimed for delivery, this one renders a card the
+    reader already has on screen and is looking at again.
+    """
+    if card.status is not CardStatus.DELIVERED:
+        raise ValueError("task review card is not delivered")
+    if card.duplicate is None:
+        raise ValueError("task review card carries no comparison to open")
+    return _render_duplicate_check(
+        card, html.escape(card.text, quote=False), expanded=expanded,
+    )
+
+
+def _render_duplicate_check(
+    card: TaskReviewCard, text: str, *, expanded: bool = False
+) -> tuple[str, dict]:
     """Ask the reader to adjudicate one suspected duplicate.
 
     The question is only answerable from facts the reader can compare, so the
@@ -1911,6 +2011,12 @@ def _render_duplicate_check(card: TaskReviewCard, text: str) -> tuple[str, dict]
     The detector's own reason is shown as well.  A reader who can see that the
     pair was matched on one re-read mail thread, rather than on a handful of
     shared words, knows how much to trust the suggestion before answering.
+
+    `expanded` renders the same comparison without those compressions: every
+    source extract each side carries, and the detector's basis in its own
+    words.  It is what the reader opens when the compact card is not enough
+    to decide on, and there is nowhere else to look -- the counterpart is
+    usually already closed, and a closed task has no card of its own.
     """
     duplicate = card.duplicate
     recent_closed = duplicate.other_status in {"done", "dropped"}
@@ -1924,10 +2030,10 @@ def _render_duplicate_check(card: TaskReviewCard, text: str) -> tuple[str, dict]
             raised=card.first_raised or card.task_created,
             last=card.last_mentioned, status="open", closed_at=None,
         ),
-        *origin_lines(
+        *_comparison_origin(
             kind=card.origin_kind, record=card.origin_record,
-            item=card.origin_item, sources=_quotable_sources(card.origin_sources),
-            html_output=True,
+            item=card.origin_item, sources=card.origin_sources,
+            expanded=expanded,
         ),
         "",
         f"<b>Task T{duplicate.other_task_id}</b>",
@@ -1937,15 +2043,18 @@ def _render_duplicate_check(card: TaskReviewCard, text: str) -> tuple[str, dict]
             raised=duplicate.other_raised, last=None,
             status=duplicate.other_status, closed_at=duplicate.other_closed_at,
         ),
-        *origin_lines(
+        *_comparison_origin(
             kind=duplicate.other_origin_kind,
             record=duplicate.other_origin_record,
             item=duplicate.other_origin_item,
-            sources=_quotable_sources(duplicate.other_origin_sources),
-            html_output=True,
+            sources=duplicate.other_origin_sources,
+            expanded=expanded,
         ),
     ]
-    reason = _duplicate_reason(duplicate.basis)
+    reason = (
+        _escape(duplicate.basis) if expanded
+        else _duplicate_reason(duplicate.basis)
+    )
     if reason:
         lines.extend(("", f"🔎 <b>Matched on:</b> {reason}"))
     lines.extend((
@@ -1970,8 +2079,66 @@ def _render_duplicate_check(card: TaskReviewCard, text: str) -> tuple[str, dict]
             "callback_data": callback("duplicate_confirm"),
         },
         {"text": "↔️ Keep separate", "callback_data": callback("duplicate_reject")},
+        # A read, never an answer. It rides the same card id and version as
+        # the two answers beside it, so opening the comparison and then
+        # answering it is one decision on one card rather than two.
+        {
+            "text": "↩️ Less" if expanded else "🔍 Show both in full",
+            "callback_data": callback(
+                DUPLICATE_COLLAPSE if expanded else DUPLICATE_EXPAND
+            ),
+        },
     ]]}
     return "\n".join(lines), keyboard
+
+
+def _comparison_origin(
+    *, kind: str, record: str, item: str,
+    sources: Sequence[CardSourceEvidence], expanded: bool,
+) -> list[str]:
+    """One side's provenance, at the detail the surface asked for.
+
+    Compact drops the handoff extract and keeps the rest. Expanded keeps
+    everything that fits and says what it could not fit, because a reader who
+    opened the comparison for the evidence must not be shown a shortened list
+    that looks complete.
+    """
+    if not expanded:
+        return origin_lines(
+            kind=kind, record=record, item=item,
+            sources=_quotable_sources(sources), html_output=True,
+        )
+    kept, dropped = _affordable_sources(sources)
+    lines = origin_lines(
+        kind=kind, record=record, item=item, sources=kept, html_output=True,
+    )
+    if dropped:
+        lines.append(
+            f"⋯ <i>{dropped} further extract"
+            f"{'' if dropped == 1 else 's'} not shown here.</i>"
+        )
+    return lines
+
+
+def _affordable_sources(
+    sources: Sequence[CardSourceEvidence],
+) -> tuple[tuple[CardSourceEvidence, ...], int]:
+    """As many whole extracts as the body can afford, and the count left out.
+
+    At least one is always kept. A side whose single extract is longer than
+    the whole budget is exactly the side worth reading, and answering it with
+    provenance alone would be the compact card again.
+    """
+    kept: list[CardSourceEvidence] = []
+    spent = 0
+    for source in sources:
+        cost = len(source.name.encode("utf-8")) + len(
+            quotable(source.extract).encode("utf-8"))
+        if kept and spent + cost > EXPANDED_EVIDENCE_BUDGET_BYTES:
+            break
+        kept.append(source)
+        spent += cost
+    return tuple(kept), len(sources) - len(kept)
 
 
 def _quotable_sources(
@@ -2069,8 +2236,10 @@ def _card(row) -> TaskReviewCard:
         version=int(row["version"]),
         due_at=row["due_at"],
         text=row["text"],
-        owner=canonical_owner_display(row["owner"], row["owner_kind"]),
+        owner=canonical_owner_display(row["owner_display"], row["owner_kind"]),
         due=row["due"],
+        participants=tuple(filter(None, str(row["participants_display"] or "").split(chr(30)))),
+        confidence=(None if row["confidence"] is None else float(row["confidence"])),
         first_raised=row["first_raised"],
         task_created=_optional_text(row["task_created"]),
         last_mentioned=row["last_mentioned"],
@@ -2193,6 +2362,35 @@ def _valid_digest(value: object) -> bool:
         isinstance(value, str)
         and len(value) == 64
         and all(char in "0123456789abcdef" for char in value)
+    )
+
+
+def _card_is_current(connection: sqlite3.Connection, row) -> bool:
+    """The card still describes the task as it stands now.
+
+    The same fence `act` applies, asked without writing: a read that restored
+    a card the reader could no longer answer would hand back a keyboard whose
+    every tap refuses.
+    """
+    task = connection.execute(
+        "SELECT t.status,t.version," + _bound_source_revision("t.id")
+        + " AS source_revision FROM tasks AS t WHERE t.id=?",
+        (int(row["task_id"]),),
+    ).fetchone()
+    return (
+        task is not None
+        and task["status"] == TaskStatus.OPEN
+        and int(task["version"]) == int(row["task_version"])
+        and (task["source_revision"] or None) == (row["source_revision"] or None)
+    )
+
+
+def _view_refused(card_id: int, row, refusal: CardRefusal) -> CardPresentation:
+    return CardPresentation(
+        CardDisposition.REFUSED,
+        card_id=card_id,
+        card_version=None if row is None else int(row["version"]),
+        refusal=refusal,
     )
 
 

@@ -199,6 +199,9 @@ class TaskRecord:
     text: str
     owner: str | None
     due: str | None
+    object: str | None
+    action: str | None
+    confidence: float | None
     version: int
     created_at: str
     updated_at: str
@@ -701,6 +704,10 @@ class TaskLedger:
                         task["text"] == candidate.task.text
                         and task["due"] == candidate.task.due
                         and _row_owner_values(task) == desired_owner
+                        and _row_structure_values(task)
+                        == _candidate_structure_values(candidate)
+                        and _stored_participants(connection, int(task["id"]))
+                        == _candidate_participants(candidate)
                     ):
                         # A producer may enrich the evidence for an already
                         # accepted task without changing the work itself.
@@ -747,7 +754,8 @@ class TaskLedger:
                         continue
                     version = int(task["version"]) + 1
                     connection.execute(
-                        "UPDATE tasks SET text=?,owner=?,due=?,version=?,"
+                        "UPDATE tasks SET text=?,owner=?,due=?,object=?,action=?,"
+                        "confidence=?,version=?,"
                         "updated_at=?,owner_ref_version=?,owner_kind=?,"
                         "owner_speaker_id=?,owner_canonical_speaker_id=?,"
                         "owner_speaker_registry_id=?,owner_pinned=?,"
@@ -756,11 +764,15 @@ class TaskLedger:
                             candidate.task.text,
                             desired_owner[0],
                             candidate.task.due,
+                            *_candidate_structure_values(candidate),
                             version,
                             now,
                             *desired_owner[1:],
                             int(binding["task_id"]),
                         ),
+                    )
+                    _replace_participants(
+                        connection, int(binding["task_id"]), candidate
                     )
                     connection.execute(
                         "UPDATE task_candidate_bindings SET source_revision=?,"
@@ -1616,7 +1628,8 @@ class TaskLedger:
                 else _candidate_owner_values(candidate)
             )
             connection.execute(
-                "UPDATE tasks SET text=?,owner=?,due=?,version=?,updated_at=?,"
+                "UPDATE tasks SET text=?,owner=?,due=?,object=?,action=?,"
+                "confidence=?,version=?,updated_at=?,"
                 "owner_ref_version=?,owner_kind=?,owner_speaker_id=?,"
                 "owner_canonical_speaker_id=?,owner_speaker_registry_id=?,"
                 "owner_pinned=?,owner_provisional=? WHERE id=?",
@@ -1624,12 +1637,14 @@ class TaskLedger:
                     candidate.task.text,
                     desired_owner[0],
                     candidate.task.due,
+                    *_candidate_structure_values(candidate),
                     version,
                     now,
                     *desired_owner[1:],
                     int(binding["task_id"]),
                 ),
             )
+            _replace_participants(connection, int(binding["task_id"]), candidate)
             connection.execute(
                 "UPDATE work_items SET state='active',updated_at=? "
                 "WHERE task_id=?",
@@ -1735,15 +1750,18 @@ class TaskLedger:
             candidate, effective_owner=effective_owner
         )
         cursor = connection.execute(
-            "INSERT INTO tasks(status,text,owner,due,version,created_at,"
+            "INSERT INTO tasks(status,text,owner,due,object,action,confidence,"
+            "version,created_at,"
             "updated_at,closed_at,owner_ref_version,owner_kind,"
             "owner_speaker_id,owner_canonical_speaker_id,"
             "owner_speaker_registry_id,owner_pinned,owner_provisional) "
-            "VALUES('open',?,?,?,?,?,?,NULL,?,?,?,?,?,?,?)",
-            (task.text, owner_values[0], task.due, 1, now, now,
+            "VALUES('open',?,?,?,?,?,?,?,?,?,NULL,?,?,?,?,?,?,?)",
+            (task.text, owner_values[0], task.due,
+             *_candidate_structure_values(candidate), 1, now, now,
              *owner_values[1:]),
         )
         task_id = int(cursor.lastrowid)
+        _replace_participants(connection, task_id, candidate)
         connection.execute(
             "INSERT INTO task_events("
             "task_id,kind,task_version,candidate_id,source_revision,"
@@ -1833,6 +1851,52 @@ def _row_owner_values(row: sqlite3.Row) -> tuple[object, ...]:
     )
 
 
+def _candidate_structure_values(candidate: TaskCandidate) -> tuple[object, ...]:
+    return (candidate.task.object, candidate.task.action, candidate.task.confidence)
+
+
+def _row_structure_values(row: sqlite3.Row) -> tuple[object, ...]:
+    return (row["object"], row["action"], row["confidence"])
+
+
+def _candidate_participants(candidate: TaskCandidate) -> tuple[tuple[object, ...], ...]:
+    return tuple(
+        (reference.kind, reference.speaker_id, reference.canonical_speaker_id,
+         reference.speaker_registry_id)
+        for reference in candidate.task.participants
+    )
+
+
+def _stored_participants(
+    connection: sqlite3.Connection, task_id: int
+) -> tuple[tuple[object, ...], ...]:
+    rows = connection.execute(
+        "SELECT kind,speaker_id,canonical_speaker_id,speaker_registry_id "
+        "FROM task_participants WHERE task_id=? ORDER BY position",
+        (task_id,),
+    ).fetchall()
+    return tuple(
+        (row["kind"], row["speaker_id"], row["canonical_speaker_id"],
+         row["speaker_registry_id"])
+        for row in rows
+    )
+
+
+def _replace_participants(
+    connection: sqlite3.Connection, task_id: int, candidate: TaskCandidate
+) -> None:
+    connection.execute("DELETE FROM task_participants WHERE task_id=?", (task_id,))
+    connection.executemany(
+        "INSERT INTO task_participants("
+        "task_id,position,kind,speaker_id,canonical_speaker_id,"
+        "speaker_registry_id) VALUES(?,?,?,?,?,?)",
+        (
+            (task_id, position, *reference)
+            for position, reference in enumerate(_candidate_participants(candidate))
+        ),
+    )
+
+
 def _task_record(row: sqlite3.Row) -> TaskRecord:
     try:
         return TaskRecord(
@@ -1841,6 +1905,9 @@ def _task_record(row: sqlite3.Row) -> TaskRecord:
             text=row["text"],
             owner=row["owner"],
             due=row["due"],
+            object=row["object"],
+            action=row["action"],
+            confidence=row["confidence"],
             version=int(row["version"]),
             created_at=row["created_at"],
             updated_at=row["updated_at"],

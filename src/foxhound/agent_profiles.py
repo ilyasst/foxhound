@@ -390,6 +390,19 @@ def _historical_general_profiles() -> tuple[AgentProfile, ...]:
             kill_grace_seconds=30,
             allowed_phases=_PHASES,
         ),
+        AgentProfile(
+            profile_id="general",
+            display_name="General",
+            runtime="hermes",
+            prompt_template=_GENERAL_PROMPT_TEMPLATE_V10,
+            toolsets=("terminal", "file", "web"),
+            max_turns=80,
+            timeout_seconds=2_700,
+            claim_lease_seconds=3_300,
+            heartbeat_seconds=60,
+            kill_grace_seconds=30,
+            allowed_phases=_PHASES,
+        ),
     )
 
 
@@ -994,17 +1007,26 @@ _GENERAL_PROMPT_TEMPLATE_V10 = _GENERAL_PROMPT_TEMPLATE_V9.replace(
 )
 
 
-_GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V10
+_GENERAL_PROMPT_TEMPLATE_V11 = _GENERAL_PROMPT_TEMPLATE_V10.replace(
+    "Do not overwrite unrelated dirty worktrees. `task.origin` is the authoritative repository or record identity when present. Treat it as the lead to start from, not a limit on what you may read and not permission to affect anything else.",
+    "\n".join((
+        "Do not overwrite unrelated dirty worktrees. `task.origin` is the authoritative repository or record identity when present. Treat it as the lead to start from, not a limit on what you may read and not permission to affect anything else.",
+        "Read forge state with the `gh` CLI in a terminal command, such as `GH_PAGER=cat gh issue view N --repo OWNER/REPO --comments`, `gh pr view`, `gh pr diff`, or `gh api`, and never by fetching a `github.com` URL with a web tool. A repository may be private, so a web fetch returns nothing; that is your tool choice failing, not evidence that the origin is missing or unreachable. The gating on `act` operations below governs remote writes only; reads are expected to go through `gh`.",
+    )),
+)
+
+
+_GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V11
 
 # A built-in profile is a release artifact.  Keep its fingerprints beside the
 # prompt so changing the prompt or policy without publishing a new profile
 # revision fails at every runner and scheduler startup, rather than leaving a
 # stale test in a different file to discover the mismatch later.
 GENERAL_PROFILE_RELEASE_REVISION = (
-    "2018a6f332e26540adb1aded36144458ebf724da2aac8519b6fa29c6b8a383d8"
+    "e053679570bac66457955a79c0b56c4fb8c62a735cfe740198f6daa100d0647e"
 )
 GENERAL_PROFILE_RELEASE_PROMPT_SHA256 = (
-    "a06302650b0c55a453ef64baabc68a72486dfbe141828a3d39ad6332d47e05dd"
+    "1749bc45b888263614ff29677524fdc428d4931bdd953e31f6cb71d0a99d49f9"
 )
 
 
