@@ -26,6 +26,7 @@ from .execution_cards import (
     AGENT_SELECTION_TOKEN_CHARS,
     ExecutionCardOperationResult,
     ExecutionCardPresentation,
+    ExecutionCardDeliverables,
     ExecutionCardDetail,
     ExecutionCardScheduleResult,
     ExecutionCardService,
@@ -73,6 +74,7 @@ EXECUTION_CLAIM_SCHEMA = "foxhound.execution-card-service.claim"
 EXECUTION_OPERATION_SCHEMA = "foxhound.execution-card-service.operation"
 EXECUTION_STATS_SCHEMA = "foxhound.execution-card-service.stats"
 EXECUTION_BRIEF_SCHEMA = "foxhound.execution-card-service.brief"
+EXECUTION_DELIVERABLES_SCHEMA = "foxhound.execution-card-service.deliverables"
 EXECUTION_VIEW_SCHEMA = "foxhound.execution-card-service.view"
 EXECUTION_DETAIL_SCHEMA = "foxhound.execution-card-service.detail"
 EXECUTION_DETAIL_SCHEMA_VERSION = 2
@@ -122,6 +124,7 @@ ROUTES = {
     "/v1/execution-cards/agent-options": "execution_agent_options",
     "/v1/execution-cards/agent-selection": "execution_agent_selection",
     "/v1/execution-cards/brief": "execution_brief",
+    "/v1/execution-cards/deliverables": "execution_deliverables",
     "/v1/execution-cards/view": "execution_view",
     "/v1/execution-cards/detail": "execution_detail",
     "/v1/execution-cards/queue": "execution_queue",
@@ -877,6 +880,15 @@ class TaskCardApplication:
                     None if result.refusal is None else result.refusal.value
                 ),
             }
+        if operation == "execution_deliverables":
+            request = _request(payload, required={"card_id", "card_version"})
+            return _execution_deliverables_document(
+                self._execution_cards().deliverables(
+                    _integer(request["card_id"], minimum=1),
+                    expected_version=_integer(
+                        request["card_version"], minimum=1),
+                )
+            )
         if operation == "execution_agent_options":
             request = _request(
                 payload, required={"card_id", "card_version"}
@@ -1508,6 +1520,22 @@ def _execution_view_document(
             "reply_markup": reply_markup,
         }
     return document
+
+
+def _execution_deliverables_document(
+    result: ExecutionCardDeliverables,
+) -> dict[str, Any]:
+    """Serialize one non-mutating, version-fenced deliverables read."""
+    return {
+        "schema": EXECUTION_DELIVERABLES_SCHEMA,
+        "schema_version": SERVICE_VERSION,
+        "ok": result.accepted,
+        "disposition": result.disposition.value,
+        "card_id": result.card_id,
+        "card_version": result.card_version,
+        "text": result.text if result.accepted else None,
+        "refusal": None if result.refusal is None else result.refusal.value,
+    }
 
 
 def _execution_detail_document(result: ExecutionCardDetail) -> dict[str, Any]:

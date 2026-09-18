@@ -1470,7 +1470,7 @@ class ExecutionCardTests(unittest.TestCase):
                 [
                     "revise", "discuss", "approve", "agent", "comment_go",
                     "snooze",
-                    "done", "reassign", "drop", "brief",
+                    "done", "reassign", "drop", "deliverables", "brief",
                 ],
             )
             self.assertEqual(
@@ -1483,6 +1483,7 @@ class ExecutionCardTests(unittest.TestCase):
                     SNOOZE_LABEL_ROW,
                     ["✅ Mark as done"],
                     ["👥 Reassign", "🗑 Drop task"],
+                    ["📦 Deliverables"],
                     ["📋 Task brief"],
                 ],
             )
@@ -2233,6 +2234,38 @@ class ExecutionCardTests(unittest.TestCase):
         self.cards.brief(claim.card.id, expected_version=claim.card.version)
 
         self.assertEqual(self.cards.stats(), before)
+
+    def test_deliverables_are_a_versioned_read_for_review_cards(self):
+        """Prepared Markdown can be sent separately without answering it."""
+        task_id = 1
+        self._plan_review(task_id, "deliverables-read")
+        self.assertEqual(self.cards.schedule().created, 1)
+        claim = self._claim_and_deliver()
+        before = self.cards.stats()
+
+        body, keyboard = render_execution_review_card(claim.card)
+        actions = [
+            parse_execution_review_callback(button["callback_data"])[2]
+            for row in keyboard["inline_keyboard"] for button in row
+        ]
+        self.assertIn("deliverables", actions)
+        self.assertIn("Synthetic deliverable", body)
+
+        result = self.cards.deliverables(
+            claim.card.id, expected_version=claim.card.version
+        )
+
+        self.assertTrue(result.accepted, result.refusal)
+        self.assertEqual(result.card_version, claim.card.version)
+        self.assertIn("# Deliverables", result.text)
+        self.assertIn("Synthetic deliverable", result.text)
+        self.assertEqual(self.cards.stats(), before)
+
+        stale = self.cards.deliverables(
+            claim.card.id, expected_version=claim.card.version + 1
+        )
+        self.assertFalse(stale.accepted)
+        self.assertEqual(stale.refusal, ExecutionCardRefusal.STALE_VERSION)
 
     def test_a_delivered_card_can_be_rendered_again_unchanged(self):
         """Backing out of a sub-menu must land exactly where you left.
@@ -3391,7 +3424,7 @@ class ExecutionCardTests(unittest.TestCase):
                 for button in row
             ],
             ["done", "discuss", "snooze",
-             "reassign", "drop", "brief"],
+             "reassign", "drop", "deliverables", "brief"],
         )
         self.cards.complete_delivery(
             claim.card.id,

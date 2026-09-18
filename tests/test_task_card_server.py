@@ -40,6 +40,7 @@ from foxhound.task_card_server import (
     EXECUTION_AGENT_OPTIONS_SCHEMA,
     EXECUTION_AGENT_SELECTION_SCHEMA,
     EXECUTION_BRIEF_SCHEMA,
+    EXECUTION_DELIVERABLES_SCHEMA,
     EXECUTION_VIEW_SCHEMA,
     EXECUTION_CLAIM_SCHEMA,
     EXECUTION_DETAIL_SCHEMA,
@@ -209,6 +210,60 @@ class TaskCardServerTests(unittest.TestCase):
             request_document(
                 card_id=claim.card.id,
                 card_version=claim.card.version + 1,
+            ),
+        )
+        self.assertFalse(stale["ok"])
+        self.assertIsNone(stale["text"])
+        self.assertEqual(stale["refusal"], "stale_version")
+
+    def test_execution_deliverables_route_is_a_delivered_card_read(self):
+        workflow = self.execution.schedule(1, expected_task_version=1)
+        self.execution.start_action(
+            1, expected_version=workflow.version, action="start"
+        )
+        run = self.execution.claim_next()
+        self.execution.record_result(ExecutionResultEnvelope(
+            result_id="synthetic-deliverables-plan",
+            task_id=1,
+            task_version=1,
+            workflow_version=run.workflow_version,
+            phase="plan",
+            claim_token=run.token,
+            outcome="awaiting_plan",
+            summary="Synthetic plan.",
+            work_markdown="Synthetic work.",
+            deliverables=("## Synthetic deliverable\n\nReview this draft.",),
+        ))
+        self.execution_cards.schedule()
+        claim = self.execution_cards.claim_next()
+        delivered = self.execution_cards.complete_delivery(
+            claim.card.id,
+            expected_version=claim.card.version,
+            claim_token=claim.token,
+            transport="synthetic",
+            delivery_ref="synthetic-deliverables-message",
+        )
+        before = self.execution_cards.stats()
+
+        response = self.app.dispatch(
+            "execution_deliverables",
+            request_document(
+                card_id=claim.card.id,
+                card_version=delivered.card_version,
+            ),
+        )
+
+        self.assertEqual(response["schema"], EXECUTION_DELIVERABLES_SCHEMA)
+        self.assertTrue(response["ok"])
+        self.assertIn("# Deliverables", response["text"])
+        self.assertIn("Synthetic deliverable", response["text"])
+        self.assertEqual(self.execution_cards.stats(), before)
+
+        stale = self.app.dispatch(
+            "execution_deliverables",
+            request_document(
+                card_id=claim.card.id,
+                card_version=delivered.card_version + 1,
             ),
         )
         self.assertFalse(stale["ok"])
