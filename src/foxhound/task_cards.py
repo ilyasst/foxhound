@@ -60,6 +60,25 @@ TASK_CARD_ACTIONS = frozenset({
     "duplicate_reject",
 })
 
+#: Wire tokens for the controls that read a card instead of answering it.
+#: Kept apart from `TASK_CARD_ACTIONS` because the separation is the
+#: guarantee: a read reaches a route that writes nothing, and no list a
+#: client validates against can let it arrive at `act` by accident.
+DUPLICATE_EXPAND = "duplicate_expand"
+DUPLICATE_COLLAPSE = "duplicate_collapse"
+
+TASK_CARD_READS = frozenset({DUPLICATE_EXPAND, DUPLICATE_COLLAPSE})
+
+#: What the expansion may spend on source extracts, per side, in bytes.
+#:
+#: The compact card is bounded by what it drops. The expansion is not bounded
+#: by anything, and the transport's own ceiling is a hard one -- a body over
+#: it is not shortened, it is refused, and the reader loses the card rather
+#: than the evidence. So the expansion stops adding extracts and says how
+#: many it left out. Whole extracts are dropped rather than the body being
+#: cut to length: a body cut mid-tag renders as nothing at all.
+EXPANDED_EVIDENCE_BUDGET_BYTES = 1_400
+
 #: Workflow statuses that mean execution is finished with a task. Everything
 #: else counts as execution still holding it.
 #:
@@ -321,6 +340,26 @@ class CardOperationResult:
         return self.disposition is not CardDisposition.REFUSED
 
 
+@dataclass(frozen=True)
+class CardPresentation:
+    """One delivered card rendered again, or the refusal instead.
+
+    `card` is absent rather than partial on a refusal: a caller that cannot
+    show the card must not be handed something that looks like it could be.
+    """
+
+    disposition: CardDisposition
+    card_id: int
+    card_version: int | None = None
+    card: TaskReviewCard | None = field(default=None, repr=False)
+    expanded: bool = False
+    refusal: CardRefusal | None = None
+
+    @property
+    def accepted(self) -> bool:
+        return self.disposition is not CardDisposition.REFUSED
+
+
 class TaskCardService:
     """Durable scheduling and actions for Foxhound task review cards."""
 
@@ -430,6 +469,53 @@ class TaskCardService:
             except Exception:
                 connection.rollback()
                 raise
+
+    def view(
+        self, card_id: int, *, expected_version: int, expanded: bool
+    ) -> CardPresentation:
+        """One delivered duplicate card, rendered again at another detail.
+
+        A read. Nothing is written and no version moves, so the answers on
+        the keyboard it returns still address the card the reader was looking
+        at -- a restored keyboard whose taps all answer "stale" would be the
+        same dead end reached more slowly.
+
+        Delivered and current are both required. A card that was never
+        delivered has no presentation to reopen, and one already answered or
+        superseded must not be handed back looking answerable.
+
+        Only a duplicate card has a second detail to show. Every other card
+        already shows everything it holds, so asking to expand one is a
+        caller error rather than an empty result.
+        """
+        if not _valid_identity(card_id, expected_version) or not isinstance(
+                expanded, bool):
+            return _view_refused(
+                card_id if isinstance(card_id, int)
+                and not isinstance(card_id, bool) else 0,
+                None, CardRefusal.INVALID_ARGUMENT,
+            )
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                self._card_select() + " WHERE c.id=?", (card_id,)
+            ).fetchone()
+            refusal = _card_guard(row, expected_version)
+            if refusal is None and row["status"] != CardStatus.DELIVERED:
+                refusal = CardRefusal.INVALID_STATE
+            if refusal is None and not _card_is_current(connection, row):
+                refusal = CardRefusal.STALE_VERSION
+            if refusal is not None:
+                return _view_refused(card_id, row, refusal)
+            card = _card(row)
+        if card.duplicate is None:
+            return _view_refused(card_id, row, CardRefusal.INVALID_STATE)
+        return CardPresentation(
+            CardDisposition.UNCHANGED,
+            card_id,
+            card_version=expected_version,
+            card=card,
+            expanded=expanded,
+        )
 
     def due(self, *, limit: int = 20) -> tuple[TaskReviewCard, ...]:
         if not _valid_limit(limit):
@@ -1893,7 +1979,27 @@ def _render_done_check(card: TaskReviewCard, text: str) -> tuple[str, dict]:
     return "\n".join(lines), keyboard
 
 
-def _render_duplicate_check(card: TaskReviewCard, text: str) -> tuple[str, dict]:
+def render_duplicate_view(
+    card: TaskReviewCard, *, expanded: bool
+) -> tuple[str, dict]:
+    """Render a delivered duplicate card again, at the asked-for detail.
+
+    Separate from `render_task_review_card` on its status guard alone: that
+    one renders a card claimed for delivery, this one renders a card the
+    reader already has on screen and is looking at again.
+    """
+    if card.status is not CardStatus.DELIVERED:
+        raise ValueError("task review card is not delivered")
+    if card.duplicate is None:
+        raise ValueError("task review card carries no comparison to open")
+    return _render_duplicate_check(
+        card, html.escape(card.text, quote=False), expanded=expanded,
+    )
+
+
+def _render_duplicate_check(
+    card: TaskReviewCard, text: str, *, expanded: bool = False
+) -> tuple[str, dict]:
     """Ask the reader to adjudicate one suspected duplicate.
 
     The question is only answerable from facts the reader can compare, so the
@@ -1905,6 +2011,12 @@ def _render_duplicate_check(card: TaskReviewCard, text: str) -> tuple[str, dict]
     The detector's own reason is shown as well.  A reader who can see that the
     pair was matched on one re-read mail thread, rather than on a handful of
     shared words, knows how much to trust the suggestion before answering.
+
+    `expanded` renders the same comparison without those compressions: every
+    source extract each side carries, and the detector's basis in its own
+    words.  It is what the reader opens when the compact card is not enough
+    to decide on, and there is nowhere else to look -- the counterpart is
+    usually already closed, and a closed task has no card of its own.
     """
     duplicate = card.duplicate
     recent_closed = duplicate.other_status in {"done", "dropped"}
@@ -1918,10 +2030,10 @@ def _render_duplicate_check(card: TaskReviewCard, text: str) -> tuple[str, dict]
             raised=card.first_raised or card.task_created,
             last=card.last_mentioned, status="open", closed_at=None,
         ),
-        *origin_lines(
+        *_comparison_origin(
             kind=card.origin_kind, record=card.origin_record,
-            item=card.origin_item, sources=_quotable_sources(card.origin_sources),
-            html_output=True,
+            item=card.origin_item, sources=card.origin_sources,
+            expanded=expanded,
         ),
         "",
         f"<b>Task T{duplicate.other_task_id}</b>",
@@ -1931,15 +2043,18 @@ def _render_duplicate_check(card: TaskReviewCard, text: str) -> tuple[str, dict]
             raised=duplicate.other_raised, last=None,
             status=duplicate.other_status, closed_at=duplicate.other_closed_at,
         ),
-        *origin_lines(
+        *_comparison_origin(
             kind=duplicate.other_origin_kind,
             record=duplicate.other_origin_record,
             item=duplicate.other_origin_item,
-            sources=_quotable_sources(duplicate.other_origin_sources),
-            html_output=True,
+            sources=duplicate.other_origin_sources,
+            expanded=expanded,
         ),
     ]
-    reason = _duplicate_reason(duplicate.basis)
+    reason = (
+        _escape(duplicate.basis) if expanded
+        else _duplicate_reason(duplicate.basis)
+    )
     if reason:
         lines.extend(("", f"🔎 <b>Matched on:</b> {reason}"))
     lines.extend((
@@ -1964,8 +2079,66 @@ def _render_duplicate_check(card: TaskReviewCard, text: str) -> tuple[str, dict]
             "callback_data": callback("duplicate_confirm"),
         },
         {"text": "↔️ Keep separate", "callback_data": callback("duplicate_reject")},
+        # A read, never an answer. It rides the same card id and version as
+        # the two answers beside it, so opening the comparison and then
+        # answering it is one decision on one card rather than two.
+        {
+            "text": "↩️ Less" if expanded else "🔍 Show both in full",
+            "callback_data": callback(
+                DUPLICATE_COLLAPSE if expanded else DUPLICATE_EXPAND
+            ),
+        },
     ]]}
     return "\n".join(lines), keyboard
+
+
+def _comparison_origin(
+    *, kind: str, record: str, item: str,
+    sources: Sequence[CardSourceEvidence], expanded: bool,
+) -> list[str]:
+    """One side's provenance, at the detail the surface asked for.
+
+    Compact drops the handoff extract and keeps the rest. Expanded keeps
+    everything that fits and says what it could not fit, because a reader who
+    opened the comparison for the evidence must not be shown a shortened list
+    that looks complete.
+    """
+    if not expanded:
+        return origin_lines(
+            kind=kind, record=record, item=item,
+            sources=_quotable_sources(sources), html_output=True,
+        )
+    kept, dropped = _affordable_sources(sources)
+    lines = origin_lines(
+        kind=kind, record=record, item=item, sources=kept, html_output=True,
+    )
+    if dropped:
+        lines.append(
+            f"⋯ <i>{dropped} further extract"
+            f"{'' if dropped == 1 else 's'} not shown here.</i>"
+        )
+    return lines
+
+
+def _affordable_sources(
+    sources: Sequence[CardSourceEvidence],
+) -> tuple[tuple[CardSourceEvidence, ...], int]:
+    """As many whole extracts as the body can afford, and the count left out.
+
+    At least one is always kept. A side whose single extract is longer than
+    the whole budget is exactly the side worth reading, and answering it with
+    provenance alone would be the compact card again.
+    """
+    kept: list[CardSourceEvidence] = []
+    spent = 0
+    for source in sources:
+        cost = len(source.name.encode("utf-8")) + len(
+            quotable(source.extract).encode("utf-8"))
+        if kept and spent + cost > EXPANDED_EVIDENCE_BUDGET_BYTES:
+            break
+        kept.append(source)
+        spent += cost
+    return tuple(kept), len(sources) - len(kept)
 
 
 def _quotable_sources(
@@ -2189,6 +2362,35 @@ def _valid_digest(value: object) -> bool:
         isinstance(value, str)
         and len(value) == 64
         and all(char in "0123456789abcdef" for char in value)
+    )
+
+
+def _card_is_current(connection: sqlite3.Connection, row) -> bool:
+    """The card still describes the task as it stands now.
+
+    The same fence `act` applies, asked without writing: a read that restored
+    a card the reader could no longer answer would hand back a keyboard whose
+    every tap refuses.
+    """
+    task = connection.execute(
+        "SELECT t.status,t.version," + _bound_source_revision("t.id")
+        + " AS source_revision FROM tasks AS t WHERE t.id=?",
+        (int(row["task_id"]),),
+    ).fetchone()
+    return (
+        task is not None
+        and task["status"] == TaskStatus.OPEN
+        and int(task["version"]) == int(row["task_version"])
+        and (task["source_revision"] or None) == (row["source_revision"] or None)
+    )
+
+
+def _view_refused(card_id: int, row, refusal: CardRefusal) -> CardPresentation:
+    return CardPresentation(
+        CardDisposition.REFUSED,
+        card_id=card_id,
+        card_version=None if row is None else int(row["version"]),
+        refusal=refusal,
     )
 
 

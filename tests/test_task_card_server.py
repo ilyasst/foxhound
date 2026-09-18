@@ -58,6 +58,7 @@ from foxhound.task_card_server import (
     SCHEDULE_SCHEMA,
     STATS_SCHEMA,
     STATS_SCHEMA_VERSION,
+    VIEW_SCHEMA,
     TASK_CARD_CONSUMER_ROLES,
     ConsumerIdentity,
     TaskCardApplication,
@@ -72,7 +73,7 @@ from foxhound.task_card_server import (
     main,
 )
 from review_card_fixture import raise_review_cards
-from foxhound.task_cards import TaskCardService
+from foxhound.task_cards import TASK_CARD_READS, TaskCardService
 from foxhound.task_execution import (
     ExecutionOutcome,
     ExecutionResultEnvelope,
@@ -143,6 +144,16 @@ def request(
     except urllib.error.HTTPError as exc:
         with exc:
             return exc.code, dict(exc.headers), json.load(exc)
+
+
+def _read_control(document: dict) -> str:
+    """The read action the rendered keyboard offers, whichever row it is on."""
+    rows = document["presentation"]["reply_markup"]["inline_keyboard"]
+    return [
+        button["callback_data"].rsplit("|", 1)[1]
+        for row in rows for button in row
+        if button["callback_data"].rsplit("|", 1)[1] in TASK_CARD_READS
+    ][0]
 
 
 class TaskCardServerTests(unittest.TestCase):
@@ -578,6 +589,94 @@ class TaskCardServerTests(unittest.TestCase):
         self.assertEqual((body["held_count"], body["ceiling"]), (2, 2))
         self.assertNotIn("card_id", body)
         self.assertNotIn("task_id", body)
+
+    def test_view_route_opens_a_comparison_without_answering_it(self):
+        """A read: the card stays exactly as answerable as it was."""
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.row_factory = sqlite3.Row
+            # A proposal compares two tasks the same person owns.
+            connection.execute(
+                "UPDATE tasks SET owner='Person A',owner_ref_version=1,"
+                "owner_kind='person',owner_speaker_id='SPK_1',"
+                "owner_canonical_speaker_id='SPK_1',"
+                "owner_speaker_registry_id='registry-A',owner_pinned=0,"
+                "owner_provisional=0 WHERE id IN (1,2)"
+            )
+            task_duplicate_proposals.propose(
+                connection,
+                task_id_a=1,
+                task_id_b=2,
+                basis="Same synthetic deliverable and confirmed owner.",
+                detector="synthetic-detector",
+                now=NOW.isoformat(timespec="seconds"),
+            )
+        self.cards.schedule_duplicate_proposals()
+        digest = hashlib.sha256(TOKEN.encode()).hexdigest()
+        claim = self.cards.claim_next(consumer_digest=digest)
+        self.assertTrue(self.cards.complete_delivery(
+            claim.card.id,
+            expected_version=claim.card.version,
+            claim_token=claim.token,
+            transport="synthetic",
+            delivery_ref="view-message",
+        ).accepted)
+        before = (self.cards.count(), self.cards.event_count())
+
+        response = self.app.dispatch(
+            "view",
+            request_document(
+                card_id=claim.card.id,
+                card_version=claim.card.version,
+                view="duplicate_expand",
+            ),
+        )
+
+        self.assertEqual(response["schema"], VIEW_SCHEMA)
+        self.assertTrue(response["ok"])
+        self.assertTrue(response["expanded"])
+        self.assertIn("Same task?", response["presentation"]["body"])
+        self.assertIn("&lt;private&gt;", response["presentation"]["body"])
+        self.assertIn(
+            "inline_keyboard", response["presentation"]["reply_markup"])
+        self.assertEqual(
+            (self.cards.count(), self.cards.event_count()), before)
+
+        collapsed = self.app.dispatch(
+            "view",
+            request_document(
+                card_id=claim.card.id,
+                card_version=claim.card.version,
+                view="duplicate_collapse",
+            ),
+        )
+        self.assertFalse(collapsed["expanded"])
+        # Which control the reader is offered is what the two views differ
+        # by here: this pair carries no evidence for the expansion to add.
+        self.assertEqual(
+            [_read_control(document) for document in (response, collapsed)],
+            ["duplicate_collapse", "duplicate_expand"],
+        )
+
+        stale = self.app.dispatch(
+            "view",
+            request_document(
+                card_id=claim.card.id,
+                card_version=claim.card.version + 1,
+                view="duplicate_expand",
+            ),
+        )
+        self.assertFalse(stale["ok"])
+        self.assertIsNone(stale["presentation"])
+
+        with self.assertRaises(TaskCardServerRequestError):
+            self.app.dispatch(
+                "view",
+                request_document(
+                    card_id=claim.card.id,
+                    card_version=claim.card.version,
+                    view="duplicate_confirm",
+                ),
+            )
 
     def test_execution_view_route_restores_a_card_without_writing(self):
         self.execution.schedule(1, expected_task_version=1)
