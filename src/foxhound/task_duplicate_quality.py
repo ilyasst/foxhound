@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+from . import task_duplicate_assessments as assessments
 from . import task_duplicate_proposals as proposals
 from .candidate_inbox import CandidateInbox, InboxError
 
@@ -29,13 +30,16 @@ def report(database_path: str | Path) -> tuple[dict[str, object], ...]:
     connection.row_factory = sqlite3.Row
     try:
         inbox._require_current_schema(connection)
-        rows = proposals.counts(connection)
+        proposal_rows = proposals.counts(connection)
+        assessment_rows = assessments.counts(connection)
     finally:
         connection.close()
-    return tuple(_line(row) for row in rows)
+    rows = [_proposal_line(row) for row in proposal_rows]
+    rows.extend(_assessment_line(row) for row in assessment_rows)
+    return tuple(sorted(rows, key=lambda row: str(row["detector"])))
 
 
-def _line(counts: proposals.ProposalCounts) -> dict[str, object]:
+def _proposal_line(counts: proposals.ProposalCounts) -> dict[str, object]:
     settled = counts.confirmed + counts.rejected
     return {
         "detector": counts.detector,
@@ -44,9 +48,40 @@ def _line(counts: proposals.ProposalCounts) -> dict[str, object]:
         "rejected": counts.rejected,
         "reopened": counts.reopened,
         "awaiting": max(counts.proposed - settled, 0),
+        "label_count": settled,
         # None until the reader has answered something: a rate over zero
         # answers would read as a score rather than as an absence of evidence.
         "confirm_rate": None if settled == 0 else round(counts.confirmed / settled, 3),
+    }
+
+
+def _assessment_line(counts: assessments.AssessmentCounts) -> dict[str, object]:
+    """Project local-model results onto reader labels without task content."""
+    settled = counts.confirmed + counts.rejected
+    return {
+        "detector": counts.detector,
+        # A semantic ``redundant`` verdict is the directly comparable proposal.
+        "proposed": counts.redundant,
+        "confirmed": counts.confirmed,
+        "rejected": counts.rejected,
+        "reopened": 0,
+        "awaiting": counts.awaiting,
+        # This is all settled reader evidence available to the semantic
+        # evaluator, including the labels for its non-redundant verdicts.
+        "label_count": counts.labeled,
+        "confirm_rate": None if settled == 0 else round(counts.confirmed / settled, 3),
+        "assessed": counts.assessed,
+        "redundant": counts.redundant,
+        "intersecting": counts.intersecting,
+        "interconnected": counts.interconnected,
+        "latency_ms": counts.latency_ms,
+        "prompt_tokens": counts.prompt_tokens,
+        "completion_tokens": counts.completion_tokens,
+        "cost_usd": 0,
+        # These disagreement counts use the incumbent's explicit lexical
+        # basis, never task text or a stored explanation.
+        "redundant_without_term_overlap": counts.redundant_without_overlap,
+        "not_redundant_with_term_overlap": counts.not_redundant_with_overlap,
     }
 
 
