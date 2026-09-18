@@ -87,6 +87,13 @@ class LocalSemanticEvaluationTests(unittest.TestCase):
         )
 
     def _opener(self, verdict: str = "redundant") -> _Opener:
+        """A gateway reply in the default dialect."""
+        return _Opener({"choices": [{"message": {"content": json.dumps({
+            "judgements": [{"task_id": 2, "verdict": verdict}],
+        })}}], "usage": {"prompt_tokens": 12, "completion_tokens": 3}})
+
+    def _runner_opener(self, verdict: str = "redundant") -> _Opener:
+        """The same answer in the single-machine runner dialect."""
         return _Opener({"message": {"content": json.dumps({
             "judgements": [{"task_id": 2, "verdict": verdict}],
         })}, "prompt_eval_count": 12, "eval_count": 3})
@@ -101,8 +108,9 @@ class LocalSemanticEvaluationTests(unittest.TestCase):
         self.assertEqual((result.pairs_retrieved, result.model_requests,
                           result.redundant, result.prompt_tokens), (1, 1, 1, 12))
         self.assertEqual(len(opener.requests), 1)
-        self.assertEqual(opener.requests[0][0].host, "127.0.0.1:11434")
-        self.assertEqual(opener.requests[0][0].selector, "/api/chat")
+        self.assertEqual(opener.requests[0][0].host, "127.0.0.1:8800")
+        self.assertEqual(
+            opener.requests[0][0].selector, "/v1/chat/completions")
         with closing(sqlite3.connect(self.database)) as connection:
             rows = connection.execute(
                 "SELECT count(*) FROM task_duplicate_assessments"
@@ -273,9 +281,9 @@ class LoopbackStaysLoopbackTests(unittest.TestCase):
         class Chat(http.server.BaseHTTPRequestHandler):
             def do_POST(self):  # noqa: N802
                 seen.append(self.path)
-                body = json.dumps({"message": {"content": json.dumps(
+                body = json.dumps({"choices": [{"message": {"content": json.dumps(
                     {"judgements": [{"task_id": 2, "verdict": "interconnected"}]}
-                )}}).encode("utf-8")
+                )}}]}).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
@@ -297,4 +305,53 @@ class LoopbackStaysLoopbackTests(unittest.TestCase):
             endpoint=f"http://127.0.0.1:{server.server_port}",
         )
 
-        self.assertEqual(seen, ["/api/chat"])
+        self.assertEqual(seen, ["/v1/chat/completions"])
+
+
+class DialectTests(unittest.TestCase):
+    """Two gateways, two shapes, one scanner."""
+
+    def test_the_runner_dialect_still_works(self):
+        reply = {"message": {"content": "X"},
+                 "prompt_eval_count": 12, "eval_count": 3}
+        runner = semantic.DIALECTS["runner"]
+        self.assertEqual(runner.path, "/api/chat")
+        self.assertEqual(runner.content(reply), "X")
+        self.assertEqual(runner.usage(reply), (12, 3))
+
+    def test_the_gateway_dialect_reads_the_first_choice(self):
+        reply = {"choices": [{"message": {"content": "X"}}],
+                 "usage": {"prompt_tokens": 30, "completion_tokens": 7}}
+        gateway = semantic.DIALECTS["openai"]
+        self.assertEqual(gateway.path, "/v1/chat/completions")
+        self.assertEqual(gateway.content(reply), "X")
+        self.assertEqual(gateway.usage(reply), (30, 7))
+
+    def test_a_reply_with_no_usable_choice_is_refused(self):
+        gateway = semantic.DIALECTS["openai"]
+        for reply in ({}, {"choices": None}, {"choices": []},
+                      {"choices": [{}]}, {"choices": ["not an object"]},
+                      "not an object"):
+            with self.subTest(reply=reply):
+                with self.assertRaises(semantic.LocalModelError):
+                    gateway.content(reply)
+
+    def test_absent_usage_counts_as_nothing_rather_than_failing(self):
+        """A gateway that omits usage must not fail the scan."""
+        gateway = semantic.DIALECTS["openai"]
+        self.assertEqual(gateway.usage({"choices": []}), (0, 0))
+        self.assertEqual(gateway.usage({"usage": "not an object"}), (0, 0))
+
+    def test_an_unknown_dialect_is_refused(self):
+        with self.assertRaises(semantic.LocalModelError):
+            semantic._dialect("smoke-signals")
+        with self.assertRaises(semantic.LocalModelError):
+            semantic._dialect(None)
+
+    def test_the_gateway_request_asks_for_json_at_zero_temperature(self):
+        body = semantic.DIALECTS["openai"].body("light", "SYS", "USER")
+        self.assertEqual(body["model"], "light")
+        self.assertEqual(body["temperature"], 0)
+        self.assertEqual(body["response_format"], {"type": "json_object"})
+        self.assertEqual([m["role"] for m in body["messages"]],
+                         ["system", "user"])
