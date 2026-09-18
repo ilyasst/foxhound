@@ -355,3 +355,41 @@ class DialectTests(unittest.TestCase):
         self.assertEqual(body["response_format"], {"type": "json_object"})
         self.assertEqual([m["role"] for m in body["messages"]],
                          ["system", "user"])
+
+
+class TimeoutTests(unittest.TestCase):
+    """A slow answer is not a bad answer."""
+
+    def test_a_slow_gateway_raises_a_timeout_not_an_invalid_judgement(self):
+        import time as _time
+
+        class Slow(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                _time.sleep(2)
+
+            def log_message(self, *arguments):
+                return
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Slow)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+
+        with self.assertRaises(semantic.LocalModelTimeout):
+            semantic._classify(
+                "synthetic task", ((2, "synthetic other"),),
+                model="synthetic-local",
+                endpoint=f"http://127.0.0.1:{server.server_port}",
+                timeout=0.25,
+            )
+
+    def test_a_timeout_is_not_a_local_model_error(self):
+        """The two must stay distinguishable, or slow reads as inaccurate."""
+        self.assertFalse(
+            issubclass(semantic.LocalModelTimeout, semantic.LocalModelError))
+
+    def test_the_default_budget_suits_a_reasoning_capability(self):
+        # A measured reasoning request took over 160 seconds for one line of
+        # JSON; a budget near that would abort work the gateway completes.
+        self.assertGreaterEqual(semantic.TIMEOUT_SECONDS, 300)
