@@ -1,6 +1,7 @@
 import unittest
 
 from foxhound import migrate_database
+from foxhound.candidate_inbox import SCHEMA_VERSION
 from foxhound.effect_intents import EffectIntent, EffectIntentError, EffectReceipt
 from foxhound.forge_action import (
     IssueCommentReceipt,
@@ -162,9 +163,9 @@ class PersistentEffectExecutorTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(state, "completed")
 
-    def test_v40_migration_replays_when_its_tables_already_exist(self):
+    def test_the_effect_migration_replays_when_its_tables_exist(self):
         with closing(sqlite3.connect(self.database)) as connection, connection:
-            connection.execute("PRAGMA user_version = 39")
+            connection.execute("PRAGMA user_version = 40")
 
         migrate_database(self.database)
 
@@ -177,7 +178,7 @@ class PersistentEffectExecutorTests(unittest.TestCase):
             }
             version = connection.execute("PRAGMA user_version").fetchone()[0]
         self.assertEqual(tables, {"effect_intents", "effect_receipts"})
-        self.assertEqual(version, 40)
+        self.assertEqual(version, SCHEMA_VERSION)
 
 
 class _RecordingExecutor:
