@@ -108,6 +108,76 @@ class DuplicateReviewCardTests(unittest.TestCase):
         ).fetchone()
         self.assertIsNotNone(proposal[0])
 
+    def _hold(self, task_id: int, status: str = "queued") -> None:
+        """Put an unfinished execution workflow on one task."""
+        self.connection.execute(
+            "INSERT INTO task_execution_workflows("
+            "task_id,task_version,status,phase,version,created_at,updated_at,"
+            "completed_at,agent_profile_id,agent_profile_revision) "
+            "VALUES(?,1,?,'plan',1,?,?,?,'synthetic',?)",
+            (task_id, status, NOW.isoformat(), NOW.isoformat(),
+             NOW.isoformat() if status in ("completed", "cancelled") else None,
+             f"{7:064x}"),
+        )
+        self.connection.commit()
+
+    def _live_cards(self) -> list[int]:
+        return [int(row[0]) for row in self.connection.execute(
+            "SELECT id FROM task_review_cards WHERE status IN "
+            "('pending','delivering','delivered','snoozed') ORDER BY id"
+        )]
+
+    def test_a_held_pair_is_not_asked_even_when_the_other_side_is_free(self):
+        """Confirming closes one side, so holding either makes it unsafe."""
+        self._hold(2)
+
+        scheduled = self.cards.schedule_duplicate_proposals()
+
+        self.assertEqual(scheduled.asked, 0)
+        self.assertEqual(self._live_cards(), [])
+
+    def test_a_held_pair_does_not_loop_across_repeated_passes(self):
+        """The loop, not the single card, is what reaches the reader.
+
+        Asserting one fewer card in one pass would have passed while this
+        was happening: `_cancel_stale` retracts on the hold and releases the
+        proposal's card binding, restoring exactly what the selection looks
+        for, so every pass cancelled a card and raised another. Only running
+        several passes shows it.
+        """
+        self._hold(1)
+
+        raised = 0
+        for _ in range(5):
+            raised += self.cards.schedule_duplicate_proposals().created
+            raised += self.cards.schedule().created
+
+        self.assertEqual(raised, 0)
+        self.assertEqual(self._live_cards(), [])
+        cancelled = self.connection.execute(
+            "SELECT count(*) FROM task_review_cards WHERE status='cancelled'"
+        ).fetchone()[0]
+        self.assertEqual(cancelled, 0)
+
+    def test_a_card_on_screen_is_retracted_once_a_workflow_takes_the_task(self):
+        """A live card must go when execution picks the task up."""
+        self.assertEqual(self.cards.schedule_duplicate_proposals().asked, 1)
+        self.assertEqual(len(self._live_cards()), 1)
+
+        self._hold(1)
+        self.cards.schedule_duplicate_proposals()
+
+        self.assertEqual(self._live_cards(), [])
+
+    def test_a_finished_workflow_does_not_block_the_question(self):
+        """The hold is about live work, not about ever having run."""
+        self._hold(2, status="completed")
+
+        scheduled = self.cards.schedule_duplicate_proposals()
+
+        self.assertEqual(scheduled.asked, 1)
+        self.assertEqual(len(self._live_cards()), 1)
+
     def test_confirm_records_relation_and_hides_the_noncanonical_task(self) -> None:
         claim = self._deliver()
         result = self.cards.act(
