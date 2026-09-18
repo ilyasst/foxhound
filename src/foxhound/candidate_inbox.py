@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 40
+SCHEMA_VERSION = 41
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -412,6 +412,26 @@ _SCHEMA_COLUMNS = {
         "prior_value",
         "occurred_at",
     ),
+    "effect_intents": (
+        "intent_id",
+        "work_item_id",
+        "work_revision_id",
+        "kind",
+        "target",
+        "payload_digest",
+        "idempotency_key",
+        "freshness_required",
+        "created_at",
+    ),
+    "effect_receipts": (
+        "intent_id",
+        "work_item_id",
+        "work_revision_id",
+        "state",
+        "receipt_id",
+        "reversible",
+        "recorded_at",
+    ),
     "task_owner_events": (
         "sequence",
         "task_id",
@@ -486,13 +506,19 @@ _SCHEMA_COLUMNS = {
 # keeps `work_digest`, the v21 state has neither column but keeps
 # `task_relations`, and the v20 state has none of the five.
 #: Every historical checkpoint derives from the current map by removing what
-#: was added after it, so a column added now has to be stripped here or the
-#: mid-migration checks demand it from a database that predates it.
+#: was added after it, so a table or column added now has to be stripped here
+#: or the mid-migration checks demand it from a database that predates it.
+_SCHEMA_V39_COLUMNS = {
+    name: columns
+    for name, columns in _SCHEMA_COLUMNS.items()
+    if name not in {"effect_intents", "effect_receipts"}
+}
+
 _SCHEMA_V38_COLUMNS = {
     name: tuple(column for column in columns if not (
         name == "execution_review_cards" and column == "work_revision_id"
     ))
-    for name, columns in _SCHEMA_COLUMNS.items()
+    for name, columns in _SCHEMA_V39_COLUMNS.items()
 }
 
 _SCHEMA_V34_COLUMNS = {
@@ -2462,6 +2488,16 @@ _SCHEMA_V39 = (
     "CREATE INDEX IF NOT EXISTS execution_review_cards_work_revision ON execution_review_cards(work_revision_id);",
 )
 
+# An effect is made durable before it crosses an external boundary.  The
+# idempotency key belongs to the intent rather than a receipt because retries
+# need to identify an already-completed effect before calling an adapter.
+# Payloads never enter this schema: their SHA-256 digest is enough to detect a
+# contradictory replay without retaining the text that would be sent.
+_SCHEMA_V41 = (
+    "CREATE TABLE IF NOT EXISTS effect_intents (intent_id TEXT PRIMARY KEY,work_item_id INTEGER NOT NULL REFERENCES work_items(id),work_revision_id INTEGER NOT NULL REFERENCES work_revisions(id),kind TEXT NOT NULL CHECK(kind IN ('forge','email','teams')),target TEXT NOT NULL,payload_digest TEXT NOT NULL,idempotency_key TEXT NOT NULL UNIQUE,freshness_required INTEGER NOT NULL CHECK(freshness_required IN (0,1)),created_at TEXT NOT NULL);",
+    "CREATE TABLE IF NOT EXISTS effect_receipts (intent_id TEXT PRIMARY KEY REFERENCES effect_intents(intent_id),work_item_id INTEGER NOT NULL REFERENCES work_items(id),work_revision_id INTEGER NOT NULL REFERENCES work_revisions(id),state TEXT NOT NULL CHECK(state IN ('completed','failed','cancelled')),receipt_id TEXT,reversible INTEGER NOT NULL CHECK(reversible IN (0,1)),recorded_at TEXT NOT NULL);",
+)
+
 
 # A refused repeat is still something that happened to the workflow. Without
 # an event, the only trace of a pass that answered nothing is its absence from
@@ -3559,6 +3595,18 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 40
+            if version == 40:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V41:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 41")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 41
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:
