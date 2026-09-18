@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+from foxhound import task_cards as cards_module
 from foxhound import migrate_database
 
+import pathlib
 import sqlite3
 import tempfile
 import unittest
@@ -539,16 +541,59 @@ class DuplicateSchedulingCollisionTests(DuplicateReviewCardTests):
 
     def test_a_merely_busy_pair_keeps_its_place(self):
         """An execution hold is transient; superseding it would lose a live question."""
-        self.connection.execute(
-            "INSERT INTO task_execution_workflows(task_id,task_version,status,"
-            "phase,version,failure_count,created_at,updated_at) "
-            "VALUES(1,1,'queued','plan',1,0,?,?)",
-            (NOW.isoformat(), NOW.isoformat()))
-        self.connection.commit()
+        self._workflow(1, "queued")
 
         self.cards.schedule_duplicate_proposals()
 
         self.assertEqual(self._state(), "proposed")
+
+    def _workflow(self, task_id: int, status: str) -> None:
+        """Insert one workflow, satisfying that status's own invariants."""
+        when = NOW.isoformat()
+        running = status == "running"
+        claim = ("d" * 64, when, when, when) if running else (None,) * 4
+        self.connection.execute(
+            "INSERT INTO task_execution_workflows(task_id,task_version,status,"
+            "phase,version,failure_count,created_at,updated_at,due_at,"
+            "claim_token_digest,claimed_at,claim_heartbeat_at,"
+            "claim_expires_at) VALUES(?,1,?,'plan',1,0,?,?,?,?,?,?,?)",
+            (task_id, status, when, when,
+             when if status == "snoozed" else None, *claim))
+        self.connection.commit()
+
+    def test_work_in_flight_still_withholds_the_question(self):
+        """Confirming closes a task; that must not happen under live work."""
+        for status in ("queued", "running", "awaiting_review"):
+            with self.subTest(status=status):
+                self.connection.execute("DELETE FROM task_execution_workflows")
+                self._workflow(1, status)
+                self.assertEqual(
+                    self.cards.schedule_duplicate_proposals().created, 0)
+
+    def test_a_snoozed_workflow_no_longer_withholds_the_question(self):
+        """A snooze defers work with no deadline; it is not work in flight.
+
+        Closing the task under it is safe -- the scheduler cancels any
+        unfinished workflow whose task stops being open -- so waiting on a
+        snooze only kept the question unaskable and the gate shut.
+        """
+        self._workflow(1, "snoozed")
+
+        scheduled = self.cards.schedule_duplicate_proposals()
+
+        self.assertEqual((scheduled.created, scheduled.asked), (1, 1))
+
+    def test_the_ordinary_card_path_still_waits_on_a_snooze(self):
+        """Only the duplicate question was measured; do not widen the change."""
+        self._workflow(1, "snoozed")
+        held = self.connection.execute(
+            "SELECT COUNT(*) FROM task_execution_workflows "
+            "WHERE task_id=1 AND status='snoozed'").fetchone()[0]
+        self.assertEqual(held, 1)
+        self.assertIn(
+            "_EXECUTION_HOLDS",
+            (pathlib.Path(cards_module.__file__).read_text()
+             .split("def _ask_duplicate_proposals")[0]))
 
     def test_the_recorded_versions_are_still_immutable(self):
         """Superseding is a state change; it must not license editing history."""

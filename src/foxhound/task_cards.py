@@ -94,6 +94,38 @@ def _execution_holds(task_id: str) -> str:
 
 _EXECUTION_HOLDS = _execution_holds("t.id")
 
+#: A workflow that exists but is not in flight. A snooze defers work with no
+#: deadline, so treating it as a hold kept a duplicate question unaskable for
+#: as long as the snooze lasted -- while it still counted as unsettled, which
+#: holds the gate that requires every proposal to be settled.
+DORMANT_WORKFLOW_STATUSES = ("snoozed",)
+
+_UNHELD_WORKFLOW_SQL = ",".join(
+    f"'{status}'"
+    for status in FINISHED_WORKFLOW_STATUSES + DORMANT_WORKFLOW_STATUSES
+)
+
+
+def _duplicate_execution_holds(task_id: str) -> str:
+    """SQL predicate: a workflow holds this task against a duplicate question.
+
+    Deliberately narrower than `_execution_holds`, and only for this question.
+    The hold exists because confirming a duplicate closes one of the two
+    tasks, which must not happen under work in flight. A snoozed workflow is
+    not in flight, and closing its task is already safe: the scheduler cancels
+    any unfinished workflow whose task stops being open, so a confirmed
+    duplicate retires the snooze rather than stranding it.
+
+    The ordinary task-card path keeps the wider predicate. Its reasons for
+    waiting on a snoozed workflow are its own, and nothing measured here says
+    they are wrong.
+    """
+    return (
+        "EXISTS(SELECT 1 FROM task_execution_workflows AS workflow "
+        f" WHERE workflow.task_id={task_id} "
+        f" AND workflow.status NOT IN ({_UNHELD_WORKFLOW_SQL}))"
+    )
+
 #: A task whose workflow finished recently. Execution raises its own end card
 #: on completion, so carding the task the moment the workflow lets go asks the
 #: same question from two surfaces at once. The backlog waits one review
@@ -1385,8 +1417,8 @@ class TaskCardService:
             # condition this selection looks for -- a proposed pair with no
             # card -- so every pass cancelled a card and raised another, and
             # the reader was sent every one of them.
-            "AND NOT " + _execution_holds("left_task.id") + " "
-            "AND NOT " + _execution_holds("right_task.id") + " "
+            "AND NOT " + _duplicate_execution_holds("left_task.id") + " "
+            "AND NOT " + _duplicate_execution_holds("right_task.id") + " "
             "AND left_task.version=d.left_task_version "
             "AND right_task.version=d.right_task_version "
             "AND ((left_task.status='open' AND right_task.status "
