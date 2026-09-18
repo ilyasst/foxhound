@@ -271,6 +271,7 @@ class ExecutionResultEnvelope:
     repository_impact: bool = field(default=True, repr=False)
     task_work_directory: str | None = field(default=None, repr=False)
     task_kb_file: str | None = field(default=None, repr=False)
+    artifacts: Sequence[object] = field(default=(), repr=False)
     #: Which reader instruction this run was handed, if any.
     reader_instruction_sequence: int | None = field(
         default=None, repr=False)
@@ -1357,6 +1358,15 @@ class TaskExecutionService:
                         result["work_digest"],
                         result["reader_instruction_sequence"],
                     ),
+                )
+                connection.executemany(
+                    "INSERT INTO execution_result_artifacts("
+                    "result_id,ordinal,relative_path,name,size_bytes,"
+                    "content_digest,run_directory) VALUES(?,?,?,?,?,?,?)",
+                    [(result["result_id"], index, artifact["relative_path"],
+                      artifact["name"], artifact["size_bytes"],
+                      artifact["content_digest"], artifact["run_directory"])
+                     for index, artifact in enumerate(result["artifacts"])],
                 )
                 version = result["workflow_version"] + 1
                 completed = (
@@ -2595,6 +2605,7 @@ def _validated_result(envelope: ExecutionResultEnvelope) -> dict[str, object]:
     )
     repository_references = _repository_references(
         envelope.repository_references)
+    artifacts = _artifact_records(envelope.artifacts)
     if not isinstance(envelope.repository_impact, bool):
         raise ValueError("execution result repository impact is invalid")
     # Deliberately absent from `document` below, and so from the content
@@ -2633,6 +2644,7 @@ def _validated_result(envelope: ExecutionResultEnvelope) -> dict[str, object]:
         "repository_impact": envelope.repository_impact,
         "task_work_directory": task_work_directory,
         "task_kb_file": task_kb_file,
+        "artifacts": artifacts,
     }
     raw = _canonical_json(document).encode("utf-8")
     if len(raw) > MAX_RESULT_BYTES:
@@ -2649,6 +2661,7 @@ def _validated_result(envelope: ExecutionResultEnvelope) -> dict[str, object]:
         "reader_instruction_sequence": instruction,
         "work_digest": work_digest or None,
         "content_digest": digest,
+        "artifacts": artifacts,
         "questions_json": _canonical_json(questions),
         "external_actions_json": _canonical_json(actions),
         "deliverables_json": _canonical_json(deliverables),
@@ -2742,6 +2755,59 @@ def _result_instruction(value: object) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError("execution result reader instruction is invalid")
     return value
+
+
+def _artifact_records(value: object) -> list[dict[str, object]]:
+    if (
+        not isinstance(value, Sequence)
+        or isinstance(value, (str, bytes))
+        or len(value) > 100
+    ):
+        raise ValueError("execution result artifacts are invalid")
+    records: list[dict[str, object]] = []
+    paths: set[str] = set()
+    for item in value:
+        if not isinstance(item, Mapping) or set(item) != {
+            "relative_path", "name", "size_bytes", "content_digest",
+            "run_directory",
+        }:
+            raise ValueError("execution result artifacts are invalid")
+        path = item["relative_path"]
+        name = item["name"]
+        size = item["size_bytes"]
+        digest = item["content_digest"]
+        run = item["run_directory"]
+        path_parts = path.split("/") if isinstance(path, str) else ()
+        if (
+            not isinstance(path, str)
+            or not path
+            or path.startswith("/")
+            or "\\" in path
+            or any(part in {"", ".", ".."} for part in path_parts)
+            or Path(path).name != name
+            or path in paths
+            or not isinstance(name, str)
+            or not name
+            or name in {".", ".."}
+            or "/" in name
+            or "\\" in name
+            or isinstance(size, bool)
+            or not isinstance(size, int)
+            or not 0 <= size <= 2 * 1024 * 1024
+            or not isinstance(digest, str)
+            or not _DIGEST_RE.fullmatch(digest)
+            or _result_path(run, "artifact run directory") is None
+        ):
+            raise ValueError("execution result artifacts are invalid")
+        paths.add(path)
+        records.append({
+            "relative_path": path,
+            "name": name,
+            "size_bytes": size,
+            "content_digest": digest,
+            "run_directory": run,
+        })
+    return records
 
 
 def _result_path(value: object, label: str) -> str | None:

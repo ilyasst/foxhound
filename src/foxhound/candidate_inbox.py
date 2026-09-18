@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 45
+SCHEMA_VERSION = 46
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -390,6 +390,10 @@ _SCHEMA_COLUMNS = {
         "instruction_sequence",
         "occurred_at",
     ),
+    "execution_result_artifacts": (
+        "result_id", "ordinal", "relative_path", "name", "size_bytes",
+        "content_digest", "run_directory",
+    ),
     "task_execution_events": (
         "sequence",
         "task_id",
@@ -553,7 +557,7 @@ _SCHEMA_COLUMNS = {
 _SCHEMA_V42_COLUMNS = {
     name: columns
     for name, columns in _SCHEMA_COLUMNS.items()
-    if name != "task_duplicate_assessments"
+    if name not in {"task_duplicate_assessments", "execution_result_artifacts"}
 }
 
 _SCHEMA_V41_COLUMNS = {
@@ -2803,6 +2807,20 @@ END;
 """,
 )
 
+_SCHEMA_V46 = (
+    """CREATE TABLE IF NOT EXISTS execution_result_artifacts (
+    result_id       TEXT NOT NULL REFERENCES task_execution_results(result_id),
+    ordinal         INTEGER NOT NULL CHECK(ordinal >= 0),
+    relative_path   TEXT NOT NULL CHECK(length(relative_path) BETWEEN 1 AND 1024),
+    name            TEXT NOT NULL CHECK(length(name) BETWEEN 1 AND 255),
+    size_bytes      INTEGER NOT NULL CHECK(size_bytes BETWEEN 0 AND 2097152),
+    content_digest  TEXT NOT NULL CHECK(length(content_digest)=64),
+    run_directory   TEXT NOT NULL CHECK(length(run_directory) BETWEEN 1 AND 4096),
+    PRIMARY KEY(result_id, ordinal),
+    UNIQUE(result_id, relative_path)
+);""",
+)
+
 
 # Structured fields enrich a task without replacing the reader-facing text.
 # Participants are a collection of identity references, so they are never
@@ -4054,6 +4072,16 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 45
+            if version == 45:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    connection.execute(_SCHEMA_V46[0])
+                    connection.execute("PRAGMA user_version = 46")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 46
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:

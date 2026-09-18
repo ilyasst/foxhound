@@ -25,6 +25,8 @@ as task-review cards:
 - one bounded, versioned Comment-and-Go input that advances the card atomically;
 - one bounded, versioned deliverables read for a still-delivered Plan Review
   or Result Review card; and
+- one version-fenced result-artifact listing and one verified file read for
+  the same delivered review cards; and
 - bounded eligible-agent options for a current Start card; and
 - one opaque-token agent selection that returns a refreshed presentation.
 
@@ -39,6 +41,14 @@ chunking does not weaken the card's single versioned decision capability.
 Free-text input is accepted only at `/v1/execution-cards/input`; prompt-only
 callbacks make no durable change, and stale or malformed responses fail
 without partial task, workflow, card, or event writes.
+
+Each execution result permanently records the manifest-authorised artifact
+name, relative path, byte size, digest, and archive run directory in the
+ledger. The public artifact list discloses only ordinal, filename, and size.
+The byte route is available only when the packaged server is configured with a
+canonical `--task-work-root`; it refuses paths outside that root, symlinks,
+non-regular files, changed sizes, and changed digests. Archive paths and
+digests never appear in a response.
 
 Trusted integrations open the agent selector through the dedicated service
 operation; the legacy-compatible Start keyboard does not add an Agent button.

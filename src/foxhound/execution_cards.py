@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import html
 import json
 import os
 import re
 import secrets
 import sqlite3
+import stat
 import unicodedata
 import urllib.parse
 from contextlib import closing
@@ -55,7 +57,7 @@ from .task_ledger import (
     TransitionDisposition,
     _apply_task_transition,
 )
-from .task_archive import review_links
+from .task_archive import MAX_ARTIFACT_BYTES, review_links
 from .task_owner import canonical_owner_display
 
 
@@ -346,6 +348,33 @@ class ExecutionCardDeliverables:
 
 
 @dataclass(frozen=True)
+class ExecutionCardArtifact:
+    """Public metadata and verified bytes for one recorded result artifact."""
+
+    ordinal: int
+    name: str
+    size_bytes: int
+    content: bytes = field(default=b"", repr=False)
+
+
+@dataclass(frozen=True)
+class ExecutionCardArtifacts:
+    """A version-fenced list of files belonging to one delivered result."""
+
+    disposition: ExecutionCardDisposition
+    card_id: int
+    card_version: int | None = None
+    artifacts: tuple[ExecutionCardArtifact, ...] = field(
+        default=(), repr=False
+    )
+    refusal: ExecutionCardRefusal | None = None
+
+    @property
+    def accepted(self) -> bool:
+        return self.disposition is not ExecutionCardDisposition.REFUSED
+
+
+@dataclass(frozen=True)
 class ExecutionCardDetail:
     """Bounded, non-mutating current-run projection for a queue reader."""
 
@@ -424,6 +453,7 @@ class ExecutionCardService:
             [str, Mapping[str, object]], OwnerUpcomingMeeting
         ] | None = None,
         reader_aliases: Sequence[str] = (),
+        artifact_root: str | os.PathLike[str] | None = None,
     ) -> None:
         self.database_path = Path(database_path)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
@@ -449,6 +479,13 @@ class ExecutionCardService:
         self._reader_aliases = frozenset(
             _normalized_owner(alias) for alias in aliases
         )
+        if artifact_root is None:
+            self._artifact_root = None
+        else:
+            root = Path(artifact_root)
+            if not root.is_dir() or root.is_symlink():
+                raise ValueError("execution artifact root is invalid")
+            self._artifact_root = root.resolve(strict=True)
 
     def schedule(self, *, limit: int = 100) -> ExecutionCardScheduleResult:
         if not _valid_limit(limit):
@@ -1390,6 +1427,132 @@ class ExecutionCardService:
             card_version=expected_version,
             text=card_deliverables(card),
         )
+
+    def artifacts(
+        self, card_id: int, *, expected_version: int
+    ) -> ExecutionCardArtifacts:
+        """List exact recorded files for one current delivered review card."""
+        if self._artifact_root is None:
+            return ExecutionCardArtifacts(
+                ExecutionCardDisposition.REFUSED, card_id,
+                refusal=ExecutionCardRefusal.INVALID_STATE,
+            )
+        if not _valid_identity(card_id, expected_version):
+            return ExecutionCardArtifacts(
+                ExecutionCardDisposition.REFUSED, card_id,
+                refusal=ExecutionCardRefusal.INVALID_ARGUMENT,
+            )
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                self._card_select() + " WHERE c.id=?", (card_id,)
+            ).fetchone()
+            refusal = _artifact_card_refusal(row, expected_version)
+            if refusal is not None:
+                return ExecutionCardArtifacts(
+                    ExecutionCardDisposition.REFUSED, card_id, refusal=refusal
+                )
+            artifact_rows = connection.execute(
+                "SELECT ordinal,name,size_bytes FROM execution_result_artifacts "
+                "WHERE result_id=? ORDER BY ordinal",
+                (row["workflow_result_id"],),
+            ).fetchall()
+        return ExecutionCardArtifacts(
+            ExecutionCardDisposition.UNCHANGED,
+            card_id,
+            card_version=expected_version,
+            artifacts=tuple(
+                ExecutionCardArtifact(
+                    ordinal=int(item["ordinal"]), name=str(item["name"]),
+                    size_bytes=int(item["size_bytes"]),
+                ) for item in artifact_rows
+            ),
+        )
+
+    def artifact(
+        self, card_id: int, *, expected_version: int, ordinal: int
+    ) -> ExecutionCardArtifacts:
+        """Read one exact result artifact after validating its saved digest."""
+        listed = self.artifacts(card_id, expected_version=expected_version)
+        if not listed.accepted:
+            return listed
+        if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 0:
+            return ExecutionCardArtifacts(
+                ExecutionCardDisposition.REFUSED, card_id,
+                refusal=ExecutionCardRefusal.INVALID_ARGUMENT,
+            )
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                self._card_select() + " WHERE c.id=?", (card_id,)
+            ).fetchone()
+            refusal = _artifact_card_refusal(row, expected_version)
+            if refusal is not None:
+                return ExecutionCardArtifacts(
+                    ExecutionCardDisposition.REFUSED, card_id, refusal=refusal
+                )
+            record = connection.execute(
+                "SELECT ordinal,relative_path,name,size_bytes,content_digest,"
+                "run_directory FROM execution_result_artifacts "
+                "WHERE result_id=? AND ordinal=?",
+                (row["workflow_result_id"], ordinal),
+            ).fetchone()
+        if record is None:
+            return ExecutionCardArtifacts(
+                ExecutionCardDisposition.REFUSED, card_id,
+                refusal=ExecutionCardRefusal.NOT_FOUND,
+            )
+        try:
+            content = self._read_recorded_artifact(record)
+        except (OSError, ValueError):
+            return ExecutionCardArtifacts(
+                ExecutionCardDisposition.REFUSED, card_id,
+                refusal=ExecutionCardRefusal.INVALID_STATE,
+            )
+        return ExecutionCardArtifacts(
+            ExecutionCardDisposition.UNCHANGED,
+            card_id,
+            card_version=expected_version,
+            artifacts=(ExecutionCardArtifact(
+                ordinal=int(record["ordinal"]), name=str(record["name"]),
+                size_bytes=int(record["size_bytes"]), content=content,
+            ),),
+        )
+
+    def _read_recorded_artifact(self, record: Mapping[str, object]) -> bytes:
+        if self._artifact_root is None:
+            raise ValueError("execution artifact root is unavailable")
+        run_directory = Path(str(record["run_directory"]))
+        relative = Path(str(record["relative_path"]))
+        if run_directory.is_absolute() is False or relative.is_absolute():
+            raise ValueError("recorded artifact path is invalid")
+        if not run_directory.is_relative_to(self._artifact_root):
+            raise ValueError("recorded artifact is outside configured root")
+        run_parts = run_directory.relative_to(self._artifact_root).parts
+        if any(part in {"", ".", ".."} for part in run_parts + relative.parts):
+            raise ValueError("recorded artifact path is invalid")
+        current = self._artifact_root
+        for part in run_parts + relative.parts[:-1]:
+            current = current / part
+            info = current.lstat()
+            if not stat.S_ISDIR(info.st_mode) or current.is_symlink():
+                raise ValueError("recorded artifact path is unsafe")
+        target = current / relative.name
+        descriptor = os.open(target, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            info = os.fstat(descriptor)
+            expected_size = int(record["size_bytes"])
+            if (not stat.S_ISREG(info.st_mode) or expected_size > MAX_ARTIFACT_BYTES
+                    or info.st_size != expected_size):
+                raise ValueError("recorded artifact content is unsafe")
+            with os.fdopen(descriptor, "rb", closefd=False) as source:
+                content = source.read(MAX_ARTIFACT_BYTES + 1)
+        finally:
+            os.close(descriptor)
+        if len(content) != int(record["size_bytes"]):
+            raise ValueError("recorded artifact changed during read")
+        digest = hashlib.sha256(content).hexdigest()
+        if not hmac.compare_digest(digest, str(record["content_digest"])):
+            raise ValueError("recorded artifact digest differs")
+        return content
 
     def detail(
         self, card_id: int, *, expected_version: int
@@ -4411,6 +4574,25 @@ def _card_guard(
         return ExecutionCardRefusal.NOT_FOUND
     if int(row["version"]) != expected_version:
         return ExecutionCardRefusal.STALE_VERSION
+    return None
+
+
+def _artifact_card_refusal(
+    row: Mapping[str, object] | None, expected_version: int,
+) -> ExecutionCardRefusal | None:
+    """Apply the deliverables button's state fence to file reads."""
+    refusal = _card_guard(row, expected_version)
+    if refusal is not None:
+        return refusal
+    if row["status"] != ExecutionCardStatus.DELIVERED:
+        return ExecutionCardRefusal.INVALID_STATE
+    if not _current_card(row):
+        return ExecutionCardRefusal.STALE_VERSION
+    if ExecutionCardKind(row["kind"]) not in {
+        ExecutionCardKind.PLAN_REVIEW,
+        ExecutionCardKind.RESULT_REVIEW,
+    } or row["workflow_result_id"] is None:
+        return ExecutionCardRefusal.INVALID_STATE
     return None
 
 

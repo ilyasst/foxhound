@@ -14,7 +14,7 @@ import re
 import shutil
 import stat
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -63,6 +63,7 @@ from .task_archive import (
     TaskArchivePaths,
     append_result,
     preserve_run_files,
+    recorded_artifacts,
 )
 
 
@@ -638,6 +639,8 @@ class ExecutionWorker:
                     paths.run_directory,
                     include_transcript=False,
                 )
+                envelope = replace(
+                    envelope, artifacts=recorded_artifacts(paths.run_directory))
                 append_result(
                     paths,
                     result=draft,

@@ -46,6 +46,8 @@ class DeploymentConfigTests(unittest.TestCase):
         self.execution_token = self._private_file("execution.token", "b" * 32)
         self.gateway_token = self._private_file("gateway.token", "c" * 32)
         self.config_path = self.root / "deployment.json"
+        self.task_work_root = self.root / "task-work"
+        self.task_work_root.mkdir(mode=0o700)
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -59,7 +61,7 @@ class DeploymentConfigTests(unittest.TestCase):
     def _document(self) -> dict[str, object]:
         return {
             "schema": "foxhound.deployment-config",
-            "schema_version": 7,
+            "schema_version": 8,
             "database": str(self.database),
             "agent_profile_directory": None,
             "card_service": {
@@ -70,6 +72,7 @@ class DeploymentConfigTests(unittest.TestCase):
                 "task_token_files": {"drip": str(self.task_token)},
                 "execution_card_delivery": True,
                 "execution_token_files": {"drip": str(self.execution_token)},
+                "task_work_root": str(self.task_work_root),
                 "gw_endpoint": f"http://{LOOPBACK}:8787",
                 "gw_alias": "example-operator",
                 "gw_token_file": str(self.gateway_token),
@@ -150,6 +153,7 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn("drip=" + str(self.task_token), cards)
         self.assertIn("drip=" + str(self.execution_token), cards)
         self.assertIn("--gw-endpoint", cards)
+        self.assertIn("--task-work-root", cards)
         schedule = config.argv("execution-schedule")
         self.assertEqual(schedule[0], "foxhound-execution-schedule")
         self.assertNotIn("--execution-slot-cap", schedule)
@@ -199,6 +203,7 @@ class DeploymentConfigTests(unittest.TestCase):
     def test_version_one_configuration_remains_valid_without_card_gw_settings(self) -> None:
         document = self._document()
         document["schema_version"] = 1
+        del document["card_service"]["task_work_root"]  # type: ignore[index]
         del document["workflow"]["act_without_asking"]  # type: ignore[index]
         del document["workflow"]["execute_without_asking"]  # type: ignore[index]
         document["execution_runner"] = document.pop("execution_runners")[0]
@@ -214,6 +219,7 @@ class DeploymentConfigTests(unittest.TestCase):
     def test_version_two_configuration_remains_valid(self) -> None:
         document = self._document()
         document["schema_version"] = 2
+        del document["card_service"]["task_work_root"]  # type: ignore[index]
         del document["workflow"]["act_without_asking"]  # type: ignore[index]
         del document["workflow"]["execute_without_asking"]  # type: ignore[index]
         document["execution_runner"] = document.pop("execution_runners")[0]
@@ -229,6 +235,7 @@ class DeploymentConfigTests(unittest.TestCase):
     def test_version_three_configuration_remains_valid_without_title_worker(self) -> None:
         document = self._document()
         document["schema_version"] = 3
+        del document["card_service"]["task_work_root"]  # type: ignore[index]
         del document["workflow"]["act_without_asking"]  # type: ignore[index]
         del document["workflow"]["execute_without_asking"]  # type: ignore[index]
         del document["database_consumers"]["fused_task_titles"]  # type: ignore[index]
@@ -246,6 +253,7 @@ class DeploymentConfigTests(unittest.TestCase):
     ) -> None:
         document = self._document()
         document["schema_version"] = 4
+        del document["card_service"]["task_work_root"]  # type: ignore[index]
         del document["workflow"]["act_without_asking"]  # type: ignore[index]
         del document["workflow"]["execute_without_asking"]  # type: ignore[index]
         del document["database_consumers"]["duplicate_card_schedule"]  # type: ignore[index]
@@ -261,6 +269,7 @@ class DeploymentConfigTests(unittest.TestCase):
         """A file written before the key existed keeps asking, silently."""
         document = self._document()
         document["schema_version"] = 5
+        del document["card_service"]["task_work_root"]  # type: ignore[index]
         del document["workflow"]["act_without_asking"]  # type: ignore[index]
         del document["workflow"]["execute_without_asking"]  # type: ignore[index]
         self._write_config(document)
@@ -317,6 +326,7 @@ class DeploymentConfigTests(unittest.TestCase):
         """A file written for the previous key keeps asking about actions."""
         document = self._document()
         document["schema_version"] = 6
+        del document["card_service"]["task_work_root"]  # type: ignore[index]
         del document["workflow"]["act_without_asking"]  # type: ignore[index]
         self._write_config(document)
 

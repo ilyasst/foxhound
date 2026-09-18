@@ -9,6 +9,7 @@ manifest.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import stat
@@ -262,6 +263,43 @@ def publish_deliverables(
             continue
         copied.append(name)
     return tuple(copied)
+
+
+def recorded_artifacts(run_directory: Path) -> tuple[dict[str, object], ...]:
+    """Return immutable metadata for the run's manifest-authorised files."""
+    records = []
+    for relative in _artifact_manifest(run_directory):
+        path = run_directory / relative
+        descriptor = -1
+        try:
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(path, flags)
+            info = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_size > MAX_ARTIFACT_BYTES
+            ):
+                raise TaskArchiveError("task result artifacts are unsafe")
+            digest = hashlib.sha256()
+            with os.fdopen(descriptor, "rb") as source:
+                descriptor = -1
+                for block in iter(lambda: source.read(64 * 1024), b""):
+                    digest.update(block)
+        except OSError as exc:
+            raise TaskArchiveError(
+                "task result artifacts are unavailable"
+            ) from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        records.append({
+            "relative_path": relative.as_posix(),
+            "name": relative.name,
+            "size_bytes": info.st_size,
+            "content_digest": digest.hexdigest(),
+            "run_directory": str(run_directory),
+        })
+    return tuple(records)
 
 
 def append_result(

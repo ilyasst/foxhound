@@ -36,7 +36,7 @@ from .task_execution import TaskExecutionService
 
 
 DEPLOYMENT_SCHEMA = "foxhound.deployment-config"
-DEPLOYMENT_SCHEMA_VERSION = 7
+DEPLOYMENT_SCHEMA_VERSION = 8
 MAX_CONFIG_BYTES = 64 * 1024
 
 
@@ -56,6 +56,7 @@ class CardServiceConfig:
     gw_endpoint: str | None = None
     gw_alias: str | None = None
     gw_token_file: Path | None = None
+    task_work_root: Path | None = None
 
     def argv(self, database: Path, profile_directory: Path | None) -> list[str]:
         if not self.enabled:
@@ -87,6 +88,8 @@ class CardServiceConfig:
                 "--gw-alias", self.gw_alias,
                 "--gw-token-file", str(self.gw_token_file),
             ))
+        if self.task_work_root is not None:
+            result.extend(("--task-work-root", str(self.task_work_root)))
         return result
 
 
@@ -392,7 +395,7 @@ def _parse_document(document: object) -> DeploymentConfig:
     version = document.get("schema_version")
     if (
         document.get("schema") != DEPLOYMENT_SCHEMA
-        or version not in {1, 2, 3, 4, 5, 6, DEPLOYMENT_SCHEMA_VERSION}
+        or version not in {1, 2, 3, 4, 5, 6, 7, DEPLOYMENT_SCHEMA_VERSION}
         or isinstance(version, bool)
     ):
         raise DeploymentConfigError("deployment configuration version is invalid")
@@ -445,6 +448,8 @@ def _parse_card_service(value: object, *, version: int) -> CardServiceConfig:
     }
     if version >= 2:
         fields.update({"gw_endpoint", "gw_alias", "gw_token_file"})
+    if version >= 8:
+        fields.add("task_work_root")
     document = _object(value, fields)
     bind = document["bind"]
     port = document["port"]
@@ -469,6 +474,12 @@ def _parse_card_service(value: object, *, version: int) -> CardServiceConfig:
         or not isinstance(gw_values[1], str)
     ):
         raise DeploymentConfigError("card service configuration is invalid")
+    task_work_root = (
+        _optional_absolute_path(document.get("task_work_root"))
+        if version >= 8 else None
+    )
+    if version >= 8 and delivery and task_work_root is None:
+        raise DeploymentConfigError("card service configuration is invalid")
     return CardServiceConfig(
         enabled=True,
         bind=bind,
@@ -484,6 +495,7 @@ def _parse_card_service(value: object, *, version: int) -> CardServiceConfig:
         gw_token_file=(
             _absolute_path(gw_values[2]) if gw_values[2] is not None else None
         ),
+        task_work_root=task_work_root,
     )
 
 
@@ -824,6 +836,12 @@ def _validate_runtime(config: DeploymentConfig) -> None:
         load_knowledge_config(
             cards.gw_endpoint, cards.gw_alias, cards.gw_token_file
         )
+    if cards.task_work_root is not None and (
+        not cards.task_work_root.is_dir()
+        or cards.task_work_root.is_symlink()
+        or cards.task_work_root.resolve(strict=True) != cards.task_work_root
+    ):
+        raise DeploymentConfigError("card service configuration is invalid")
     task_roles = {role for role, _ in cards.task_token_files}
     if DRIP_ROLE not in task_roles:
         raise DeploymentConfigError("task card delivery role is unavailable")
