@@ -656,8 +656,11 @@ control. GW failures leave the hold in place. Update records private steering
 but does not start work; Continue is the explicit planning
 approval. Plan and result cards can request more
 investigation, collect one private discussion instruction, execute, snooze for
-a bounded interval, complete, reassign, or drop as appropriate. External
-effects still require their own exact authorization. Every delivered decision
+a bounded interval, complete, reassign, or drop as appropriate. Plan and
+result cards with prepared deliverables also offer a non-mutating
+control that lets the card surface send those bounded Markdown drafts as a
+separate review message while preserving the original card and its controls.
+External effects still require their own exact authorization. Every delivered decision
 advances all affected task and workflow state and resolves the card in one
 SQLite transaction, so a stale or failed input changes nothing. Card rendering
 is HTML-escaped and transport-bounded. If the complete private content cannot
