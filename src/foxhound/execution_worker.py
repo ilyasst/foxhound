@@ -35,6 +35,8 @@ from .task_execution import (
     WorkflowStatus,
     _validated_result,
 )
+from .source_policy import action_grants as _action_grants
+from .source_policy import execution_grants as _execution_grants
 from . import forge_action
 from .workflow_policy import (
     CHECKPOINTS,
@@ -59,7 +61,7 @@ from .task_archive import (
 
 
 RUN_STATE_SCHEMA = "foxhound.execution-run-state"
-RUN_STATE_SCHEMA_VERSION = 4
+RUN_STATE_SCHEMA_VERSION = 5
 INSTRUCTIONS_NAME = "agent-instructions.json"
 WORK_CONTEXT_SCHEMA = "foxhound.execution-work-context"
 WORK_CONTEXT_SCHEMA_VERSION = 6
@@ -203,6 +205,8 @@ class ExecutionRunState:
     agent_profile_id: str
     agent_profile_revision: str
     worker_command: str
+    execution_grants: frozenset[str] = field(default_factory=frozenset)
+    action_grants: frozenset[str] = field(default_factory=frozenset)
     knowledge_root: str | None = None
     task_work_directory: str | None = None
     task_kb_file: str | None = None
@@ -573,7 +577,11 @@ class ExecutionWorker:
 
     def record(self, draft_name: str) -> dict[str, Any]:
         state = load_run_state(self._state_path)
-        service = TaskExecutionService(state.database_path)
+        service = TaskExecutionService(
+            state.database_path,
+            execution_grants=state.execution_grants,
+            action_grants=state.action_grants,
+        )
         draft_path, draft = load_result_draft(
             self._state_path.parent, draft_name
         )
@@ -822,7 +830,11 @@ class ExecutionWorker:
 
     def _active(self) -> tuple[ExecutionRunState, TaskExecutionService]:
         state = load_run_state(self._state_path)
-        service = TaskExecutionService(state.database_path)
+        service = TaskExecutionService(
+            state.database_path,
+            execution_grants=state.execution_grants,
+            action_grants=state.action_grants,
+        )
         self._renew(service, state)
         return state, service
 
@@ -898,17 +910,20 @@ def load_run_state(path: str | os.PathLike[str]) -> ExecutionRunState:
         "agent_profile_revision", "knowledge_root", "worker_command",
     }
     version = document.get("schema_version")
+    archive_fields = {
+        "task_work_directory", "task_kb_file", "task_run_directory",
+    }
+    grant_fields = {"execution_grants", "action_grants"}
     _exact_fields(
         document,
         base_fields | (
-            {"task_work_directory", "task_kb_file", "task_run_directory"}
-            if version == RUN_STATE_SCHEMA_VERSION else set()
-        ),
+            archive_fields if version in {4, RUN_STATE_SCHEMA_VERSION} else set()
+        ) | (grant_fields if version == RUN_STATE_SCHEMA_VERSION else set()),
         "execution run state",
     )
     if (
         document["schema"] != RUN_STATE_SCHEMA
-        or document["schema_version"] not in {3, RUN_STATE_SCHEMA_VERSION}
+        or document["schema_version"] not in {3, 4, RUN_STATE_SCHEMA_VERSION}
         or isinstance(document["schema_version"], bool)
         or not isinstance(document["run_id"], str)
         or not _RUN_ID_RE.fullmatch(document["run_id"])
@@ -964,6 +979,11 @@ def load_run_state(path: str | os.PathLike[str]) -> ExecutionRunState:
         task_work_directory, task_kb_file, task_run_directory
     )}) != 1:
         raise ExecutionWorkerConfigError("execution run state is invalid")
+    try:
+        execution_grants = _execution_grants(document.get("execution_grants"))
+        action_grants = _action_grants(document.get("action_grants"))
+    except ValueError:
+        raise ExecutionWorkerConfigError("execution run state is invalid") from None
     return ExecutionRunState(
         run_id=document["run_id"],
         database_path=database,
@@ -976,6 +996,8 @@ def load_run_state(path: str | os.PathLike[str]) -> ExecutionRunState:
         agent_profile_id=profile_id,
         agent_profile_revision=profile_revision,
         worker_command=worker_command,
+        execution_grants=execution_grants,
+        action_grants=action_grants,
         knowledge_root=_knowledge_root(document["knowledge_root"]),
         task_work_directory=task_work_directory,
         task_kb_file=task_kb_file,

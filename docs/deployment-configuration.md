@@ -164,8 +164,8 @@ from one selected release with arguments rendered from the same document.
 
 ## Gates a machine may stand down
 
-A task passes reader gates on its way through a workflow. Two of them are
-declared per machine, as lists of source kinds, and both default to empty: a
+A task passes reader gates on its way through a workflow. Three of them are
+declared per machine, as lists of source kinds, and all default to empty: a
 machine that says nothing is asked about everything.
 
 `plan_without_asking` skips the Start gate. Enrolling a source is the

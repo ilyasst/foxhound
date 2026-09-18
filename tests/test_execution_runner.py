@@ -126,6 +126,25 @@ class ExecutionRunnerTests(unittest.TestCase):
         values.update(changes)
         return ExecutionRunnerConfig(**values)
 
+    def _bind_origin(self, kind: str) -> None:
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "INSERT INTO candidate_inbox(candidate_id,source_system,"
+                "source_kind,source_record_id,source_item_id,source_revision,"
+                "payload_json,created_at,first_imported_at,updated_at) "
+                "VALUES('candidate-1','gw',?,'record-1','item-1',?,'{}',"
+                "'2030-01-02T03:04:05+00:00','2030-01-02T03:04:05+00:00',"
+                "'2030-01-02T03:04:05+00:00')",
+                (kind, "a" * 64),
+            )
+            connection.execute(
+                "INSERT INTO task_candidate_bindings(candidate_id,"
+                "source_revision,task_id,relation,decided_at) "
+                "VALUES('candidate-1',?,1,'accepted',?)",
+                ("a" * 64, "2030-01-02T03:04:05+00:00"),
+            )
+            connection.commit()
+
     @staticmethod
     def _terminator(process, _grace, **_kwargs) -> bool:
         process.terminated = True
@@ -202,6 +221,9 @@ class ExecutionRunnerTests(unittest.TestCase):
         def popen(argv, **kwargs):
             launched.update(argv=argv, kwargs=kwargs)
             state_path = Path(kwargs["env"]["FOXHOUND_EXECUTION_STATE"])
+            state_document = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state_document["execution_grants"], [])
+            self.assertEqual(state_document["action_grants"], [])
 
             def record():
                 state = load_run_state(state_path)
@@ -266,6 +288,95 @@ class ExecutionRunnerTests(unittest.TestCase):
         self.assertEqual(
             self.service.get(1).status, WorkflowStatus.AWAITING_REVIEW
         )
+
+    def test_a_granted_advance_is_a_recorded_run_not_a_release(self):
+        """A grant queues the next phase instead of raising a card, so the
+        run ends `queued` -- the one status a release also leaves behind.
+        Read as a release it counted as no progress, and every successful
+        run on a deployment that configures a grant exited 70. The new
+        result is what tells them apart.
+        """
+        self._bind_origin("issue")
+        self._ready()
+        launched = {}
+
+        def popen(_argv, **kwargs):
+            state_path = Path(kwargs["env"]["FOXHOUND_EXECUTION_STATE"])
+            document = json.loads(state_path.read_text(encoding="utf-8"))
+            launched["grants"] = document["execution_grants"]
+
+            def record():
+                state = load_run_state(state_path)
+                # As the worker does: the grants the runner handed it.
+                service = TaskExecutionService(
+                    state.database_path,
+                    execution_grants=tuple(state.execution_grants),
+                    action_grants=tuple(state.action_grants),
+                )
+                recorded = service.record_result(
+                    ExecutionResultEnvelope(
+                        result_id=RESULT_ID,
+                        task_id=state.task_id,
+                        task_version=state.task_version,
+                        workflow_version=state.workflow_version,
+                        phase=state.phase,
+                        claim_token=state.claim_token,
+                        outcome=ExecutionOutcome.AWAITING_PLAN,
+                        summary="Synthetic result",
+                        work_markdown="Synthetic plan",
+                    )
+                )
+                self.assertEqual(recorded.status, WorkflowStatus.QUEUED)
+
+            return FakeProcess(callback=record)
+
+        result = run_once(
+            self._config(execution_grants=("issue",)),
+            base_environment={"PATH": "/usr/bin"},
+            popen=popen,
+            run_id_factory=lambda: "e" * 32,
+            terminate=self._terminator,
+        )
+
+        self.assertEqual(launched["grants"], ["issue"])
+        self.assertEqual((result.outcome, result.exit_code), ("recorded", 0))
+        self.assertTrue(result.ok)
+        workflow = self.service.get(1)
+        self.assertEqual(workflow.status, WorkflowStatus.QUEUED)
+        self.assertEqual(workflow.phase, WorkflowPhase.EXECUTE)
+
+    def test_a_released_claim_is_still_no_progress(self):
+        """The other `queued` ending, kept beside the one above: an agent
+        that releases without recording has produced nothing, and must not
+        be reported as a run that did.
+        """
+        self._ready()
+
+        def popen(_argv, **kwargs):
+            state_path = Path(kwargs["env"]["FOXHOUND_EXECUTION_STATE"])
+
+            def release():
+                state = load_run_state(state_path)
+                TaskExecutionService(state.database_path).release(
+                    state.task_id,
+                    expected_version=state.workflow_version,
+                    claim_token=state.claim_token,
+                )
+
+            return FakeProcess(callback=release)
+
+        result = run_once(
+            self._config(),
+            base_environment={"PATH": "/usr/bin"},
+            popen=popen,
+            run_id_factory=lambda: "f" * 32,
+            terminate=self._terminator,
+        )
+
+        self.assertEqual(
+            (result.outcome, result.exit_code), ("released", 70)
+        )
+        self.assertFalse(result.ok)
 
     def test_process_exit_and_start_failure_enter_durable_backoff(self):
         self._ready()
