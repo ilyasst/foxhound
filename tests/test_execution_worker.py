@@ -797,6 +797,144 @@ class ExecutionWorkerTests(unittest.TestCase):
         self.assertEqual(document["external_actions"], [])
         self.assertEqual(document["deliverables"], [])
 
+    def test_draft_uses_this_claims_run_inputs_over_stale_task_inputs(self):
+        """A durable task folder cannot make a later run replay old work."""
+        paths = self._enable_archive()
+        stale = {
+            "result-summary.txt": "Earlier synthetic summary.\n",
+            "result-work.md": "# Earlier synthetic work\n",
+        }
+        for name, text in stale.items():
+            path = paths.working_directory / name
+            path.write_text(text, encoding="utf-8")
+            path.chmod(0o600)
+            # The task folder outlives runs.  Make these files explicitly
+            # older than this claim's private run-state anchor.
+            anchor = self.state_path.stat().st_mtime_ns
+            os.utime(path, ns=(anchor - 1_000_000, anchor - 1_000_000))
+
+        self._write_result_inputs()
+        with knowledge_server() as endpoint:
+            ready = self._worker(endpoint).draft(outcome="awaiting_plan")
+
+        document = json.loads(
+            (self.run_directory / ready["draft"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(document["summary"], "Synthetic result summary")
+        self.assertEqual(document["work_markdown"],
+                         "# Synthetic work\n\nNo private evidence.")
+
+    def test_draft_still_accepts_task_inputs_written_during_this_claim(self):
+        paths = self._enable_archive()
+        for name, text in (
+            ("result-summary.txt", "Task-folder synthetic summary.\n"),
+            ("result-work.md", "# Task-folder synthetic work\n"),
+        ):
+            path = paths.working_directory / name
+            path.write_text(text, encoding="utf-8")
+            path.chmod(0o600)
+
+        with knowledge_server() as endpoint:
+            ready = self._worker(endpoint).draft(outcome="awaiting_plan")
+
+        document = json.loads(
+            (self.run_directory / ready["draft"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(document["summary"], "Task-folder synthetic summary.")
+        self.assertEqual(document["work_markdown"],
+                         "# Task-folder synthetic work")
+
+    def _age_task_input(self, path: Path) -> None:
+        """Make a task-folder file predate this claim's run-state anchor."""
+        anchor = self.state_path.stat().st_mtime_ns
+        os.utime(path, ns=(anchor - 1_000_000, anchor - 1_000_000))
+
+    def test_stale_task_input_is_not_read_when_this_run_wrote_none(self):
+        """The fence must not be undone by the not-found fallback.
+
+        Skipping a stale candidate and then returning that same path as the
+        reported location handed it straight back to the readers, so a name
+        this run never authored still replayed the previous claim.
+        """
+        paths = self._enable_archive()
+        for name, text in (
+            ("result-summary.txt", "Earlier synthetic summary.\n"),
+            ("result-work.md", "# Earlier synthetic work\n"),
+            ("result-questions.json", '["Stale synthetic question?"]\n'),
+        ):
+            path = paths.working_directory / name
+            path.write_text(text, encoding="utf-8")
+            path.chmod(0o600)
+            self._age_task_input(path)
+
+        # This claim authors a summary and a work body, but no questions.
+        self._write_result_input(
+            "result-summary.txt", "Synthetic result summary\n"
+        )
+        self._write_result_input(
+            "result-work.md", "# Synthetic work\n\nNo private evidence.\n"
+        )
+        with knowledge_server() as endpoint:
+            ready = self._worker(endpoint).draft(outcome="awaiting_plan")
+
+        document = json.loads(
+            (self.run_directory / ready["draft"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(document["questions"], [])
+
+    def test_draft_refuses_when_only_stale_task_inputs_exist(self):
+        """A claim that authored nothing is empty, not the previous claim."""
+        paths = self._enable_archive()
+        for name, text in (
+            ("result-summary.txt", "Earlier synthetic summary.\n"),
+            ("result-work.md", "# Earlier synthetic work\n"),
+        ):
+            path = paths.working_directory / name
+            path.write_text(text, encoding="utf-8")
+            path.chmod(0o600)
+            self._age_task_input(path)
+
+        with knowledge_server() as endpoint:
+            with self.assertRaises(ExecutionWorkerDraftError):
+                self._worker(endpoint).draft(outcome="awaiting_plan")
+
+    def test_release_sees_result_inputs_authored_in_the_task_folder(self):
+        """Releasing must not silently drop work authored where it belongs.
+
+        The guard looked only at the private run directory, so an agent that
+        used the intended durable location was released as having produced
+        nothing at all.
+        """
+        paths = self._enable_archive()
+        for name, text in (
+            ("result-summary.txt", "Task-folder synthetic summary.\n"),
+            ("result-work.md", "# Task-folder synthetic work\n"),
+        ):
+            path = paths.working_directory / name
+            path.write_text(text, encoding="utf-8")
+            path.chmod(0o600)
+
+        with knowledge_server() as endpoint:
+            receipt = self._worker(endpoint).release()
+
+        self.assertEqual(receipt["schema"], "foxhound.execution-result-receipt")
+        self.assertEqual(receipt["disposition"], "applied")
+
+    def test_release_ignores_stale_task_inputs_from_an_earlier_claim(self):
+        """A durable leftover must not block every future release."""
+        paths = self._enable_archive()
+        path = paths.working_directory / "result-summary.txt"
+        path.write_text("Earlier synthetic summary.\n", encoding="utf-8")
+        path.chmod(0o600)
+        self._age_task_input(path)
+
+        with knowledge_server() as endpoint:
+            receipt = self._worker(endpoint).release()
+
+        self.assertEqual(
+            receipt["schema"], "foxhound.execution-release-receipt"
+        )
+
     def test_repository_receipt_is_private_and_deduplicated(self):
         receipt = {
             "kind": "issue-comment",
@@ -1168,8 +1306,40 @@ class ResultLocationTests(unittest.TestCase):
             self._state(str(self.task)), self.run)
 
         self.assertEqual(
-            execution_worker._locate_result(order, "result-summary.txt"),
+            execution_worker._locate_result(
+                order, "result-summary.txt",
+                task_folder_not_before=expected.stat().st_mtime_ns - 1,
+            ),
             expected,
+        )
+
+    def test_a_stale_task_result_is_not_returned_as_the_path_to_read(self):
+        """Fencing a candidate and then reporting it is not fencing it.
+
+        Nothing else stands between this path and the readers: whatever comes
+        back here is opened and recorded.
+        """
+        stale = self._write(self.task, "result-summary.txt")
+        order = execution_worker._result_search_path(
+            self._state(str(self.task)), self.run)
+
+        located = execution_worker._locate_result(
+            order, "result-summary.txt",
+            task_folder_not_before=stale.stat().st_mtime_ns + 1,
+        )
+
+        self.assertNotEqual(located, stale)
+        self.assertEqual(located, self.run / "result-summary.txt")
+
+    def test_an_unreadable_anchor_fences_the_shared_folder(self):
+        """No anchor means no way to prove freshness, so nothing shared wins."""
+        self._write(self.task, "result-summary.txt")
+        order = execution_worker._result_search_path(
+            self._state(str(self.task)), self.run)
+
+        self.assertEqual(
+            execution_worker._locate_result(order, "result-summary.txt"),
+            self.run / "result-summary.txt",
         )
 
     def test_a_result_in_the_run_directory_still_records(self):

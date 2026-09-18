@@ -673,35 +673,57 @@ class ExecutionWorker:
         # records keeps working by accident, but the task folder is tried
         # first because that is the intended home.
         search_directories = _result_search_path(state, run_directory)
+        task_folder_not_before = _claim_started_at(self._state_path)
         result_id = state.run_id
         draft = _repository_result(state, {
             "outcome": outcome,
             "summary": _read_result_text(
-                _locate_result(search_directories, "result-summary.txt"),
+                _locate_result(
+                    search_directories, "result-summary.txt",
+                    task_folder_not_before=task_folder_not_before,
+                ),
                 label="execution result summary",
             ),
             "work_markdown": _read_result_text(
-                _locate_result(search_directories, "result-work.md"),
+                _locate_result(
+                    search_directories, "result-work.md",
+                    task_folder_not_before=task_folder_not_before,
+                ),
                 label="execution result work",
             ),
             "questions": _read_optional_string_array(
-                _locate_result(search_directories, "result-questions.json"),
+                _locate_result(
+                    search_directories, "result-questions.json",
+                    task_folder_not_before=task_folder_not_before,
+                ),
                 label="execution result questions",
             ),
             "external_actions": _read_optional_string_array(
-                _locate_result(search_directories, "result-external-actions.json"),
+                _locate_result(
+                    search_directories, "result-external-actions.json",
+                    task_folder_not_before=task_folder_not_before,
+                ),
                 label="execution result external actions",
             ),
             "deliverables": _read_optional_string_array(
-                _locate_result(search_directories, "result-deliverables.json"),
+                _locate_result(
+                    search_directories, "result-deliverables.json",
+                    task_folder_not_before=task_folder_not_before,
+                ),
                 label="execution result deliverables",
             ),
             "repository_references": _read_optional_repository_references(
-                _locate_result(search_directories, "result-repository-references.json"),
+                _locate_result(
+                    search_directories, "result-repository-references.json",
+                    task_folder_not_before=task_folder_not_before,
+                ),
                 label="execution result repository references",
             ),
             "repository_impact": _read_optional_repository_impact(
-                _locate_result(search_directories, "result-repository-impact.json"),
+                _locate_result(
+                    search_directories, "result-repository-impact.json",
+                    task_folder_not_before=task_folder_not_before,
+                ),
                 label="execution result repository impact",
             ),
         }, run_directory)
@@ -762,7 +784,10 @@ class ExecutionWorker:
 
     def release(self) -> dict[str, Any]:
         state, service = self._active()
-        if _result_inputs_present(self._state_path.parent):
+        if _result_inputs_present(
+            _result_search_path(state, self._state_path.parent),
+            task_folder_not_before=_claim_started_at(self._state_path),
+        ):
             if state.phase is WorkflowPhase.PLAN:
                 ready = self.draft(outcome="awaiting_plan")
                 return self.record(ready["draft"])
@@ -1141,21 +1166,78 @@ def _result_search_path(state, run_directory: Path) -> tuple[Path, ...]:
     return tuple(directories)
 
 
-def _locate_result(directories: tuple[Path, ...], name: str) -> Path:
+def _claim_started_at(state_path: Path) -> int | None:
+    """The private run-state mtime, used to fence shared result inputs.
+
+    The runner writes this file after it creates the task archive and before
+    it launches the worker.  It is therefore the durable start marker for the
+    claim.  If it cannot be read, accepting a task-folder file would risk
+    harvesting a prior claim, so callers deliberately fall through to private
+    run inputs instead.
+    """
+    try:
+        return state_path.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def _fenced_out(
+    index: int,
+    directories: tuple[Path, ...],
+    candidate: Path,
+    task_folder_not_before: int | None,
+) -> bool:
+    """Whether a shared task-folder file predates this claim.
+
+    Only the task folder is fenced, and only when a private run directory
+    exists to fall back to.  A claim that cannot read its own anchor fences
+    everything shared, because harvesting a prior claim is the worse failure.
+    """
+    if index != 0 or len(directories) <= 1:
+        return False
+    if task_folder_not_before is None:
+        return True
+    try:
+        return candidate.stat().st_mtime_ns < task_folder_not_before
+    except OSError:
+        return True
+
+
+def _locate_result(
+    directories: tuple[Path, ...],
+    name: str,
+    *,
+    task_folder_not_before: int | None = None,
+) -> Path:
     """The first directory that actually holds `name`.
 
     When none does, the first candidate is returned so the caller reports the
     location the reader was most likely aiming at, rather than the private
     scratch directory they never chose.
     """
-    for directory in directories:
+    fenced_out = False
+    for index, directory in enumerate(directories):
         candidate = directory / name
         try:
             if candidate.is_file():
+                # The task folder is deliberately durable and shared between
+                # runs.  It can be a source for this claim only when this
+                # exact file was written after the run-state anchor.  A stale
+                # file must never outrank the current run's private input.
+                if _fenced_out(
+                    index, directories, candidate, task_folder_not_before
+                ):
+                    fenced_out = True
+                    continue
                 return candidate
         except OSError:
             continue
-    return directories[0] / name
+    # Nothing matched.  Naming the task folder is the friendlier report when
+    # the agent simply never wrote the file -- but not when a file IS there
+    # and was rejected as stale.  Returning it then hands the caller the very
+    # path the fence just refused, and the readers read it happily, which
+    # restores the whole defect for any name this run did not author itself.
+    return (directories[-1] if fenced_out else directories[0]) / name
 
 
 def _result_read_failure(path: Path, exc: Exception) -> str:
@@ -1665,16 +1747,37 @@ def _remove_result_inputs(run_directory: Path) -> None:
             pass
 
 
-def _result_inputs_present(run_directory: Path) -> bool:
-    """Fail closed when this run has any agent-authored result artifact."""
-    for name in _RESULT_INPUTS:
-        try:
-            (run_directory / name).lstat()
-        except FileNotFoundError:
-            continue
-        except OSError:
+def _result_inputs_present(
+    directories: tuple[Path, ...],
+    *,
+    task_folder_not_before: int | None = None,
+) -> bool:
+    """Fail closed when this claim has any agent-authored result artifact.
+
+    Searches everywhere a result may legitimately be authored, under the same
+    fence `_locate_result` applies.  Looking only at the private run directory
+    meant an agent that authored into the task folder -- the intended,
+    documented location -- was released as though it had produced nothing, and
+    its work was dropped without a draft and without a refusal.
+
+    A stale task-folder file is NOT an artifact of this claim, so the fence
+    has to apply here too; otherwise every release on a task whose folder
+    holds an older result would refuse or auto-draft forever.
+    """
+    for index, directory in enumerate(directories):
+        for name in _RESULT_INPUTS:
+            candidate = directory / name
+            try:
+                candidate.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return True
+            if _fenced_out(
+                index, directories, candidate, task_folder_not_before
+            ):
+                continue
             return True
-        return True
     return False
 
 
