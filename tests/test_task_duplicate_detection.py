@@ -311,3 +311,49 @@ class BasisTests(DetectionFixture):
         proposal = proposals.next_open(self.connection)
         self.assertNotIn("owner", proposal.basis)
         self.assertIn("shared task terms", proposal.basis)
+
+
+class StructuredRouteTests(DetectionFixture):
+    def _participant(self, task_id: int, *, kind: str, speaker: str | None) -> None:
+        self.connection.execute(
+            "INSERT INTO task_participants("
+            "task_id,position,kind,speaker_id,canonical_speaker_id,"
+            "speaker_registry_id) VALUES(?,0,?,?,?,?)",
+            (task_id, kind, speaker, speaker if kind == "person" else None,
+             "registry-synthetic" if speaker is not None else None),
+        )
+
+    def test_object_agreement_adds_a_pair_without_shared_words(self):
+        self._task(1, kind="email", text="Arrange a synthetic venue")
+        self._task(2, kind="meeting", text="Confirm the demonstration site")
+        self.connection.execute("UPDATE tasks SET object=' The Sample Archive ' WHERE id=1")
+        self.connection.execute("UPDATE tasks SET object='sample archive' WHERE id=2")
+        result = detection.scan(self.connection, now=NOW)
+        self.assertEqual(result.proposals_recorded, 1)
+        proposal = proposals.next_open(self.connection)
+        routes = self.connection.execute(
+            "SELECT route FROM task_duplicate_proposal_routes WHERE proposal_id=?",
+            (proposal.id,),
+        ).fetchall()
+        self.assertEqual({row["route"] for row in routes}, {"object"})
+
+    def test_resolved_participant_agreement_adds_a_pair_without_words(self):
+        self._task(1, kind="email", text="Arrange a synthetic venue")
+        self._task(2, kind="meeting", text="Confirm the demonstration site")
+        self._participant(1, kind="person", speaker="SPK_001")
+        self._participant(2, kind="person", speaker="SPK_001")
+        self.assertEqual(detection.scan(self.connection, now=NOW).proposals_recorded, 1)
+
+    def test_unresolved_participants_do_not_match(self):
+        self._task(1, kind="email", text="Arrange a synthetic venue")
+        self._task(2, kind="meeting", text="Confirm the demonstration site")
+        self._participant(1, kind="unresolved", speaker="SPK_999")
+        self._participant(2, kind="unresolved", speaker="SPK_999")
+        self.assertEqual(detection.scan(self.connection, now=NOW).proposals_recorded, 0)
+
+    def test_lexical_pair_survives_structural_disagreement(self):
+        self._task(1, kind="email", text="Prepare the synthetic rollout checklist")
+        self._task(2, kind="meeting", text="Draft the synthetic rollout checklist")
+        self.connection.execute("UPDATE tasks SET object='sample archive' WHERE id=1")
+        self.connection.execute("UPDATE tasks SET object='different archive' WHERE id=2")
+        self.assertEqual(detection.scan(self.connection, now=NOW).proposals_recorded, 1)

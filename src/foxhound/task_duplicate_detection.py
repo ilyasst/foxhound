@@ -60,7 +60,7 @@ _STOP_WORDS = frozenset({
 })
 
 
-DETECTOR = "duplicate-review-v2"
+DETECTOR = "duplicate-review-v3"
 
 # Source kinds minted from a forge.  Two of these are paired by the exact
 # `Closes #N` join below, so comparing their prose adds noise and no recall:
@@ -109,6 +109,8 @@ class DuplicateCandidate:
     owner_canonical_speaker_id: str | None
     owner_speaker_registry_id: str | None
     owner_provisional: bool
+    object: str | None = None
+    participants: tuple[tuple[str, str | None, str | None, str | None], ...] = ()
     terms: frozenset[str] = frozenset()
     identifiers: tuple[tuple[str, frozenset[str]], ...] = ()
 
@@ -140,14 +142,14 @@ def scan(connection: sqlite3.Connection, *, now: str,
     weights = _weights(candidates)
 
     considered = signalled = 0
-    pairs: dict[tuple[int, int], str] = {}
+    pairs: dict[tuple[int, int], set[str]] = {}
 
     def offer(left: DuplicateCandidate, right: DuplicateCandidate,
-              reason: str) -> None:
+              route: str) -> None:
         key = (left.task_id, right.task_id)
         if key[0] > key[1]:
             key = (key[1], key[0])
-        pairs.setdefault(key, reason)
+        pairs.setdefault(key, set()).add(route)
 
     for index, left in enumerate(candidates):
         for right in candidates[index + 1:]:
@@ -162,19 +164,38 @@ def scan(connection: sqlite3.Connection, *, now: str,
             if len(shared) < MIN_SHARED_TERMS or coverage < MIN_WEIGHTED_COVERAGE:
                 continue
             signalled += 1
-            offer(left, right, _overlap_basis(left, right, shared))
+            offer(left, right, "words")
+
+    # This is intentionally a second route, rather than a condition on the
+    # lexical route above. Structure may add a reader question but can never
+    # remove one wording would otherwise have raised.
+    for index, left in enumerate(candidates):
+        for right in candidates[index + 1:]:
+            if focus is not None and left.task_id not in focus \
+                    and right.task_id not in focus:
+                continue
+            if not _comparable(left, right, now=now):
+                continue
+            routes = _structured_routes(left, right)
+            if not routes:
+                continue
+            considered += 1
+            signalled += 1
+            for route in routes:
+                offer(left, right, route)
 
     for left, right in _reread_pairs(candidates, focus=focus, now=now):
         signalled += 1
-        offer(left, right, _reread_basis(left, right))
+        offer(left, right, "reread")
 
     recorded = unchanged = refused = 0
-    for (left_id, right_id), basis in sorted(pairs.items()):
+    for (left_id, right_id), routes in sorted(pairs.items()):
         result = proposals.propose(
             connection,
             task_id_a=left_id, task_id_b=right_id,
-            basis=basis, detector=DETECTOR, now=now,
+            basis=_basis(routes, by_id[left_id], by_id[right_id]), detector=DETECTOR, now=now,
             allow_unconfirmed_owner=True,
+            routes=routes,
         )
         if result.disposition is proposals.ProposalDisposition.RECORDED:
             recorded += 1
@@ -344,7 +365,7 @@ def _candidates(connection: sqlite3.Connection) -> Iterable[DuplicateCandidate]:
     # the cross-source gate; neither evidence nor source identifiers leave the
     # database through this scan.
     rows = connection.execute(
-        "SELECT t.id,t.text,t.version,t.status,t.closed_at,c.source_kind,c.created_at,"
+        "SELECT t.id,t.text,t.version,t.status,t.closed_at,t.object,c.source_kind,c.created_at,"
         "c.source_record_id,"
         "t.owner_ref_version,t.owner_kind,t.owner_speaker_id,"
         "t.owner_canonical_speaker_id,t.owner_speaker_registry_id,"
@@ -356,6 +377,16 @@ def _candidates(connection: sqlite3.Connection) -> Iterable[DuplicateCandidate]:
         "AND t.closed_at IS NOT NULL)) AND b.relation='accepted' "
         "ORDER BY t.id"
     ).fetchall()
+    participant_rows = connection.execute(
+        "SELECT task_id,kind,speaker_id,canonical_speaker_id,speaker_registry_id "
+        "FROM task_participants ORDER BY task_id,position"
+    ).fetchall()
+    participants: dict[int, list[tuple[str, str | None, str | None, str | None]]] = {}
+    for participant in participant_rows:
+        participants.setdefault(int(participant["task_id"]), []).append(
+            (participant["kind"], participant["speaker_id"],
+             participant["canonical_speaker_id"], participant["speaker_registry_id"])
+        )
     for row in rows:
         text = row["text"]
         yield DuplicateCandidate(
@@ -373,6 +404,8 @@ def _candidates(connection: sqlite3.Connection) -> Iterable[DuplicateCandidate]:
             owner_canonical_speaker_id=row["owner_canonical_speaker_id"],
             owner_speaker_registry_id=row["owner_speaker_registry_id"],
             owner_provisional=bool(row["owner_provisional"]),
+            object=row["object"],
+            participants=tuple(participants.get(int(row["id"]), [])),
             terms=frozenset(_terms(text)),
             identifiers=_identifiers(text),
         )
@@ -395,6 +428,48 @@ def _same_confirmed_owner(left: DuplicateCandidate,
         and bool(left.owner_speaker_registry_id)
         and not left.owner_provisional
     )
+
+
+def _structured_routes(
+    left: DuplicateCandidate, right: DuplicateCandidate
+) -> set[str]:
+    routes: set[str] = set()
+    if left.object and right.object and _object_key(left.object) == _object_key(right.object):
+        routes.add("object")
+    if _resolved_participants(left.participants) & _resolved_participants(right.participants):
+        routes.add("participant")
+    return routes
+
+
+def _object_key(value: str) -> str:
+    """Normalise only case, surrounding space, and a leading article."""
+    folded = " ".join(_fold(value).split())
+    return re.sub(r"^(?:a|an|the)\s+", "", folded)
+
+
+def _resolved_participants(
+    references: tuple[tuple[str, str | None, str | None, str | None], ...]
+) -> set[tuple[str, str]]:
+    """Return comparable people; unresolved references never self-match."""
+    return {
+        (registry_id, canonical_id or speaker_id)
+        for kind, speaker_id, canonical_id, registry_id in references
+        if kind == "person" and speaker_id is not None and registry_id is not None
+    }
+
+
+def _basis(
+    routes: set[str], left: DuplicateCandidate, right: DuplicateCandidate
+) -> str:
+    if "words" in routes:
+        return _overlap_basis(left, right, left.terms & right.terms)
+    if "reread" in routes:
+        return _reread_basis(left, right)
+    labels = {
+        "object": "structured object agreement",
+        "participant": "structured participant agreement",
+    }
+    return _bounded("; ".join(labels[route] for route in sorted(routes)))
 
 
 def _eligible_status_pair(left: DuplicateCandidate, right: DuplicateCandidate,

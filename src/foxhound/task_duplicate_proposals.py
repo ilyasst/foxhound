@@ -13,6 +13,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
+from typing import Iterable
 
 
 MAX_BASIS = 1_200
@@ -20,6 +21,7 @@ MAX_DETECTOR = 64
 MAX_ACTOR = 200
 MAX_OPEN_PROPOSALS_PER_TASK = 5
 RECENTLY_CLOSED_DAYS = 30
+PROPOSAL_ROUTES = frozenset({"words", "reread", "object", "participant", "legacy"})
 
 
 class DuplicateProposalError(ValueError):
@@ -100,6 +102,7 @@ def propose(
     detector: str,
     now: str,
     allow_unconfirmed_owner: bool = False,
+    routes: Iterable[str] = ("legacy",),
 ) -> ProposalResult:
     """Record one unordered candidate pair for later reader review.
 
@@ -113,6 +116,7 @@ def propose(
     basis = _bounded(basis, "proposal basis", MAX_BASIS)
     detector = _bounded(detector, "detector", MAX_DETECTOR)
     now = _bounded(now, "timestamp", 40)
+    routes = _routes(routes)
     if task_id_a == task_id_b:
         return ProposalResult(
             ProposalDisposition.REFUSED,
@@ -150,6 +154,7 @@ def propose(
         (left_task_id, right_task_id),
     ).fetchone()
     if existing is not None:
+        _record_routes(connection, int(existing["id"]), routes)
         return ProposalResult(
             ProposalDisposition.UNCHANGED, proposal_id=int(existing["id"])
         )
@@ -178,7 +183,28 @@ def propose(
         "proposal_id,kind,actor,occurred_at) VALUES(?, 'proposed', ?, ?)",
         (proposal_id, detector, now),
     )
+    _record_routes(connection, proposal_id, routes)
     return ProposalResult(ProposalDisposition.RECORDED, proposal_id=proposal_id)
+
+
+def _routes(value: Iterable[str]) -> tuple[str, ...]:
+    try:
+        routes = tuple(value)
+    except TypeError as exc:
+        raise DuplicateProposalError("proposal routes are invalid") from exc
+    if not routes or any(route not in PROPOSAL_ROUTES for route in routes):
+        raise DuplicateProposalError("proposal routes are invalid")
+    return tuple(sorted(set(routes)))
+
+
+def _record_routes(
+    connection: sqlite3.Connection, proposal_id: int, routes: tuple[str, ...]
+) -> None:
+    connection.executemany(
+        "INSERT OR IGNORE INTO task_duplicate_proposal_routes(proposal_id,route) "
+        "VALUES(?,?)",
+        ((proposal_id, route) for route in routes),
+    )
 
 
 def get(connection: sqlite3.Connection, proposal_id: int) -> DuplicateProposal:

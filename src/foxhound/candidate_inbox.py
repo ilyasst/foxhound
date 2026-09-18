@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 44
+SCHEMA_VERSION = 45
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -133,6 +133,28 @@ _SCHEMA_COLUMNS = {
         "owner_speaker_registry_id",
         "owner_pinned",
         "owner_provisional",
+        "object",
+        "action",
+        "confidence",
+    ),
+    "task_participants": (
+        "task_id",
+        "position",
+        "kind",
+        "speaker_id",
+        "canonical_speaker_id",
+        "speaker_registry_id",
+    ),
+    "speaker_registry_entries": (
+        "speaker_registry_id",
+        "speaker_id",
+        "canonical_speaker_id",
+        "display_name",
+        "updated_at",
+    ),
+    "task_duplicate_proposal_routes": (
+        "proposal_id",
+        "route",
     ),
     "task_candidate_bindings": (
         "candidate_id",
@@ -719,6 +741,40 @@ _SCHEMA_V11_COLUMNS = {
     )
     for name, columns in _SCHEMA_V14_COLUMNS.items()
 }
+
+# The versioned maps above are used to validate historical schemas while they
+# migrate.  V45 is additive, so remove its tables and task columns from every
+# predecessor map rather than teaching an old migration to expect the future.
+def _before_structured_tasks(
+    schema: dict[str, tuple[str, ...]]
+) -> dict[str, tuple[str, ...]]:
+    return {
+        name: tuple(
+            column for column in columns
+            if not (name == "tasks" and column in {"object", "action", "confidence"})
+        )
+        for name, columns in schema.items()
+        if name not in {
+            "task_participants", "speaker_registry_entries",
+            "task_duplicate_proposal_routes",
+        }
+    }
+
+
+for _schema_map_name in (
+    "_SCHEMA_V11_COLUMNS", "_SCHEMA_V14_COLUMNS", "_SCHEMA_V15_COLUMNS",
+    "_SCHEMA_V16_COLUMNS", "_SCHEMA_V17_COLUMNS", "_SCHEMA_V18_COLUMNS",
+    "_SCHEMA_V20_COLUMNS", "_SCHEMA_V21_COLUMNS", "_SCHEMA_V22_COLUMNS",
+    "_SCHEMA_V24_COLUMNS", "_SCHEMA_V25_COLUMNS", "_SCHEMA_V26_COLUMNS",
+    "_SCHEMA_V27_COLUMNS", "_SCHEMA_V28_COLUMNS", "_SCHEMA_V29_COLUMNS",
+    "_SCHEMA_V30_COLUMNS", "_SCHEMA_V31_COLUMNS", "_SCHEMA_V32_COLUMNS",
+    "_SCHEMA_V33_COLUMNS", "_SCHEMA_V34_COLUMNS", "_SCHEMA_V38_COLUMNS",
+    "_SCHEMA_V39_COLUMNS", "_SCHEMA_V41_COLUMNS", "_SCHEMA_V42_COLUMNS",
+):
+    globals()[_schema_map_name] = _before_structured_tasks(
+        globals()[_schema_map_name]
+    )
+del _schema_map_name
 
 _SCHEMA_OBJECTS = {
     "task_candidate_bindings_one_accepted": "index",
@@ -2748,6 +2804,63 @@ END;
 )
 
 
+# Structured fields enrich a task without replacing the reader-facing text.
+# Participants are a collection of identity references, so they are never
+# packed into a JSON column or copied display names.
+_SCHEMA_V45 = (
+    "ALTER TABLE tasks ADD COLUMN object TEXT ",
+    "ALTER TABLE tasks ADD COLUMN action TEXT ",
+    "ALTER TABLE tasks ADD COLUMN confidence REAL ",
+    """
+CREATE TABLE task_participants (
+    task_id                     INTEGER NOT NULL REFERENCES tasks(id),
+    position                    INTEGER NOT NULL CHECK(position >= 0),
+    kind                        TEXT NOT NULL CHECK(kind IN (
+                                   'person','unresolved','external','group'
+                               )),
+    speaker_id                  TEXT,
+    canonical_speaker_id        TEXT,
+    speaker_registry_id         TEXT,
+    PRIMARY KEY(task_id, position),
+    UNIQUE(task_id, kind, speaker_id, canonical_speaker_id, speaker_registry_id),
+    CHECK(
+        (speaker_id IS NULL AND speaker_registry_id IS NULL)
+        OR (speaker_id IS NOT NULL AND speaker_registry_id IS NOT NULL)
+    ),
+    CHECK(canonical_speaker_id IS NULL OR speaker_id IS NOT NULL),
+    CHECK(kind NOT IN ('external','group') OR (
+        speaker_id IS NULL AND canonical_speaker_id IS NULL
+        AND speaker_registry_id IS NULL
+    )),
+    CHECK(kind <> 'unresolved' OR canonical_speaker_id IS NULL)
+);
+""",
+    """
+CREATE TABLE task_duplicate_proposal_routes (
+    proposal_id INTEGER NOT NULL REFERENCES task_duplicate_proposals(id),
+    route       TEXT NOT NULL CHECK(route IN (
+                    'words','reread','object','participant','legacy'
+                )),
+    PRIMARY KEY(proposal_id, route)
+);
+""",
+    """
+CREATE TABLE speaker_registry_entries (
+    speaker_registry_id   TEXT NOT NULL,
+    speaker_id            TEXT NOT NULL,
+    canonical_speaker_id  TEXT,
+    display_name          TEXT NOT NULL,
+    updated_at            TEXT NOT NULL,
+    PRIMARY KEY(speaker_registry_id, speaker_id)
+);
+""",
+    """
+INSERT OR IGNORE INTO task_duplicate_proposal_routes(proposal_id,route)
+SELECT id,'legacy' FROM task_duplicate_proposals;
+""",
+)
+
+
 _SCHEMA_V20 = (
     # SQLite cannot alter a CHECK in place, and three tables carry a foreign
     # key to this one. Renaming the card table would rewrite all three to
@@ -3905,6 +4018,42 @@ class CandidateInbox:
                     connection.execute("PRAGMA legacy_alter_table = OFF")
                     connection.execute("PRAGMA foreign_keys = ON")
                 version = 44
+            if version == 44:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    columns = {
+                        row["name"] for row in connection.execute(
+                            "PRAGMA table_info(tasks)"
+                        )
+                    }
+                    for name, statement in zip(
+                        ("object", "action", "confidence"), _SCHEMA_V45[:3]
+                    ):
+                        if name not in columns:
+                            connection.execute(statement)
+                    connection.execute(
+                        _SCHEMA_V45[3].replace(
+                            "CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1
+                        )
+                    )
+                    connection.execute(
+                        _SCHEMA_V45[4].replace(
+                            "CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1
+                        )
+                    )
+                    connection.execute(
+                        _SCHEMA_V45[5].replace(
+                            "CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1
+                        )
+                    )
+                    connection.execute(_SCHEMA_V45[6])
+                    connection.execute("PRAGMA user_version = 45")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 45
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:
@@ -4554,6 +4703,19 @@ class CandidateInbox:
             if columns != expected_columns and not (
                 allow_appended_columns
                 and columns[:len(expected_columns)] == expected_columns
+            ) and not (
+                table == "tasks"
+                and tuple(column for column in columns if column not in {
+                    "object", "action", "confidence"
+                }) == expected_columns
+            ) and not (
+                # SQLite re-adds owner columns at the end when a synthetic
+                # historical-migration rehearsal first drops them. V45 may
+                # already have appended its nullable fields, so the final
+                # shape is equivalent but its harmless column order differs.
+                table == "tasks"
+                and set(columns) == set(expected_columns)
+                and len(columns) == len(expected_columns)
             ):
                 raise InboxError("candidate inbox schema is incomplete")
 
