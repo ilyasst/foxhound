@@ -41,6 +41,7 @@ from foxhound.task_card_server import (
     EXECUTION_AGENT_SELECTION_SCHEMA,
     EXECUTION_BRIEF_SCHEMA,
     EXECUTION_DELIVERABLES_SCHEMA,
+    EXECUTION_ARTIFACTS_SCHEMA,
     EXECUTION_VIEW_SCHEMA,
     EXECUTION_CLAIM_SCHEMA,
     EXECUTION_DETAIL_SCHEMA,
@@ -161,6 +162,8 @@ class TaskCardServerTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.database = Path(self.temporary.name) / "foxhound.sqlite3"
+        self.artifact_root = Path(self.temporary.name) / "task-work"
+        self.artifact_root.mkdir(mode=0o700)
         self.clock = Clock()
         migrate_database(self.database)
         with closing(sqlite3.connect(self.database)) as connection, connection:
@@ -191,6 +194,7 @@ class TaskCardServerTests(unittest.TestCase):
             self.database,
             clock=self.clock,
             token_factory=lambda: EXECUTION_DELIVERY_TOKEN,
+            artifact_root=self.artifact_root,
         )
         self.app = TaskCardApplication(
             self.cards,
@@ -281,6 +285,79 @@ class TaskCardServerTests(unittest.TestCase):
         self.assertFalse(stale["ok"])
         self.assertIsNone(stale["text"])
         self.assertEqual(stale["refusal"], "stale_version")
+
+    def test_execution_artifacts_are_listed_and_downloaded_by_record(self):
+        workflow = self.execution.schedule(1, expected_task_version=1)
+        self.execution.start_action(
+            1, expected_version=workflow.version, action="start"
+        )
+        run = self.execution.claim_next()
+        run_directory = self.artifact_root / "task-1" / "runs" / "plan-example"
+        run_directory.mkdir(parents=True, mode=0o700)
+        content = b"Synthetic attachment.\n"
+        (run_directory / "example.txt").write_bytes(content)
+        self.execution.record_result(ExecutionResultEnvelope(
+            result_id="synthetic-artifact-plan",
+            task_id=1,
+            task_version=1,
+            workflow_version=run.workflow_version,
+            phase="plan",
+            claim_token=run.token,
+            outcome="awaiting_plan",
+            summary="Synthetic plan.",
+            work_markdown="Synthetic work.",
+            artifacts=({
+                "relative_path": "example.txt",
+                "name": "example.txt",
+                "size_bytes": len(content),
+                "content_digest": hashlib.sha256(content).hexdigest(),
+                "run_directory": str(run_directory),
+            },),
+        ))
+        self.execution_cards.schedule()
+        claim = self.execution_cards.claim_next()
+        delivered = self.execution_cards.complete_delivery(
+            claim.card.id, expected_version=claim.card.version,
+            claim_token=claim.token, transport="synthetic",
+            delivery_ref="synthetic-artifact-message",
+        )
+
+        listed = self.app.dispatch("execution_artifacts", request_document(
+            card_id=claim.card.id, card_version=delivered.card_version,
+        ))
+        self.assertEqual(listed["schema"], EXECUTION_ARTIFACTS_SCHEMA)
+        self.assertEqual(listed["artifacts"], [{
+            "ordinal": 0, "name": "example.txt", "size_bytes": len(content),
+        }])
+        downloaded = self.app.dispatch("execution_artifact", request_document(
+            card_id=claim.card.id, card_version=delivered.card_version,
+            ordinal=0,
+        ))
+        self.assertEqual(downloaded["artifact"].content, content)
+        with running_server(self.app) as endpoint:
+            raw_request = urllib.request.Request(
+                endpoint + "/v1/execution-cards/artifact",
+                data=json.dumps(request_document(
+                    card_id=claim.card.id,
+                    card_version=delivered.card_version,
+                    ordinal=0,
+                )).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {TOKEN}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(raw_request, timeout=2) as response:
+                self.assertEqual(response.headers["Content-Type"],
+                                 "application/octet-stream")
+                self.assertEqual(response.read(), content)
+        (run_directory / "example.txt").write_bytes(b"Changed.")
+        refused = self.execution_cards.artifact(
+            claim.card.id, expected_version=delivered.card_version, ordinal=0,
+        )
+        self.assertFalse(refused.accepted)
+        self.assertEqual(refused.refusal.value, "invalid_state")
 
     def _queue_card(self):
         self.execution.schedule(1, expected_task_version=1)

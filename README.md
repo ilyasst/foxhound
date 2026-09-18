@@ -674,6 +674,14 @@ a bounded interval, complete, reassign, or drop as appropriate. Plan and
 result cards with prepared deliverables also offer a non-mutating
 control that lets the card surface send those bounded Markdown drafts as a
 separate review message while preserving the original card and its controls.
+When the runner records a manifest-authorised result file, it also records the
+file's name, size, and SHA-256 digest with that exact result. With the
+server's `--task-work-root` set to the canonical task archive root, a trusted
+gateway can list the safe filename/size metadata at
+`POST /v1/execution-cards/artifacts` and fetch one version-fenced file at
+`POST /v1/execution-cards/artifact`. The server rechecks the stored size and
+digest immediately before returning bytes; archive paths and digests never
+cross the API boundary.
 External effects still require their own exact authorization. Every delivered decision
 advances all affected task and workflow state and resolves the card in one
 SQLite transaction, so a stale or failed input changes nothing. Card rendering

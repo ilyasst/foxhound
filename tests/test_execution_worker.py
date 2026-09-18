@@ -1032,8 +1032,18 @@ class ExecutionWorkerTests(unittest.TestCase):
                 "FROM task_execution_results WHERE result_id=?",
                 (RUN_ID,),
             ).fetchone()
+            artifact_record = connection.execute(
+                "SELECT relative_path,name,size_bytes,content_digest,run_directory "
+                "FROM execution_result_artifacts WHERE result_id=?",
+                (RUN_ID,),
+            ).fetchone()
         self.assertEqual(stored, (
             str(paths.working_directory), str(paths.task_file)
+        ))
+        self.assertEqual(artifact_record, (
+            "verification.txt", "verification.txt", 24,
+            hashlib.sha256(b"Synthetic verification.\n").hexdigest(),
+            str(paths.run_directory),
         ))
 
     def test_draft_rejects_invalid_inputs_before_writing(self):
