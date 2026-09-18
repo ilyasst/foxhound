@@ -5,8 +5,12 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sqlite3
 import tempfile
+import http.server
+import threading
+import urllib.request
 import unittest
 from contextlib import closing, redirect_stdout
 from pathlib import Path
@@ -40,7 +44,7 @@ class _Opener:
         self.document = document
         self.requests = []
 
-    def urlopen(self, request, *, timeout: float):
+    def open(self, request, *, timeout: float):
         self.requests.append((request, timeout))
         return _Response(self.document)
 
@@ -209,3 +213,88 @@ class LocalSemanticEvaluationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LoopbackStaysLoopbackTests(unittest.TestCase):
+    """A validated loopback endpoint must stay loopback for the exchange."""
+
+    def _server(self, handler_cls):
+        server = http.server.HTTPServer(("127.0.0.1", 0), handler_cls)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        return server
+
+    def test_a_redirect_away_from_the_endpoint_is_refused(self):
+        reached = []
+
+        class Elsewhere(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                reached.append(self.path)
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *arguments):
+                return
+
+        target = self._server(Elsewhere)
+        elsewhere = f"http://127.0.0.1:{target.server_port}/api/chat"
+
+        class Redirector(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                self.send_response(302)
+                self.send_header("Location", elsewhere)
+                self.end_headers()
+
+            def log_message(self, *arguments):
+                return
+
+        redirector = self._server(Redirector)
+
+        with self.assertRaises(semantic.LocalModelError):
+            semantic._classify(
+                "synthetic task", ((2, "synthetic other"),),
+                model="synthetic-local",
+                endpoint=f"http://127.0.0.1:{redirector.server_port}",
+            )
+        # The point of the test: the second server never heard from us.
+        self.assertEqual(reached, [])
+
+    def test_a_proxy_in_the_environment_is_ignored(self):
+        """Passing an empty ProxyHandler suppresses the default one.
+
+        It is never registered as a handler, so asserting on the handler list
+        proves nothing; what matters is that a proxy variable pointing at a
+        dead port does not stop a loopback request from arriving.
+        """
+        seen = []
+
+        class Chat(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                seen.append(self.path)
+                body = json.dumps({"message": {"content": json.dumps(
+                    {"judgements": [{"task_id": 2, "verdict": "interconnected"}]}
+                )}}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *arguments):
+                return
+
+        server = self._server(Chat)
+        # A proxy that would fail loudly if it were consulted.
+        for name in ("http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"):
+            self.addCleanup(os.environ.pop, name, None)
+            os.environ[name] = "http://127.0.0.1:9"
+
+        semantic._classify(
+            "synthetic task", ((2, "synthetic other"),),
+            model="synthetic-local",
+            endpoint=f"http://127.0.0.1:{server.server_port}",
+        )
+
+        self.assertEqual(seen, ["/api/chat"])
