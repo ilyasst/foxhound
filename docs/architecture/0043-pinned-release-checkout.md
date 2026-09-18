@@ -90,6 +90,53 @@ one at a time does not reduce risk in the usual way: each host carries its own
 database and migrates independently, so a failure on the second host is a
 second incident rather than a warning about the first.
 
+## How a release is built
+
+The procedures above begin with a release that already exists.  Building one is
+four steps, and each has a way of being subtly wrong that does not announce
+itself.
+
+1. **Export the tracked tree at the chosen commit** into a directory under the
+   releases root.  An export, not a copy of a working tree: a copy carries
+   whatever was uncommitted at the time, and the release then is not the commit
+   it is named for, while looking exactly as though it were.
+2. **Name the directory for the revision.**  This is load-bearing rather than a
+   convention.  A promoted release has no git metadata, so the revision every
+   component reports is derived from the directory name; name it anything else
+   and each one reports an unknown revision, which removes the single line that
+   makes a stale process visible.
+3. **Create the environment inside the release and install the release into
+   it, not as an editable install.**  An editable install resolves back to the
+   tree it was installed from, which reintroduces precisely the coupling to a
+   working tree that a release exists to remove.
+4. **Repoint the symlink last**, once the release answers with the revision
+   expected of it.  Until that point nothing running has been touched, which is
+   what makes the first three steps safe to do at any time.
+
+None of this is currently scripted.  That is tolerable while promotion is rare
+and deliberate, but it means the procedure is reproduced from memory each time,
+and steps 1 to 3 are the ones where a mistake produces a release that runs and
+is wrong rather than one that fails.
+
+## Before promoting a release that changes cards
+
+Card buttons are a contract with the system that delivers them, and this
+repository cannot test the other half.
+
+Every button carries a verb.  The delivering side validates each verb against
+its own set and refuses one it does not know — refusing the entire delivery
+sweep, not the single card that carries it.  A release that adds a button
+therefore stops *all* card delivery on every host running it, from the moment
+the symlink moves until the other side is advanced.
+
+The delivering side's verb set must be a superset of the buttons emitted here.
+So it is advanced first, and rolled back last.
+
+Nothing enforces this and no test here can: a new verb is valid on this side,
+and the failure appears only in the deliverer's log, once per sweep interval.
+Treat a release that adds or renames a button as a two-repository deploy with a
+required order, not as a release.
+
 ## Revision reporting
 
 A long-running service reports its deployed revision when it starts.  A process
