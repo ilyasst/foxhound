@@ -21,6 +21,7 @@ from foxhound.card_provenance import (
 from foxhound.candidate_inbox import SCHEMA_VERSION
 from foxhound.contracts import candidate_id_for, comparable_task_digest
 from foxhound.task_cards import (
+    OPEN_REVIEW_INTERVAL,
     ClaimAtCeiling,
     CardDisposition,
     CardRefusal,
@@ -325,6 +326,115 @@ class TaskCardTests(unittest.TestCase):
                     "SELECT source_revision FROM task_review_cards"
                 ).fetchall(),
                 [(expected,)],
+            )
+
+    def set_workflow(self, task_id: int, status: str, *, phase: str = "plan",
+                     completed_at: str | None = None) -> None:
+        """Model one execution workflow row without running a workflow.
+
+        The card surface only ever reads this table, so a row is enough to
+        state the case: execution is holding this task, or has finished with
+        it at a given moment.
+        """
+        stamp = self.clock().isoformat(timespec="seconds")
+        # The table ties each status to its companion columns with CHECK
+        # constraints, so a synthetic row has to be as consistent as a real
+        # one: a running workflow holds a claim, a snoozed one has a wake
+        # time, a parked one a parked stamp, a finished one an end stamp.
+        claim = "c" * 64 if status == "running" else None
+        claimed = stamp if status == "running" else None
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "INSERT INTO task_execution_workflows("
+                "task_id,task_version,status,phase,version,due_at,"
+                "claim_token_digest,claimed_at,claim_heartbeat_at,"
+                "claim_expires_at,parked_at,created_at,updated_at,"
+                "completed_at) VALUES(?,1,?,?,1,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(task_id) DO UPDATE SET status=excluded.status,"
+                "phase=excluded.phase,due_at=excluded.due_at,"
+                "claim_token_digest=excluded.claim_token_digest,"
+                "claimed_at=excluded.claimed_at,"
+                "claim_heartbeat_at=excluded.claim_heartbeat_at,"
+                "claim_expires_at=excluded.claim_expires_at,"
+                "parked_at=excluded.parked_at,updated_at=excluded.updated_at,"
+                "completed_at=excluded.completed_at",
+                (
+                    task_id, status, phase,
+                    stamp if status == "snoozed" else None,
+                    claim, claimed, claimed, claimed,
+                    stamp if status == "parked" else None,
+                    stamp, stamp, completed_at,
+                ),
+            )
+            connection.commit()
+
+    def carded_task_ids(self) -> list[int]:
+        with closing(sqlite3.connect(self.database)) as connection:
+            return [
+                row[0] for row in connection.execute(
+                    "SELECT task_id FROM task_review_cards WHERE status IN "
+                    "('pending','delivering','delivered','snoozed') "
+                    "ORDER BY task_id"
+                )
+            ]
+
+    def test_schedule_leaves_a_task_the_execution_workflow_holds(self):
+        """Execution answers for a task it still holds.
+
+        The backlog card would ask the same task a second question, and two
+        of its four answers close the task -- which cancels the workflow
+        underneath it, without the card ever saying so.
+        """
+        for status in ("awaiting_start", "snoozed", "queued", "running",
+                       "awaiting_review", "parked"):
+            with self.subTest(status=status):
+                self.set_workflow(1, status)
+                self.cards.schedule()
+                self.assertNotIn(1, self.carded_task_ids())
+        # Every task execution is NOT holding is carded as before.
+        self.assertEqual(self.carded_task_ids(), [2, 3, 4])
+
+    def test_schedule_waits_a_review_interval_after_a_workflow_ends(self):
+        """A finished workflow raises its own end card.
+
+        Carding the task the moment execution lets go would put the same
+        question on two surfaces at once, so the backlog treats a task as
+        dormant only one review interval after the workflow ended.
+        """
+        for status in ("completed", "cancelled"):
+            with self.subTest(status=status):
+                self.set_workflow(
+                    1, status,
+                    completed_at=self.clock().isoformat(timespec="seconds"),
+                )
+                self.cards.schedule()
+                self.assertNotIn(1, self.carded_task_ids())
+
+        self.clock.advance(OPEN_REVIEW_INTERVAL + timedelta(seconds=1))
+        self.cards.schedule()
+        self.assertIn(1, self.carded_task_ids())
+
+    def test_a_scheduled_card_is_retracted_when_a_workflow_takes_the_task(self):
+        """The window between scheduling and answering is not safe either.
+
+        A card already on screen is withdrawn through the ordinary stale
+        path, so the completion question it carried goes back to the queue
+        rather than down with the card.
+        """
+        self.cards.schedule()
+        self.assertIn(1, self.carded_task_ids())
+
+        self.set_workflow(1, "queued")
+        result = self.cards.schedule()
+
+        self.assertEqual(result.cancelled, 1)
+        self.assertNotIn(1, self.carded_task_ids())
+        with closing(sqlite3.connect(self.database)) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT status FROM task_review_cards WHERE task_id=1"
+                ).fetchone()[0],
+                "cancelled",
             )
 
     def test_explicit_schedule_is_bounded_ordered_and_idempotent(self):
