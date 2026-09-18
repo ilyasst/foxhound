@@ -142,8 +142,11 @@ def propose(
             refusal=ProposalRefusal.INCOMPATIBLE_OWNER,
         )
     existing = connection.execute(
+        # A superseded proposal is an expired question, not an answered one.
+        # It must not block the pair being raised again at current versions,
+        # which is the only way an expired question can come back.
         "SELECT id FROM task_duplicate_proposals "
-        "WHERE left_task_id=? AND right_task_id=?",
+        "WHERE left_task_id=? AND right_task_id=? AND state<>'superseded'",
         (left_task_id, right_task_id),
     ).fetchone()
     if existing is not None:
