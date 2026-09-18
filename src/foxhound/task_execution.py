@@ -311,10 +311,26 @@ class ExecutionReadiness:
 
 @dataclass(frozen=True)
 class ExecutionScheduleResult:
-    """Content-free result of one bounded new-task scheduling pass."""
+    """Content-free result of one bounded new-task scheduling pass.
+
+    `remaining` alone cannot say why a candidate was left behind. A pass that
+    scheduled nothing because nothing was eligible and a pass that scheduled
+    nothing because a capacity cap is saturated report the same two numbers,
+    and only the second one means new work has stopped entering the system.
+    That ambiguity is not theoretical: one deployment ran `scheduled: 0,
+    remaining: 36` every five minutes for days -- a `plan_ready_cap` of 10
+    against 158 ready plans -- while every pass logged `ok: true`.
+
+    `capped` closes it. It counts candidates this pass declined to admit
+    *because a cap was binding*, and deliberately not those left for the next
+    pass by `limit`, which is ordinary paging and drains on its own.
+    """
 
     scheduled: int
     remaining: int
+    #: Eligible candidates held back by `plan_ready_cap` or
+    #: `awaiting_reader_cap`. Non-zero means admission is closed, not idle.
+    capped: int = 0
 
 
 @dataclass(frozen=True)
@@ -552,6 +568,7 @@ class TaskExecutionService:
                     "t.id"
                 )
                 scheduled = 0
+                capped = 0
                 for row in rows:
                     if scheduled >= limit:
                         break
@@ -562,11 +579,13 @@ class TaskExecutionService:
                     if status.value in WORKING_STATUSES:
                         if plan_room is not None:
                             if plan_room == 0:
+                                capped += 1
                                 continue
                             plan_room -= 1
                     else:
                         if waiting_room is not None:
                             if waiting_room == 0:
+                                capped += 1
                                 continue
                             waiting_room -= 1
                     profile = self._profile_for(row["origin_kind"])
@@ -597,6 +616,7 @@ class TaskExecutionService:
                 return ExecutionScheduleResult(
                     scheduled=promoted + granted + scheduled,
                     remaining=eligible - scheduled,
+                    capped=capped,
                 )
             except Exception:
                 connection.rollback()

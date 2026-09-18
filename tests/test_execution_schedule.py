@@ -51,7 +51,9 @@ class ExecutionScheduleCommandTests(unittest.TestCase):
                 "--database", str(self.database), "--limit", "1"
             ]), 0)
         first = json.loads(first_stdout.getvalue())
-        self.assertEqual(first, {"ok": True, "remaining": 1, "scheduled": 1})
+        self.assertEqual(
+            first, {"ok": True, "capped": 0, "remaining": 1, "scheduled": 1}
+        )
         self.assertNotIn("Synthetic task", first_stdout.getvalue())
         self.assertEqual(
             TaskExecutionService(self.database).get(1).status,
@@ -65,7 +67,7 @@ class ExecutionScheduleCommandTests(unittest.TestCase):
             ]), 0)
         self.assertEqual(
             json.loads(second_stdout.getvalue()),
-            {"ok": True, "remaining": 0, "scheduled": 1},
+            {"ok": True, "capped": 0, "remaining": 0, "scheduled": 1},
         )
 
         replay_stdout = StringIO()
@@ -75,7 +77,7 @@ class ExecutionScheduleCommandTests(unittest.TestCase):
             ]), 0)
         self.assertEqual(
             json.loads(replay_stdout.getvalue()),
-            {"ok": True, "remaining": 0, "scheduled": 0},
+            {"ok": True, "capped": 0, "remaining": 0, "scheduled": 0},
         )
 
     def test_unsafe_database_parent_and_invalid_limit_fail_closed(self):
@@ -115,7 +117,7 @@ class ExecutionScheduleCommandTests(unittest.TestCase):
         self.assertEqual(scheduled.agent_profile_revision, profile.revision)
         self.assertEqual(
             json.loads(stdout.getvalue()),
-            {"ok": True, "remaining": 1, "scheduled": 1},
+            {"ok": True, "capped": 0, "remaining": 1, "scheduled": 1},
         )
 
     def test_invalid_default_profile_configuration_schedules_nothing(self):
@@ -166,6 +168,58 @@ class ExecutionScheduleCommandTests(unittest.TestCase):
                 ).fetchone()[0],
                 0,
             )
+
+    def test_a_saturated_cap_is_reported_and_not_mistaken_for_idle(self):
+        """A cap that stops admission must not report as an idle pass.
+
+        Both tasks are eligible; a cap of zero admits neither. Before
+        `capped` existed this printed `scheduled: 0, remaining: 2` -- the
+        same shape a pass with nothing to do prints -- so a deployment whose
+        intake had stopped entirely looked healthy on every run.
+        """
+        stdout, stderr = StringIO(), StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            self.assertEqual(main([
+                "--database", str(self.database),
+                "--plan-ready-cap", "0",
+                "--awaiting-reader-cap", "0",
+            ]), 0)
+        self.assertEqual(
+            json.loads(stdout.getvalue()),
+            {"ok": True, "capped": 2, "remaining": 2, "scheduled": 0},
+        )
+        self.assertEqual(
+            stderr.getvalue(),
+            "foxhound execution schedule: "
+            "2 eligible task(s) held by a capacity cap\n",
+        )
+        self.assertNotIn("Synthetic task", stderr.getvalue())
+        with closing(sqlite3.connect(self.database)) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM task_execution_workflows"
+                ).fetchone()[0],
+                0,
+            )
+
+    def test_a_paged_pass_is_not_reported_as_capped(self):
+        """`limit` leaving work behind is paging, not starvation.
+
+        The distinction is the whole point: a paged pass drains by itself on
+        the next tick, so reporting it the same way a saturated cap is
+        reported would make the new signal noise and train a reader to
+        ignore it.
+        """
+        stdout, stderr = StringIO(), StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            self.assertEqual(main([
+                "--database", str(self.database), "--limit", "1",
+            ]), 0)
+        self.assertEqual(
+            json.loads(stdout.getvalue()),
+            {"ok": True, "capped": 0, "remaining": 1, "scheduled": 1},
+        )
+        self.assertEqual(stderr.getvalue(), "")
 
     def test_internal_failure_is_content_free(self):
         private_text = "Synthetic private task content"
