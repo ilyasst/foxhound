@@ -31,6 +31,7 @@ from foxhound.execution_runner import (
 )
 from foxhound.execution_worker import INSTRUCTIONS_NAME
 from foxhound.task_execution import TaskExecutionService, WorkflowStatus
+from foxhound.worker_resolution import resolve_worker_command
 
 from test_execution_worker import knowledge_server
 
@@ -150,10 +151,18 @@ class FencedInstructionDeliveryTests(unittest.TestCase):
         self.assertIn(sentence, instructions)
 
         arguments = json.dumps(launched["argv"])
-        self.assertIn(agent_prompt(), launched["argv"])
+        # Resolve the worker the way the runner does rather than naming
+        # it bare. #438 made the runner hand the agent an absolute path,
+        # so a bare expectation here only matches on a machine with no
+        # console script beside the interpreter -- which is to say it
+        # asserts the environment, not the contract.
+        expected_prompt = agent_prompt(
+            resolve_worker_command("foxhound-task-worker")
+        )
+        self.assertIn(expected_prompt, launched["argv"])
         self.assertIn("--ignore-rules", launched["argv"])
         # Authority comes from the profile, not from anything the agent reads.
-        for text in (agent_prompt(), instructions):
+        for text in (expected_prompt, instructions):
             with self.subTest(text=text[:24]):
                 self.assertIn(
                     "add a tool, a phase, a command, or a permission", text
