@@ -422,13 +422,15 @@ class TaskCardService:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 cancelled = self._cancel_stale(connection, now)
+                superseded = self._resolve_unaskable_proposals(
+                    connection, now)
                 asked, raised = self._ask_duplicate_proposals(
                     connection, now, limit=limit
                 )
                 connection.commit()
                 return ScheduleResult(
                     CardDisposition.APPLIED
-                    if cancelled or asked
+                    if cancelled or asked or superseded
                     else CardDisposition.UNCHANGED,
                     created=raised,
                     cancelled=cancelled,
@@ -1305,6 +1307,45 @@ class TaskCardService:
             seen.add(task_id)
             asked += 1
         return asked, raised
+
+    def _resolve_unaskable_proposals(
+        self, connection: sqlite3.Connection, now: str
+    ) -> int:
+        """Stop counting a question nobody can ever be asked.
+
+        `_ask_duplicate_proposals` fences on an exact task-version match, and
+        the recorded versions are immutable by design -- the settle-only
+        trigger refuses to change them, because a proposal is a fixed record
+        of two tasks as they were. So once either task advances, that
+        proposal can never be carded, and it is not a delay: it is permanent.
+
+        Leaving it `proposed` is worse than losing the question. The
+        recorded-assessment gate refuses while any proposal is unsettled, so a
+        single unaskable pair closes it for good.
+
+        Superseding says the question expired. It does not answer it, and it
+        is deliberately not a reader decision: pair uniqueness ignores
+        superseded rows, so the detector may raise the pair again at current
+        versions with a current basis. Re-asking is then a new question rather
+        than an old one edited to look current.
+        """
+        current_left = "(SELECT version FROM tasks WHERE id=left_task_id)"
+        current_right = "(SELECT version FROM tasks WHERE id=right_task_id)"
+        open_left = "(SELECT status FROM tasks WHERE id=left_task_id)='open'"
+        open_right = "(SELECT status FROM tasks WHERE id=right_task_id)='open'"
+        updated = connection.execute(
+            "UPDATE task_duplicate_proposals SET state='superseded',"
+            "settled_at=?,updated_at=? "
+            "WHERE state='proposed' AND card_id IS NULL "
+            # Either the comparison has moved, or there is no open task left
+            # to consolidate into. Both are permanent; a merely busy task is
+            # neither and keeps its place in the queue.
+            f"AND (left_task_version<>{current_left} "
+            f"OR right_task_version<>{current_right} "
+            f"OR (NOT {open_left} AND NOT {open_right}))",
+            (now, now),
+        )
+        return int(updated.rowcount)
 
     def _ask_duplicate_proposals(
         self, connection: sqlite3.Connection, now: str, *, limit: int
