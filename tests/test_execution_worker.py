@@ -15,6 +15,7 @@ import types
 import threading
 import unittest
 from contextlib import closing, contextmanager, redirect_stderr, redirect_stdout
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import StringIO
 from pathlib import Path
@@ -223,6 +224,54 @@ class ExecutionWorkerTests(unittest.TestCase):
         return ExecutionWorker(self.state_path, KnowledgeClientConfig(
             endpoint=endpoint, alias="primary", token=TOKEN
         ), **changes)
+
+    def _bind_fresh_origin(
+        self, task_id: int, *, kind: str, item_id: str,
+    ) -> None:
+        """Bind one synthetic forge origin for an effect-fence test."""
+        now = "2030-01-02T03:04:05+00:00"
+        candidate_id = f"fresh-{task_id}"
+        with closing(sqlite3.connect(self.database)) as connection:
+            if task_id != 1:
+                connection.execute(
+                    "INSERT INTO tasks(id,status,text,owner,due,version,"
+                    "created_at,updated_at,closed_at) VALUES(?,'open',"
+                    "'Synthetic task',NULL,NULL,1,?,?,NULL)",
+                    (task_id, now, now),
+                )
+            connection.execute(
+                "INSERT INTO candidate_inbox(candidate_id,source_system,"
+                "source_kind,source_record_id,source_item_id,source_revision,"
+                "payload_json,created_at,first_imported_at,updated_at) "
+                "VALUES(?,'gw',?,'github.com/example-org/example-repo',?,?,'{}',?,?,?)",
+                (candidate_id, kind, item_id, "b" * 64, now, now, now),
+            )
+            connection.execute(
+                "INSERT INTO task_candidate_bindings(candidate_id,"
+                "source_revision,task_id,relation,decided_at) "
+                "VALUES(?,?,?,'accepted',?)",
+                (candidate_id, "b" * 64, task_id, now),
+            )
+            connection.commit()
+
+    def _effect_worker(
+        self, endpoint: str, *, task_id: int, kind: str, item_id: str,
+    ) -> tuple[ExecutionWorker, mock._patch]:
+        self._bind_fresh_origin(task_id, kind=kind, item_id=item_id)
+        worker = self._worker(endpoint, policy=_policy(kinds=(kind,)))
+        state = replace(
+            load_run_state(self.state_path), task_id=task_id,
+            phase=WorkflowPhase.EXTERNAL_ACTION,
+        )
+        return worker, mock.patch.object(
+            worker, "_active", return_value=(state, SimpleNamespace()),
+        )
+
+    def _write_effect_body(self, name: str) -> str:
+        path = self.run_directory / name
+        path.write_text("Synthetic approved effect body.\n", encoding="utf-8")
+        path.chmod(0o600)
+        return path.name
 
     def _write_draft(self, **changes) -> Path:
         document = {
@@ -625,6 +674,167 @@ class ExecutionWorkerTests(unittest.TestCase):
             ):
                 with self.assertRaises(ExecutionWorkerClaimError):
                     worker._fresh_active("effect")
+
+    def test_noncurrent_snapshots_refuse_every_forge_effect_before_writing(self):
+        """A status that is not current must not reach any forge adapter."""
+        actions = (
+            (
+                "review", "review_request", "42/revision", "post_review",
+                lambda worker: worker.act_review(
+                    body_file=self._write_effect_body("review.md")),
+            ),
+            (
+                "comment", "issue", "42", "post_issue_comment",
+                lambda worker: worker.act_comment(
+                    body_file=self._write_effect_body("comment.md")),
+            ),
+            (
+                "pull_request", "issue", "43", "open_pull_request",
+                lambda worker: worker.act_pull_request(
+                    head="foxhound/issue-43", title="Synthetic proposal",
+                    body_file=None,
+                ),
+            ),
+        )
+        for index, (name, kind, item_id, forge_call, action) in enumerate(
+            actions, start=1,
+        ):
+            with self.subTest(effect=name):
+                with knowledge_server() as endpoint:
+                    worker, active = self._effect_worker(
+                        endpoint, task_id=index, kind=kind, item_id=item_id,
+                    )
+                    for status in (
+                        "changed", "withdrawn", "unavailable", "unsupported",
+                    ):
+                        with self.subTest(status=status), active, mock.patch.object(
+                            worker, "_renew"
+                        ), mock.patch.object(
+                            execution_worker.GwKnowledgeClient, "refresh_source",
+                            return_value=SimpleNamespace(
+                                status=status, usable=False,
+                            ),
+                        ), mock.patch.object(
+                            execution_worker.forge_action, forge_call,
+                        ) as forge:
+                            with self.assertRaises(ExecutionWorkerClaimError):
+                                action(worker)
+                            forge.assert_not_called()
+
+    def test_transport_failure_refuses_every_forge_effect_before_writing(self):
+        actions = (
+            (
+                "review", "review_request", "42/revision", "post_review",
+                lambda worker: worker.act_review(
+                    body_file=self._write_effect_body("review.md")),
+            ),
+            (
+                "comment", "issue", "42", "post_issue_comment",
+                lambda worker: worker.act_comment(
+                    body_file=self._write_effect_body("comment.md")),
+            ),
+            (
+                "pull_request", "issue", "43", "open_pull_request",
+                lambda worker: worker.act_pull_request(
+                    head="foxhound/issue-43", title="Synthetic proposal",
+                    body_file=None,
+                ),
+            ),
+        )
+        for index, (name, kind, item_id, forge_call, action) in enumerate(
+            actions, start=1,
+        ):
+            with self.subTest(effect=name), knowledge_server() as endpoint:
+                worker, active = self._effect_worker(
+                    endpoint, task_id=index, kind=kind, item_id=item_id,
+                )
+                with active, mock.patch.object(worker, "_renew"), mock.patch.object(
+                    execution_worker.GwKnowledgeClient, "refresh_source",
+                    side_effect=KnowledgeClientError("synthetic"),
+                ), mock.patch.object(
+                    execution_worker.forge_action, forge_call,
+                ) as forge:
+                    with self.assertRaises(ExecutionWorkerClaimError):
+                        action(worker)
+                    forge.assert_not_called()
+
+    def test_current_snapshot_allows_every_forge_effect(self):
+        actions = (
+            (
+                "review", "review_request", "42/revision", "post_review",
+                lambda worker: worker.act_review(
+                    body_file=self._write_effect_body("review.md")),
+                SimpleNamespace(
+                    repository="github.com/example-org/example-repo", number=42,
+                    url="https://github.com/example-org/example-repo/pull/42",
+                ),
+            ),
+            (
+                "comment", "issue", "42", "post_issue_comment",
+                lambda worker: worker.act_comment(
+                    body_file=self._write_effect_body("comment.md")),
+                SimpleNamespace(
+                    repository="github.com/example-org/example-repo", number=42,
+                    url="https://github.com/example-org/example-repo/issues/42",
+                ),
+            ),
+            (
+                "pull_request", "issue", "43", "open_pull_request",
+                lambda worker: worker.act_pull_request(
+                    head="foxhound/issue-43", title="Synthetic proposal",
+                    body_file=None,
+                ),
+                SimpleNamespace(
+                    repository="github.com/example-org/example-repo", issue="43",
+                    number=43, url="https://github.com/example-org/example-repo/pull/43",
+                    head="foxhound/issue-43", base="main",
+                ),
+            ),
+        )
+        for index, (name, kind, item_id, forge_call, action, receipt) in enumerate(
+            actions, start=1,
+        ):
+            with self.subTest(effect=name), knowledge_server() as endpoint:
+                worker, active = self._effect_worker(
+                    endpoint, task_id=index, kind=kind, item_id=item_id,
+                )
+                with active, mock.patch.object(worker, "_renew"), mock.patch.object(
+                    execution_worker.GwKnowledgeClient, "refresh_source",
+                    return_value=SimpleNamespace(status="current", usable=True),
+                ) as refresh, mock.patch.object(
+                    execution_worker.forge_action, forge_call,
+                    return_value=receipt,
+                ) as forge:
+                    action(worker)
+                    refresh.assert_called_once()
+                    forge.assert_called_once()
+
+    def test_before_effect_rechecks_after_phase_entry(self):
+        self._bind_fresh_origin(1, kind="issue", item_id="42")
+        body = self._write_effect_body("comment.md")
+        with knowledge_server() as endpoint:
+            worker = self._worker(endpoint, policy=_policy())
+            effect_state = replace(
+                load_run_state(self.state_path), phase=WorkflowPhase.EXTERNAL_ACTION,
+            )
+            with mock.patch.object(
+                execution_worker.GwKnowledgeClient, "refresh_source",
+                return_value=SimpleNamespace(status="current", usable=True),
+            ) as refresh, mock.patch.object(
+                execution_worker.forge_action, "post_issue_comment",
+                return_value=SimpleNamespace(
+                    repository="github.com/example-org/example-repo", number=42,
+                    url="https://github.com/example-org/example-repo/issues/42",
+                ),
+            ), mock.patch.object(worker, "_renew"), mock.patch.object(
+                worker, "_active", wraps=worker._active,
+            ):
+                worker.context()
+                with mock.patch.object(
+                    worker, "_active", return_value=(effect_state, SimpleNamespace()),
+                ):
+                    worker.act_comment(body_file=body)
+        self.assertEqual(refresh.call_count, 2)
 
     def test_a_task_about_nothing_addressable_says_so(self):
         # An ordinary state, not an error: a task may come from a meeting,
