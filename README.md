@@ -282,6 +282,58 @@ The default alert thresholds are 15 minutes for pending work and delivery
 freshness, and three failures within 15 minutes. Supply the explicit bounded
 threshold options when a deployment needs a different policy.
 
+## Local semantic duplicate evaluation
+
+Duplicate-proposal quality is measured only from reader decisions. Before a
+semantic comparison, settle the existing duplicate-review cards and inspect
+the content-free baseline:
+
+```sh
+foxhound-task-duplicate-quality \
+  --database /srv/example/private-foxhound-state/foxhound.sqlite3
+```
+
+`foxhound-task-local-duplicate-eval` sends task text only to a model gateway
+on an explicit IPv4 or IPv6 loopback HTTP endpoint. It refuses names, public
+addresses, HTTPS endpoints, redirects, and hosted APIs. Two request shapes are
+supported and selected with `--dialect`, because the URL alone cannot say
+which one an endpoint speaks: an OpenAI-compatible chat-completions gateway
+(the default) and a single-machine runner.
+
+**What the loopback rule does and does not promise.** It guarantees that this
+service addresses nothing but the local machine. It does not guarantee that
+the text stays there: a gateway listening on loopback may itself forward the
+request to another machine the operator runs. That is a property of the
+gateway a deployment chooses, not of this client, and a deployment that needs
+the stronger guarantee must point this at a model the local machine serves
+itself. The check here is a boundary on what Foxhound will talk to, not a
+claim about where the text finally lands.
+
+Its default is a
+read-only dry run; `--record` stores only task-pair IDs, a closed relation
+verdict, and resource counts after every proposal has been settled. An explicit
+`--propose-redundant` may additionally create ordinary, reader-gated proposals
+under the local detector's name. It never creates relations, cards, or task
+changes, and it never settles a proposal.
+
+```sh
+foxhound-task-local-duplicate-eval \
+  --database /srv/example/private-foxhound-state/foxhound.sqlite3 \
+  --model local-model-name \
+  --record
+foxhound-task-duplicate-quality \
+  --database /srv/example/private-foxhound-state/foxhound.sqlite3
+```
+
+The report gives each detector's confirm rate and label count, semantic
+verdict counts, content-free disagreement counts, and local scan latency and
+token totals. Local model API cost is reported as zero. Do not activate a
+semantic intake detector or auto-confirmation until the same settled queue
+shows the required measured precision; reader confirmation remains mandatory.
+The future auto-confirmation threshold is at least 0.98 measured precision on
+at least 100 settled local-detector proposals; the current command does not
+implement auto-confirmation.
+
 Foxhound now also owns a transport-neutral execution workflow ledger. An
 explicitly scheduled open task stops at a reader start gate, then advances
 through separately approved plan, execution, and external-action phases under
@@ -618,8 +670,11 @@ control. GW failures leave the hold in place. Update records private steering
 but does not start work; Continue is the explicit planning
 approval. Plan and result cards can request more
 investigation, collect one private discussion instruction, execute, snooze for
-a bounded interval, complete, reassign, or drop as appropriate. External
-effects still require their own exact authorization. Every delivered decision
+a bounded interval, complete, reassign, or drop as appropriate. Plan and
+result cards with prepared deliverables also offer a non-mutating
+control that lets the card surface send those bounded Markdown drafts as a
+separate review message while preserving the original card and its controls.
+External effects still require their own exact authorization. Every delivered decision
 advances all affected task and workflow state and resolves the card in one
 SQLite transaction, so a stale or failed input changes nothing. Card rendering
 is HTML-escaped and transport-bounded. If the complete private content cannot

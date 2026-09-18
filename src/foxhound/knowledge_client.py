@@ -23,6 +23,13 @@ from .contracts.task_owner_equivalence import (
     owner_equivalence_request_document,
     parse_owner_equivalence_response,
 )
+from .contracts.source_snapshot import (
+    SourceRefreshResult,
+    SourceSnapshotContractError,
+    SourceSnapshotRequest,
+    parse_source_snapshot_response,
+    source_snapshot_request_document,
+)
 
 
 SEARCH_SCHEMA = "gw.search"
@@ -227,6 +234,20 @@ class GwKnowledgeClient:
             "/v1/owner-upcoming-meeting", request
         )
         return _parse_owner_meeting_response(document)
+
+    def refresh_source(
+        self, request: SourceSnapshotRequest,
+    ) -> SourceRefreshResult:
+        """Ask GW's source-owning boundary for one bounded freshness check."""
+        try:
+            payload = source_snapshot_request_document(request)
+        except SourceSnapshotContractError:
+            raise KnowledgeRequestError("source snapshot request is invalid") from None
+        document = self._request_json("/v1/source-snapshot", payload)
+        try:
+            return parse_source_snapshot_response(document, request)
+        except SourceSnapshotContractError:
+            raise KnowledgeResponseError("GW source snapshot response is invalid") from None
 
     def _request_json(
         self, route: str, request: Mapping[str, Any]

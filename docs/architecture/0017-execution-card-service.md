@@ -23,6 +23,8 @@ as task-review cards:
 - one versioned reader action; and
 - one bounded, versioned discussion or reassignment input;
 - one bounded, versioned Comment-and-Go input that advances the card atomically;
+- one bounded, versioned deliverables read for a still-delivered Plan Review
+  or Result Review card; and
 - bounded eligible-agent options for a current Start card; and
 - one opaque-token agent selection that returns a refreshed presentation.
 

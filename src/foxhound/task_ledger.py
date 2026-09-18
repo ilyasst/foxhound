@@ -34,6 +34,10 @@ from .contracts import (
     owner_equivalence_request,
     parse_task_candidate,
 )
+from .contracts.source_snapshot import (
+    SourceSnapshotRequest,
+    source_snapshot_request,
+)
 from .source_policy import source_kinds_accepting
 
 
@@ -779,6 +783,12 @@ class TaskLedger:
                             candidate.candidate_id,
                         ),
                     )
+                    TaskLedger._append_work_revision(
+                        connection, task_id=int(binding["task_id"]),
+                        candidate_id=candidate.candidate_id,
+                        source_revision=candidate.source.revision,
+                        task_version=version, now=now,
+                    )
                     connection.execute(
                         "INSERT INTO task_events("
                         "task_id,kind,task_version,candidate_id,source_revision,"
@@ -1346,6 +1356,31 @@ class TaskLedger:
             item_id=str(row["source_item_id"]),
         )
 
+    def source_snapshot_request(
+        self, task_id: int,
+    ) -> SourceSnapshotRequest | None:
+        """Return the exact accepted source revision for a bounded refresh.
+
+        This read exposes identifiers and the immutable candidate revision
+        only.  Source content stays with the producer-facing resolver.
+        """
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT i.source_system,i.source_kind,i.source_record_id,"
+                "i.source_item_id,b.source_revision "
+                "FROM task_candidate_bindings AS b "
+                "JOIN candidate_inbox AS i ON i.candidate_id=b.candidate_id "
+                "WHERE b.task_id=? AND b.relation='accepted'",
+                (task_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return source_snapshot_request(
+            system=row["source_system"], kind=row["source_kind"],
+            record_id=row["source_record_id"], item_id=row["source_item_id"],
+            expected_revision=row["source_revision"],
+        )
+
     def count(self) -> int:
         with closing(self._connect()) as connection:
             row = connection.execute("SELECT COUNT(*) AS total FROM tasks").fetchone()
@@ -1378,6 +1413,31 @@ class TaskLedger:
                 candidate.lifecycle.changed_at,
                 now,
             ),
+        )
+
+    @staticmethod
+    def _append_work_revision(
+        connection: sqlite3.Connection,
+        *, task_id: int, candidate_id: str, source_revision: str,
+        task_version: int, now: str,
+    ) -> None:
+        """Append only a source state the ledger actually folded into work.
+
+        Candidate bindings also move for evidence enrichment, withdrawal, and
+        reader-conflict acknowledgement.  Those are deliberately not work
+        advances.  Repeated digests remain distinct occurrences here: an
+        edit followed by a revert is still a real source transition.
+        """
+        row = connection.execute(
+            "SELECT id FROM work_items WHERE task_id=?", (task_id,)
+        ).fetchone()
+        if row is None:
+            raise _NativeIntakeConflict
+        connection.execute(
+            "INSERT INTO work_revisions(work_item_id,candidate_id,"
+            "source_revision,task_version,kind,created_at) VALUES(?,?,?,?,"
+            "'source_advance',?)",
+            (int(row["id"]), candidate_id, source_revision, task_version, now),
         )
 
     @staticmethod
@@ -1475,6 +1535,11 @@ class TaskLedger:
                 "UPDATE tasks SET version=?,updated_at=? WHERE id=?",
                 (version, now, int(binding["task_id"])),
             )
+            connection.execute(
+                "UPDATE work_items SET state='withdrawn',updated_at=? "
+                "WHERE task_id=?",
+                (now, int(binding["task_id"])),
+            )
             event_kind = "candidate_withdrawn"
             resolution = "preserved_open"
         connection.execute(
@@ -1564,6 +1629,11 @@ class TaskLedger:
                     *desired_owner[1:],
                     int(binding["task_id"]),
                 ),
+            )
+            connection.execute(
+                "UPDATE work_items SET state='active',updated_at=? "
+                "WHERE task_id=?",
+                (now, int(binding["task_id"])),
             )
             event_kind = "candidate_reactivated"
             resolution = "current"
@@ -1900,6 +1970,10 @@ def _apply_task_transition(
             target,
             now,
         ),
+    )
+    connection.execute(
+        "UPDATE work_items SET state=?,updated_at=? WHERE task_id=?",
+        ("active" if target is TaskStatus.OPEN else "closed", now, task_id),
     )
     return TransitionResult(
         TransitionDisposition.APPLIED,

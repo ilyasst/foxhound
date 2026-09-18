@@ -43,6 +43,7 @@ from .task_execution import (
     WorkflowPhase,
     WorkflowRefusal,
     WorkflowStatus,
+    _ANSWER_COLUMNS,
     _apply_agent_selection,
     _apply_plan_review_agent_selection,
     _apply_review_action,
@@ -240,6 +241,9 @@ class ExecutionReviewCard:
         default=(), repr=False)
     revisions: int = 0
     revision_note: str = field(default="", repr=False)
+    #: True only when this result says exactly what the preceding result in
+    #: its phase said, by the same definition the ledger refuses on.
+    unchanged_from_previous: bool = False
     origin_kind: str = field(default="", repr=False)
     origin_record: str = field(default="", repr=False)
     origin_item: str = field(default="", repr=False)
@@ -308,6 +312,26 @@ class ExecutionCardBrief:
     Its own type rather than an operation result: nothing was operated on,
     and the one thing a caller wants from it — the text — is not something
     any other result carries.
+    """
+
+    disposition: ExecutionCardDisposition
+    card_id: int
+    card_version: int | None = None
+    text: str = field(default="", repr=False)
+    refusal: ExecutionCardRefusal | None = None
+
+    @property
+    def accepted(self) -> bool:
+        return self.disposition is not ExecutionCardDisposition.REFUSED
+
+
+@dataclass(frozen=True)
+class ExecutionCardDeliverables:
+    """Prepared deliverables from one still-actionable review card.
+
+    Reading them is deliberately not an action on the card.  A chat surface
+    sends this text as a separate message so a reader can inspect or copy a
+    draft without losing the review controls underneath the original card.
     """
 
     disposition: ExecutionCardDisposition
@@ -511,10 +535,18 @@ class ExecutionCardService:
                         else row["last_result_id"]
                     )
                     cursor = connection.execute(
+                        # The work revision is the source state this approval
+                        # is being asked about. Recorded so a later outcome
+                        # can name what the reader was actually shown; it is
+                        # not a staleness check, which _current_card owns.
                         "INSERT INTO execution_review_cards("
                         "task_id,task_version,workflow_version,kind,phase,"
-                        "result_id,status,version,created_at,updated_at) "
-                        "VALUES(?,?,?,?,?,?,'pending',1,?,?)",
+                        "result_id,status,version,created_at,updated_at,"
+                        "work_revision_id) "
+                        "VALUES(?,?,?,?,?,?,'pending',1,?,?,"
+                        "(SELECT r.id FROM work_revisions AS r "
+                        " JOIN work_items AS w ON w.id=r.work_item_id "
+                        " WHERE w.task_id=? ORDER BY r.id DESC LIMIT 1))",
                         (
                             int(row["task_id"]),
                             int(row["task_version"]),
@@ -524,6 +556,7 @@ class ExecutionCardService:
                             result_id,
                             now,
                             now,
+                            int(row["task_id"]),
                         ),
                     )
                     self._event(
@@ -1306,6 +1339,56 @@ class ExecutionCardService:
             card_id,
             card_version=expected_version,
             text=task_brief(card),
+        )
+
+    def deliverables(
+        self, card_id: int, *, expected_version: int
+    ) -> ExecutionCardDeliverables:
+        """Return prepared drafts from an eligible delivered review card.
+
+        This is intentionally narrower than ``brief``: the button exists
+        only on Plan Review and Result Review cards that have deliverables,
+        and it is meaningful only while the reader still has that exact
+        delivered card.  The read neither resolves the card nor advances any
+        workflow state.
+        """
+        def refused(
+            reason: ExecutionCardRefusal,
+        ) -> ExecutionCardDeliverables:
+            return ExecutionCardDeliverables(
+                ExecutionCardDisposition.REFUSED, card_id, refusal=reason
+            )
+
+        if not _valid_identity(card_id, expected_version):
+            return refused(ExecutionCardRefusal.INVALID_ARGUMENT)
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                self._card_select() + " WHERE c.id=?", (card_id,)
+            ).fetchone()
+            refusal = _card_guard(row, expected_version)
+            if (
+                refusal is None
+                and row["status"] != ExecutionCardStatus.DELIVERED
+            ):
+                refusal = ExecutionCardRefusal.INVALID_STATE
+            if refusal is None and not _current_card(row):
+                refusal = ExecutionCardRefusal.STALE_VERSION
+            if refusal is not None:
+                return refused(refusal)
+            card = self._render_card(row)
+            if (
+                card.kind not in {
+                    ExecutionCardKind.PLAN_REVIEW,
+                    ExecutionCardKind.RESULT_REVIEW,
+                }
+                or not card.deliverables
+            ):
+                return refused(ExecutionCardRefusal.INVALID_STATE)
+        return ExecutionCardDeliverables(
+            ExecutionCardDisposition.UNCHANGED,
+            card_id,
+            card_version=expected_version,
+            text=card_deliverables(card),
         )
 
     def detail(
@@ -2144,6 +2227,18 @@ class ExecutionCardService:
             "(SELECT i.value FROM execution_reader_inputs AS i "
             " WHERE i.task_id=c.task_id AND i.kind='discussion' "
             " ORDER BY i.sequence DESC LIMIT 1) AS revision_note,"
+            # Whether this pass actually changed anything. Read from the
+            # ledger's own definition of an answer rather than a second one
+            # kept here: a card that says "unchanged" while the ledger would
+            # have accepted the result as new is worse than no marker, and
+            # two lists in two files drift the first time either is widened.
+            "(SELECT " + " AND ".join(
+                f"prior.{column} IS r.{column}" for column in _ANSWER_COLUMNS
+            ) + " FROM task_execution_results AS prior "
+            " WHERE prior.task_id=c.task_id AND prior.phase=r.phase "
+            " AND prior.workflow_version<r.workflow_version "
+            " ORDER BY prior.workflow_version DESC LIMIT 1) "
+            " AS unchanged_from_previous,"
             # Where the task came from. A reader asked to authorise work on
             # an issue cannot answer without being told which issue.
             "(SELECT o.source_kind FROM task_candidate_bindings AS b "
@@ -2368,7 +2463,7 @@ def parse_execution_review_callback(
         return None
     if parts[3] not in {
         "start", "snooze", "cancel", "approve", "revise", "discuss",
-        "comment_go",
+        "comment_go", "deliverables",
         "done", "reassign", "drop", "agent", "brief", OWNER_HOLD_ACTION,
         *REVIEW_SNOOZE_ACTIONS,
     }:
@@ -2609,6 +2704,7 @@ def _card(
             ),
             revisions=max(0, int(row["revision_count"] or 0)),
             revision_note=str(row["revision_note"] or ""),
+            unchanged_from_previous=bool(row["unchanged_from_previous"]),
             origin_kind=str(row["origin_kind"] or ""),
             origin_record=str(row["origin_record"] or ""),
             origin_item=str(row["origin_item"] or ""),
@@ -2912,6 +3008,8 @@ _ITEM_STEM = (
 #: identifiers only this machine can resolve and no capability of any kind.
 MAX_BRIEF_CHARS = 12_000
 MAX_BRIEF_BYTES = 24_000
+MAX_DELIVERABLES_CHARS = 12_000
+MAX_DELIVERABLES_BYTES = 24_000
 
 
 def task_brief(card: ExecutionReviewCard) -> str:
@@ -2995,6 +3093,54 @@ def task_brief(card: ExecutionReviewCard) -> str:
             size += width
         brief = "".join(fragments).rstrip() + suffix
     return brief
+
+
+def card_deliverables(card: ExecutionReviewCard) -> str:
+    """One bounded Markdown message containing a card's prepared drafts.
+
+    The transport, rather than the execution authority, chooses how Markdown
+    looks in its chat UI.  Keeping the source Markdown here preserves the
+    deliverable a reader was asked to review, while the bounded response keeps
+    a malicious or accidentally huge result from turning a tap into an
+    unbounded loopback response.
+    """
+    if card.kind not in {
+        ExecutionCardKind.PLAN_REVIEW,
+        ExecutionCardKind.RESULT_REVIEW,
+    } or not card.deliverables:
+        raise TaskLedgerError("execution card has no review deliverables")
+    lines = ["# Deliverables"]
+    for record in card.deliverables:
+        lines.extend(("", f"## {record.label or 'Prepared draft'}"))
+        if record.recipient:
+            lines.append(f"To: {record.recipient}")
+        if record.subject:
+            lines.append(f"Subject: {record.subject}")
+        if record.channel:
+            lines.append(f"Channel: {record.channel}")
+        lines.extend(("", record.text))
+    return _bounded_deliverables("\n".join(lines).strip())
+
+
+def _bounded_deliverables(value: str) -> str:
+    """Fit an outbound deliverables message within the read contract."""
+    suffix = "\n\n[…truncated. Open the task working folder for the rest.]"
+    if (
+        len(value) <= MAX_DELIVERABLES_CHARS
+        and len(value.encode("utf-8")) <= MAX_DELIVERABLES_BYTES
+    ):
+        return value
+    character_limit = MAX_DELIVERABLES_CHARS - len(suffix)
+    byte_limit = MAX_DELIVERABLES_BYTES - len(suffix.encode("utf-8"))
+    fragments: list[str] = []
+    size = 0
+    for character in value[:character_limit]:
+        width = len(character.encode("utf-8"))
+        if size + width > byte_limit:
+            break
+        fragments.append(character)
+        size += width
+    return "".join(fragments).rstrip() + suffix
 
 def _continues_lines(
     card: ExecutionReviewCard, *, html: bool
@@ -3175,6 +3321,16 @@ def _heading_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
         chips.append(f"due {card.due}")
     chip = " · ".join(chip for chip in chips if chip)
     lines.append(f"<i>{_escape(chip)}</i>" if html else chip)
+    if card.unchanged_from_previous:
+        # Precise about WHAT is unchanged. "Same answer" is a claim about the
+        # whole card, and a reader who reads it above an effect list they are
+        # being asked to authorise has been told something the card cannot
+        # know. This says only what was actually compared.
+        note = (
+            "⚠️ Unchanged from the previous revision — "
+            "this pass produced no new answer"
+        )
+        lines.append(f"<b>{_escape(note)}</b>" if html else note)
     if card.kind is ExecutionCardKind.START:
         # Provenance belongs to the card that FIRST asks. A start gate is
         # that card here -- it proposes work on something the reader may
@@ -3977,6 +4133,11 @@ def _button_rows(
             (("✅ Mark as done", "done"),),
             stop_row,
         )
+    if (
+        kind in {ExecutionCardKind.PLAN_REVIEW, ExecutionCardKind.RESULT_REVIEW}
+        and card.deliverables
+    ):
+        rows += ((("📦 Deliverables", "deliverables"),),)
     if approvable:
         return rows + ((("📋 Task brief", "brief"),),)
     reduced = tuple(

@@ -92,6 +92,96 @@ class TaskOriginRead(unittest.TestCase):
         self.assertEqual(
             set(vars(origin)), {"system", "kind", "record_id", "item_id"})
 
+    def test_source_snapshot_request_is_bound_to_accepted_revision(self) -> None:
+        candidate = _issue_candidate(42)
+        self._bind(1, candidate)
+        request = self.ledger.source_snapshot_request(1)
+        self.assertIsNotNone(request)
+        self.assertEqual(request.locator.record_id, "forge.example/acme/widget")
+        self.assertEqual(request.expected_revision, "b" * 64)
+
+    def test_binding_updates_do_not_themselves_advance_work(self) -> None:
+        # Bindings move for provenance, withdrawals, and reader-conflict
+        # acknowledgement.  Those transitions are not necessarily work the
+        # ledger accepted, so a broad binding trigger must not mint a revision.
+        self._bind(1, _issue_candidate(42))
+        with closing(sqlite3.connect(self.db)) as connection:
+            connection.execute(
+                "UPDATE task_candidate_bindings SET source_revision=? "
+                "WHERE task_id=1", ("c" * 64,)
+            )
+            rows = connection.execute(
+                "SELECT w.task_id,r.source_revision FROM work_items AS w "
+                "JOIN work_revisions AS r ON r.work_item_id=w.id "
+                "ORDER BY r.id"
+            ).fetchall()
+        self.assertEqual(rows, [(1, "b" * 64)])
+
+    def test_a_repeated_source_digest_is_still_an_auditable_advance(self) -> None:
+        self._bind(1, _issue_candidate(42))
+        with closing(sqlite3.connect(self.db)) as connection:
+            connection.row_factory = sqlite3.Row
+            TaskLedger._append_work_revision(
+                connection,
+                task_id=1,
+                candidate_id=_issue_candidate(42)["candidate_id"],
+                source_revision="b" * 64,
+                task_version=2,
+                now="2030-01-02T12:00:00Z",
+            )
+            rows = connection.execute(
+                "SELECT source_revision,task_version,kind FROM work_revisions "
+                "ORDER BY id"
+            ).fetchall()
+        rows = [tuple(row) for row in rows]
+        self.assertEqual(
+            rows,
+            [("b" * 64, 1, "accepted"), ("b" * 64, 2, "source_advance")],
+        )
+
+    def test_the_work_item_migration_can_be_replayed(self) -> None:
+        # A migration may run again over a database that already carries
+        # these rows. Re-running must be passive, not an integrity error.
+        self._bind(1, _issue_candidate(42))
+        with closing(sqlite3.connect(self.db)) as connection:
+            connection.execute("PRAGMA user_version = 36")
+            connection.commit()
+        CandidateInbox(self.db)._migrate()
+        with closing(sqlite3.connect(self.db)) as connection:
+            total = connection.execute(
+                "SELECT COUNT(*) FROM work_revisions"
+            ).fetchone()[0]
+        self.assertEqual(total, 1)
+
+    def test_replaying_the_migration_keeps_work_advances_distinct(self) -> None:
+        # The v38 rebuild relabels every row it copies as 'accepted', and
+        # replaying v37 re-creates the broad update trigger v38 removes. Both
+        # have to be skipped when the conversion has already happened, or a
+        # replay quietly erases the distinction this schema exists to record.
+        self._bind(1, _issue_candidate(42))
+        with closing(sqlite3.connect(self.db)) as connection:
+            connection.row_factory = sqlite3.Row
+            TaskLedger._append_work_revision(
+                connection, task_id=1,
+                candidate_id=_issue_candidate(42)["candidate_id"],
+                source_revision="c" * 64, task_version=2,
+                now="2030-01-02T12:00:00Z",
+            )
+            connection.execute("PRAGMA user_version = 37")
+            connection.commit()
+
+        migrate_database(self.db)
+
+        with closing(sqlite3.connect(self.db)) as connection:
+            kinds = [row[0] for row in connection.execute(
+                "SELECT kind FROM work_revisions ORDER BY id"
+            )]
+            triggers = {row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger'"
+            )}
+        self.assertEqual(kinds, ["accepted", "source_advance"])
+        self.assertNotIn("work_revision_on_source_update", triggers)
+
     def test_a_task_bound_to_nothing_has_no_origin(self) -> None:
         # An ordinary state, not an error: a task may predate binding.
         with closing(sqlite3.connect(self.db)) as conn, conn:

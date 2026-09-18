@@ -15,6 +15,7 @@ import types
 import threading
 import unittest
 from contextlib import closing, contextmanager, redirect_stderr, redirect_stdout
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import StringIO
 from pathlib import Path
@@ -24,9 +25,11 @@ from unittest import mock
 
 from foxhound.agent_profiles import general_profile
 from foxhound.candidate_inbox import CandidateInbox
+from foxhound.contracts import SourceSnapshotContractError
 from foxhound.execution_worker import (
     INSTRUCTIONS_NAME,
     ExecutionWorker,
+    ExecutionWorkerClaimError,
     ExecutionWorkerConfigError,
     ExecutionWorkerDraftError,
     load_result_draft,
@@ -38,7 +41,9 @@ from foxhound.execution_worker import (
     _repository_receipts,
     _worker_operations,
 )
-from foxhound.knowledge_client import KnowledgeClientConfig
+from foxhound.knowledge_client import KnowledgeClientConfig, KnowledgeClientError
+from foxhound.workflow_policy import parse_workflow_policy
+from foxhound.execution_worker import _workflow_policy
 from foxhound.task_execution import (
     ExecutionResultEnvelope,
     TaskExecutionService,
@@ -79,6 +84,19 @@ def knowledge_server() -> Iterator[str]:
                     "alias": request["alias"],
                     "revision": hashlib.sha256(canonical).hexdigest(),
                     "variables": variables,
+                }
+            elif self.path == "/v1/source-snapshot":
+                response = {
+                    "schema": "foxhound.source-snapshot", "schema_version": 1,
+                    "ok": True, "system": request["system"],
+                    "kind": request["kind"], "record_id": request["record_id"],
+                    "item_id": request["item_id"],
+                    "expected_revision": request["expected_revision"],
+                    "status": "current", "snapshot": {
+                        "revision": request["expected_revision"],
+                        "observed_at": "2030-01-02T03:04:05+00:00",
+                        "lifecycle": "active", "actionability": "actionable",
+                    },
                 }
             else:
                 response = {
@@ -129,6 +147,16 @@ def knowledge_server() -> Iterator[str]:
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def _policy(freshness="before_effect", kinds=("issue",)):
+    """One synthetic policy, fencing the named kinds at the named strictness."""
+    return parse_workflow_policy({
+        "policy_id": "synthetic-fence", "grants": {
+            "plan": [], "execute": [], "external_action": [],
+        }, "freshness": freshness, "freshness_kinds": list(kinds),
+        "effects": [], "final_decision": True,
+    })
 
 
 class ExecutionWorkerTests(unittest.TestCase):
@@ -229,10 +257,58 @@ class ExecutionWorkerTests(unittest.TestCase):
         path.chmod(0o600)
         return path
 
-    def _worker(self, endpoint: str) -> ExecutionWorker:
+    def _worker(self, endpoint: str, **changes) -> ExecutionWorker:
         return ExecutionWorker(self.state_path, KnowledgeClientConfig(
             endpoint=endpoint, alias="primary", token=TOKEN
-        ))
+        ), **changes)
+
+    def _bind_fresh_origin(
+        self, task_id: int, *, kind: str, item_id: str,
+    ) -> None:
+        """Bind one synthetic forge origin for an effect-fence test."""
+        now = "2030-01-02T03:04:05+00:00"
+        candidate_id = f"fresh-{task_id}"
+        with closing(sqlite3.connect(self.database)) as connection:
+            if task_id != 1:
+                connection.execute(
+                    "INSERT INTO tasks(id,status,text,owner,due,version,"
+                    "created_at,updated_at,closed_at) VALUES(?,'open',"
+                    "'Synthetic task',NULL,NULL,1,?,?,NULL)",
+                    (task_id, now, now),
+                )
+            connection.execute(
+                "INSERT INTO candidate_inbox(candidate_id,source_system,"
+                "source_kind,source_record_id,source_item_id,source_revision,"
+                "payload_json,created_at,first_imported_at,updated_at) "
+                "VALUES(?,'gw',?,'github.com/example-org/example-repo',?,?,'{}',?,?,?)",
+                (candidate_id, kind, item_id, "b" * 64, now, now, now),
+            )
+            connection.execute(
+                "INSERT INTO task_candidate_bindings(candidate_id,"
+                "source_revision,task_id,relation,decided_at) "
+                "VALUES(?,?,?,'accepted',?)",
+                (candidate_id, "b" * 64, task_id, now),
+            )
+            connection.commit()
+
+    def _effect_worker(
+        self, endpoint: str, *, task_id: int, kind: str, item_id: str,
+    ) -> tuple[ExecutionWorker, mock._patch]:
+        self._bind_fresh_origin(task_id, kind=kind, item_id=item_id)
+        worker = self._worker(endpoint, policy=_policy(kinds=(kind,)))
+        state = replace(
+            load_run_state(self.state_path), task_id=task_id,
+            phase=WorkflowPhase.EXTERNAL_ACTION,
+        )
+        return worker, mock.patch.object(
+            worker, "_active", return_value=(state, SimpleNamespace()),
+        )
+
+    def _write_effect_body(self, name: str) -> str:
+        path = self.run_directory / name
+        path.write_text("Synthetic approved effect body.\n", encoding="utf-8")
+        path.chmod(0o600)
+        return path.name
 
     def _write_draft(self, **changes) -> Path:
         document = {
@@ -547,6 +623,256 @@ class ExecutionWorkerTests(unittest.TestCase):
              "record_id": "forge.example/acme/widget", "item_id": "42"},
         )
 
+    def test_freshness_is_opt_in_and_refuses_noncurrent_effects(self):
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "INSERT INTO candidate_inbox(candidate_id,source_system,"
+                "source_kind,source_record_id,source_item_id,source_revision,"
+                "payload_json,created_at,first_imported_at,updated_at) "
+                "VALUES('fresh-1','gw','issue','forge.example/acme/widget',"
+                "'42',?,'{}','2030-01-01T00:00:00Z','2030-01-01T00:00:00Z',"
+                "'2030-01-01T00:00:00Z')", ("b" * 64,))
+            connection.execute(
+                "INSERT INTO task_candidate_bindings(candidate_id,source_revision,"
+                "task_id,relation,decided_at) VALUES('fresh-1',?,1,'accepted',?)",
+                ("b" * 64, "2030-01-01T00:00:00Z"))
+            connection.commit()
+        with knowledge_server() as endpoint:
+            disabled = self._worker(endpoint)
+            disabled._fresh_active("effect")
+            enabled = self._worker(endpoint, policy=_policy())
+            with mock.patch(
+                "foxhound.execution_worker.GwKnowledgeClient.refresh_source",
+                return_value=type("Result", (), {"usable": False})(),
+            ):
+                with self.assertRaises(ExecutionWorkerClaimError):
+                    enabled._fresh_active("effect")
+
+    def test_an_unconfigured_worker_checks_no_freshness(self):
+        """The default is the behaviour before any of this existed."""
+        with knowledge_server() as endpoint:
+            worker = self._worker(endpoint)
+            with mock.patch(
+                "foxhound.execution_worker.GwKnowledgeClient.refresh_source",
+                side_effect=AssertionError("must not be called"),
+            ):
+                worker._fresh_active("phase")
+                worker._fresh_active("effect")
+
+    def test_a_phase_only_policy_does_not_fence_an_effect(self):
+        with knowledge_server() as endpoint:
+            worker = self._worker(
+                endpoint, policy=_policy(freshness="before_phase"))
+            with mock.patch(
+                "foxhound.execution_worker.GwKnowledgeClient.refresh_source",
+                side_effect=AssertionError("must not be called"),
+            ), mock.patch(
+                "foxhound.execution_worker.TaskLedger.source_snapshot_request",
+                return_value=SimpleNamespace(
+                    locator=SimpleNamespace(kind="issue")),
+            ):
+                worker._fresh_active("effect")
+
+    def test_the_policy_in_force_is_recoverable_from_the_environment(self):
+        """An absent policy is the compatibility one; a broken one refuses."""
+        self.assertIsNone(_workflow_policy(""))
+        self.assertIsNone(_workflow_policy("   "))
+        parsed = _workflow_policy(json.dumps({
+            "policy_id": "synthetic-fence", "grants": {
+                "plan": [], "execute": [], "external_action": [],
+            }, "freshness": "before_effect", "freshness_kinds": ["issue"],
+            "effects": [], "final_decision": True,
+        }))
+        self.assertEqual(parsed.revision, _policy().revision)
+        for broken in ("{", "null", json.dumps({"policy_id": "x"})):
+            with self.assertRaises(ExecutionWorkerConfigError):
+                _workflow_policy(broken)
+
+    def test_freshness_refusals_are_controlled(self):
+        """A malformed request or unavailable source never escapes as a crash."""
+        with knowledge_server() as endpoint:
+            worker = self._worker(endpoint, policy=_policy())
+            with self.assertRaises(ExecutionWorkerConfigError):
+                worker._fresh_active("unknown")
+            with mock.patch(
+                "foxhound.execution_worker.TaskLedger.source_snapshot_request",
+                side_effect=SourceSnapshotContractError("synthetic"),
+            ):
+                with self.assertRaises(ExecutionWorkerClaimError):
+                    worker._fresh_active("effect")
+            with mock.patch(
+                "foxhound.execution_worker.TaskLedger.source_snapshot_request",
+                return_value=SimpleNamespace(
+                    locator=SimpleNamespace(kind="issue"),
+                ),
+            ), mock.patch(
+                "foxhound.execution_worker.GwKnowledgeClient.refresh_source",
+                side_effect=KnowledgeClientError("synthetic"),
+            ):
+                with self.assertRaises(ExecutionWorkerClaimError):
+                    worker._fresh_active("effect")
+
+    def test_noncurrent_snapshots_refuse_every_forge_effect_before_writing(self):
+        """A status that is not current must not reach any forge adapter."""
+        actions = (
+            (
+                "review", "review_request", "42/revision", "post_review",
+                lambda worker: worker.act_review(
+                    body_file=self._write_effect_body("review.md")),
+            ),
+            (
+                "comment", "issue", "42", "post_issue_comment",
+                lambda worker: worker.act_comment(
+                    body_file=self._write_effect_body("comment.md")),
+            ),
+            (
+                "pull_request", "issue", "43", "open_pull_request",
+                lambda worker: worker.act_pull_request(
+                    head="foxhound/issue-43", title="Synthetic proposal",
+                    body_file=None,
+                ),
+            ),
+        )
+        for index, (name, kind, item_id, forge_call, action) in enumerate(
+            actions, start=1,
+        ):
+            with self.subTest(effect=name):
+                with knowledge_server() as endpoint:
+                    worker, active = self._effect_worker(
+                        endpoint, task_id=index, kind=kind, item_id=item_id,
+                    )
+                    for status in (
+                        "changed", "withdrawn", "unavailable", "unsupported",
+                    ):
+                        with self.subTest(status=status), active, mock.patch.object(
+                            worker, "_renew"
+                        ), mock.patch.object(
+                            execution_worker.GwKnowledgeClient, "refresh_source",
+                            return_value=SimpleNamespace(
+                                status=status, usable=False,
+                            ),
+                        ), mock.patch.object(
+                            execution_worker.forge_action, forge_call,
+                        ) as forge:
+                            with self.assertRaises(ExecutionWorkerClaimError):
+                                action(worker)
+                            forge.assert_not_called()
+
+    def test_transport_failure_refuses_every_forge_effect_before_writing(self):
+        actions = (
+            (
+                "review", "review_request", "42/revision", "post_review",
+                lambda worker: worker.act_review(
+                    body_file=self._write_effect_body("review.md")),
+            ),
+            (
+                "comment", "issue", "42", "post_issue_comment",
+                lambda worker: worker.act_comment(
+                    body_file=self._write_effect_body("comment.md")),
+            ),
+            (
+                "pull_request", "issue", "43", "open_pull_request",
+                lambda worker: worker.act_pull_request(
+                    head="foxhound/issue-43", title="Synthetic proposal",
+                    body_file=None,
+                ),
+            ),
+        )
+        for index, (name, kind, item_id, forge_call, action) in enumerate(
+            actions, start=1,
+        ):
+            with self.subTest(effect=name), knowledge_server() as endpoint:
+                worker, active = self._effect_worker(
+                    endpoint, task_id=index, kind=kind, item_id=item_id,
+                )
+                with active, mock.patch.object(worker, "_renew"), mock.patch.object(
+                    execution_worker.GwKnowledgeClient, "refresh_source",
+                    side_effect=KnowledgeClientError("synthetic"),
+                ), mock.patch.object(
+                    execution_worker.forge_action, forge_call,
+                ) as forge:
+                    with self.assertRaises(ExecutionWorkerClaimError):
+                        action(worker)
+                    forge.assert_not_called()
+
+    def test_current_snapshot_allows_every_forge_effect(self):
+        actions = (
+            (
+                "review", "review_request", "42/revision", "post_review",
+                lambda worker: worker.act_review(
+                    body_file=self._write_effect_body("review.md")),
+                SimpleNamespace(
+                    repository="github.com/example-org/example-repo", number=42,
+                    url="https://github.com/example-org/example-repo/pull/42",
+                ),
+            ),
+            (
+                "comment", "issue", "42", "post_issue_comment",
+                lambda worker: worker.act_comment(
+                    body_file=self._write_effect_body("comment.md")),
+                SimpleNamespace(
+                    repository="github.com/example-org/example-repo", number=42,
+                    url="https://github.com/example-org/example-repo/issues/42",
+                ),
+            ),
+            (
+                "pull_request", "issue", "43", "open_pull_request",
+                lambda worker: worker.act_pull_request(
+                    head="foxhound/issue-43", title="Synthetic proposal",
+                    body_file=None,
+                ),
+                SimpleNamespace(
+                    repository="github.com/example-org/example-repo", issue="43",
+                    number=43, url="https://github.com/example-org/example-repo/pull/43",
+                    head="foxhound/issue-43", base="main",
+                ),
+            ),
+        )
+        for index, (name, kind, item_id, forge_call, action, receipt) in enumerate(
+            actions, start=1,
+        ):
+            with self.subTest(effect=name), knowledge_server() as endpoint:
+                worker, active = self._effect_worker(
+                    endpoint, task_id=index, kind=kind, item_id=item_id,
+                )
+                with active, mock.patch.object(worker, "_renew"), mock.patch.object(
+                    execution_worker.GwKnowledgeClient, "refresh_source",
+                    return_value=SimpleNamespace(status="current", usable=True),
+                ) as refresh, mock.patch.object(
+                    execution_worker.forge_action, forge_call,
+                    return_value=receipt,
+                ) as forge:
+                    action(worker)
+                    refresh.assert_called_once()
+                    forge.assert_called_once()
+
+    def test_before_effect_rechecks_after_phase_entry(self):
+        self._bind_fresh_origin(1, kind="issue", item_id="42")
+        body = self._write_effect_body("comment.md")
+        with knowledge_server() as endpoint:
+            worker = self._worker(endpoint, policy=_policy())
+            effect_state = replace(
+                load_run_state(self.state_path), phase=WorkflowPhase.EXTERNAL_ACTION,
+            )
+            with mock.patch.object(
+                execution_worker.GwKnowledgeClient, "refresh_source",
+                return_value=SimpleNamespace(status="current", usable=True),
+            ) as refresh, mock.patch.object(
+                execution_worker.forge_action, "post_issue_comment",
+                return_value=SimpleNamespace(
+                    repository="github.com/example-org/example-repo", number=42,
+                    url="https://github.com/example-org/example-repo/issues/42",
+                ),
+            ), mock.patch.object(worker, "_renew"), mock.patch.object(
+                worker, "_active", wraps=worker._active,
+            ):
+                worker.context()
+                with mock.patch.object(
+                    worker, "_active", return_value=(effect_state, SimpleNamespace()),
+                ):
+                    worker.act_comment(body_file=body)
+        self.assertEqual(refresh.call_count, 2)
+
     def test_a_task_about_nothing_addressable_says_so(self):
         # An ordinary state, not an error: a task may come from a meeting,
         # or predate binding. The agent must be able to tell that apart from
@@ -752,6 +1078,144 @@ class ExecutionWorkerTests(unittest.TestCase):
         self.assertEqual(document["questions"], [])
         self.assertEqual(document["external_actions"], [])
         self.assertEqual(document["deliverables"], [])
+
+    def test_draft_uses_this_claims_run_inputs_over_stale_task_inputs(self):
+        """A durable task folder cannot make a later run replay old work."""
+        paths = self._enable_archive()
+        stale = {
+            "result-summary.txt": "Earlier synthetic summary.\n",
+            "result-work.md": "# Earlier synthetic work\n",
+        }
+        for name, text in stale.items():
+            path = paths.working_directory / name
+            path.write_text(text, encoding="utf-8")
+            path.chmod(0o600)
+            # The task folder outlives runs.  Make these files explicitly
+            # older than this claim's private run-state anchor.
+            anchor = self.state_path.stat().st_mtime_ns
+            os.utime(path, ns=(anchor - 1_000_000, anchor - 1_000_000))
+
+        self._write_result_inputs()
+        with knowledge_server() as endpoint:
+            ready = self._worker(endpoint).draft(outcome="awaiting_plan")
+
+        document = json.loads(
+            (self.run_directory / ready["draft"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(document["summary"], "Synthetic result summary")
+        self.assertEqual(document["work_markdown"],
+                         "# Synthetic work\n\nNo private evidence.")
+
+    def test_draft_still_accepts_task_inputs_written_during_this_claim(self):
+        paths = self._enable_archive()
+        for name, text in (
+            ("result-summary.txt", "Task-folder synthetic summary.\n"),
+            ("result-work.md", "# Task-folder synthetic work\n"),
+        ):
+            path = paths.working_directory / name
+            path.write_text(text, encoding="utf-8")
+            path.chmod(0o600)
+
+        with knowledge_server() as endpoint:
+            ready = self._worker(endpoint).draft(outcome="awaiting_plan")
+
+        document = json.loads(
+            (self.run_directory / ready["draft"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(document["summary"], "Task-folder synthetic summary.")
+        self.assertEqual(document["work_markdown"],
+                         "# Task-folder synthetic work")
+
+    def _age_task_input(self, path: Path) -> None:
+        """Make a task-folder file predate this claim's run-state anchor."""
+        anchor = self.state_path.stat().st_mtime_ns
+        os.utime(path, ns=(anchor - 1_000_000, anchor - 1_000_000))
+
+    def test_stale_task_input_is_not_read_when_this_run_wrote_none(self):
+        """The fence must not be undone by the not-found fallback.
+
+        Skipping a stale candidate and then returning that same path as the
+        reported location handed it straight back to the readers, so a name
+        this run never authored still replayed the previous claim.
+        """
+        paths = self._enable_archive()
+        for name, text in (
+            ("result-summary.txt", "Earlier synthetic summary.\n"),
+            ("result-work.md", "# Earlier synthetic work\n"),
+            ("result-questions.json", '["Stale synthetic question?"]\n'),
+        ):
+            path = paths.working_directory / name
+            path.write_text(text, encoding="utf-8")
+            path.chmod(0o600)
+            self._age_task_input(path)
+
+        # This claim authors a summary and a work body, but no questions.
+        self._write_result_input(
+            "result-summary.txt", "Synthetic result summary\n"
+        )
+        self._write_result_input(
+            "result-work.md", "# Synthetic work\n\nNo private evidence.\n"
+        )
+        with knowledge_server() as endpoint:
+            ready = self._worker(endpoint).draft(outcome="awaiting_plan")
+
+        document = json.loads(
+            (self.run_directory / ready["draft"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(document["questions"], [])
+
+    def test_draft_refuses_when_only_stale_task_inputs_exist(self):
+        """A claim that authored nothing is empty, not the previous claim."""
+        paths = self._enable_archive()
+        for name, text in (
+            ("result-summary.txt", "Earlier synthetic summary.\n"),
+            ("result-work.md", "# Earlier synthetic work\n"),
+        ):
+            path = paths.working_directory / name
+            path.write_text(text, encoding="utf-8")
+            path.chmod(0o600)
+            self._age_task_input(path)
+
+        with knowledge_server() as endpoint:
+            with self.assertRaises(ExecutionWorkerDraftError):
+                self._worker(endpoint).draft(outcome="awaiting_plan")
+
+    def test_release_sees_result_inputs_authored_in_the_task_folder(self):
+        """Releasing must not silently drop work authored where it belongs.
+
+        The guard looked only at the private run directory, so an agent that
+        used the intended durable location was released as having produced
+        nothing at all.
+        """
+        paths = self._enable_archive()
+        for name, text in (
+            ("result-summary.txt", "Task-folder synthetic summary.\n"),
+            ("result-work.md", "# Task-folder synthetic work\n"),
+        ):
+            path = paths.working_directory / name
+            path.write_text(text, encoding="utf-8")
+            path.chmod(0o600)
+
+        with knowledge_server() as endpoint:
+            receipt = self._worker(endpoint).release()
+
+        self.assertEqual(receipt["schema"], "foxhound.execution-result-receipt")
+        self.assertEqual(receipt["disposition"], "applied")
+
+    def test_release_ignores_stale_task_inputs_from_an_earlier_claim(self):
+        """A durable leftover must not block every future release."""
+        paths = self._enable_archive()
+        path = paths.working_directory / "result-summary.txt"
+        path.write_text("Earlier synthetic summary.\n", encoding="utf-8")
+        path.chmod(0o600)
+        self._age_task_input(path)
+
+        with knowledge_server() as endpoint:
+            receipt = self._worker(endpoint).release()
+
+        self.assertEqual(
+            receipt["schema"], "foxhound.execution-release-receipt"
+        )
 
     def test_repository_receipt_is_private_and_deduplicated(self):
         receipt = {
@@ -1124,8 +1588,40 @@ class ResultLocationTests(unittest.TestCase):
             self._state(str(self.task)), self.run)
 
         self.assertEqual(
-            execution_worker._locate_result(order, "result-summary.txt"),
+            execution_worker._locate_result(
+                order, "result-summary.txt",
+                task_folder_not_before=expected.stat().st_mtime_ns - 1,
+            ),
             expected,
+        )
+
+    def test_a_stale_task_result_is_not_returned_as_the_path_to_read(self):
+        """Fencing a candidate and then reporting it is not fencing it.
+
+        Nothing else stands between this path and the readers: whatever comes
+        back here is opened and recorded.
+        """
+        stale = self._write(self.task, "result-summary.txt")
+        order = execution_worker._result_search_path(
+            self._state(str(self.task)), self.run)
+
+        located = execution_worker._locate_result(
+            order, "result-summary.txt",
+            task_folder_not_before=stale.stat().st_mtime_ns + 1,
+        )
+
+        self.assertNotEqual(located, stale)
+        self.assertEqual(located, self.run / "result-summary.txt")
+
+    def test_an_unreadable_anchor_fences_the_shared_folder(self):
+        """No anchor means no way to prove freshness, so nothing shared wins."""
+        self._write(self.task, "result-summary.txt")
+        order = execution_worker._result_search_path(
+            self._state(str(self.task)), self.run)
+
+        self.assertEqual(
+            execution_worker._locate_result(order, "result-summary.txt"),
+            self.run / "result-summary.txt",
         )
 
     def test_a_result_in_the_run_directory_still_records(self):

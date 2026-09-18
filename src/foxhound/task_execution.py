@@ -13,6 +13,7 @@ import os
 import re
 import secrets
 import sqlite3
+from collections.abc import Mapping
 from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta, timezone
@@ -192,6 +193,7 @@ class WorkflowRefusal(StrEnum):
     STALE_WORKFLOW = "stale_workflow"
     CLAIM_MISMATCH = "claim_mismatch"
     RESULT_CONFLICT = "result_conflict"
+    RESULT_UNCHANGED = "result_unchanged"
     AGENT_PROFILE_UNAVAILABLE = "agent_profile_unavailable"
 
 
@@ -269,6 +271,9 @@ class ExecutionResultEnvelope:
     repository_impact: bool = field(default=True, repr=False)
     task_work_directory: str | None = field(default=None, repr=False)
     task_kb_file: str | None = field(default=None, repr=False)
+    #: Which reader instruction this run was handed, if any.
+    reader_instruction_sequence: int | None = field(
+        default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -524,6 +529,10 @@ class TaskExecutionService:
                     )
                     promoted += 1
 
+                granted = self._reconcile_granted_review_gates(
+                    connection, now
+                )
+
                 rows = connection.execute(
                     "SELECT t.id,t.version,("
                     " SELECT o.source_kind FROM task_candidate_bindings AS b "
@@ -586,7 +595,7 @@ class TaskExecutionService:
                     scheduled += 1
                 connection.commit()
                 return ExecutionScheduleResult(
-                    scheduled=promoted + scheduled,
+                    scheduled=promoted + granted + scheduled,
                     remaining=eligible - scheduled,
                 )
             except Exception:
@@ -1258,6 +1267,28 @@ class TaskExecutionService:
                 if refusal is not None:
                     connection.rollback()
                     return _refused_row(result["task_id"], row, refusal)
+                if _repeats_an_earlier_answer(connection, result):
+                    # A pass that was asked to change something and produced
+                    # a byte-identical result did not answer the request. It
+                    # is the shape of work that was done and then lost before
+                    # recording, and presenting it to the reader as an answer
+                    # is what made that loss invisible.
+                    #
+                    # The claim stays live: the agent can re-read its own run
+                    # directory, find what it actually wrote, and record that
+                    # instead. A refusal it can act on is worth more than a
+                    # result nobody can trust.
+                    self._event(
+                        connection, result["task_id"], "result_unchanged",
+                        int(row["version"]), int(row["task_version"]),
+                        WorkflowPhase(row["phase"]),
+                        WorkflowStatus(row["status"]), now,
+                    )
+                    connection.commit()
+                    return _refused_row(
+                        result["task_id"], row,
+                        WorkflowRefusal.RESULT_UNCHANGED,
+                    )
                 target = _result_target(
                     WorkflowPhase(result["phase"]),
                     ExecutionOutcome(result["outcome"]),
@@ -1286,8 +1317,9 @@ class TaskExecutionService:
                     "questions_json,external_actions_json,deliverables_json,"
                     "repository_references_json,repository_impact,"
                     "created_at,agent_profile_id,agent_profile_revision,"
-                    "task_work_directory,task_kb_file,work_digest) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "task_work_directory,task_kb_file,work_digest,"
+                    "reader_instruction_sequence) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         result["result_id"], result["task_id"],
                         result["workflow_version"], result["task_version"],
@@ -1303,6 +1335,7 @@ class TaskExecutionService:
                         result["task_work_directory"],
                         result["task_kb_file"],
                         result["work_digest"],
+                        result["reader_instruction_sequence"],
                     ),
                 )
                 version = result["workflow_version"] + 1
@@ -1436,16 +1469,79 @@ class TaskExecutionService:
             if refusal is not None:
                 raise TaskLedgerError("execution claim is unavailable")
             value = connection.execute(
-                "SELECT i.value FROM execution_reader_inputs AS i "
+                "SELECT i.sequence,i.value FROM execution_reader_inputs AS i "
                 "WHERE i.task_id=? AND i.kind='discussion' "
                 "AND i.target_workflow_version<=? AND NOT EXISTS("
                 " SELECT 1 FROM task_execution_results AS r "
-                " WHERE r.task_id=i.task_id "
-                " AND r.workflow_version>=i.target_workflow_version"
+                " WHERE r.task_id=i.task_id AND ("
+                "  r.reader_instruction_sequence=i.sequence"
+                # The fallback. Results recorded before deliveries existed
+                # name no instruction, so for those the only thing that can
+                # say an instruction was answered is still the version it
+                # was aimed at. A recorded link is preferred wherever there
+                # is one, because version arithmetic cannot tell a run that
+                # answered an instruction from one that merely ran after it.
+                "  OR (r.reader_instruction_sequence IS NULL"
+                "      AND r.workflow_version>=i.target_workflow_version)"
+                " )"
                 ") ORDER BY i.sequence DESC LIMIT 1",
                 (task_id, expected_version),
             ).fetchone()
-        return None if value is None else str(value["value"])
+            if value is None:
+                return None
+            self._record_instruction_delivery(
+                connection, row, expected_version, int(value["sequence"]), now)
+        return str(value["value"])
+
+    @staticmethod
+    def _record_instruction_delivery(
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        workflow_version: int,
+        instruction_sequence: int,
+        now: str,
+    ) -> None:
+        """Note that this run was handed this instruction, exactly once.
+
+        Handing the same run its instruction twice is one delivery, not two:
+        a worker that rebuilds its payload after a retry must not produce a
+        second event. `INSERT OR IGNORE` on the primary key makes the second
+        attempt a no-op without a round trip to check first, which also makes
+        it safe against two processes arriving together.
+        """
+        task_id = int(row["task_id"])
+        cursor = connection.execute(
+            "INSERT OR IGNORE INTO execution_reader_instruction_deliveries("
+            "task_id,workflow_version,instruction_sequence,occurred_at) "
+            "VALUES(?,?,?,?)",
+            (task_id, workflow_version, instruction_sequence, now),
+        )
+        if cursor.rowcount:
+            # The event says a handoff happened, never what was said. The
+            # reader's words live in `execution_reader_inputs` and stay
+            # there; an event stream is read in places a discussion is not.
+            TaskExecutionService._event(
+                connection, task_id, "reader_instruction_delivered",
+                workflow_version, int(row["task_version"]),
+                WorkflowPhase(row["phase"]), WorkflowStatus(row["status"]),
+                now,
+            )
+        connection.commit()
+
+    def delivered_reader_instruction_sequence(
+        self, task_id: int, *, expected_version: int
+    ) -> int | None:
+        """The instruction this run was handed, for the result to name."""
+        if not _valid_identity(task_id, expected_version):
+            return None
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT instruction_sequence "
+                "FROM execution_reader_instruction_deliveries "
+                "WHERE task_id=? AND workflow_version=?",
+                (task_id, expected_version),
+            ).fetchone()
+        return None if row is None else int(row["instruction_sequence"])
 
     def readiness(self) -> ExecutionReadiness:
         now = self._now()
@@ -1550,6 +1646,79 @@ class TaskExecutionService:
             raise TaskLedgerError(
                 "execution agent profile is unavailable"
             ) from exc
+
+    def _reconcile_granted_review_gates(
+        self, connection: sqlite3.Connection, now: str
+    ) -> int:
+        """Advance old review gates now covered by configured grants.
+
+        A policy change is a machine decision, not a reader approval.  Each
+        update therefore increments the workflow version and emits
+        ``phase_granted``.  Existing cards retain their old version and are
+        retired by the card scheduler's ordinary stale-card pass.
+        """
+        rows = connection.execute(
+            "SELECT w.*,r.outcome,("
+            " SELECT o.source_kind FROM task_candidate_bindings AS b "
+            " JOIN candidate_inbox AS o ON o.candidate_id=b.candidate_id "
+            " WHERE b.task_id=t.id AND b.relation='accepted'"
+            ") AS origin_kind FROM task_execution_workflows AS w "
+            "JOIN tasks AS t ON t.id=w.task_id "
+            "JOIN task_execution_results AS r "
+            "ON r.result_id=w.last_result_id AND r.task_id=w.task_id "
+            "WHERE w.status='awaiting_review' "
+            "AND w.phase IN ('plan','execute') "
+            "AND t.status='open' AND t.version=w.task_version "
+            "AND NOT EXISTS("
+            " SELECT 1 FROM task_candidate_bindings AS blocked JOIN "
+            " task_candidate_lifecycle AS l "
+            " ON l.candidate_id=blocked.candidate_id "
+            " WHERE blocked.task_id=t.id AND blocked.relation='accepted' "
+            " AND l.state='withdrawn' "
+            " AND l.resolution='preserved_open'"
+            f") ORDER BY {_SOURCE_QUEUE_ORDER_SQL}w.task_id"
+        ).fetchall()
+        granted = 0
+        for row in rows:
+            phase = WorkflowPhase(row["phase"])
+            target = _granted_advance(
+                phase,
+                ExecutionOutcome(row["outcome"]),
+                row["origin_kind"],
+                self._execution_grants,
+                self._action_grants,
+            )
+            if target is None:
+                continue
+            version = int(row["version"]) + 1
+            profile = self._profile_for(row["origin_kind"])
+            updated = connection.execute(
+                "UPDATE task_execution_workflows SET status='queued',"
+                "phase=?,version=?,due_at=NULL,claim_token_digest=NULL,"
+                "claimed_at=NULL,claim_heartbeat_at=NULL,"
+                "claim_expires_at=NULL,failure_count=0,"
+                "last_failure_reason=NULL,last_failure_exit_code=NULL,"
+                "last_failure_run_id=NULL,last_failure_at=NULL,"
+                "next_attempt_at=NULL,parked_at=NULL,agent_profile_id=?,"
+                "agent_profile_revision=?,updated_at=?,completed_at=NULL "
+                "WHERE task_id=? AND task_version=? AND version=? "
+                "AND status='awaiting_review' AND phase=?",
+                (
+                    target.value, version, profile.profile_id,
+                    profile.revision, now, int(row["task_id"]),
+                    int(row["task_version"]), int(row["version"]),
+                    phase.value,
+                ),
+            )
+            if updated.rowcount != 1:
+                continue
+            self._event(
+                connection, int(row["task_id"]), "phase_granted", version,
+                int(row["task_version"]), target, WorkflowStatus.QUEUED,
+                now,
+            )
+            granted += 1
+        return granted
 
     def _cancel_stale(
         self, connection: sqlite3.Connection, now: str
@@ -2425,6 +2594,7 @@ def _validated_result(envelope: ExecutionResultEnvelope) -> dict[str, object]:
         envelope.task_work_directory, "task work directory"
     )
     task_kb_file = _result_path(envelope.task_kb_file, "task KB file")
+    instruction = _result_instruction(envelope.reader_instruction_sequence)
     if (task_work_directory is None) != (task_kb_file is None):
         raise ValueError("execution result review paths are invalid")
     document = {
@@ -2452,6 +2622,11 @@ def _validated_result(envelope: ExecutionResultEnvelope) -> dict[str, object]:
         raise ValueError("execution result digest is invalid")
     return {
         **document,
+        # Provenance, not content. A result that says the same thing is the
+        # same answer whether or not a reader prompted it, so the digest --
+        # which exists to recognise a repeat -- must not move because the
+        # instruction did.
+        "reader_instruction_sequence": instruction,
         "work_digest": work_digest or None,
         "content_digest": digest,
         "questions_json": _canonical_json(questions),
@@ -2460,6 +2635,93 @@ def _validated_result(envelope: ExecutionResultEnvelope) -> dict[str, object]:
         "repository_references_json": _canonical_json(repository_references),
         "claim_token": envelope.claim_token,
     }
+
+
+#: The fields that are the agent's answer. Everything else on a result is
+#: bookkeeping: identifiers, the phase, the locations it was authored in, and
+#: the queue blurb.
+#:
+#: `questions` is deliberately absent. An agent re-asks a different set almost
+#: every pass, and letting a changed question list prove the answer changed is
+#: what a repeated report already looks like in practice: the same prose,
+#: recorded three passes running, under four distinct content digests.
+#:
+#: `outcome` is deliberately present. The same prose recorded as `completed`
+#: rather than `awaiting_plan` is a different answer -- the difference between
+#: proposing something and declaring it done -- and excluding it made a
+#: terminal outcome impossible to record over unchanged text.
+#:
+#: The deliverables, external actions and repository references are present
+#: because a correction that attaches the deliverable it forgot HAS changed
+#: its answer. Excluding them taught an agent to pad its wording to get past
+#: the guard, and told a reader "same answer" above an effect list that had
+#: changed completely.
+_ANSWER_COLUMNS = (
+    "outcome",
+    "summary",
+    "work_markdown",
+    "external_actions_json",
+    "deliverables_json",
+    "repository_references_json",
+    "repository_impact",
+)
+
+
+def _cycle_started_at(connection: sqlite3.Connection, task_id: int) -> int:
+    """The workflow version this task was most recently scheduled at.
+
+    A task that is cancelled and scheduled again, or dropped back into the
+    queue, begins a new cycle. Results from the cycle before it describe work
+    the reader already saw and closed, and comparing against them would refuse
+    a new cycle's opening result -- forever, since every retry would be refused
+    identically, until the claim expired and the workflow parked.
+    """
+    row = connection.execute(
+        "SELECT workflow_version FROM task_execution_events "
+        "WHERE task_id=? AND kind='scheduled' "
+        "ORDER BY sequence DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return 0 if row is None else int(row["workflow_version"])
+
+
+def _repeats_an_earlier_answer(
+    connection: sqlite3.Connection, result: Mapping[str, object]
+) -> bool:
+    """Whether this result says exactly what an earlier one in this cycle said.
+
+    Compared against every prior result in the cycle rather than only the most
+    recent. A pass that reproduces the one before last is the same failure as
+    one that reproduces the last, and checking only the newest let an X, Y, X
+    sequence through -- which is the shape the reports that prompted this
+    actually had.
+
+    Scoped to the same `task_version`, so editing the task always opens a
+    clean slate, and to the same phase, so planning and executing are never
+    held against each other.
+    """
+    predicate = " AND ".join(f"{column}=?" for column in _ANSWER_COLUMNS)
+    row = connection.execute(
+        "SELECT 1 FROM task_execution_results "
+        "WHERE task_id=? AND task_version=? AND phase=? "
+        "AND workflow_version>=? "
+        f"AND {predicate} LIMIT 1",
+        (
+            result["task_id"], result["task_version"], result["phase"],
+            _cycle_started_at(connection, int(result["task_id"])),
+            *(result[column] for column in _ANSWER_COLUMNS),
+        ),
+    ).fetchone()
+    return row is not None
+
+
+def _result_instruction(value: object) -> int | None:
+    """The reader-instruction sequence a result may name, if it names one."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError("execution result reader instruction is invalid")
+    return value
 
 
 def _result_path(value: object, label: str) -> str | None:

@@ -99,6 +99,7 @@ from .execution_cards import (
     ExecutionAgentOption,
     ExecutionAgentSelectorResult,
     ExecutionCardDeliveryClaim,
+    ExecutionCardDeliverables,
     ExecutionCardDetail,
     ExecutionCardDisposition,
     ExecutionCardKind,
@@ -123,6 +124,7 @@ from .execution_runner import (
     profile_argv,
     run_once,
 )
+from .persistent_effects import PersistentEffectError, PersistentEffectExecutor
 
 __version__ = "0.1.0"
 
@@ -209,6 +211,7 @@ __all__ = (
     "ExecutionAgentOption",
     "ExecutionAgentSelectorResult",
     "ExecutionCardDeliveryClaim",
+    "ExecutionCardDeliverables",
     "ExecutionCardDetail",
     "ExecutionCardDisposition",
     "ExecutionCardKind",
@@ -230,4 +233,6 @@ __all__ = (
     "hermes_argv",
     "profile_argv",
     "run_once",
+    "PersistentEffectError",
+    "PersistentEffectExecutor",
 )

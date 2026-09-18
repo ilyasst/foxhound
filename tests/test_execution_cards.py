@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from foxhound import migrate_database
+from foxhound import execution_cards
 
 import json
 import os
@@ -190,6 +191,54 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertTrue(result.accepted)
         return result
 
+    def _work_revision(self, task_id: int, kind: str = "accepted") -> int:
+        """Give a task a work item and one revision, as intake would."""
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO work_items(task_id,created_at,"
+                "updated_at) VALUES(?,?,?)",
+                (task_id, NOW.isoformat(timespec="seconds"),
+                 NOW.isoformat(timespec="seconds")),
+            )
+            item = connection.execute(
+                "SELECT id FROM work_items WHERE task_id=?", (task_id,)
+            ).fetchone()[0]
+            cursor = connection.execute(
+                "INSERT INTO work_revisions(work_item_id,candidate_id,"
+                "source_revision,task_version,kind,created_at) "
+                "VALUES(?,?,?,1,?,?)",
+                (item, "tc_" + "0" * 64, "a" * 64, kind,
+                 NOW.isoformat(timespec="seconds")),
+            )
+            return int(cursor.lastrowid)
+
+    def _card_work_revision(self, task_id: int):
+        with closing(sqlite3.connect(self.database)) as connection:
+            return connection.execute(
+                "SELECT work_revision_id FROM execution_review_cards "
+                "WHERE task_id=? ORDER BY id DESC LIMIT 1", (task_id,)
+            ).fetchone()[0]
+
+    def test_an_approval_records_the_work_revision_it_was_raised_against(self):
+        """So a later outcome can name the source state the reader saw."""
+        revision = self._work_revision(1)
+        self._schedule_workflow(1)
+        self.assertEqual(self.cards.schedule().created, 1)
+        self.assertEqual(self._card_work_revision(1), revision)
+
+    def test_an_approval_records_the_newest_revision_not_the_first(self):
+        self._work_revision(2)
+        newer = self._work_revision(2, kind="source_advance")
+        self._schedule_workflow(2)
+        self.assertEqual(self.cards.schedule().created, 1)
+        self.assertEqual(self._card_work_revision(2), newer)
+
+    def test_a_task_with_no_work_revision_still_raises_a_card(self):
+        """Cards predate work items; an unknown revision is not an error."""
+        self._schedule_workflow(3)
+        self.assertEqual(self.cards.schedule().created, 1)
+        self.assertIsNone(self._card_work_revision(3))
+
     def _set_structured_owner(
         self,
         task_id: int,
@@ -352,6 +401,12 @@ class ExecutionCardTests(unittest.TestCase):
             # not got it yet.
             connection.execute(
                 "ALTER TABLE task_execution_results DROP COLUMN work_digest"
+            )
+            # v42 added this; a database older than that has not
+            # got it yet.
+            connection.execute(
+                "ALTER TABLE task_execution_results DROP COLUMN "
+                "reader_instruction_sequence"
             )
             connection.execute(
                 "ALTER TABLE task_execution_results DROP COLUMN "
@@ -1415,7 +1470,7 @@ class ExecutionCardTests(unittest.TestCase):
                 [
                     "revise", "discuss", "approve", "agent", "comment_go",
                     "snooze",
-                    "done", "reassign", "drop", "brief",
+                    "done", "reassign", "drop", "deliverables", "brief",
                 ],
             )
             self.assertEqual(
@@ -1428,6 +1483,7 @@ class ExecutionCardTests(unittest.TestCase):
                     SNOOZE_LABEL_ROW,
                     ["✅ Mark as done"],
                     ["👥 Reassign", "🗑 Drop task"],
+                    ["📦 Deliverables"],
                     ["📋 Task brief"],
                 ],
             )
@@ -2179,6 +2235,38 @@ class ExecutionCardTests(unittest.TestCase):
 
         self.assertEqual(self.cards.stats(), before)
 
+    def test_deliverables_are_a_versioned_read_for_review_cards(self):
+        """Prepared Markdown can be sent separately without answering it."""
+        task_id = 1
+        self._plan_review(task_id, "deliverables-read")
+        self.assertEqual(self.cards.schedule().created, 1)
+        claim = self._claim_and_deliver()
+        before = self.cards.stats()
+
+        body, keyboard = render_execution_review_card(claim.card)
+        actions = [
+            parse_execution_review_callback(button["callback_data"])[2]
+            for row in keyboard["inline_keyboard"] for button in row
+        ]
+        self.assertIn("deliverables", actions)
+        self.assertIn("Synthetic deliverable", body)
+
+        result = self.cards.deliverables(
+            claim.card.id, expected_version=claim.card.version
+        )
+
+        self.assertTrue(result.accepted, result.refusal)
+        self.assertEqual(result.card_version, claim.card.version)
+        self.assertIn("# Deliverables", result.text)
+        self.assertIn("Synthetic deliverable", result.text)
+        self.assertEqual(self.cards.stats(), before)
+
+        stale = self.cards.deliverables(
+            claim.card.id, expected_version=claim.card.version + 1
+        )
+        self.assertFalse(stale.accepted)
+        self.assertEqual(stale.refusal, ExecutionCardRefusal.STALE_VERSION)
+
     def test_a_delivered_card_can_be_rendered_again_unchanged(self):
         """Backing out of a sub-menu must land exactly where you left.
 
@@ -2862,6 +2950,80 @@ class ExecutionCardTests(unittest.TestCase):
             f"Synthetic deliverable {MAX_ADVISORY_RECORDS}.", body)
         self.assertIn("and 2 more", body)
 
+    def test_an_unchanged_revision_is_marked_in_html_and_plain_text(self):
+        card = self._plan_card(
+            revisions=2,
+            revision_note="Please revise the synthetic plan.",
+            unchanged_from_previous=True,
+        )
+        body, _ = render_execution_review_card(card)
+        plain = "\n".join(execution_cards._card_lines(card))
+
+        self.assertIn("Unchanged from the previous revision", body)
+        self.assertIn("Unchanged from the previous revision", plain)
+        self.assertIn("You asked for:", body)
+
+    def test_the_unchanged_marker_is_computed_from_the_ledger(self):
+        """The query is the whole point, so the query is what is tested.
+
+        Constructing the flag by hand covers the one line that renders it and
+        none of the mechanism, which can then be removed without a single test
+        noticing.
+
+        The ledger refuses a repeat inside one cycle, so the case that reaches
+        a card is a repeat ACROSS cycles: that is not certainly wrong, which
+        is why it records, and it is exactly what a marker is for.
+        """
+        self._plan_review(1, "cycle-one")
+        first = self.execution.get(1)
+        cancelled = self.execution.review_action(
+            1, expected_version=first.version, action="cancel")
+        self.assertEqual(cancelled.status, WorkflowStatus.CANCELLED)
+
+        rescheduled = self._schedule_workflow(1)
+        self.execution.start_action(
+            1, expected_version=rescheduled.version, action="start")
+        self._record(
+            1,
+            phase=WorkflowPhase.PLAN,
+            outcome=ExecutionOutcome.AWAITING_PLAN,
+            result_id="cycle-two",
+        )
+
+        self.assertEqual(self.cards.schedule().created, 1)
+        card = self.cards.claim_next().card
+        self.assertTrue(card.unchanged_from_previous)
+        self.assertIn(
+            "Unchanged from the previous revision",
+            render_execution_review_card(card)[0],
+        )
+
+    def test_a_changed_effect_list_is_not_called_unchanged(self):
+        """The marker must never sit above an effect list that has changed.
+
+        A reader told "same answer" over a different set of effects has been
+        told something the card cannot know, directly above the decision it
+        exists to ask for.
+        """
+        self._plan_review(2, "effects-one")
+        first = self.execution.get(2)
+        self.execution.review_action(
+            2, expected_version=first.version, action="cancel")
+        rescheduled = self._schedule_workflow(2)
+        self.execution.start_action(
+            2, expected_version=rescheduled.version, action="start")
+        self._record(
+            2,
+            phase=WorkflowPhase.PLAN,
+            outcome=ExecutionOutcome.AWAITING_PLAN,
+            result_id="effects-two",
+            external_actions=("Email example@example.com: a different effect.",),
+        )
+
+        self.assertEqual(self.cards.schedule().created, 1)
+        card = self.cards.claim_next().card
+        self.assertFalse(card.unchanged_from_previous)
+
     def test_the_authorising_list_is_never_capped(self):
         """The cap must not reach the card that asks for authorisation.
 
@@ -3262,7 +3424,7 @@ class ExecutionCardTests(unittest.TestCase):
                 for button in row
             ],
             ["done", "discuss", "snooze",
-             "reassign", "drop", "brief"],
+             "reassign", "drop", "deliverables", "brief"],
         )
         self.cards.complete_delivery(
             claim.card.id,
@@ -3502,6 +3664,130 @@ class ExecutionCardTests(unittest.TestCase):
             claim_token=next_run.token,
         ))
         self.assertGreater(discussed.workflow_version, before.version)
+
+    def _reader_events(self, task_id: int) -> list[str]:
+        import sqlite3 as _sqlite3
+        with closing(_sqlite3.connect(self.database)) as connection:
+            return [
+                row[0] for row in connection.execute(
+                    "SELECT kind FROM task_execution_events WHERE task_id=? "
+                    "ORDER BY sequence", (task_id,))
+            ]
+
+    def _delivery_rows(self, task_id: int) -> list[tuple]:
+        import sqlite3 as _sqlite3
+        with closing(_sqlite3.connect(self.database)) as connection:
+            return list(connection.execute(
+                "SELECT workflow_version,instruction_sequence "
+                "FROM execution_reader_instruction_deliveries "
+                "WHERE task_id=? ORDER BY workflow_version", (task_id,)))
+
+    def test_a_delivered_instruction_is_recorded_and_named_by_its_result(self):
+        """A run that was steered can be told from one that was not.
+
+        Without this the same three failures look identical: the instruction
+        was never selected, it was selected and disregarded, or it was acted
+        on and the work was lost before recording.
+        """
+        self._plan_review(1, "audit-plan")
+        self.cards.schedule()
+        claim = self._claim_and_deliver()
+        self.cards.submit_input(
+            claim.card.id,
+            expected_version=claim.card.version,
+            kind="discussion",
+            value="Check the synthetic constraint.",
+        )
+        run = self.execution.claim_next()
+
+        self.assertEqual(self._delivery_rows(1), [])
+        self.execution.reader_instruction(
+            1, expected_version=run.workflow_version, claim_token=run.token)
+
+        rows = self._delivery_rows(1)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], run.workflow_version)
+        self.assertEqual(self._reader_events(1)[-1],
+                         "reader_instruction_delivered")
+        self.assertEqual(
+            self.execution.delivered_reader_instruction_sequence(
+                1, expected_version=run.workflow_version),
+            rows[0][1],
+        )
+
+        self.execution.record_result(ExecutionResultEnvelope(
+            result_id="audit-result",
+            task_id=1,
+            task_version=1,
+            workflow_version=run.workflow_version,
+            phase="plan",
+            claim_token=run.token,
+            outcome="awaiting_plan",
+            summary="Synthetic revised plan.",
+            work_markdown="Synthetic revised work.",
+            reader_instruction_sequence=rows[0][1],
+        ))
+        import sqlite3 as _sqlite3
+        with closing(_sqlite3.connect(self.database)) as connection:
+            named = connection.execute(
+                "SELECT reader_instruction_sequence FROM "
+                "task_execution_results WHERE result_id=?",
+                ("audit-result",)).fetchone()[0]
+        self.assertEqual(named, rows[0][1])
+
+    def test_delivering_the_same_instruction_twice_is_one_delivery(self):
+        """A worker that rebuilds its payload must not log a second handoff."""
+        self._plan_review(2, "audit-twice")
+        self.cards.schedule()
+        claim = self._claim_and_deliver()
+        self.cards.submit_input(
+            claim.card.id,
+            expected_version=claim.card.version,
+            kind="discussion",
+            value="Synthetic direction.",
+        )
+        run = self.execution.claim_next()
+        for _ in range(3):
+            self.execution.reader_instruction(
+                2, expected_version=run.workflow_version,
+                claim_token=run.token)
+
+        self.assertEqual(len(self._delivery_rows(2)), 1)
+        self.assertEqual(
+            self._reader_events(2).count("reader_instruction_delivered"), 1)
+
+    def test_a_run_given_no_instruction_records_none(self):
+        """The whole point is the difference between none and one."""
+        self._plan_review(3, "audit-none")
+        run_version = self.execution.get(3).version
+        self.assertEqual(self._delivery_rows(3), [])
+        self.assertIsNone(
+            self.execution.delivered_reader_instruction_sequence(
+                3, expected_version=run_version))
+        self.assertNotIn("reader_instruction_delivered",
+                         self._reader_events(3))
+
+    def test_the_instruction_is_not_part_of_what_makes_a_result_the_same(self):
+        """Provenance must not move the content digest.
+
+        A result that says the same thing is the same answer whether or not a
+        reader prompted it; letting the instruction change the digest would
+        make the repeat guard blind exactly when a reader asked for a change.
+        """
+        base = dict(
+            result_id="digest-a", task_id=4, task_version=1,
+            workflow_version=1, phase="plan", claim_token="x" * 40,
+            outcome="awaiting_plan", summary="Same synthetic summary.",
+            work_markdown="Same synthetic work.",
+        )
+        from foxhound.task_execution import _validated_result
+        without = _validated_result(ExecutionResultEnvelope(**base))
+        with_one = _validated_result(ExecutionResultEnvelope(
+            **{**base, "reader_instruction_sequence": 7}))
+
+        self.assertEqual(without["content_digest"], with_one["content_digest"])
+        self.assertIsNone(without["reader_instruction_sequence"])
+        self.assertEqual(with_one["reader_instruction_sequence"], 7)
 
     def _assert_comment_and_go(
         self, task_id: int, expected_phase: WorkflowPhase

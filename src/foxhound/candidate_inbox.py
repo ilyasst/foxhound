@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 36
+SCHEMA_VERSION = 43
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -255,6 +255,16 @@ _SCHEMA_COLUMNS = {
         "actor",
         "occurred_at",
     ),
+    "task_duplicate_assessments": (
+        "left_task_id",
+        "right_task_id",
+        "detector",
+        "verdict",
+        "latency_ms",
+        "prompt_tokens",
+        "completion_tokens",
+        "assessed_at",
+    ),
     "task_fused_title_jobs": (
         "task_id",
         "state",
@@ -350,6 +360,13 @@ _SCHEMA_COLUMNS = {
         "work_digest",
         "repository_references_json",
         "repository_impact",
+        "reader_instruction_sequence",
+    ),
+    "execution_reader_instruction_deliveries": (
+        "task_id",
+        "workflow_version",
+        "instruction_sequence",
+        "occurred_at",
     ),
     "task_execution_events": (
         "sequence",
@@ -385,6 +402,9 @@ _SCHEMA_COLUMNS = {
         "consumer_digest",
         "superseded_delivery_ref",
         "superseded_transport",
+        # Appended by v39. Declared last because the check below compares the
+        # column tuple in order, and ALTER TABLE adds to the end.
+        "work_revision_id",
     ),
     "execution_review_card_events": (
         "sequence",
@@ -408,6 +428,26 @@ _SCHEMA_COLUMNS = {
         "value",
         "prior_value",
         "occurred_at",
+    ),
+    "effect_intents": (
+        "intent_id",
+        "work_item_id",
+        "work_revision_id",
+        "kind",
+        "target",
+        "payload_digest",
+        "idempotency_key",
+        "freshness_required",
+        "created_at",
+    ),
+    "effect_receipts": (
+        "intent_id",
+        "work_item_id",
+        "work_revision_id",
+        "state",
+        "receipt_id",
+        "reversible",
+        "recorded_at",
     ),
     "task_owner_events": (
         "sequence",
@@ -482,12 +522,46 @@ _SCHEMA_COLUMNS = {
 # the new table removed, the v22 state also has the card column removed but
 # keeps `work_digest`, the v21 state has neither column but keeps
 # `task_relations`, and the v20 state has none of the five.
+#: Every historical checkpoint derives from the current map by removing what
+#: was added after it, so a table or column added now has to be stripped here
+#: or the mid-migration checks demand it from a database that predates it.
+#: Semantic assessments arrive at v43, and the delivery record and the result
+#: column that names it both arrive at v42. Every earlier checkpoint excludes
+#: the fields it has not yet introduced.
+_SCHEMA_V42_COLUMNS = {
+    name: columns
+    for name, columns in _SCHEMA_COLUMNS.items()
+    if name != "task_duplicate_assessments"
+}
+
+_SCHEMA_V41_COLUMNS = {
+    name: tuple(column for column in columns if not (
+        name == "task_execution_results"
+        and column == "reader_instruction_sequence"
+    ))
+    for name, columns in _SCHEMA_V42_COLUMNS.items()
+    if name != "execution_reader_instruction_deliveries"
+}
+
+_SCHEMA_V39_COLUMNS = {
+    name: columns
+    for name, columns in _SCHEMA_V41_COLUMNS.items()
+    if name not in {"effect_intents", "effect_receipts"}
+}
+
+_SCHEMA_V38_COLUMNS = {
+    name: tuple(column for column in columns if not (
+        name == "execution_review_cards" and column == "work_revision_id"
+    ))
+    for name, columns in _SCHEMA_V39_COLUMNS.items()
+}
+
 _SCHEMA_V34_COLUMNS = {
     name: tuple(column for column in columns if not (
         name == "execution_review_cards"
         and column in {"superseded_delivery_ref", "superseded_transport"}
     ))
-    for name, columns in _SCHEMA_COLUMNS.items()
+    for name, columns in _SCHEMA_V38_COLUMNS.items()
 }
 
 _SCHEMA_V33_COLUMNS = {
@@ -666,6 +740,9 @@ _SCHEMA_OBJECTS = {
     "task_duplicate_proposal_events_no_delete": "trigger",
     "task_duplicate_proposals_no_delete": "trigger",
     "task_duplicate_proposals_settle_only": "trigger",
+    "task_duplicate_assessments_pair": "index",
+    "task_duplicate_assessments_no_update": "trigger",
+    "task_duplicate_assessments_no_delete": "trigger",
     "task_fused_title_jobs_pending": "index",
     "task_fused_title_jobs_no_delete": "trigger",
     "task_owner_equivalences_no_update": "trigger",
@@ -691,6 +768,7 @@ _SCHEMA_OBJECTS = {
     "native_intake_historical_refusals_no_delete": "trigger",
     "execution_reader_inputs_no_update": "trigger",
     "execution_reader_inputs_no_delete": "trigger",
+    "execution_reader_instruction_deliveries": "table",
     "task_owner_events_no_update": "trigger",
     "task_owner_events_no_delete": "trigger",
     "task_execution_owner_holds_one_active": "index",
@@ -2391,6 +2469,184 @@ _SCHEMA_V36 = (
     _SCHEMA_V8[7],
 )
 
+# A continuing ask has one durable identity even as its accepted source
+# revision advances.  The task remains the compatibility projection; these
+# rows preserve why a new revision superseded prior runnable work.
+#
+# Every statement here is replayable: a migration may be re-run against a
+# database that already carries these rows, and one task may hold several
+# accepted bindings that share a source revision.  The backfill therefore
+# ignores conflicts rather than failing the whole migration on the
+# UNIQUE(work_item_id,source_revision) constraint.
+_SCHEMA_V37 = (
+    "CREATE TABLE IF NOT EXISTS work_items (id INTEGER PRIMARY KEY,task_id INTEGER NOT NULL UNIQUE REFERENCES tasks(id),state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active','withdrawn','closed')),created_at TEXT NOT NULL,updated_at TEXT NOT NULL);",
+    "CREATE TABLE IF NOT EXISTS work_revisions (id INTEGER PRIMARY KEY,work_item_id INTEGER NOT NULL REFERENCES work_items(id),candidate_id TEXT NOT NULL,source_revision TEXT NOT NULL,task_version INTEGER NOT NULL,created_at TEXT NOT NULL,UNIQUE(work_item_id,source_revision));",
+    "CREATE INDEX IF NOT EXISTS work_revisions_current ON work_revisions(work_item_id,id DESC);",
+    "INSERT OR IGNORE INTO work_items(task_id,created_at,updated_at) SELECT id,created_at,updated_at FROM tasks;",
+    "INSERT OR IGNORE INTO work_revisions(work_item_id,candidate_id,source_revision,task_version,created_at) SELECT w.id,b.candidate_id,b.source_revision,t.version,b.decided_at FROM task_candidate_bindings b JOIN work_items w ON w.task_id=b.task_id JOIN tasks t ON t.id=b.task_id WHERE b.relation='accepted';",
+    "CREATE TRIGGER IF NOT EXISTS work_revision_on_accepted_binding AFTER INSERT ON task_candidate_bindings WHEN NEW.relation='accepted' BEGIN INSERT OR IGNORE INTO work_items(task_id,created_at,updated_at) SELECT NEW.task_id,NEW.decided_at,NEW.decided_at; INSERT OR IGNORE INTO work_revisions(work_item_id,candidate_id,source_revision,task_version,created_at) SELECT id,NEW.candidate_id,NEW.source_revision,(SELECT version FROM tasks WHERE id=NEW.task_id),NEW.decided_at FROM work_items WHERE task_id=NEW.task_id; END;",
+    "CREATE TRIGGER IF NOT EXISTS work_revision_on_source_update AFTER UPDATE OF source_revision ON task_candidate_bindings WHEN NEW.relation='accepted' BEGIN INSERT OR IGNORE INTO work_revisions(work_item_id,candidate_id,source_revision,task_version,created_at) SELECT id,NEW.candidate_id,NEW.source_revision,(SELECT version FROM tasks WHERE id=NEW.task_id),NEW.decided_at FROM work_items WHERE task_id=NEW.task_id; END;",
+)
+
+# Binding writes also acknowledge evidence-only and reader-conflict updates.
+# A work revision instead records a source state actually folded into work, so
+# it is appended explicitly by the ledger rather than by a broad UPDATE trigger.
+#
+# Split into three parts because this migration has to be replayable, and the
+# rebuild is the one piece that is not. Replaying v37 re-creates the broad
+# update trigger this version exists to remove, so the drops must run every
+# time; and the rebuild relabels every row it copies as 'accepted', so running
+# it over an already-converted table would silently erase the
+# 'source_advance' distinction it was written to introduce.
+_SCHEMA_V38_DROP = (
+    "DROP TRIGGER IF EXISTS work_revision_on_accepted_binding;",
+    "DROP TRIGGER IF EXISTS work_revision_on_source_update;",
+)
+_SCHEMA_V38_REBUILD = (
+    "DROP INDEX IF EXISTS work_revisions_current;",
+    "ALTER TABLE work_revisions RENAME TO work_revisions_v37;",
+    "CREATE TABLE work_revisions (id INTEGER PRIMARY KEY,work_item_id INTEGER NOT NULL REFERENCES work_items(id),candidate_id TEXT NOT NULL,source_revision TEXT NOT NULL,task_version INTEGER NOT NULL,kind TEXT NOT NULL CHECK(kind IN ('accepted','source_advance')),created_at TEXT NOT NULL);",
+    "INSERT INTO work_revisions(id,work_item_id,candidate_id,source_revision,task_version,kind,created_at) SELECT id,work_item_id,candidate_id,source_revision,task_version,'accepted',created_at FROM work_revisions_v37;",
+    "DROP TABLE work_revisions_v37;",
+    "CREATE INDEX work_revisions_current ON work_revisions(work_item_id,id DESC);",
+)
+_SCHEMA_V38_TRIGGER = (
+    "CREATE TRIGGER work_revision_on_accepted_binding AFTER INSERT ON task_candidate_bindings WHEN NEW.relation='accepted' BEGIN INSERT OR IGNORE INTO work_items(task_id,created_at,updated_at) SELECT NEW.task_id,NEW.decided_at,NEW.decided_at; INSERT INTO work_revisions(work_item_id,candidate_id,source_revision,task_version,kind,created_at) SELECT id,NEW.candidate_id,NEW.source_revision,(SELECT version FROM tasks WHERE id=NEW.task_id),'accepted',NEW.decided_at FROM work_items WHERE task_id=NEW.task_id; END;",
+)
+
+
+# An execution approval says a reader agreed to an action. It recorded which
+# task version and workflow version were in force, but not which source state
+# the reader was actually looking at, so afterwards nothing could say what was
+# approved. The work revision names exactly that.
+#
+# Nullable and not backfilled on purpose: cards raised before this column
+# existed were approved against a source state nobody recorded, and inventing
+# one now would be a worse answer than admitting it is unknown.
+_SCHEMA_V39 = (
+    "CREATE INDEX IF NOT EXISTS execution_review_cards_work_revision ON execution_review_cards(work_revision_id);",
+)
+
+# An effect is made durable before it crosses an external boundary.  The
+# idempotency key belongs to the intent rather than a receipt because retries
+# need to identify an already-completed effect before calling an adapter.
+# Payloads never enter this schema: their SHA-256 digest is enough to detect a
+# contradictory replay without retaining the text that would be sent.
+_SCHEMA_V41 = (
+    "CREATE TABLE IF NOT EXISTS effect_intents (intent_id TEXT PRIMARY KEY,work_item_id INTEGER NOT NULL REFERENCES work_items(id),work_revision_id INTEGER NOT NULL REFERENCES work_revisions(id),kind TEXT NOT NULL CHECK(kind IN ('forge','email','teams')),target TEXT NOT NULL,payload_digest TEXT NOT NULL,idempotency_key TEXT NOT NULL UNIQUE,freshness_required INTEGER NOT NULL CHECK(freshness_required IN (0,1)),created_at TEXT NOT NULL);",
+    "CREATE TABLE IF NOT EXISTS effect_receipts (intent_id TEXT PRIMARY KEY REFERENCES effect_intents(intent_id),work_item_id INTEGER NOT NULL REFERENCES work_items(id),work_revision_id INTEGER NOT NULL REFERENCES work_revisions(id),state TEXT NOT NULL CHECK(state IN ('completed','failed','cancelled')),receipt_id TEXT,reversible INTEGER NOT NULL CHECK(reversible IN (0,1)),recorded_at TEXT NOT NULL);",
+)
+
+
+# A refused repeat is still something that happened to the workflow. Without
+# an event, the only trace of a pass that answered nothing is its absence from
+# the result table -- which reads exactly like a pass that never ran.
+_SCHEMA_V40_EXECUTION_EVENT_TABLE = _SCHEMA_V36_EXECUTION_EVENT_TABLE.replace(
+    "'phase_approved','phase_granted','revision_requested'",
+    "'phase_approved','phase_granted','revision_requested',"
+    "'result_unchanged'",
+)
+_SCHEMA_V40 = (
+    "DROP TRIGGER task_execution_events_no_update;",
+    "DROP TRIGGER task_execution_events_no_delete;",
+    "ALTER TABLE task_execution_events RENAME TO task_execution_events_v39;",
+    _SCHEMA_V40_EXECUTION_EVENT_TABLE,
+    "INSERT INTO task_execution_events("
+    "sequence,task_id,kind,workflow_version,task_version,phase,status,"
+    "occurred_at,agent_profile_id,agent_profile_revision) "
+    "SELECT sequence,task_id,kind,workflow_version,task_version,phase,status,"
+    "occurred_at,agent_profile_id,agent_profile_revision "
+    "FROM task_execution_events_v39;",
+    "DROP TABLE task_execution_events_v39;",
+    _SCHEMA_V8[6],
+    _SCHEMA_V8[7],
+)
+
+
+# Which reader instruction a run was actually handed. Three failures were
+# indistinguishable without it -- the instruction was never selected, it was
+# selected and disregarded, or it was acted on and the work was lost before
+# recording -- and telling them apart meant diffing files on disk by hand.
+#
+# One row per (task, workflow version): a run is handed at most one
+# instruction, and handing it twice is the same delivery, not a second one.
+# The reader's words are NOT copied here; they already live in
+# `execution_reader_inputs` and belong in one place.
+_SCHEMA_V42_EXECUTION_EVENT_TABLE = _SCHEMA_V40_EXECUTION_EVENT_TABLE.replace(
+    "'revision_requested',"
+    "'result_unchanged'",
+    "'revision_requested',"
+    "'result_unchanged','reader_instruction_delivered'",
+)
+_SCHEMA_V42 = (
+    "ALTER TABLE task_execution_results ADD COLUMN "
+    "reader_instruction_sequence INTEGER REFERENCES "
+    "execution_reader_inputs(sequence);",
+    """CREATE TABLE execution_reader_instruction_deliveries (
+    task_id              INTEGER NOT NULL,
+    workflow_version     INTEGER NOT NULL CHECK(workflow_version >= 1),
+    instruction_sequence INTEGER NOT NULL,
+    occurred_at          TEXT NOT NULL,
+    PRIMARY KEY(task_id, workflow_version),
+    FOREIGN KEY(task_id) REFERENCES task_execution_workflows(task_id),
+    FOREIGN KEY(instruction_sequence)
+        REFERENCES execution_reader_inputs(sequence)
+);""",
+    "DROP TRIGGER task_execution_events_no_update;",
+    "DROP TRIGGER task_execution_events_no_delete;",
+    "ALTER TABLE task_execution_events RENAME TO task_execution_events_v41;",
+    _SCHEMA_V42_EXECUTION_EVENT_TABLE,
+    "INSERT INTO task_execution_events("
+    "sequence,task_id,kind,workflow_version,task_version,phase,status,"
+    "occurred_at,agent_profile_id,agent_profile_revision) "
+    "SELECT sequence,task_id,kind,workflow_version,task_version,phase,status,"
+    "occurred_at,agent_profile_id,agent_profile_revision "
+    "FROM task_execution_events_v41;",
+    "DROP TABLE task_execution_events_v41;",
+    _SCHEMA_V8[6],
+    _SCHEMA_V8[7],
+)
+
+
+# A local semantic evaluator records only opaque pair identities, its closed
+# verdict, and aggregate-cost inputs. It never stores a prompt, model reply,
+# or task-derived explanation. The reader's proposal ledger remains the source
+# of truth for labels.
+_SCHEMA_V43 = (
+    """
+CREATE TABLE IF NOT EXISTS task_duplicate_assessments (
+    left_task_id      INTEGER NOT NULL REFERENCES tasks(id),
+    right_task_id     INTEGER NOT NULL REFERENCES tasks(id),
+    detector          TEXT NOT NULL CHECK(length(detector) BETWEEN 1 AND 64),
+    verdict           TEXT NOT NULL CHECK(verdict IN (
+                          'redundant','intersecting','interconnected'
+                      )),
+    latency_ms        INTEGER NOT NULL CHECK(latency_ms >= 0),
+    prompt_tokens     INTEGER NOT NULL CHECK(prompt_tokens >= 0),
+    completion_tokens INTEGER NOT NULL CHECK(completion_tokens >= 0),
+    assessed_at       TEXT NOT NULL,
+    PRIMARY KEY(left_task_id,right_task_id,detector),
+    CHECK(left_task_id < right_task_id)
+);
+""",
+    "CREATE INDEX IF NOT EXISTS task_duplicate_assessments_pair "
+    "ON task_duplicate_assessments(left_task_id,right_task_id);",
+    """
+CREATE TRIGGER IF NOT EXISTS task_duplicate_assessments_no_update
+BEFORE UPDATE ON task_duplicate_assessments
+BEGIN
+    SELECT RAISE(ABORT, 'task duplicate assessments are immutable');
+END;
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS task_duplicate_assessments_no_delete
+BEFORE DELETE ON task_duplicate_assessments
+BEGIN
+    SELECT RAISE(ABORT, 'task duplicate assessments are retained');
+END;
+""",
+)
+
 
 _SCHEMA_V20 = (
     # SQLite cannot alter a CHECK in place, and three tables carry a foreign
@@ -3391,6 +3647,134 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 36
+            if version == 36:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V37:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 37")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 37
+            if version == 37:
+                connection.execute("PRAGMA foreign_keys = OFF")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V38_DROP:
+                        connection.execute(statement)
+                    columns = tuple(item["name"] for item in connection.execute(
+                        "PRAGMA table_info(work_revisions)"
+                    ))
+                    if "kind" not in columns:
+                        for statement in _SCHEMA_V38_REBUILD:
+                            connection.execute(statement)
+                    for statement in _SCHEMA_V38_TRIGGER:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 38")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                finally:
+                    connection.execute("PRAGMA foreign_keys = ON")
+                version = 38
+            if version == 38:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    columns = tuple(item["name"] for item in connection.execute(
+                        "PRAGMA table_info(execution_review_cards)"
+                    ))
+                    if "work_revision_id" not in columns:
+                        connection.execute(
+                            "ALTER TABLE execution_review_cards ADD COLUMN "
+                            "work_revision_id INTEGER REFERENCES "
+                            "work_revisions(id);"
+                        )
+                    connection.execute("PRAGMA user_version = 39")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 39
+            if version == 39:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    definition = connection.execute(
+                        "SELECT sql FROM sqlite_master WHERE type='table' "
+                        "AND name='task_execution_events'"
+                    ).fetchone()
+                    if definition is None:
+                        raise InboxError("candidate inbox schema is incomplete")
+                    # Replayable: a database already carrying the widened
+                    # CHECK must not be rebuilt a second time.
+                    if "'result_unchanged'" not in definition["sql"]:
+                        for statement in _SCHEMA_V40:
+                            connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 40")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 40
+            if version == 40:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V41:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 41")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 41
+            if version == 41:
+                connection.execute("PRAGMA foreign_keys = OFF")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    columns = tuple(item["name"] for item in connection.execute(
+                        "PRAGMA table_info(task_execution_results)"
+                    ))
+                    # Replayable: a database that already carries the column,
+                    # the table or the widened CHECK must not be rebuilt.
+                    if "reader_instruction_sequence" not in columns:
+                        connection.execute(_SCHEMA_V42[0])
+                    connection.execute(
+                        _SCHEMA_V42[1].replace(
+                            "CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1))
+                    definition = connection.execute(
+                        "SELECT sql FROM sqlite_master WHERE type='table' "
+                        "AND name='task_execution_events'"
+                    ).fetchone()
+                    if definition is None:
+                        raise InboxError("candidate inbox schema is incomplete")
+                    widened = "'reader_instruction_delivered'"
+                    if widened not in definition["sql"]:
+                        for statement in _SCHEMA_V42[2:]:
+                            connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 42")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                finally:
+                    connection.execute("PRAGMA foreign_keys = ON")
+                version = 42
+            if version == 42:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V43:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 43")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 43
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:

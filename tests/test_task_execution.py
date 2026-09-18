@@ -349,6 +349,12 @@ class TaskExecutionTests(unittest.TestCase):
             connection.execute(
                 "ALTER TABLE task_execution_results DROP COLUMN work_digest"
             )
+            # v42 added this; a database older than that has not
+            # got it yet.
+            connection.execute(
+                "ALTER TABLE task_execution_results DROP COLUMN "
+                "reader_instruction_sequence"
+            )
             connection.execute(
                 "ALTER TABLE task_execution_results DROP COLUMN "
                 "repository_references_json"
@@ -393,6 +399,11 @@ class TaskExecutionTests(unittest.TestCase):
             )
             connection.execute(
                 "ALTER TABLE task_review_cards DROP COLUMN source_revision"
+            )
+            # v39 added this; a database at an older version has not got it.
+            connection.execute(
+                "ALTER TABLE execution_review_cards DROP COLUMN "
+                "work_revision_id"
             )
             connection.execute("PRAGMA user_version = 11")
             connection.commit()
@@ -1553,6 +1564,69 @@ class TaskExecutionTests(unittest.TestCase):
         self.assertEqual(events[-2], "result_recorded")
         self.assertEqual(events[-1], "phase_granted")
 
+    def test_new_execution_grant_reconciles_an_existing_plan_gate(self):
+        """A policy edit advances an old plan card without human approval."""
+        self._bind_origin(1, "issue")
+        self._schedule_and_start()
+        recorded = self.service.record_result(self._result(self._claim()))
+        self.assertEqual(recorded.status, WorkflowStatus.AWAITING_REVIEW)
+
+        reconciled = self._grant_service("issue").schedule_new()
+
+        workflow = self.service.get(1)
+        self.assertEqual(reconciled.scheduled, 1)
+        self.assertEqual(workflow.status, WorkflowStatus.QUEUED)
+        self.assertEqual(workflow.phase, WorkflowPhase.EXECUTE)
+        self.assertEqual(workflow.version, recorded.version + 1)
+        self.assertEqual(self._events(1)[-1], "phase_granted")
+        self.assertNotIn("phase_approved", self._events(1))
+
+    def test_reconciliation_retires_a_delivered_review_card_as_stale(self):
+        """The card service owns retirement once a version fence advances."""
+        self._bind_origin(1, "issue")
+        self._schedule_and_start()
+        self.service.record_result(self._result(self._claim()))
+        cards = ExecutionCardService(self.database, clock=self.clock)
+        self.assertEqual(cards.schedule().created, 1)
+
+        self._grant_service("issue").schedule_new()
+        retired = cards.schedule()
+
+        self.assertEqual(retired.created, 0)
+        self.assertEqual(retired.cancelled, 1)
+
+    def test_reconciliation_is_idempotent(self):
+        self._bind_origin(1, "issue")
+        self._schedule_and_start()
+        self.service.record_result(self._result(self._claim()))
+        granted = self._grant_service("issue")
+
+        first = granted.schedule_new()
+        workflow = granted.get(1)
+        second = granted.schedule_new()
+
+        self.assertEqual(first.scheduled, 1)
+        self.assertEqual(second.scheduled, 0)
+        self.assertEqual(granted.get(1).version, workflow.version)
+        self.assertEqual(self._events(1).count("phase_granted"), 1)
+
+    def test_reconciliation_skips_completed_results_and_stale_workflows(self):
+        self._bind_origin(1, "issue")
+        self._schedule_and_start()
+        recorded = self.service.record_result(self._result(
+            self._claim(), outcome=ExecutionOutcome.COMPLETED
+        ))
+        completed = self._grant_service("issue").schedule_new()
+        self.assertEqual(completed.scheduled, 0)
+        self.assertEqual(self.service.get(1).version, recorded.version)
+
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute("UPDATE tasks SET version=2 WHERE id=1")
+            connection.commit()
+        stale = self._grant_service("issue").schedule_new()
+        self.assertEqual(stale.scheduled, 0)
+        self.assertEqual(self.service.get(1).status, WorkflowStatus.CANCELLED)
+
     def test_granting_execution_does_not_grant_a_completed_result(self):
         """Only the plan-approval gate is granted; an ending still lands."""
         self._bind_origin(1, "issue")
@@ -1663,6 +1737,30 @@ class TaskExecutionTests(unittest.TestCase):
         self.assertNotIn("phase_approved", events)
         self.assertEqual(events.count("phase_granted"), 2)
 
+    def test_new_action_grant_reconciles_an_existing_external_gate(self):
+        self._bind_origin(1, "issue")
+        service = self._grant_service("issue")
+        claim = self._reach_execute_phase(service)
+        recorded = service.record_result(self._result(
+            claim,
+            result_id="result-002",
+            outcome=ExecutionOutcome.AWAITING_EXTERNAL,
+        ))
+        self.assertEqual(recorded.status, WorkflowStatus.AWAITING_REVIEW)
+        approvals_before = self._events(1).count("phase_approved")
+
+        reconciled = self._grant_service(
+            "issue", acting=("issue",)
+        ).schedule_new()
+
+        workflow = service.get(1)
+        self.assertEqual(reconciled.scheduled, 1)
+        self.assertEqual(workflow.status, WorkflowStatus.QUEUED)
+        self.assertEqual(workflow.phase, WorkflowPhase.EXTERNAL_ACTION)
+        self.assertEqual(workflow.version, recorded.version + 1)
+        self.assertEqual(self._events(1).count("phase_approved"), approvals_before)
+        self.assertEqual(self._events(1)[-1], "phase_granted")
+
     def test_a_completed_action_still_reaches_the_reader(self):
         """Neither knob hides the end of the work."""
         self._bind_origin(1, "issue")
@@ -1740,6 +1838,112 @@ class TaskExecutionTests(unittest.TestCase):
             connection.rollback()
             with self.assertRaises(sqlite3.IntegrityError):
                 connection.execute("DELETE FROM task_execution_events")
+
+    def _revise_and_reclaim(self, version):
+        self.service.review_action(1, expected_version=version, action="revise")
+        return self._claim()
+
+    def test_unchanged_answer_is_refused_even_when_questions_change(self):
+        """A changing question list cannot make stale work a new answer."""
+        self._schedule_and_start()
+        first_claim = self._claim()
+        first = self.service.record_result(self._result(first_claim))
+        second_claim = self._revise_and_reclaim(first.version)
+
+        repeated = replace(
+            self._result(second_claim, result_id="result-002"),
+            questions=("A different synthetic question?",),
+        )
+        refused = self.service.record_result(repeated)
+
+        self.assertEqual(refused.disposition, WorkflowDisposition.REFUSED)
+        self.assertEqual(refused.refusal, WorkflowRefusal.RESULT_UNCHANGED)
+        self.assertEqual(self.service.result_count(), 1)
+        self.assertEqual(self.service.get(1).status, WorkflowStatus.RUNNING)
+        self.assertEqual(self.service.get(1).version,
+                         second_claim.workflow_version)
+        self.assertEqual(self._events(1)[-1], "result_unchanged")
+
+        changed = replace(repeated, summary="Revised synthetic summary")
+        recorded = self.service.record_result(changed)
+        self.assertEqual(recorded.disposition, WorkflowDisposition.APPLIED)
+        self.assertEqual(self.service.result_count(), 2)
+
+    def test_an_answer_repeated_from_two_passes_ago_is_refused(self):
+        """Comparing only the newest result let an X, Y, X sequence through."""
+        self._schedule_and_start()
+        claim = self._claim()
+        first = self.service.record_result(self._result(claim))
+
+        claim = self._revise_and_reclaim(first.version)
+        second = self.service.record_result(replace(
+            self._result(claim, result_id="result-002"),
+            summary="A different synthetic summary",
+        ))
+        self.assertEqual(second.disposition, WorkflowDisposition.APPLIED)
+
+        claim = self._revise_and_reclaim(second.version)
+        refused = self.service.record_result(
+            self._result(claim, result_id="result-003"))
+
+        self.assertEqual(refused.refusal, WorkflowRefusal.RESULT_UNCHANGED)
+        self.assertEqual(self.service.result_count(), 2)
+
+    def test_attaching_a_missing_deliverable_is_a_changed_answer(self):
+        """The guard must not teach an agent to pad its prose."""
+        self._schedule_and_start()
+        claim = self._claim()
+        first = self.service.record_result(self._result(claim))
+        claim = self._revise_and_reclaim(first.version)
+
+        corrected = replace(
+            self._result(claim, result_id="result-002"),
+            deliverables=("Synthetic deliverable", "The one it forgot"),
+        )
+        recorded = self.service.record_result(corrected)
+
+        self.assertEqual(recorded.disposition, WorkflowDisposition.APPLIED)
+        self.assertEqual(self.service.result_count(), 2)
+
+    def test_the_same_prose_under_a_new_outcome_is_a_changed_answer(self):
+        """Proposing something and declaring it done are different answers."""
+        self._schedule_and_start()
+        claim = self._claim()
+        first = self.service.record_result(self._result(claim))
+        claim = self._revise_and_reclaim(first.version)
+
+        terminal = self._result(
+            claim, result_id="result-002",
+            outcome=ExecutionOutcome.INELIGIBLE,
+        )
+        recorded = self.service.record_result(terminal)
+
+        self.assertEqual(recorded.disposition, WorkflowDisposition.APPLIED)
+
+    def test_a_rescheduled_task_may_open_with_its_previous_answer(self):
+        """A new cycle must never be refused for matching the closed one.
+
+        Nothing recovers from this: the identical result is all the agent has,
+        every retry is refused the same way, and the claim expires into a
+        parked workflow.
+        """
+        self._schedule_and_start()
+        claim = self._claim()
+        first = self.service.record_result(self._result(claim))
+        cancelled = self.service.review_action(
+            1, expected_version=first.version, action="cancel")
+        self.assertEqual(cancelled.status, WorkflowStatus.CANCELLED)
+
+        rescheduled = self.service.schedule(1, expected_task_version=1)
+        self.service.start_action(
+            1, expected_version=rescheduled.version, action="start")
+        claim = self._claim()
+
+        repeated = self._result(claim, result_id="result-002")
+        recorded = self.service.record_result(repeated)
+
+        self.assertEqual(recorded.disposition, WorkflowDisposition.APPLIED)
+        self.assertEqual(self.service.result_count(), 2)
 
     def test_invalid_result_cannot_change_a_running_claim(self):
         self._schedule_and_start()

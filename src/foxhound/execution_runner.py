@@ -18,8 +18,9 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
+from .workflow_policy import WorkflowPolicyError, parse_workflow_policy
 from .agent_profiles import (
     AgentProfile,
     AgentProfileError,
@@ -31,6 +32,7 @@ from .execution_worker import (
     GW_ALIAS_ENV,
     GW_ENDPOINT_ENV,
     GW_TOKEN_FILE_ENV,
+    WORKFLOW_POLICY_ENV,
     INSTRUCTIONS_NAME,
     RUN_STATE_SCHEMA,
     RUN_STATE_SCHEMA_VERSION,
@@ -105,6 +107,9 @@ class ExecutionRunnerConfig:
     planning_grants: tuple[str, ...] = ()
     execution_grants: tuple[str, ...] = ()
     action_grants: tuple[str, ...] = ()
+    #: One versioned workflow policy document, or None for the compatibility
+    #: policy that grants nothing and checks nothing.
+    workflow_policy: Mapping[str, Any] | None = None
     runner_slot: str = "default"
     poll_seconds: float = 0.1
     execution_slot_cap: int | None = None
@@ -165,6 +170,13 @@ class ExecutionRunnerConfig:
             _action_grants(self.action_grants)
         except ValueError as exc:
             raise ValueError("execution action grants are invalid") from exc
+        if self.workflow_policy is not None:
+            try:
+                parse_workflow_policy(self.workflow_policy)
+            except WorkflowPolicyError as exc:
+                # Rejected here rather than in the worker: a policy that only
+                # fails once a run has claimed a task burns the claim.
+                raise ValueError("workflow policy is invalid") from exc
         if (
             isinstance(self.poll_seconds, bool)
             or not isinstance(self.poll_seconds, (int, float))
@@ -408,6 +420,10 @@ def _run_claim(
         GW_ENDPOINT_ENV: config.gw_endpoint,
         GW_ALIAS_ENV: config.gw_alias,
         GW_TOKEN_FILE_ENV: str(config.gw_token_file),
+        WORKFLOW_POLICY_ENV: (
+            "" if config.workflow_policy is None
+            else json.dumps(config.workflow_policy, sort_keys=True)
+        ),
         "HERMES_CRON_SESSION": "1",
     })
     process: subprocess.Popen | None = None
@@ -930,6 +946,19 @@ def _terminate_process_group(
     return True
 
 
+def _read_workflow_policy(path: object) -> dict[str, Any] | None:
+    """Load one policy document, or None when the deployment configures none."""
+    if path is None:
+        return None
+    try:
+        document = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        raise SystemExit("workflow policy could not be read") from None
+    if not isinstance(document, dict):
+        raise SystemExit("workflow policy could not be read")
+    return document
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="foxhound-execution-runner",
@@ -960,6 +989,12 @@ def _parser() -> argparse.ArgumentParser:
         "--act-without-asking", action="append", metavar="SOURCE_KIND",
         help="perform a reviewed external action for this source kind "
              "without a card",
+    )
+    parser.add_argument(
+        "--workflow-policy",
+        type=Path,
+        help="path to one versioned workflow policy document; omitted means "
+             "the compatibility policy, which checks no source freshness",
     )
     parser.add_argument(
         "--knowledge-root",
@@ -1062,6 +1097,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             planning_grants=tuple(args.plan_without_asking or ()),
             execution_grants=tuple(args.execute_without_asking or ()),
             action_grants=tuple(args.act_without_asking or ()),
+            workflow_policy=_read_workflow_policy(args.workflow_policy),
             knowledge_root=args.knowledge_root,
             task_work_root=args.task_work_root,
             task_kb_root=args.task_kb_root,

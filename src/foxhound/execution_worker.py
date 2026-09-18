@@ -25,6 +25,7 @@ from .knowledge_client import (
     KnowledgeClientError,
     KnowledgeSearchResult,
 )
+from .contracts import SourceSnapshotContractError
 from . import work_digest
 from .task_execution import (
     ExecutionResultEnvelope,
@@ -37,6 +38,13 @@ from .task_execution import (
 from .source_policy import action_grants as _action_grants
 from .source_policy import execution_grants as _execution_grants
 from . import forge_action
+from .workflow_policy import (
+    CHECKPOINTS,
+    WorkflowPolicy,
+    WorkflowPolicyError,
+    parse_workflow_policy,
+    policy_from_legacy,
+)
 from .agent_profiles import (
     MAX_MANIFEST_BYTES,
     AgentProfileError,
@@ -69,6 +77,11 @@ STATE_ENV = "FOXHOUND_EXECUTION_STATE"
 GW_ENDPOINT_ENV = "FOXHOUND_GW_ENDPOINT"
 GW_ALIAS_ENV = "FOXHOUND_GW_ALIAS"
 GW_TOKEN_FILE_ENV = "FOXHOUND_GW_TOKEN_FILE"
+#: The whole workflow policy, as one versioned document.  It replaced a pair
+#: of comma-separated source-kind lists: those said what to check without
+#: saying under which policy, so a run could not name the policy it was
+#: fenced by and enabling a check was a per-host edit with no revision.
+WORKFLOW_POLICY_ENV = "FOXHOUND_WORKFLOW_POLICY"
 
 MAX_STATE_BYTES = 16 * 1024
 MAX_INSTRUCTIONS_BYTES = MAX_MANIFEST_BYTES
@@ -207,6 +220,8 @@ class ExecutionWorker:
         self,
         state_path: str | os.PathLike[str],
         knowledge_config: KnowledgeClientConfig,
+        *,
+        policy: WorkflowPolicy | None = None,
     ) -> None:
         if not isinstance(knowledge_config, KnowledgeClientConfig):
             raise ExecutionWorkerConfigError(
@@ -214,9 +229,18 @@ class ExecutionWorker:
             )
         self._state_path = Path(state_path)
         self._knowledge_config = knowledge_config
+        if policy is None:
+            # No policy configured is the same answer as a policy that grants
+            # nothing and checks nothing: today's behaviour, with a revision.
+            policy = policy_from_legacy()
+        if not isinstance(policy, WorkflowPolicy):
+            raise ExecutionWorkerConfigError(
+                "execution worker policy is invalid"
+            )
+        self._policy = policy
 
     def context(self) -> dict[str, Any]:
-        state, service = self._active()
+        state, service = self._fresh_active("phase")
         instructions = self._instructions(state)
         context = GwKnowledgeClient(self._knowledge_config).execution_context()
         self._renew(service, state)
@@ -237,6 +261,12 @@ class ExecutionWorker:
                 # date for deadlines, drafts, and proposed actions.
                 **_local_calendar(),
                 "toolsets": instructions["toolsets"],
+                # Which policy this run is fenced by.  A decision or a final
+                # outcome is recorded against a policy revision, so the run
+                # has to be able to say which one was in force; an
+                # environment variable could not answer that.
+                "policy_id": self._policy.policy_id,
+                "policy_revision": self._policy.revision,
             },
             "capabilities": {
                 # This is descriptive evidence from the worker, not authority
@@ -408,7 +438,7 @@ class ExecutionWorker:
         before the state: a review of Thursday's state is still a review of
         pull request 7.
         """
-        state, service = self._active()
+        state, service = self._fresh_active("effect")
         if state.phase is not WorkflowPhase.EXTERNAL_ACTION:
             raise ExecutionWorkerClaimError(
                 "an external action is only available in the external_action "
@@ -454,7 +484,7 @@ class ExecutionWorker:
         choose the reviewed body but never redirect this external write to a
         similarly named record.
         """
-        state, service = self._active()
+        state, service = self._fresh_active("effect")
         if state.phase is not WorkflowPhase.EXTERNAL_ACTION:
             raise ExecutionWorkerClaimError(
                 "an external action is only available in the external_action "
@@ -494,7 +524,7 @@ class ExecutionWorker:
         planning or executing would bypass the gate that makes the approval
         mean anything.
         """
-        state, service = self._active()
+        state, service = self._fresh_active("effect")
         if state.phase is not WorkflowPhase.EXTERNAL_ACTION:
             raise ExecutionWorkerClaimError(
                 "an external action is only available in the external_action "
@@ -547,6 +577,11 @@ class ExecutionWorker:
 
     def record(self, draft_name: str) -> dict[str, Any]:
         state = load_run_state(self._state_path)
+        service = TaskExecutionService(
+            state.database_path,
+            execution_grants=state.execution_grants,
+            action_grants=state.action_grants,
+        )
         draft_path, draft = load_result_draft(
             self._state_path.parent, draft_name
         )
@@ -574,6 +609,12 @@ class ExecutionWorker:
             repository_impact=draft["repository_impact"],
             task_work_directory=state.task_work_directory,
             task_kb_file=state.task_kb_file,
+            # Which reader instruction this run was handed, so a result can
+            # say what it was answering. Read from the delivery record rather
+            # than re-selected, so it names what the agent actually got.
+            reader_instruction_sequence=(
+                service.delivered_reader_instruction_sequence(
+                    state.task_id, expected_version=state.workflow_version)),
         )
         if state.task_run_directory is not None:
             ledger = TaskLedger(state.database_path)
@@ -603,13 +644,7 @@ class ExecutionWorker:
                 raise ExecutionWorkerDraftError(
                     "execution result review files could not be preserved"
                 ) from None
-        result = TaskExecutionService(
-            state.database_path,
-            execution_grants=state.execution_grants,
-            action_grants=state.action_grants,
-        ).record_result(
-            envelope
-        )
+        result = service.record_result(envelope)
         if result.disposition is WorkflowDisposition.REFUSED:
             # The ledger says exactly why. Discarding it left an agent to
             # guess: one tried to record three times, was told only
@@ -651,35 +686,57 @@ class ExecutionWorker:
         # records keeps working by accident, but the task folder is tried
         # first because that is the intended home.
         search_directories = _result_search_path(state, run_directory)
+        task_folder_not_before = _claim_started_at(self._state_path)
         result_id = state.run_id
         draft = _repository_result(state, {
             "outcome": outcome,
             "summary": _read_result_text(
-                _locate_result(search_directories, "result-summary.txt"),
+                _locate_result(
+                    search_directories, "result-summary.txt",
+                    task_folder_not_before=task_folder_not_before,
+                ),
                 label="execution result summary",
             ),
             "work_markdown": _read_result_text(
-                _locate_result(search_directories, "result-work.md"),
+                _locate_result(
+                    search_directories, "result-work.md",
+                    task_folder_not_before=task_folder_not_before,
+                ),
                 label="execution result work",
             ),
             "questions": _read_optional_string_array(
-                _locate_result(search_directories, "result-questions.json"),
+                _locate_result(
+                    search_directories, "result-questions.json",
+                    task_folder_not_before=task_folder_not_before,
+                ),
                 label="execution result questions",
             ),
             "external_actions": _read_optional_string_array(
-                _locate_result(search_directories, "result-external-actions.json"),
+                _locate_result(
+                    search_directories, "result-external-actions.json",
+                    task_folder_not_before=task_folder_not_before,
+                ),
                 label="execution result external actions",
             ),
             "deliverables": _read_optional_string_array(
-                _locate_result(search_directories, "result-deliverables.json"),
+                _locate_result(
+                    search_directories, "result-deliverables.json",
+                    task_folder_not_before=task_folder_not_before,
+                ),
                 label="execution result deliverables",
             ),
             "repository_references": _read_optional_repository_references(
-                _locate_result(search_directories, "result-repository-references.json"),
+                _locate_result(
+                    search_directories, "result-repository-references.json",
+                    task_folder_not_before=task_folder_not_before,
+                ),
                 label="execution result repository references",
             ),
             "repository_impact": _read_optional_repository_impact(
-                _locate_result(search_directories, "result-repository-impact.json"),
+                _locate_result(
+                    search_directories, "result-repository-impact.json",
+                    task_folder_not_before=task_folder_not_before,
+                ),
                 label="execution result repository impact",
             ),
         }, run_directory)
@@ -700,6 +757,12 @@ class ExecutionWorker:
             repository_impact=draft["repository_impact"],
             task_work_directory=state.task_work_directory,
             task_kb_file=state.task_kb_file,
+            # Which reader instruction this run was handed, so a result can
+            # say what it was answering. Read from the delivery record rather
+            # than re-selected, so it names what the agent actually got.
+            reader_instruction_sequence=(
+                service.delivered_reader_instruction_sequence(
+                    state.task_id, expected_version=state.workflow_version)),
         )
         try:
             validated = _validated_result(envelope)
@@ -740,7 +803,10 @@ class ExecutionWorker:
 
     def release(self) -> dict[str, Any]:
         state, service = self._active()
-        if _result_inputs_present(self._state_path.parent):
+        if _result_inputs_present(
+            _result_search_path(state, self._state_path.parent),
+            task_folder_not_before=_claim_started_at(self._state_path),
+        ):
             if state.phase is WorkflowPhase.PLAN:
                 ready = self.draft(outcome="awaiting_plan")
                 return self.record(ready["draft"])
@@ -770,6 +836,49 @@ class ExecutionWorker:
             action_grants=state.action_grants,
         )
         self._renew(service, state)
+        return state, service
+
+    def _fresh_active(
+        self, checkpoint: str
+    ) -> tuple[ExecutionRunState, TaskExecutionService]:
+        """Fail closed when a bound source no longer matches this claim.
+
+        Calls at phase entry and immediately before each forge effect are
+        deliberately separate: a long-running agent must not publish against
+        a source that changed after it started.
+        """
+        # Checked before anything else and regardless of what is bound: a
+        # caller naming a checkpoint that does not exist is a mistake in this
+        # file, and it must not depend on whether a task happens to have a
+        # source for it to be noticed.
+        if checkpoint not in CHECKPOINTS:
+            raise ExecutionWorkerConfigError(
+                "source freshness checkpoint is invalid")
+        state, service = self._active()
+        try:
+            request = TaskLedger(state.database_path).source_snapshot_request(
+                state.task_id
+            )
+        except (SourceSnapshotContractError, ValueError):
+            raise ExecutionWorkerClaimError("source freshness is unavailable") from None
+        try:
+            required = request is not None and self._policy.checks_freshness(
+                checkpoint, request.locator.kind)
+        except WorkflowPolicyError:
+            raise ExecutionWorkerConfigError(
+                "source freshness checkpoint is invalid") from None
+        if not required:
+            return state, service
+        try:
+            result = GwKnowledgeClient(self._knowledge_config).refresh_source(
+                request
+            )
+        except KnowledgeClientError:
+            raise ExecutionWorkerClaimError("source freshness is unavailable") from None
+        if not result.usable:
+            raise ExecutionWorkerClaimError(
+                "source freshness no longer matches this execution claim"
+            )
         return state, service
 
     @staticmethod
@@ -989,7 +1098,26 @@ def load_worker_from_environment(
             "execution worker configuration is unavailable"
         )
     config = load_knowledge_config(endpoint, alias, token_path)
-    return ExecutionWorker(state, config)
+    return ExecutionWorker(
+        state, config,
+        policy=_workflow_policy(values.get(WORKFLOW_POLICY_ENV, "")),
+    )
+
+
+def _workflow_policy(value: object) -> WorkflowPolicy | None:
+    """Parse the deployed policy, or fall back to the compatibility one."""
+    if not isinstance(value, str):
+        raise ExecutionWorkerConfigError("workflow policy configuration is invalid")
+    if not value.strip():
+        return None
+    try:
+        return parse_workflow_policy(json.loads(value))
+    except (ValueError, TypeError):
+        # Failing closed on an unreadable policy would stop every run; failing
+        # open would silently drop a check a deployment asked for. Refuse to
+        # start instead, which is loud and happens once.
+        raise ExecutionWorkerConfigError(
+            "workflow policy configuration is invalid") from None
 
 
 def load_knowledge_config(
@@ -1071,21 +1199,78 @@ def _result_search_path(state, run_directory: Path) -> tuple[Path, ...]:
     return tuple(directories)
 
 
-def _locate_result(directories: tuple[Path, ...], name: str) -> Path:
+def _claim_started_at(state_path: Path) -> int | None:
+    """The private run-state mtime, used to fence shared result inputs.
+
+    The runner writes this file after it creates the task archive and before
+    it launches the worker.  It is therefore the durable start marker for the
+    claim.  If it cannot be read, accepting a task-folder file would risk
+    harvesting a prior claim, so callers deliberately fall through to private
+    run inputs instead.
+    """
+    try:
+        return state_path.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def _fenced_out(
+    index: int,
+    directories: tuple[Path, ...],
+    candidate: Path,
+    task_folder_not_before: int | None,
+) -> bool:
+    """Whether a shared task-folder file predates this claim.
+
+    Only the task folder is fenced, and only when a private run directory
+    exists to fall back to.  A claim that cannot read its own anchor fences
+    everything shared, because harvesting a prior claim is the worse failure.
+    """
+    if index != 0 or len(directories) <= 1:
+        return False
+    if task_folder_not_before is None:
+        return True
+    try:
+        return candidate.stat().st_mtime_ns < task_folder_not_before
+    except OSError:
+        return True
+
+
+def _locate_result(
+    directories: tuple[Path, ...],
+    name: str,
+    *,
+    task_folder_not_before: int | None = None,
+) -> Path:
     """The first directory that actually holds `name`.
 
     When none does, the first candidate is returned so the caller reports the
     location the reader was most likely aiming at, rather than the private
     scratch directory they never chose.
     """
-    for directory in directories:
+    fenced_out = False
+    for index, directory in enumerate(directories):
         candidate = directory / name
         try:
             if candidate.is_file():
+                # The task folder is deliberately durable and shared between
+                # runs.  It can be a source for this claim only when this
+                # exact file was written after the run-state anchor.  A stale
+                # file must never outrank the current run's private input.
+                if _fenced_out(
+                    index, directories, candidate, task_folder_not_before
+                ):
+                    fenced_out = True
+                    continue
                 return candidate
         except OSError:
             continue
-    return directories[0] / name
+    # Nothing matched.  Naming the task folder is the friendlier report when
+    # the agent simply never wrote the file -- but not when a file IS there
+    # and was rejected as stale.  Returning it then hands the caller the very
+    # path the fence just refused, and the readers read it happily, which
+    # restores the whole defect for any name this run did not author itself.
+    return (directories[-1] if fenced_out else directories[0]) / name
 
 
 def _result_read_failure(path: Path, exc: Exception) -> str:
@@ -1595,16 +1780,37 @@ def _remove_result_inputs(run_directory: Path) -> None:
             pass
 
 
-def _result_inputs_present(run_directory: Path) -> bool:
-    """Fail closed when this run has any agent-authored result artifact."""
-    for name in _RESULT_INPUTS:
-        try:
-            (run_directory / name).lstat()
-        except FileNotFoundError:
-            continue
-        except OSError:
+def _result_inputs_present(
+    directories: tuple[Path, ...],
+    *,
+    task_folder_not_before: int | None = None,
+) -> bool:
+    """Fail closed when this claim has any agent-authored result artifact.
+
+    Searches everywhere a result may legitimately be authored, under the same
+    fence `_locate_result` applies.  Looking only at the private run directory
+    meant an agent that authored into the task folder -- the intended,
+    documented location -- was released as though it had produced nothing, and
+    its work was dropped without a draft and without a refusal.
+
+    A stale task-folder file is NOT an artifact of this claim, so the fence
+    has to apply here too; otherwise every release on a task whose folder
+    holds an older result would refuse or auto-draft forever.
+    """
+    for index, directory in enumerate(directories):
+        for name in _RESULT_INPUTS:
+            candidate = directory / name
+            try:
+                candidate.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return True
+            if _fenced_out(
+                index, directories, candidate, task_folder_not_before
+            ):
+                continue
             return True
-        return True
     return False
 
 
