@@ -77,11 +77,22 @@ _FINISHED_WORKFLOW_SQL = ",".join(
 #: A task whose workflow has not finished. Execution owns the question, asks
 #: it with the evidence attached, and offers controls that do not close the
 #: task as a side effect.
-_EXECUTION_HOLDS = (
-    "EXISTS(SELECT 1 FROM task_execution_workflows AS workflow "
-    " WHERE workflow.task_id=t.id "
-    f" AND workflow.status NOT IN ({_FINISHED_WORKFLOW_SQL}))"
-)
+def _execution_holds(task_id: str) -> str:
+    """SQL predicate: an unfinished workflow holds the named task.
+
+    Parameterised by the task expression because the duplicate selection
+    joins `tasks` twice. Both sides of a proposal have to be testable, and a
+    predicate that could only say `t.id` is what let that selection keep
+    asking about a task the workflow already held.
+    """
+    return (
+        "EXISTS(SELECT 1 FROM task_execution_workflows AS workflow "
+        f" WHERE workflow.task_id={task_id} "
+        f" AND workflow.status NOT IN ({_FINISHED_WORKFLOW_SQL}))"
+    )
+
+
+_EXECUTION_HOLDS = _execution_holds("t.id")
 
 #: A task whose workflow finished recently. Execution raises its own end card
 #: on completion, so carding the task the moment the workflow lets go asks the
@@ -1231,6 +1242,10 @@ class TaskCardService:
             "JOIN tasks AS t ON t.id=e.task_id "
             "WHERE e.state='proposed' AND e.card_id IS NULL "
             "AND t.status='open' "
+            # The answer to a done-check closes the task, which cancels the
+            # workflow underneath it. While execution holds the task, that
+            # question is not this surface's to ask.
+            "AND NOT " + _EXECUTION_HOLDS + " "
             "AND NOT EXISTS("
             " SELECT 1 FROM task_candidate_bindings AS b JOIN "
             " task_candidate_lifecycle AS l ON l.candidate_id=b.candidate_id "
@@ -1319,6 +1334,18 @@ class TaskCardService:
             "JOIN tasks AS left_task ON left_task.id=d.left_task_id "
             "JOIN tasks AS right_task ON right_task.id=d.right_task_id "
             "WHERE d.state='proposed' AND d.card_id IS NULL "
+            # Either side, not just the carded one: confirming a duplicate
+            # closes one of the two, so a workflow holding EITHER makes the
+            # question unsafe to ask.
+            #
+            # Without this the selection fought `_cancel_stale`, which
+            # retracts on the same hold and releases the proposal's card
+            # binding as it goes. The retraction restored exactly the
+            # condition this selection looks for -- a proposed pair with no
+            # card -- so every pass cancelled a card and raised another, and
+            # the reader was sent every one of them.
+            "AND NOT " + _execution_holds("left_task.id") + " "
+            "AND NOT " + _execution_holds("right_task.id") + " "
             "AND left_task.version=d.left_task_version "
             "AND right_task.version=d.right_task_version "
             "AND ((left_task.status='open' AND right_task.status "
