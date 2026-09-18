@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from foxhound import migrate_database
+from foxhound import execution_cards
 
 import json
 import os
@@ -2909,6 +2910,80 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertNotIn(
             f"Synthetic deliverable {MAX_ADVISORY_RECORDS}.", body)
         self.assertIn("and 2 more", body)
+
+    def test_an_unchanged_revision_is_marked_in_html_and_plain_text(self):
+        card = self._plan_card(
+            revisions=2,
+            revision_note="Please revise the synthetic plan.",
+            unchanged_from_previous=True,
+        )
+        body, _ = render_execution_review_card(card)
+        plain = "\n".join(execution_cards._card_lines(card))
+
+        self.assertIn("Unchanged from the previous revision", body)
+        self.assertIn("Unchanged from the previous revision", plain)
+        self.assertIn("You asked for:", body)
+
+    def test_the_unchanged_marker_is_computed_from_the_ledger(self):
+        """The query is the whole point, so the query is what is tested.
+
+        Constructing the flag by hand covers the one line that renders it and
+        none of the mechanism, which can then be removed without a single test
+        noticing.
+
+        The ledger refuses a repeat inside one cycle, so the case that reaches
+        a card is a repeat ACROSS cycles: that is not certainly wrong, which
+        is why it records, and it is exactly what a marker is for.
+        """
+        self._plan_review(1, "cycle-one")
+        first = self.execution.get(1)
+        cancelled = self.execution.review_action(
+            1, expected_version=first.version, action="cancel")
+        self.assertEqual(cancelled.status, WorkflowStatus.CANCELLED)
+
+        rescheduled = self._schedule_workflow(1)
+        self.execution.start_action(
+            1, expected_version=rescheduled.version, action="start")
+        self._record(
+            1,
+            phase=WorkflowPhase.PLAN,
+            outcome=ExecutionOutcome.AWAITING_PLAN,
+            result_id="cycle-two",
+        )
+
+        self.assertEqual(self.cards.schedule().created, 1)
+        card = self.cards.claim_next().card
+        self.assertTrue(card.unchanged_from_previous)
+        self.assertIn(
+            "Unchanged from the previous revision",
+            render_execution_review_card(card)[0],
+        )
+
+    def test_a_changed_effect_list_is_not_called_unchanged(self):
+        """The marker must never sit above an effect list that has changed.
+
+        A reader told "same answer" over a different set of effects has been
+        told something the card cannot know, directly above the decision it
+        exists to ask for.
+        """
+        self._plan_review(2, "effects-one")
+        first = self.execution.get(2)
+        self.execution.review_action(
+            2, expected_version=first.version, action="cancel")
+        rescheduled = self._schedule_workflow(2)
+        self.execution.start_action(
+            2, expected_version=rescheduled.version, action="start")
+        self._record(
+            2,
+            phase=WorkflowPhase.PLAN,
+            outcome=ExecutionOutcome.AWAITING_PLAN,
+            result_id="effects-two",
+            external_actions=("Email example@example.com: a different effect.",),
+        )
+
+        self.assertEqual(self.cards.schedule().created, 1)
+        card = self.cards.claim_next().card
+        self.assertFalse(card.unchanged_from_previous)
 
     def test_the_authorising_list_is_never_capped(self):
         """The cap must not reach the card that asks for authorisation.
