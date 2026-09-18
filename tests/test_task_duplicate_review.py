@@ -490,3 +490,69 @@ class DuplicateSchedulingCollisionTests(DuplicateReviewCardTests):
             "WHERE card_id IS NOT NULL"
         ).fetchone()[0]
         self.assertEqual(bound, 1)
+
+    def _state(self, proposal_id: int = 1) -> str:
+        return self.connection.execute(
+            "SELECT state FROM task_duplicate_proposals WHERE id=?",
+            (proposal_id,),
+        ).fetchone()[0]
+
+    def test_a_proposal_whose_task_moved_is_superseded_not_left_pending(self):
+        """The ask fences on an exact version; a moved task is permanent."""
+        self.connection.execute("UPDATE tasks SET version=version+1 WHERE id=1")
+        self.connection.commit()
+
+        self.cards.schedule_duplicate_proposals()
+
+        self.assertEqual(self._state(), "superseded")
+        self.assertIsNotNone(self.connection.execute(
+            "SELECT settled_at FROM task_duplicate_proposals WHERE id=1"
+        ).fetchone()[0])
+
+    def test_a_superseded_pair_can_be_raised_again_at_current_versions(self):
+        """Expired is not answered: the question may come back, freshly."""
+        self.connection.execute("UPDATE tasks SET version=version+1 WHERE id=1")
+        self.connection.commit()
+        self.cards.schedule_duplicate_proposals()
+        self.assertEqual(self._state(), "superseded")
+
+        result = proposals.propose(
+            self.connection, task_id_a=1, task_id_b=2,
+            basis="synthetic repeat", detector="synthetic-detector",
+            now=NOW.isoformat(), allow_unconfirmed_owner=True,
+        )
+
+        self.assertIs(result.disposition, proposals.ProposalDisposition.RECORDED)
+        states = self.connection.execute(
+            "SELECT state,COUNT(*) FROM task_duplicate_proposals GROUP BY state"
+        ).fetchall()
+        self.assertEqual(dict(states), {"superseded": 1, "proposed": 1})
+
+    def test_a_pair_with_no_open_task_left_is_superseded(self):
+        self.connection.execute(
+            "UPDATE tasks SET status='done' WHERE id IN (1,2)")
+        self.connection.commit()
+
+        self.cards.schedule_duplicate_proposals()
+
+        self.assertEqual(self._state(), "superseded")
+
+    def test_a_merely_busy_pair_keeps_its_place(self):
+        """An execution hold is transient; superseding it would lose a live question."""
+        self.connection.execute(
+            "INSERT INTO task_execution_workflows(task_id,task_version,status,"
+            "phase,version,failure_count,created_at,updated_at) "
+            "VALUES(1,1,'queued','plan',1,0,?,?)",
+            (NOW.isoformat(), NOW.isoformat()))
+        self.connection.commit()
+
+        self.cards.schedule_duplicate_proposals()
+
+        self.assertEqual(self._state(), "proposed")
+
+    def test_the_recorded_versions_are_still_immutable(self):
+        """Superseding is a state change; it must not license editing history."""
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.connection.execute(
+                "UPDATE task_duplicate_proposals SET left_task_version=99 "
+                "WHERE id=1")

@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 43
+SCHEMA_VERSION = 44
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -2648,6 +2648,106 @@ END;
 )
 
 
+# A proposal records the task versions it was raised against, and the
+# settle-only trigger makes those versions immutable on purpose: a proposal is
+# a fixed record of "these two tasks, as they were, may be one commitment".
+#
+# That leaves a gap. The ask fences on an exact version match, so once either
+# task moves the proposal can never be carded; the pair index allowed one
+# proposal per pair for all time, so no fresh one could replace it. The pair
+# became a question nobody could be asked, and it counted as unsettled
+# forever -- which permanently closes the gate that requires every proposal to
+# be settled before a detector may be measured.
+#
+# `superseded` is the terminal state for a question that stopped being worth
+# asking, as distinct from one a reader answered. Pair uniqueness now ignores
+# superseded rows, so the detector can raise the pair again at current
+# versions with a current basis, which is the honest way to re-ask: a new
+# question, not an old one edited to look new.
+_SCHEMA_V44 = (
+    "DROP TRIGGER IF EXISTS task_duplicate_proposals_settle_only;",
+    "DROP TRIGGER IF EXISTS task_duplicate_proposals_no_delete;",
+    "DROP INDEX IF EXISTS task_duplicate_proposals_pair;",
+    "DROP INDEX IF EXISTS task_duplicate_proposals_open;",
+    "ALTER TABLE task_duplicate_proposals RENAME TO task_duplicate_proposals_v43;",
+    """
+CREATE TABLE task_duplicate_proposals (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    left_task_id       INTEGER NOT NULL,
+    right_task_id      INTEGER NOT NULL,
+    left_task_version  INTEGER NOT NULL CHECK(left_task_version >= 1),
+    right_task_version INTEGER NOT NULL CHECK(right_task_version >= 1),
+    basis              TEXT NOT NULL CHECK(length(basis) BETWEEN 1 AND 1200),
+    detector           TEXT NOT NULL CHECK(length(detector) BETWEEN 1 AND 64),
+    state              TEXT NOT NULL CHECK(state IN (
+                           'proposed','confirmed','rejected','superseded'
+                       )),
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL,
+    settled_at         TEXT,
+    card_id            INTEGER REFERENCES task_review_cards(id),
+    CHECK(left_task_id < right_task_id),
+    CHECK((state = 'proposed') = (settled_at IS NULL)),
+    FOREIGN KEY(left_task_id) REFERENCES tasks(id),
+    FOREIGN KEY(right_task_id) REFERENCES tasks(id)
+);
+""",
+    "INSERT INTO task_duplicate_proposals(id,left_task_id,right_task_id,left_task_version,right_task_version,basis,detector,state,created_at,updated_at,settled_at,card_id) SELECT id,left_task_id,right_task_id,left_task_version,right_task_version,basis,detector,state,created_at,updated_at,settled_at,card_id FROM task_duplicate_proposals_v43;",
+    "DROP TABLE task_duplicate_proposals_v43;",
+    """
+CREATE UNIQUE INDEX task_duplicate_proposals_pair
+    ON task_duplicate_proposals(left_task_id, right_task_id)
+    WHERE state <> 'superseded';
+""",
+    """
+CREATE INDEX task_duplicate_proposals_open
+    ON task_duplicate_proposals(left_task_id, right_task_id)
+    WHERE state = 'proposed';
+""",
+    """
+CREATE TRIGGER task_duplicate_proposals_no_delete
+BEFORE DELETE ON task_duplicate_proposals
+BEGIN
+    SELECT RAISE(ABORT, 'task duplicate proposals are append-only');
+END;
+""",
+    """
+CREATE TRIGGER task_duplicate_proposals_settle_only
+BEFORE UPDATE ON task_duplicate_proposals
+BEGIN
+    SELECT RAISE(ABORT, 'task duplicate proposal may only be settled, reopened, rebound, or superseded')
+    WHERE OLD.left_task_id       <> NEW.left_task_id
+       OR OLD.right_task_id      <> NEW.right_task_id
+       OR OLD.left_task_version  <> NEW.left_task_version
+       OR OLD.right_task_version <> NEW.right_task_version
+       OR OLD.basis              <> NEW.basis
+       OR OLD.detector           <> NEW.detector
+       OR OLD.created_at         <> NEW.created_at
+       OR NOT (
+           (OLD.state = 'proposed' AND NEW.state IN ('confirmed','rejected')
+            AND NEW.settled_at IS NOT NULL AND OLD.card_id IS NEW.card_id)
+           OR
+           (OLD.state IN ('rejected','confirmed') AND NEW.state = 'proposed'
+            AND NEW.settled_at IS NULL
+            AND (OLD.card_id IS NEW.card_id OR NEW.card_id IS NULL))
+           OR
+           (OLD.state = 'proposed' AND NEW.state = 'proposed'
+            AND OLD.settled_at IS NULL AND NEW.settled_at IS NULL
+            AND ((OLD.card_id IS NULL AND NEW.card_id IS NOT NULL)
+                 OR (OLD.card_id IS NOT NULL AND NEW.card_id IS NULL)))
+           OR
+           -- Expiring an unaskable question. Only from `proposed`, only while
+           -- no card is bound: a question already in front of a reader is
+           -- theirs to answer, not ours to withdraw.
+           (OLD.state = 'proposed' AND NEW.state = 'superseded'
+            AND NEW.settled_at IS NOT NULL AND OLD.card_id IS NULL
+            AND NEW.card_id IS NULL)
+       );
+END;
+""",
+)
+
+
 _SCHEMA_V20 = (
     # SQLite cannot alter a CHECK in place, and three tables carry a foreign
     # key to this one. Renaming the card table would rewrite all three to
@@ -3775,6 +3875,36 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 43
+            if version == 43:
+                connection.execute("PRAGMA foreign_keys = OFF")
+                # `task_duplicate_proposal_events` has a foreign key to the
+                # table being rebuilt. Without this, RENAME helpfully rewrites
+                # that reference to point at the temporary name, and dropping
+                # the temporary table then leaves the events table referring
+                # to something that no longer exists.
+                connection.execute("PRAGMA legacy_alter_table = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    definition = connection.execute(
+                        "SELECT sql FROM sqlite_master WHERE type='table' "
+                        "AND name='task_duplicate_proposals'"
+                    ).fetchone()
+                    if definition is None:
+                        raise InboxError("candidate inbox schema is incomplete")
+                    # Replayable: a database already carrying the widened
+                    # CHECK must not be rebuilt a second time.
+                    if "'superseded'" not in definition["sql"]:
+                        for statement in _SCHEMA_V44:
+                            connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 44")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                finally:
+                    connection.execute("PRAGMA legacy_alter_table = OFF")
+                    connection.execute("PRAGMA foreign_keys = ON")
+                version = 44
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:
