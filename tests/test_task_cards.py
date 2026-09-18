@@ -936,7 +936,7 @@ class TaskCardTests(unittest.TestCase):
                 "'SPK_002','Person B','2030-03-01T00:00:00Z')"
             )
             connection.commit()
-        self.cards.schedule(limit=1)
+        self._raise_review_cards(limit=1)
         card = next(card for card in self.cards.due(limit=20) if card.task_id == 1)
         body, _ = render_task_review_card(replace(card, status=CardStatus.DELIVERING))
         self.assertIn("Participants:</b> Person B", body)
