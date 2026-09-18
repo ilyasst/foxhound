@@ -121,8 +121,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception:
         print("foxhound execution schedule: scheduling failed", file=sys.stderr)
         return 70
+    if result.capped:
+        # A saturated cap is not a failure -- the exit status stays 0 so a
+        # supervisor does not mark a healthy timer failed every pass -- but it
+        # must not look like an idle one either. Admission has stopped, and
+        # the only prior evidence was a count that also means "nothing to do".
+        # Count only; naming a task here would put ledger content in a log.
+        print(
+            "foxhound execution schedule: "
+            f"{result.capped} eligible task(s) held by a capacity cap",
+            file=sys.stderr,
+        )
     print(json.dumps({
         "ok": True,
+        "capped": result.capped,
         "remaining": result.remaining,
         "scheduled": result.scheduled,
     }, sort_keys=True))
