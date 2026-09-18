@@ -26,6 +26,8 @@ from .execution_cards import (
     AGENT_SELECTION_TOKEN_CHARS,
     ExecutionCardOperationResult,
     ExecutionCardPresentation,
+    ExecutionCardArtifacts,
+    ExecutionCardArtifact,
     ExecutionCardDeliverables,
     ExecutionCardDetail,
     ExecutionCardScheduleResult,
@@ -75,6 +77,7 @@ EXECUTION_OPERATION_SCHEMA = "foxhound.execution-card-service.operation"
 EXECUTION_STATS_SCHEMA = "foxhound.execution-card-service.stats"
 EXECUTION_BRIEF_SCHEMA = "foxhound.execution-card-service.brief"
 EXECUTION_DELIVERABLES_SCHEMA = "foxhound.execution-card-service.deliverables"
+EXECUTION_ARTIFACTS_SCHEMA = "foxhound.execution-card-service.artifacts"
 EXECUTION_VIEW_SCHEMA = "foxhound.execution-card-service.view"
 EXECUTION_DETAIL_SCHEMA = "foxhound.execution-card-service.detail"
 EXECUTION_DETAIL_SCHEMA_VERSION = 2
@@ -125,6 +128,8 @@ ROUTES = {
     "/v1/execution-cards/agent-selection": "execution_agent_selection",
     "/v1/execution-cards/brief": "execution_brief",
     "/v1/execution-cards/deliverables": "execution_deliverables",
+    "/v1/execution-cards/artifacts": "execution_artifacts",
+    "/v1/execution-cards/artifact": "execution_artifact",
     "/v1/execution-cards/view": "execution_view",
     "/v1/execution-cards/detail": "execution_detail",
     "/v1/execution-cards/queue": "execution_queue",
@@ -175,12 +180,16 @@ class TaskCardConsumerIdentityError(RuntimeError):
 class TaskCardServerLimits:
     max_body_bytes: int = 16 * 1024
     max_response_bytes: int = 64 * 1024
+    max_artifact_bytes: int = 2 * 1024 * 1024
     request_timeout_seconds: float = 5.0
 
     def validate(self) -> None:
         if any(
             isinstance(value, bool) or not isinstance(value, int) or value < 1024
-            for value in (self.max_body_bytes, self.max_response_bytes)
+            for value in (
+                self.max_body_bytes, self.max_response_bytes,
+                self.max_artifact_bytes,
+            )
         ):
             raise TaskCardServerConfigError(
                 "task card byte limits must be integers of at least 1024"
@@ -889,6 +898,39 @@ class TaskCardApplication:
                         request["card_version"], minimum=1),
                 )
             )
+        if operation == "execution_artifacts":
+            request = _request(payload, required={"card_id", "card_version"})
+            return _execution_artifacts_document(
+                self._execution_cards().artifacts(
+                    _integer(request["card_id"], minimum=1),
+                    expected_version=_integer(
+                        request["card_version"], minimum=1),
+                )
+            )
+        if operation == "execution_artifact":
+            request = _request(
+                payload, required={"card_id", "card_version", "ordinal"}
+            )
+            result = self._execution_cards().artifact(
+                _integer(request["card_id"], minimum=1),
+                expected_version=_integer(request["card_version"], minimum=1),
+                ordinal=_integer(request["ordinal"], minimum=0),
+            )
+            if not result.accepted:
+                return _execution_artifacts_document(result)
+            artifact = result.artifacts[0]
+            if len(artifact.content) > self.limits.max_artifact_bytes:
+                raise TaskCardServerResponseTooLarge
+            return {
+                "schema": EXECUTION_ARTIFACTS_SCHEMA,
+                "schema_version": SERVICE_VERSION,
+                "ok": True,
+                "disposition": result.disposition.value,
+                "card_id": result.card_id,
+                "card_version": result.card_version,
+                "artifact": artifact,
+                "refusal": None,
+            }
         if operation == "execution_agent_options":
             request = _request(
                 payload, required={"card_id", "card_version"}
@@ -1003,7 +1045,13 @@ class TaskCardRequestHandler(BaseHTTPRequestHandler):
                 self._read_json_body(),
                 authorization=auth_headers[0],
             )
-            self._json(HTTPStatus.OK, result)
+            artifact = result.pop("artifact", None)
+            if operation == "execution_artifact" and isinstance(
+                artifact, ExecutionCardArtifact
+            ):
+                self._binary(HTTPStatus.OK, artifact.content)
+            else:
+                self._json(HTTPStatus.OK, result)
             self._audit(HTTPStatus.OK, started)
         except TaskCardServerRequestError as exc:
             self._error(exc.status, exc.code, exc.message)
@@ -1130,6 +1178,17 @@ class TaskCardRequestHandler(BaseHTTPRequestHandler):
         if extra_headers:
             for name, value in extra_headers.items():
                 self.send_header(name, value)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _binary(self, status: int, body: bytes) -> None:
+        if len(body) > self.app.limits.max_artifact_bytes:
+            raise TaskCardServerResponseTooLarge
+        self.send_response(int(status))
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(body)
 
@@ -1538,6 +1597,29 @@ def _execution_deliverables_document(
     }
 
 
+def _execution_artifacts_document(
+    result: ExecutionCardArtifacts,
+) -> dict[str, Any]:
+    """Serialize file metadata without exposing archive paths or digests."""
+    return {
+        "schema": EXECUTION_ARTIFACTS_SCHEMA,
+        "schema_version": SERVICE_VERSION,
+        "ok": result.accepted,
+        "disposition": result.disposition.value,
+        "card_id": result.card_id,
+        "card_version": result.card_version,
+        "artifacts": [
+            {
+                "ordinal": artifact.ordinal,
+                "name": artifact.name,
+                "size_bytes": artifact.size_bytes,
+            }
+            for artifact in result.artifacts
+        ] if result.accepted else None,
+        "refusal": None if result.refusal is None else result.refusal.value,
+    }
+
+
 def _execution_detail_document(result: ExecutionCardDetail) -> dict[str, Any]:
     """Serialize only the bounded current-run/detail allowlist."""
     document: dict[str, Any] = {
@@ -1790,6 +1872,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=8790)
     parser.add_argument("--request-timeout", type=float, default=5.0)
     parser.add_argument("--agent-profile-directory", type=Path)
+    parser.add_argument(
+        "--task-work-root", type=Path,
+        help="canonical task archive root used for verified result files",
+    )
     parser.add_argument("--gw-endpoint")
     parser.add_argument("--gw-alias")
     parser.add_argument("--gw-token-file", type=Path)
@@ -1819,6 +1905,7 @@ def main(argv: list[str] | None = None) -> int:
             profile_registry=registry,
             owner_condition=owner_condition,
             reader_aliases=reader_aliases,
+            artifact_root=arguments.task_work_root,
         )
         execution_cards.count()
         execution_workflows = TaskExecutionService(
@@ -1860,6 +1947,7 @@ def main(argv: list[str] | None = None) -> int:
         OSError,
         TaskLedgerError,
         TaskCardServerConfigError,
+        ValueError,
     ) as exc:
         print(f"foxhound task-card-server: {exc}", file=sys.stderr)
         return 2
