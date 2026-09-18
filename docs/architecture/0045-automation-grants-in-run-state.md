@@ -1,4 +1,4 @@
-# ADR 0044: Carry automation grants in private run state
+# ADR 0045: Carry automation grants in private run state
 
 ## Status
 
