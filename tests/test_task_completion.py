@@ -23,6 +23,7 @@ from foxhound.task_cards import (
     render_task_review_card,
 )
 from foxhound.task_ledger import TaskStatus
+from review_card_fixture import raise_review_cards
 
 
 NOW = datetime(2030, 3, 1, 12, 0, tzinfo=timezone.utc)
@@ -280,7 +281,12 @@ class DoneCheckCardTests(unittest.TestCase):
         self.assertIn("Reopen", labels[1])
 
     def test_an_ordinary_card_is_unchanged(self) -> None:
-        self.cards.schedule()
+        """A plain card already in flight still renders and still asks.
+
+        Nothing raises one any more, but a deployment upgrading with one
+        on screen must let the reader answer it rather than fail to draw
+        it. This pins that fallback."""
+        raise_review_cards(self.database, self.clock())
         claim = self.cards.claim_next(consumer_digest=CONSUMER)
         text, keyboard = render_task_review_card(claim.card)
         self.assertIn("Task done?", text)
@@ -330,7 +336,7 @@ class DoneCheckCardTests(unittest.TestCase):
         self.assertEqual(follow_up.asked, 0)
 
     def test_detection_does_not_wait_for_the_weekly_rhythm(self) -> None:
-        self.cards.schedule()
+        raise_review_cards(self.database, self.clock())
         claim = self._deliver()
         self.cards.act(claim.card.id, expected_version=claim.card.version,
                        action="keep_open")
@@ -342,7 +348,7 @@ class DoneCheckCardTests(unittest.TestCase):
         self.assertEqual(self.cards.due()[0].completion.quotation, QUOTATION)
 
     def test_a_waiting_card_carries_the_question_rather_than_a_second_card(self) -> None:
-        self.cards.schedule()
+        raise_review_cards(self.database, self.clock())
         self.assertEqual(self.cards.count(), 1)
         self._propose()
         result = self.cards.schedule()
@@ -351,7 +357,7 @@ class DoneCheckCardTests(unittest.TestCase):
         self.assertEqual(self.cards.count(), 1)
 
     def test_a_card_in_flight_is_left_alone(self) -> None:
-        self.cards.schedule()
+        raise_review_cards(self.database, self.clock())
         self._deliver()
         self._propose()
         result = self.cards.schedule()

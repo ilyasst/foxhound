@@ -126,17 +126,6 @@ def _duplicate_execution_holds(task_id: str) -> str:
         f" AND workflow.status NOT IN ({_UNHELD_WORKFLOW_SQL}))"
     )
 
-#: A task whose workflow finished recently. Execution raises its own end card
-#: on completion, so carding the task the moment the workflow lets go asks the
-#: same question from two surfaces at once. The backlog waits one review
-#: interval before treating the task as dormant.
-_EXECUTION_JUST_RELEASED = (
-    "EXISTS(SELECT 1 FROM task_execution_workflows AS workflow "
-    " WHERE workflow.task_id=t.id "
-    f" AND workflow.status IN ({_FINISHED_WORKFLOW_SQL}) "
-    " AND COALESCE(workflow.completed_at,workflow.updated_at)>?)"
-)
-
 
 class CardStatus(StrEnum):
     PENDING = "pending"
@@ -338,83 +327,42 @@ class TaskCardService:
         self._token_factory = token_factory or (lambda: secrets.token_urlsafe(32))
 
     def schedule(self, *, limit: int = 100) -> ScheduleResult:
+        """Raise the cards that have something to say, and nothing else.
+
+        This used to also raise a periodic "☑️ Task done?" card for every
+        open task on a seven-day rhythm. That card asked a question the
+        ledger could not answer and the reader had no new information to
+        answer either: it started no work, and answering "still open" only
+        moved the same question a week out.
+
+        Worse, it was loudest exactly when it was least useful. A task with
+        no execution workflow is not held by `_execution_holds`, so whenever
+        admission stalled -- a saturated `plan_ready_cap`, see the sibling
+        scheduler -- every task the system had refused to start became
+        card-eligible and stayed that way. One deployment answered 69 of
+        them in a day against a baseline of 5, each one asking whether work
+        was finished that had never been allowed to begin. A failure in
+        admission was being reported to the reader as a question about
+        completion.
+
+        What remains are the two cards that carry information the reader
+        does not already have: a done-check, raised only when evidence
+        suggests the task is finished, and a duplicate check, raised only
+        when intake has proposed one. Both are answers to something, not
+        a rhythm.
+        """
         if not _valid_limit(limit):
             return ScheduleResult(
                 CardDisposition.REFUSED,
                 refusal=CardRefusal.INVALID_ARGUMENT,
             )
         now = self._now()
-        # Anything execution finished before this is treated as dormant and
-        # may be carded again; anything after it is still execution's to
-        # answer. See `_EXECUTION_JUST_RELEASED`.
-        dormant_after = (
-            self._clock_value() - OPEN_REVIEW_INTERVAL
-        ).isoformat(timespec="seconds")
         with closing(self._connect()) as connection:
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("BEGIN IMMEDIATE")
             try:
                 cancelled = self._cancel_stale(connection, now)
-                rows = connection.execute(
-                    "SELECT t.id,t.version,"
-                    + _bound_source_revision("t.id") + " AS source_revision "
-                    "FROM tasks AS t "
-                    "WHERE t.status='open' "
-                    "AND NOT " + _EXECUTION_HOLDS + " "
-                    "AND NOT " + _EXECUTION_JUST_RELEASED + " "
-                    "AND NOT EXISTS(SELECT 1 FROM task_relations AS relation "
-                    " WHERE relation.subject_id=t.id AND relation.kind='duplicate_of' "
-                    " AND relation.withdrawn_at IS NULL) "
-                    "AND NOT EXISTS(SELECT 1 FROM task_duplicate_proposals AS proposal "
-                    " WHERE proposal.state='proposed' "
-                    " AND (proposal.left_task_id=t.id OR proposal.right_task_id=t.id)) "
-                    "AND NOT EXISTS("
-                    " SELECT 1 FROM task_candidate_bindings AS b JOIN "
-                    " task_candidate_lifecycle AS l ON l.candidate_id=b.candidate_id "
-                    " WHERE b.task_id=t.id AND b.relation='accepted' "
-                    " AND l.state='withdrawn' "
-                    " AND l.resolution='preserved_open'"
-                    ") "
-                    "AND NOT EXISTS("
-                    " SELECT 1 FROM task_review_cards AS active "
-                    " WHERE active.task_id=t.id AND active.status IN "
-                    " ('pending','delivering','delivered','snoozed')"
-                    ") "
-                    "AND (COALESCE(("
-                    " SELECT prior.review_after FROM task_review_cards AS prior "
-                    " WHERE prior.task_id=t.id ORDER BY prior.id DESC LIMIT 1"
-                    "),'')<=? OR EXISTS("
-                    " SELECT 1 FROM task_candidate_bindings AS b "
-                    " WHERE b.task_id=t.id AND b.relation='accepted' "
-                    " AND NOT EXISTS("
-                    "  SELECT 1 FROM task_review_cards AS seen "
-                    "  WHERE seen.task_id=t.id "
-                    "  AND seen.source_revision=b.source_revision "
-                    "  AND EXISTS(SELECT 1 FROM task_review_card_events AS event "
-                    "             WHERE event.card_id=seen.id "
-                    "             AND event.kind='delivered')"
-                    " )) ) "
-                    "ORDER BY t.created_at,t.id LIMIT ?",
-                    (dormant_after, now, limit),
-                ).fetchall()
-                for row in rows:
-                    cursor = connection.execute(
-                        "INSERT INTO task_review_cards("
-                        "task_id,task_version,source_revision,status,version,"
-                        "due_at,created_at,updated_at) VALUES(?,?,?,'pending',1,?,?,?)",
-                        (int(row["id"]), int(row["version"]),
-                         row["source_revision"], now, now, now),
-                    )
-                    self._event(
-                        connection,
-                        card_id=int(cursor.lastrowid),
-                        task_id=int(row["id"]),
-                        kind="scheduled",
-                        card_version=1,
-                        task_version=int(row["version"]),
-                        now=now,
-                    )
-                created = len(rows)
+                created = 0
                 asked, raised = self._ask_completion_questions(
                     connection, now, limit=limit
                 )
@@ -1798,7 +1746,17 @@ class TaskCardService:
 
 
 def render_task_review_card(card: TaskReviewCard) -> tuple[str, dict]:
-    """Render one claimed card without performing I/O."""
+    """Render one claimed card without performing I/O.
+
+    The plain "☑️ Task done?" branch below is no longer reachable for any
+    card raised after `schedule()` stopped creating them. It stays because
+    a deployment upgrading mid-flight can still be holding one that was
+    raised before, and a reader who has it on screen must be able to answer
+    it rather than watch it fail to render. Once no such row remains
+    anywhere -- `SELECT COUNT(*) FROM task_review_cards WHERE status IN
+    ('pending','delivering','delivered','snoozed') AND duplicate/completion
+    are both absent` -- this branch and its buttons can go.
+    """
     if card.status is not CardStatus.DELIVERING:
         raise ValueError("task review card is not claimed for delivery")
     text = html.escape(card.text, quote=False)

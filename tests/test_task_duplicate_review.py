@@ -15,6 +15,7 @@ from pathlib import Path
 
 from foxhound import task_duplicate_proposals as proposals
 from foxhound.candidate_inbox import CandidateInbox
+from review_card_fixture import raise_review_cards
 from foxhound.task_cards import CardDisposition, CardStatus, TaskCardService, render_task_review_card
 
 
@@ -203,8 +204,11 @@ class DuplicateReviewCardTests(unittest.TestCase):
             "SELECT state,title FROM task_fused_title_jobs WHERE task_id=1"
         ).fetchone()
         self.assertEqual(tuple(job), ("pending", None))
+        # Confirming used to leave a fresh review card on the canonical task.
+        # Nothing raises one now: the duplicate question was answered, and
+        # that is the end of it.
         self.cards.schedule()
-        self.assertEqual([card.task_id for card in self.cards.due()], [1])
+        self.assertEqual([card.task_id for card in self.cards.due()], [])
 
     def test_completed_title_replaces_only_the_canonical_card_display_text(self) -> None:
         claim = self._deliver()
@@ -218,7 +222,9 @@ class DuplicateReviewCardTests(unittest.TestCase):
             ("Synthetic rollout checklist", NOW.isoformat()),
         )
         self.connection.commit()
-        self.cards.schedule()
+        # The fused title is a property of the card's display text, so this
+        # still needs a card on the canonical task; nothing raises one now.
+        raise_review_cards(self.database, NOW)
         due = self.cards.due()
         self.assertEqual([card.task_id for card in due], [1])
         self.assertEqual(due[0].text, "Synthetic rollout checklist")
