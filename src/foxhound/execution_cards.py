@@ -165,6 +165,12 @@ class ExecutionCardRefusal(StrEnum):
     STALE_VERSION = "stale_version"
     INVALID_STATE = "invalid_state"
     CLAIM_MISMATCH = "claim_mismatch"
+    #: This deployment serves no result artifacts at all, whatever the card
+    #: is. Distinct from an empty listing, which is an answer: this one says
+    #: the question cannot be answered here, and a caller that can tell them
+    #: apart can say so to a reader instead of leaving them waiting for a
+    #: file that is not coming.
+    ARTIFACTS_UNAVAILABLE = "artifacts_unavailable"
 
 
 @dataclass(frozen=True)
@@ -1428,6 +1434,16 @@ class ExecutionCardService:
             text=card_deliverables(card),
         )
 
+    @property
+    def serves_artifacts(self) -> bool:
+        """Whether this deployment can serve result artifacts at all.
+
+        Configuration, not state: it does not change while the process runs,
+        which is what makes it worth reporting once at start-up rather than
+        discovering one refusal at a time.
+        """
+        return self._artifact_root is not None
+
     def artifacts(
         self, card_id: int, *, expected_version: int
     ) -> ExecutionCardArtifacts:
@@ -1435,7 +1451,7 @@ class ExecutionCardService:
         if self._artifact_root is None:
             return ExecutionCardArtifacts(
                 ExecutionCardDisposition.REFUSED, card_id,
-                refusal=ExecutionCardRefusal.INVALID_STATE,
+                refusal=ExecutionCardRefusal.ARTIFACTS_UNAVAILABLE,
             )
         if not _valid_identity(card_id, expected_version):
             return ExecutionCardArtifacts(

@@ -1985,6 +1985,18 @@ def main(argv: list[str] | None = None) -> int:
         # its deploy is visible without being interrogated.
         print(f"foxhound task-card-server: revision {describe(__file__)}",
               flush=True)
+        # Same reasoning, for a capability rather than a revision. A
+        # deployment with no artifact root refuses every artifact request,
+        # for its whole life, and the refusal alone looks like a card that
+        # happens to have produced no files. Said once, at the only moment
+        # it can be acted on, it reads as the configuration decision it is.
+        if not execution_cards.serves_artifacts:
+            print(
+                "foxhound task-card-server: result artifacts unavailable "
+                "(no task work root configured; requires deployment "
+                "configuration version 8)",
+                flush=True,
+            )
         serve(arguments.bind, arguments.port, app)
     except (
         AgentProfileError,
