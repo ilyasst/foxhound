@@ -69,7 +69,13 @@ DEFAULT_DIALECT = "openai"
 MAX_CANDIDATES = 4
 MAX_TASK_CHARS = 8_000
 MAX_RESPONSE_BYTES = 256 * 1024
-TIMEOUT_SECONDS = 90.0
+#: A reasoning capability legitimately spends minutes on one judgement: a
+#: trivial request measured against a deployed gateway took 168 seconds and
+#: 2187 completion tokens to emit one line of JSON. A fixed 90-second budget
+#: aborted work the gateway went on to finish, and recorded it as though the
+#: model had answered badly. The default is generous because giving up early
+#: biases any comparison against the slower capability.
+TIMEOUT_SECONDS = 600.0
 
 _SYSTEM = (
     "You classify the relationship between a task and candidate tasks. "
@@ -80,6 +86,15 @@ _SYSTEM = (
     "with this exact shape: {\"judgements\":[{\"task_id\":number,"
     "\"verdict\":\"redundant|intersecting|interconnected\"}]}."
 )
+
+
+class LocalModelTimeout(Exception):
+    """The model did not answer within the budget.
+
+    Deliberately not a `LocalModelError`: a request that ran out of time is
+    not a judgement the model declined to make, and counting the two together
+    makes a merely slow capability look like an inaccurate one.
+    """
 
 
 class LocalModelError(ValueError):
@@ -122,6 +137,7 @@ def scan(
     model: str,
     endpoint_url: str | None = None,
     dialect: str = DEFAULT_DIALECT,
+    timeout: float = TIMEOUT_SECONDS,
     now: str,
     record: bool = False,
     propose_redundant: bool = False,
@@ -157,6 +173,7 @@ def scan(
             tuple((candidate.task_id, candidate.task_text) for candidate in choices),
             model=model,
             dialect=dialect,
+            timeout=timeout,
             endpoint=endpoint,
             opener=opener,
         )
@@ -239,6 +256,7 @@ def scan_database(
     model: str,
     endpoint_url: str | None = None,
     dialect: str = DEFAULT_DIALECT,
+    timeout: float = TIMEOUT_SECONDS,
     record: bool = False,
     propose_redundant: bool = False,
     now: str | None = None,
@@ -262,12 +280,12 @@ def scan_database(
         if not record:
             return scan(
                 connection, model=model, endpoint_url=endpoint_url,
-                dialect=dialect, now=timestamp,
+                dialect=dialect, timeout=timeout, now=timestamp,
                 propose_redundant=propose_redundant, opener=opener,
             )
         result = scan(
             connection, model=model, endpoint_url=endpoint_url,
-            dialect=dialect, now=timestamp,
+            dialect=dialect, timeout=timeout, now=timestamp,
             record=True, propose_redundant=propose_redundant, opener=opener,
         )
         connection.commit()
@@ -404,6 +422,7 @@ def _classify(
     model: str,
     endpoint: str,
     dialect: str = DEFAULT_DIALECT,
+    timeout: float = TIMEOUT_SECONDS,
     opener=None,
 ) -> _ModelReply:
     spoken = _dialect(dialect)
@@ -426,7 +445,7 @@ def _classify(
     )
     open_request = (opener or _OPENER).open
     try:
-        with open_request(request, timeout=TIMEOUT_SECONDS) as response:
+        with open_request(request, timeout=timeout) as response:
             raw = response.read(MAX_RESPONSE_BYTES + 1)
         if len(raw) > MAX_RESPONSE_BYTES:
             raise LocalModelError("local model response is too large")
@@ -441,7 +460,13 @@ def _classify(
         )
     except LocalModelError:
         raise
+    except TimeoutError as exc:
+        raise LocalModelTimeout("local model did not answer in time") from exc
     except Exception as exc:  # noqa: BLE001 - no model detail may escape
+        if isinstance(getattr(exc, "reason", None), TimeoutError):
+            # urllib wraps a socket timeout in URLError.
+            raise LocalModelTimeout(
+                "local model did not answer in time") from exc
         raise LocalModelError("local model did not return a valid judgement") from exc
 
 
@@ -531,6 +556,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="request shape the endpoint speaks; the URL alone cannot say",
     )
     parser.add_argument(
+        "--timeout", type=float, default=TIMEOUT_SECONDS,
+        help="seconds to wait for one judgement; a reasoning capability "
+             f"needs minutes, not seconds (default {TIMEOUT_SECONDS:g})",
+    )
+    parser.add_argument(
         "--record", action="store_true",
         help="persist aggregate-only assessments after every proposal is settled",
     )
@@ -546,6 +576,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = scan_database(
             arguments.database, model=arguments.model,
             endpoint_url=arguments.endpoint, dialect=arguments.dialect,
+            timeout=arguments.timeout,
             record=arguments.record,
             propose_redundant=arguments.propose_redundant,
         )
