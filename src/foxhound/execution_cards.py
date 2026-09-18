@@ -11,7 +11,6 @@ import re
 import secrets
 import sqlite3
 import stat
-import unicodedata
 import urllib.parse
 from contextlib import closing
 from dataclasses import dataclass, field
@@ -58,7 +57,7 @@ from .task_ledger import (
     _apply_task_transition,
 )
 from .task_archive import MAX_ARTIFACT_BYTES, review_links
-from .task_owner import canonical_owner_display
+from .task_owner import canonical_owner_display, normalized_owner
 
 
 CALLBACK_PREFIX = "fhe"
@@ -483,7 +482,7 @@ class ExecutionCardService:
             raise ValueError("reader aliases are invalid")
         self._owner_condition = owner_condition
         self._reader_aliases = frozenset(
-            _normalized_owner(alias) for alias in aliases
+            normalized_owner(alias) for alias in aliases
         )
         if artifact_root is None:
             self._artifact_root = None
@@ -2900,17 +2899,6 @@ def _card(
         raise TaskLedgerError("execution review card state is invalid") from exc
 
 
-def _normalized_owner(value: str) -> str:
-    decomposed = unicodedata.normalize("NFKD", value).casefold()
-    return " ".join(
-        "".join(
-            character if character.isalnum() else " "
-            for character in decomposed
-            if not unicodedata.combining(character)
-        ).split()
-    )
-
-
 def _owner_hold_reason(
     row: Mapping[str, object],
     owner_display: str | None,
@@ -2922,7 +2910,7 @@ def _owner_hold_reason(
         return "Meeting-aware hold is unavailable on this card service."
     if owner_display in {None, "(unassigned)"}:
         return "Owner needs confirmation before it can be held to a meeting."
-    if _normalized_owner(owner_display) in reader_aliases:
+    if normalized_owner(owner_display) in reader_aliases:
         return "Until next meeting applies only to another owner."
     if row["owner_kind"] not in {"person", "external"}:
         return "Until next meeting applies only to an individual owner."

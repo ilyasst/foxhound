@@ -36,7 +36,7 @@ from .task_execution import TaskExecutionService
 
 
 DEPLOYMENT_SCHEMA = "foxhound.deployment-config"
-DEPLOYMENT_SCHEMA_VERSION = 8
+DEPLOYMENT_SCHEMA_VERSION = 9
 MAX_CONFIG_BYTES = 64 * 1024
 
 
@@ -106,6 +106,11 @@ class WorkflowConfig:
     #: Kinds whose reviewed external action runs without a card. Separate
     #: from the key above, and defaulting to empty for the same reason.
     act_without_asking: tuple[str, ...] = ()
+    #: Names this machine's reader is known by. Operator-supplied, because
+    #: only the operator knows them; nothing here may assume a name. Empty
+    #: means ownership never admits a task, which is the behaviour of every
+    #: configuration written before this key existed.
+    reader_aliases: tuple[str, ...] = ()
 
     def schedule_argv(
         self, database: Path, profile_directory: Path | None
@@ -121,6 +126,8 @@ class WorkflowConfig:
             result.extend(("--agent-profile-directory", str(profile_directory)))
         for kind in self.plan_without_asking:
             result.extend(("--plan-without-asking", kind))
+        for alias in self.reader_aliases:
+            result.extend(("--reader-alias", alias))
         return result
 
 
@@ -395,7 +402,7 @@ def _parse_document(document: object) -> DeploymentConfig:
     version = document.get("schema_version")
     if (
         document.get("schema") != DEPLOYMENT_SCHEMA
-        or version not in {1, 2, 3, 4, 5, 6, 7, DEPLOYMENT_SCHEMA_VERSION}
+        or version not in {1, 2, 3, 4, 5, 6, 7, 8, DEPLOYMENT_SCHEMA_VERSION}
         or isinstance(version, bool)
     ):
         raise DeploymentConfigError("deployment configuration version is invalid")
@@ -508,6 +515,8 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
         fields = fields | {"execute_without_asking", "act_without_asking"}
     elif version >= 6:
         fields = fields | {"execute_without_asking"}
+    if version >= 9:
+        fields = fields | {"reader_aliases"}
     document = _object(value, fields)
     profile = document["default_agent_profile"]
     grants = document["plan_without_asking"]
@@ -515,6 +524,7 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
         document["execute_without_asking"] if version >= 6 else []
     )
     act_grants = document["act_without_asking"] if version >= 7 else []
+    aliases = document["reader_aliases"] if version >= 9 else []
     caps = tuple(document[key] for key in (
         "execution_slot_cap", "plan_ready_cap", "awaiting_reader_cap"
     ))
@@ -523,6 +533,7 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
         or not _grant_list(grants)
         or not _grant_list(execute_grants)
         or not _grant_list(act_grants)
+        or not _grant_list(aliases)
         or any(isinstance(cap, bool) or not isinstance(cap, int) for cap in caps)
     ):
         raise DeploymentConfigError("workflow configuration is invalid")
@@ -532,6 +543,7 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
         *caps,
         execute_without_asking=tuple(execute_grants),
         act_without_asking=tuple(act_grants),
+        reader_aliases=tuple(aliases),
     )
 
 
@@ -785,6 +797,7 @@ def _validate_runtime(config: DeploymentConfig) -> None:
         execution_slot_cap=config.workflow.execution_slot_cap,
         plan_ready_cap=config.workflow.plan_ready_cap,
         awaiting_reader_cap=config.workflow.awaiting_reader_cap,
+        reader_aliases=config.workflow.reader_aliases,
     )
     for runner in config.execution_runners:
         if runner.enabled:

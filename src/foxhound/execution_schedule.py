@@ -27,6 +27,7 @@ def run_schedule(
     plan_without_asking: Sequence[str] | None = None,
     plan_ready_cap: int | None = None,
     awaiting_reader_cap: int | None = None,
+    reader_aliases: Sequence[str] | None = None,
 ) -> ExecutionScheduleResult:
     database = _private_database(database_path)
     registry = load_registry(agent_profile_directory)
@@ -53,6 +54,7 @@ def run_schedule(
         planning_grants=plan_without_asking,
         plan_ready_cap=plan_ready_cap,
         awaiting_reader_cap=awaiting_reader_cap,
+        reader_aliases=reader_aliases,
     ).schedule_new(limit=limit)
 
 
@@ -73,6 +75,17 @@ def _parser() -> argparse.ArgumentParser:
             "let this machine plan tasks from SOURCE_KIND without asking "
             "first; repeat for each kind. Omitted means every task is "
             "asked about, which is the default and the cautious answer."
+        ),
+    )
+    parser.add_argument(
+        "--reader-alias",
+        action="append",
+        metavar="NAME",
+        help=(
+            "a name this machine's reader is known by; repeat for each. A "
+            "task whose confirmed owner matches one is planned without "
+            "asking, whatever its source. Omitted means ownership never "
+            "admits a task, which is the cautious answer and the default."
         ),
     )
     parser.add_argument(
@@ -108,6 +121,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             plan_without_asking=args.plan_without_asking,
             plan_ready_cap=args.plan_ready_cap,
             awaiting_reader_cap=args.awaiting_reader_cap,
+            reader_aliases=args.reader_alias,
         )
     except (AgentProfileError, TaskBootstrapConfigError, ValueError):
         print(
