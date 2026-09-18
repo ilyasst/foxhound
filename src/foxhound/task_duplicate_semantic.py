@@ -1,9 +1,15 @@
 """Local-only semantic evaluation of duplicate-task candidates.
 
 This is an evaluation detector, not an intake hook.  It retrieves a bounded
-set of cheap lexical neighbours and asks an Ollama-compatible *loopback* model
-to classify each relation as redundant, intersecting, or interconnected.  It
+set of cheap lexical neighbours and asks a *loopback* model gateway to
+classify each relation as redundant, intersecting, or interconnected.  It
 never creates a task, relation, reader decision, or duplicate proposal.
+
+The loopback rule bounds what this service will address, not where the text
+ends up.  A gateway listening on loopback may forward a request to another
+machine the operator runs, and several do.  A deployment that needs the text
+to stay on one machine has to point this at a model that machine serves
+itself; the check here cannot establish that for it.
 
 The default invocation is dry-run.  ``--record`` is deliberately unavailable
 until every existing duplicate proposal has a reader decision, so a model is
@@ -22,7 +28,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 from urllib.parse import urlsplit
 
 from . import task_duplicate_assessments as assessments
@@ -55,7 +61,11 @@ _OPENER = urllib.request.build_opener(
 )
 
 LOOPBACK_ADDRESS = "127.0.0.1"
-DEFAULT_ENDPOINT = f"http://{LOOPBACK_ADDRESS}:11434"
+#: The deployment's gateway speaks the OpenAI chat-completions shape. The
+#: single-machine runner dialect is retained because the endpoint is
+#: configurable and the two are not distinguishable from the URL alone.
+DEFAULT_ENDPOINT = f"http://{LOOPBACK_ADDRESS}:8800"
+DEFAULT_DIALECT = "openai"
 MAX_CANDIDATES = 4
 MAX_TASK_CHARS = 8_000
 MAX_RESPONSE_BYTES = 256 * 1024
@@ -111,6 +121,7 @@ def scan(
     *,
     model: str,
     endpoint_url: str | None = None,
+    dialect: str = DEFAULT_DIALECT,
     now: str,
     record: bool = False,
     propose_redundant: bool = False,
@@ -145,6 +156,7 @@ def scan(
             left.task_text,
             tuple((candidate.task_id, candidate.task_text) for candidate in choices),
             model=model,
+            dialect=dialect,
             endpoint=endpoint,
             opener=opener,
         )
@@ -226,6 +238,7 @@ def scan_database(
     *,
     model: str,
     endpoint_url: str | None = None,
+    dialect: str = DEFAULT_DIALECT,
     record: bool = False,
     propose_redundant: bool = False,
     now: str | None = None,
@@ -248,11 +261,13 @@ def scan_database(
         inbox._require_current_schema(connection)
         if not record:
             return scan(
-                connection, model=model, endpoint_url=endpoint_url, now=timestamp,
+                connection, model=model, endpoint_url=endpoint_url,
+                dialect=dialect, now=timestamp,
                 propose_redundant=propose_redundant, opener=opener,
             )
         result = scan(
-            connection, model=model, endpoint_url=endpoint_url, now=timestamp,
+            connection, model=model, endpoint_url=endpoint_url,
+            dialect=dialect, now=timestamp,
             record=True, propose_redundant=propose_redundant, opener=opener,
         )
         connection.commit()
@@ -291,14 +306,107 @@ def _nearest(
     return tuple(item[3] for item in ranked[:MAX_CANDIDATES])
 
 
+@dataclass(frozen=True)
+class _Dialect:
+    """One gateway's request shape, and where its answer sits in the reply.
+
+    Kept apart from the scanning logic so that adding a third gateway is a
+    new entry here rather than an edit to how candidates are chosen or how
+    verdicts are validated.
+    """
+
+    path: str
+    body: Callable[[str, str, str], dict]
+    content: Callable[[object], str]
+    usage: Callable[[object], tuple[int, int]]
+
+
+def _openai_body(model: str, system: str, user: str) -> dict:
+    return {
+        "model": model,
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+        "messages": (
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ),
+    }
+
+
+def _openai_content(reply: object) -> str:
+    if not isinstance(reply, dict):
+        raise LocalModelError("local model reply is not an object")
+    choices = reply.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise LocalModelError("local model reply carries no choice")
+    first = choices[0]
+    if not isinstance(first, dict) or not isinstance(first.get("message"), dict):
+        raise LocalModelError("local model reply carries no message")
+    return first["message"].get("content")
+
+
+def _openai_usage(reply: object) -> tuple[int, int]:
+    usage = reply.get("usage") if isinstance(reply, dict) else None
+    if not isinstance(usage, dict):
+        return 0, 0
+    return (
+        _nonnegative(usage.get("prompt_tokens", 0)),
+        _nonnegative(usage.get("completion_tokens", 0)),
+    )
+
+
+def _runner_body(model: str, system: str, user: str) -> dict:
+    return {
+        "model": model,
+        "stream": False,
+        "format": "json",
+        "options": {"temperature": 0},
+        "messages": (
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ),
+    }
+
+
+def _runner_content(reply: object) -> str:
+    if not isinstance(reply, dict) or not isinstance(reply.get("message"), dict):
+        raise LocalModelError("local model reply carries no message")
+    return reply["message"].get("content")
+
+
+def _runner_usage(reply: object) -> tuple[int, int]:
+    if not isinstance(reply, dict):
+        return 0, 0
+    return (
+        _nonnegative(reply.get("prompt_eval_count", 0)),
+        _nonnegative(reply.get("eval_count", 0)),
+    )
+
+
+DIALECTS = {
+    "openai": _Dialect(
+        "/v1/chat/completions", _openai_body, _openai_content, _openai_usage),
+    "runner": _Dialect(
+        "/api/chat", _runner_body, _runner_content, _runner_usage),
+}
+
+
+def _dialect(value: object) -> _Dialect:
+    if not isinstance(value, str) or value not in DIALECTS:
+        raise LocalModelError("local model dialect is invalid")
+    return DIALECTS[value]
+
+
 def _classify(
     task_text: str,
     candidates: tuple[tuple[int, str], ...],
     *,
     model: str,
     endpoint: str,
+    dialect: str = DEFAULT_DIALECT,
     opener=None,
 ) -> _ModelReply:
+    spoken = _dialect(dialect)
     document = {
         "task": task_text[:MAX_TASK_CHARS],
         "candidates": [
@@ -307,19 +415,12 @@ def _classify(
         ],
     }
     request = urllib.request.Request(
-        endpoint.rstrip("/") + "/api/chat",
-        data=json.dumps({
-            "model": model,
-            "stream": False,
-            "format": "json",
-            "options": {"temperature": 0},
-            "messages": (
-                {"role": "system", "content": _SYSTEM},
-                {"role": "user", "content": json.dumps(
-                    document, separators=(",", ":"), ensure_ascii=False
-                )},
-            ),
-        }, separators=(",", ":")).encode("utf-8"),
+        endpoint.rstrip("/") + spoken.path,
+        data=json.dumps(
+            spoken.body(model, _SYSTEM, json.dumps(
+                document, separators=(",", ":"), ensure_ascii=False)),
+            separators=(",", ":"),
+        ).encode("utf-8"),
         headers={"Content-Type": "application/json", "Accept": "application/json"},
         method="POST",
     )
@@ -330,12 +431,13 @@ def _classify(
         if len(raw) > MAX_RESPONSE_BYTES:
             raise LocalModelError("local model response is too large")
         reply = json.loads(raw.decode("utf-8"))
-        content = reply["message"]["content"]
+        content = spoken.content(reply)
         verdicts = _verdicts(content, {task_id for task_id, _ in candidates})
+        prompt_tokens, completion_tokens = spoken.usage(reply)
         return _ModelReply(
             verdicts=verdicts,
-            prompt_tokens=_nonnegative(reply.get("prompt_eval_count", 0)),
-            completion_tokens=_nonnegative(reply.get("eval_count", 0)),
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
         )
     except LocalModelError:
         raise
@@ -419,7 +521,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--database", required=True, type=Path)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--endpoint")
+    parser.add_argument(
+        "--endpoint",
+        help="loopback HTTP address of the local model gateway; defaults to "
+             f"{DEFAULT_ENDPOINT}",
+    )
+    parser.add_argument(
+        "--dialect", choices=sorted(DIALECTS), default=DEFAULT_DIALECT,
+        help="request shape the endpoint speaks; the URL alone cannot say",
+    )
     parser.add_argument(
         "--record", action="store_true",
         help="persist aggregate-only assessments after every proposal is settled",
@@ -435,7 +545,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         result = scan_database(
             arguments.database, model=arguments.model,
-            endpoint_url=arguments.endpoint, record=arguments.record,
+            endpoint_url=arguments.endpoint, dialect=arguments.dialect,
+            record=arguments.record,
             propose_redundant=arguments.propose_redundant,
         )
     except (InboxError, sqlite3.Error, ValueError, OSError):
