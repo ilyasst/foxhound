@@ -31,6 +31,15 @@ already `delivering` or `delivered` are excluded. Its response uses the
 `foxhound.task-card-service.queue` schema version 1 and is not available to
 the legacy `drip` role.
 
+The versioned `POST /v1/task-cards/view` route re-renders one delivered
+duplicate-comparison card at the detail the caller asks for, compact or
+expanded. It is a read: nothing is written and no version moves, so the
+answers on the keyboard it returns still address the card the reader is
+looking at. It refuses anything the reader could not answer now -- a card not
+delivered, at another version, or whose task has moved -- rather than handing
+back a presentation whose every control would refuse. Its response uses the
+`foxhound.task-card-service.view` schema version 1.
+
 Every application route requires one bearer token loaded from a nonsymlink,
 owner-owned, mode-0600 regular file. Request contracts are versioned and exact:
 unknown or duplicate JSON fields, invalid types, extra headers that change body
