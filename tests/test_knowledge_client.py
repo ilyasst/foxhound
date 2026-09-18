@@ -209,7 +209,16 @@ class KnowledgeClientTests(unittest.TestCase):
             result = client(endpoint).refresh_source(request)
         self.assertTrue(result.usable)
         self.assertEqual(requests[0]["path"], "/v1/source-snapshot")
-        self.assertEqual(requests[0]["document"]["expected_revision"], "b" * 64)
+        self.assertEqual(requests[0]["document"], {
+            "alias": "primary",
+            "schema": "foxhound.source-snapshot-request",
+            "schema_version": 1,
+            "system": "gw",
+            "kind": "issue",
+            "record_id": "forge.example/acme/widget",
+            "item_id": "7",
+            "expected_revision": "b" * 64,
+        })
 
     def test_owner_meeting_condition_is_exact_and_content_free(self):
         reference = {

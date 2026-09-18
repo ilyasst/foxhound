@@ -240,7 +240,10 @@ class GwKnowledgeClient:
     ) -> SourceRefreshResult:
         """Ask GW's source-owning boundary for one bounded freshness check."""
         try:
-            payload = source_snapshot_request_document(request)
+            payload = {
+                "alias": self._config.alias,
+                **source_snapshot_request_document(request),
+            }
         except SourceSnapshotContractError:
             raise KnowledgeRequestError("source snapshot request is invalid") from None
         document = self._request_json("/v1/source-snapshot", payload)
