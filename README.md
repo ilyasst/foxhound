@@ -293,9 +293,23 @@ foxhound-task-duplicate-quality \
   --database /srv/example/private-foxhound-state/foxhound.sqlite3
 ```
 
-`foxhound-task-local-duplicate-eval` sends task text only to an Ollama API on
-an explicit IPv4 or IPv6 loopback HTTP endpoint. It refuses names, public
-addresses, HTTPS endpoints, redirects, and hosted APIs. Its default is a
+`foxhound-task-local-duplicate-eval` sends task text only to a model gateway
+on an explicit IPv4 or IPv6 loopback HTTP endpoint. It refuses names, public
+addresses, HTTPS endpoints, redirects, and hosted APIs. Two request shapes are
+supported and selected with `--dialect`, because the URL alone cannot say
+which one an endpoint speaks: an OpenAI-compatible chat-completions gateway
+(the default) and a single-machine runner.
+
+**What the loopback rule does and does not promise.** It guarantees that this
+service addresses nothing but the local machine. It does not guarantee that
+the text stays there: a gateway listening on loopback may itself forward the
+request to another machine the operator runs. That is a property of the
+gateway a deployment chooses, not of this client, and a deployment that needs
+the stronger guarantee must point this at a model the local machine serves
+itself. The check here is a boundary on what Foxhound will talk to, not a
+claim about where the text finally lands.
+
+Its default is a
 read-only dry run; `--record` stores only task-pair IDs, a closed relation
 verdict, and resource counts after every proposal has been settled. An explicit
 `--propose-redundant` may additionally create ordinary, reader-gated proposals
