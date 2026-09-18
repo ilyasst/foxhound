@@ -94,6 +94,18 @@ workflow after bootstrap.
 - Minimize access to private data. Code and tests should work with synthetic
   data by default; access real data only when the task explicitly requires it
   and an approved environment provides it.
+- Work in a virtual environment, and never install this package onto the user
+  site — not with `--user`, not editable, not with an override that defeats a
+  packaging guard. The console scripts this project installs include the task
+  worker, and shell profiles conventionally prepend the user script directory
+  to `PATH`. A user-site install therefore makes *your working tree* the worker
+  that every agent on that machine runs, whatever any unit configures, because
+  the agent resolves the command in its own shell rather than the runner's.
+  Since [ADR 0046](docs/architecture/0046-worker-resolved-from-the-running-release.md)
+  the runner resolves its own worker and refuses to claim work when the two
+  disagree, so this cannot corrupt runs silently; it will, however, stop a
+  deployment. The install is one unremarkable line and the consequence shows up
+  somewhere else, so it is worth stating: use a virtual environment.
 - A change is not complete until tests pass, documentation is current, the
   publication-safety review is complete, and the issue/branch/worktree cleanup
   has been performed.
@@ -104,7 +116,11 @@ workflow after bootstrap.
 advancing one is a separate, named operation.
 
 Before deploying anything, read
-[ADR 0043](docs/architecture/0043-pinned-release-checkout.md).  In particular,
+[ADR 0043](docs/architecture/0043-pinned-release-checkout.md) and
+[ADR 0046](docs/architecture/0046-worker-resolved-from-the-running-release.md).
+0043 covers what a release is and how one is advanced; 0046 covers the worker,
+which the runner locates from the release rather than through `PATH`, and which
+it checks before claiming work.  In particular,
 a release that changes the database schema does **not** follow the ordinary
 procedure: deployed code refuses a database newer than itself, so the units
 are stopped across the migration.  Ask the candidate release whether this
