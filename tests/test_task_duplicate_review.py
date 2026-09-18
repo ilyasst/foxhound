@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from foxhound import migrate_database
 
+import json
+import pathlib
 import sqlite3
 import tempfile
 import unittest
@@ -12,9 +14,21 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from foxhound import task_duplicate_proposals as proposals
+from foxhound.contracts.task_candidate import candidate_id_for
 from foxhound.candidate_inbox import CandidateInbox
+from foxhound.card_provenance import CardSourceEvidence
 from review_card_fixture import raise_review_cards
-from foxhound.task_cards import CardDisposition, CardStatus, TaskCardService, render_task_review_card
+from foxhound.task_cards import (
+    CardDisposition,
+    CardRefusal,
+    CardStatus,
+    TaskCardService,
+    TASK_CARD_READS,
+    _affordable_sources as affordable_sources,
+    _comparison_origin,
+    render_duplicate_view,
+    render_task_review_card,
+)
 
 
 NOW = datetime(2030, 3, 1, 12, 0, tzinfo=timezone.utc)
@@ -89,7 +103,13 @@ class DuplicateReviewCardTests(unittest.TestCase):
         self.assertIn("Same task?", text)
         self.assertIn("Task T1", text)
         self.assertIn("Task T2", text)
-        self.assertEqual(len(keyboard["inline_keyboard"][0]), 2)
+        # Two answers and the read that opens the comparison.
+        self.assertEqual(len(keyboard["inline_keyboard"][0]), 3)
+        self.assertEqual(
+            [button["callback_data"].rsplit("|", 1)[1]
+             for button in keyboard["inline_keyboard"][0]],
+            ["duplicate_confirm", "duplicate_reject", "duplicate_expand"],
+        )
 
     def test_duplicate_only_scheduler_does_not_create_ordinary_task_cards(self) -> None:
         self._task(3, "note", "Review an unrelated synthetic topic")
@@ -647,3 +667,250 @@ class DuplicateSchedulingCollisionTests(DuplicateReviewCardTests):
             self.connection.execute(
                 "UPDATE task_duplicate_proposals SET left_task_version=99 "
                 "WHERE id=1")
+
+
+class DuplicateComparisonViewTests(DuplicateReviewCardTests):
+    """Opening the comparison is a read, and it shows what the card drops."""
+
+    def _payload(self, task_id: int, kind: str, sources: list[dict]) -> None:
+        """Give one task's candidate revision a full evidence block."""
+        document = {
+            "schema": "foxhound.task-candidate",
+            "schema_version": 7,
+            "candidate_id": candidate_id_for(
+                system="gw", kind=kind,
+                record_id=f"record-{task_id:03d}",
+                item_id=f"item-{task_id:03d}",
+            ),
+            "source": {
+                "system": "gw", "kind": kind,
+                "record_id": f"record-{task_id:03d}",
+                "item_id": f"item-{task_id:03d}",
+                "revision": f"{task_id:064x}",
+            },
+            "task": {
+                "text": "Prepare the synthetic rollout checklist",
+                "owner": "Person A", "due": None,
+                "owner_ref": {
+                    "kind": "person",
+                    "speaker_id": "SPK_1",
+                    "canonical_speaker_id": "SPK_1",
+                    "speaker_registry_id": "registry-A",
+                    "pinned": False,
+                    "provisional": False,
+                },
+            },
+            "evidence": {
+                "document_id": f"record-{task_id:03d}",
+                "locator": f"action-item-{task_id:03d}",
+                "sources": sources,
+            },
+            "lifecycle": {"state": "active", "generation": 1,
+                          "changed_at": "2030-01-01T12:00:00Z"},
+            "created_at": "2030-01-01T12:00:00Z",
+        }
+        self.connection.execute(
+            "INSERT INTO candidate_revision_history(candidate_id,"
+            "source_revision,payload_json,created_at,imported_at) "
+            "VALUES(?,?,?,?,?)",
+            (f"candidate-{task_id}", f"{task_id:064x}", json.dumps(document),
+             NOW.isoformat(), NOW.isoformat()),
+        )
+        self.connection.commit()
+
+    def _evidence(self, marker: str, role: str) -> list[dict]:
+        """A handoff extract, which the compact card drops, and one more."""
+        return [
+            {"name": f"20300102_{marker}_handoff.json", "role": "handoff",
+             "extract": f"The {marker} handoff declares this."},
+            {"name": f"20300102_{marker}_record.md", "role": role,
+             "extract": f"Action item: prepare the {marker} checklist."},
+        ]
+
+    def _delivered(self):
+        """One duplicate card the reader is looking at."""
+        self.assertEqual(self.cards.schedule().asked, 1)
+        claim = self.cards.claim_next(consumer_digest=CONSUMER)
+        self.assertIsNotNone(claim)
+        self.assertTrue(self.cards.complete_delivery(
+            claim.card.id, expected_version=claim.card.version,
+            claim_token=claim.token, transport="synthetic",
+            delivery_ref="message-1",
+        ).accepted)
+        # Completing a delivery does not move the card version: the reader is
+        # looking at exactly the card the claim rendered.
+        return claim.card.id, claim.card.version
+
+    def test_the_expansion_shows_evidence_the_card_drops_on_both_sides(self):
+        """The compact card drops the handoff extract; that is what to open."""
+        self._payload(1, "email", self._evidence("first", "message"))
+        self._payload(2, "meeting", self._evidence("second", "protocol"))
+        card_id, version = self._delivered()
+
+        compact = self.cards.view(
+            card_id, expected_version=version, expanded=False)
+        opened = self.cards.view(
+            card_id, expected_version=version, expanded=True)
+        compact_text = render_duplicate_view(compact.card, expanded=False)[0]
+        opened_text = render_duplicate_view(opened.card, expanded=True)[0]
+
+        for marker in ("first", "second"):
+            self.assertNotIn(f"The {marker} handoff declares this.", compact_text)
+            self.assertIn(f"The {marker} handoff declares this.", opened_text)
+            self.assertIn(f"prepare the {marker} checklist", opened_text)
+
+    def _delivered_pair(self, basis: str):
+        """A second pair, carded and delivered, carrying the given basis.
+
+        A proposal's basis is immutable by design, so a test about how the
+        basis is shown has to propose one rather than edit the fixture's.
+        """
+        self._task(3, "email", "Prepare the synthetic rollout checklist again")
+        self._task(4, "meeting", "Draft the synthetic rollout checklist again")
+        self.connection.commit()
+        second = proposals.propose(
+            self.connection, task_id_a=3, task_id_b=4, basis=basis,
+            detector="synthetic-detector", now=NOW.isoformat(),
+        )
+        self.assertTrue(second.accepted)
+        self.connection.commit()
+        self.cards.schedule()
+        while True:
+            claim = self.cards.claim_next(consumer_digest=CONSUMER)
+            self.assertIsNotNone(claim)
+            self.assertTrue(self.cards.complete_delivery(
+                claim.card.id, expected_version=claim.card.version,
+                claim_token=claim.token, transport="synthetic",
+                delivery_ref=f"message-{claim.card.id}",
+            ).accepted)
+            if claim.card.task_id == 3:
+                return claim.card.id, claim.card.version
+
+    def test_the_expansion_shows_the_detector_basis_in_full(self):
+        """A condensed reason is a summary of the evidence, not the evidence."""
+        card_id, version = self._delivered_pair(
+            "shared task terms across email and meeting: alpha, beta, gamma, "
+            "delta, epsilon, zeta, eta, theta, iota, kappa"
+        )
+
+        compact = render_duplicate_view(
+            self.cards.view(card_id, expected_version=version,
+                            expanded=False).card, expanded=False)[0]
+        opened = render_duplicate_view(
+            self.cards.view(card_id, expected_version=version,
+                            expanded=True).card, expanded=True)[0]
+
+        self.assertNotIn("kappa", compact)
+        self.assertIn("kappa", opened)
+
+    def test_opening_the_comparison_leaves_the_card_answerable(self):
+        """A read that moved the version would return a dead keyboard."""
+        card_id, version = self._delivered()
+
+        opened = self.cards.view(
+            card_id, expected_version=version, expanded=True)
+
+        self.assertTrue(opened.accepted)
+        self.assertEqual(opened.card_version, version)
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT version,status FROM task_review_cards WHERE id=?",
+                (card_id,)).fetchone()[0], version)
+        _, keyboard = render_duplicate_view(opened.card, expanded=True)
+        self.assertEqual(
+            [button["callback_data"] for button in
+             keyboard["inline_keyboard"][0]],
+            [f"fhc|{card_id}|{version}|duplicate_confirm",
+             f"fhc|{card_id}|{version}|duplicate_reject",
+             f"fhc|{card_id}|{version}|duplicate_collapse"],
+        )
+        answered = self.cards.act(
+            card_id, expected_version=version, action="duplicate_confirm")
+        self.assertIs(answered.disposition, CardDisposition.APPLIED)
+
+    def test_the_expansion_stops_before_the_body_is_refused(self):
+        """A body over the transport ceiling is not shortened, it is lost.
+
+        A task that absorbed a confirmed duplicate carries both sides'
+        evidence, so one side of a later comparison is not bounded by what a
+        single candidate may declare.
+        """
+        sources = tuple(
+            CardSourceEvidence(
+                f"20300102_example_{index:02d}.md", "message",
+                "Synthetic extract. " * 30)
+            for index in range(9)
+        )
+
+        kept, dropped = affordable_sources(sources)
+
+        self.assertGreater(len(kept), 0)
+        self.assertEqual(len(kept) + dropped, len(sources))
+        rendered = _comparison_origin(
+            kind="email", record="record-001", item="item-001",
+            sources=sources, expanded=True,
+        )
+        self.assertIn(
+            f"⋯ <i>{dropped} further extracts not shown here.</i>", rendered)
+        self.assertLess(len("\n".join(rendered).encode("utf-8")), 3_000)
+
+    def test_one_extract_longer_than_the_budget_is_still_shown(self):
+        """The side worth reading must not be answered with provenance alone."""
+        sources = (CardSourceEvidence(
+            "20300102_example_00.md", "message", "Synthetic extract. " * 200),)
+
+        kept, dropped = affordable_sources(sources)
+
+        self.assertEqual((len(kept), dropped), (1, 0))
+
+    def test_a_card_the_reader_is_not_looking_at_is_not_reopened(self):
+        """Delivered and current, or there is no presentation to restore."""
+        card_id, version = self._delivered()
+
+        self.assertIs(
+            self.cards.view(card_id, expected_version=version + 1,
+                            expanded=True).refusal,
+            CardRefusal.STALE_VERSION,
+        )
+        self.assertIs(
+            self.cards.view(card_id + 99, expected_version=version,
+                            expanded=True).refusal,
+            CardRefusal.NOT_FOUND,
+        )
+        self.cards.act(card_id, expected_version=version,
+                       action="duplicate_reject")
+        self.assertIs(
+            self.cards.view(card_id, expected_version=version,
+                            expanded=True).refusal,
+            CardRefusal.STALE_VERSION,
+        )
+
+    def test_an_ordinary_card_has_no_second_detail_to_open(self):
+        """Every other card already shows everything it holds."""
+        self._task(3, "note", "Review the synthetic rollout checklist")
+        self.connection.commit()
+        self.assertEqual(raise_review_cards(self.database, NOW), 3)
+        claim = self.cards.claim_next(consumer_digest=CONSUMER)
+        while claim is not None and claim.card.task_id != 3:
+            self.assertTrue(self.cards.complete_delivery(
+                claim.card.id, expected_version=claim.card.version,
+                claim_token=claim.token, transport="synthetic",
+                delivery_ref=f"message-{claim.card.id}").accepted)
+            claim = self.cards.claim_next(consumer_digest=CONSUMER)
+        self.assertIsNotNone(claim)
+        self.assertIsNone(claim.card.duplicate)
+        keyboard = render_task_review_card(claim.card)[1]
+        self.assertFalse([
+            button for row in keyboard["inline_keyboard"] for button in row
+            if button["callback_data"].rsplit("|", 1)[1] in TASK_CARD_READS
+        ])
+        self.assertTrue(self.cards.complete_delivery(
+            claim.card.id, expected_version=claim.card.version,
+            claim_token=claim.token, transport="synthetic",
+            delivery_ref="message-3").accepted)
+
+        refused = self.cards.view(
+            claim.card.id, expected_version=claim.card.version,
+            expanded=True)
+
+        self.assertIs(refused.refusal, CardRefusal.INVALID_STATE)

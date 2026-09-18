@@ -44,9 +44,13 @@ from .release_revision import describe
 from .task_cards import (
     ClaimAtCeiling,
     CardOperationResult,
+    CardPresentation,
+    DUPLICATE_EXPAND,
     ScheduleResult,
     TASK_CARD_ACTIONS,
+    TASK_CARD_READS,
     TaskCardService,
+    render_duplicate_view,
     render_task_review_card,
 )
 from .task_ledger import TaskLedgerError
@@ -68,6 +72,7 @@ STATS_SCHEMA_VERSION = 2
 QUEUE_SCHEMA = "foxhound.task-card-service.queue"
 QUEUE_SCHEMA_VERSION = 1
 RESOLVE_SCHEMA = "foxhound.task-card-service.resolve"
+VIEW_SCHEMA = "foxhound.task-card-service.view"
 RESOLVE_SCHEMA_VERSION = 1
 EXECUTION_SCHEDULE_SCHEMA = "foxhound.execution-card-service.schedule"
 EXECUTION_CLAIM_SCHEMA = "foxhound.execution-card-service.claim"
@@ -112,6 +117,7 @@ ROUTES = {
     "/v1/task-cards/delivered": "delivered",
     "/v1/task-cards/delivery-failed": "delivery_failed",
     "/v1/task-cards/action": "action",
+    "/v1/task-cards/view": "view",
     "/v1/execution-cards/stats": "execution_stats",
     "/v2/execution-cards/stats": "execution_stats_scoped",
     "/v1/execution-cards/schedule": "execution_schedule",
@@ -567,6 +573,22 @@ class TaskCardApplication:
                 _integer(request["card_id"], minimum=1),
                 expected_version=_integer(request["card_version"], minimum=1),
                 action=action,
+            ))
+        if operation == "view":
+            request = _strict_request(
+                payload,
+                required={"card_id", "card_version", "view"},
+                optional=set(),
+            )
+            view = request["view"]
+            if not isinstance(view, str) or view not in TASK_CARD_READS:
+                raise TaskCardServerRequestError(
+                    "invalid_request", "task card view is invalid"
+                )
+            return _view_document(self.cards.view(
+                _integer(request["card_id"], minimum=1),
+                expected_version=_integer(request["card_version"], minimum=1),
+                expanded=view == DUPLICATE_EXPAND,
             ))
         if operation == "execution_stats":
             _request(payload, required=set())
@@ -1430,6 +1452,30 @@ def _operation_document(result: CardOperationResult) -> dict[str, Any]:
         "wake_at": result.wake_at,
         "refusal": None if result.refusal is None else result.refusal.value,
     }
+
+
+def _view_document(result: CardPresentation) -> dict[str, Any]:
+    """The card as this surface would render it now, or a refusal.
+
+    `presentation` is absent rather than partial on a refusal, so a caller
+    that cannot show the card is never handed something that looks showable.
+    """
+    document: dict[str, Any] = {
+        "schema": VIEW_SCHEMA,
+        "schema_version": SERVICE_VERSION,
+        "ok": result.accepted,
+        "disposition": result.disposition.value,
+        "card_id": result.card_id,
+        "card_version": result.card_version,
+        "expanded": result.expanded,
+        "presentation": None,
+        "refusal": None if result.refusal is None else result.refusal.value,
+    }
+    if result.accepted and result.card is not None:
+        body, reply_markup = render_duplicate_view(
+            result.card, expanded=result.expanded)
+        document["presentation"] = {"body": body, "reply_markup": reply_markup}
+    return document
 
 
 def _execution_schedule_document(
