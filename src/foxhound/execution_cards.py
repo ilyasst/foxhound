@@ -43,6 +43,7 @@ from .task_execution import (
     WorkflowPhase,
     WorkflowRefusal,
     WorkflowStatus,
+    _ANSWER_COLUMNS,
     _apply_agent_selection,
     _apply_plan_review_agent_selection,
     _apply_review_action,
@@ -240,6 +241,9 @@ class ExecutionReviewCard:
         default=(), repr=False)
     revisions: int = 0
     revision_note: str = field(default="", repr=False)
+    #: True only when this result says exactly what the preceding result in
+    #: its phase said, by the same definition the ledger refuses on.
+    unchanged_from_previous: bool = False
     origin_kind: str = field(default="", repr=False)
     origin_record: str = field(default="", repr=False)
     origin_item: str = field(default="", repr=False)
@@ -2153,6 +2157,18 @@ class ExecutionCardService:
             "(SELECT i.value FROM execution_reader_inputs AS i "
             " WHERE i.task_id=c.task_id AND i.kind='discussion' "
             " ORDER BY i.sequence DESC LIMIT 1) AS revision_note,"
+            # Whether this pass actually changed anything. Read from the
+            # ledger's own definition of an answer rather than a second one
+            # kept here: a card that says "unchanged" while the ledger would
+            # have accepted the result as new is worse than no marker, and
+            # two lists in two files drift the first time either is widened.
+            "(SELECT " + " AND ".join(
+                f"prior.{column} IS r.{column}" for column in _ANSWER_COLUMNS
+            ) + " FROM task_execution_results AS prior "
+            " WHERE prior.task_id=c.task_id AND prior.phase=r.phase "
+            " AND prior.workflow_version<r.workflow_version "
+            " ORDER BY prior.workflow_version DESC LIMIT 1) "
+            " AS unchanged_from_previous,"
             # Where the task came from. A reader asked to authorise work on
             # an issue cannot answer without being told which issue.
             "(SELECT o.source_kind FROM task_candidate_bindings AS b "
@@ -2618,6 +2634,7 @@ def _card(
             ),
             revisions=max(0, int(row["revision_count"] or 0)),
             revision_note=str(row["revision_note"] or ""),
+            unchanged_from_previous=bool(row["unchanged_from_previous"]),
             origin_kind=str(row["origin_kind"] or ""),
             origin_record=str(row["origin_record"] or ""),
             origin_item=str(row["origin_item"] or ""),
@@ -3184,6 +3201,16 @@ def _heading_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
         chips.append(f"due {card.due}")
     chip = " · ".join(chip for chip in chips if chip)
     lines.append(f"<i>{_escape(chip)}</i>" if html else chip)
+    if card.unchanged_from_previous:
+        # Precise about WHAT is unchanged. "Same answer" is a claim about the
+        # whole card, and a reader who reads it above an effect list they are
+        # being asked to authorise has been told something the card cannot
+        # know. This says only what was actually compared.
+        note = (
+            "⚠️ Unchanged from the previous revision — "
+            "this pass produced no new answer"
+        )
+        lines.append(f"<b>{_escape(note)}</b>" if html else note)
     if card.kind is ExecutionCardKind.START:
         # Provenance belongs to the card that FIRST asks. A start gate is
         # that card here -- it proposes work on something the reader may
