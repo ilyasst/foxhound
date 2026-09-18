@@ -573,6 +573,7 @@ class ExecutionWorker:
 
     def record(self, draft_name: str) -> dict[str, Any]:
         state = load_run_state(self._state_path)
+        service = TaskExecutionService(state.database_path)
         draft_path, draft = load_result_draft(
             self._state_path.parent, draft_name
         )
@@ -600,6 +601,12 @@ class ExecutionWorker:
             repository_impact=draft["repository_impact"],
             task_work_directory=state.task_work_directory,
             task_kb_file=state.task_kb_file,
+            # Which reader instruction this run was handed, so a result can
+            # say what it was answering. Read from the delivery record rather
+            # than re-selected, so it names what the agent actually got.
+            reader_instruction_sequence=(
+                service.delivered_reader_instruction_sequence(
+                    state.task_id, expected_version=state.workflow_version)),
         )
         if state.task_run_directory is not None:
             ledger = TaskLedger(state.database_path)
@@ -629,9 +636,7 @@ class ExecutionWorker:
                 raise ExecutionWorkerDraftError(
                     "execution result review files could not be preserved"
                 ) from None
-        result = TaskExecutionService(state.database_path).record_result(
-            envelope
-        )
+        result = service.record_result(envelope)
         if result.disposition is WorkflowDisposition.REFUSED:
             # The ledger says exactly why. Discarding it left an agent to
             # guess: one tried to record three times, was told only
@@ -744,6 +749,12 @@ class ExecutionWorker:
             repository_impact=draft["repository_impact"],
             task_work_directory=state.task_work_directory,
             task_kb_file=state.task_kb_file,
+            # Which reader instruction this run was handed, so a result can
+            # say what it was answering. Read from the delivery record rather
+            # than re-selected, so it names what the agent actually got.
+            reader_instruction_sequence=(
+                service.delivered_reader_instruction_sequence(
+                    state.task_id, expected_version=state.workflow_version)),
         )
         try:
             validated = _validated_result(envelope)

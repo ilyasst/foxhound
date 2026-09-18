@@ -349,6 +349,12 @@ class TaskExecutionTests(unittest.TestCase):
             connection.execute(
                 "ALTER TABLE task_execution_results DROP COLUMN work_digest"
             )
+            # v42 added this; a database older than that has not
+            # got it yet.
+            connection.execute(
+                "ALTER TABLE task_execution_results DROP COLUMN "
+                "reader_instruction_sequence"
+            )
             connection.execute(
                 "ALTER TABLE task_execution_results DROP COLUMN "
                 "repository_references_json"
