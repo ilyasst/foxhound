@@ -71,6 +71,7 @@ from foxhound.task_card_server import (
     make_server,
     main,
 )
+from review_card_fixture import raise_review_cards
 from foxhound.task_cards import TaskCardService
 from foxhound.task_execution import (
     ExecutionOutcome,
@@ -554,7 +555,7 @@ class TaskCardServerTests(unittest.TestCase):
         self.assertIsNone(response["failure_run_id"])
 
     def test_claim_at_ceiling_is_distinct_and_content_free(self):
-        self.cards.schedule()
+        raise_review_cards(self.database, self.clock())
         app = TaskCardApplication(
             self.cards, {DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: "q" * 43}
         )
@@ -891,14 +892,19 @@ class TaskCardServerTests(unittest.TestCase):
             connection.close()
 
     def test_routes_drive_delivery_retry_snooze_and_atomic_completion(self):
+        raise_review_cards(self.database, self.clock(), limit=2)
         with running_server(self.app) as endpoint:
             status, _, scheduled = request(
                 endpoint,
                 "/v1/task-cards/schedule",
                 request_document(limit=2),
             )
+            # The route still runs a scheduling pass -- it retracts stale
+            # cards and asks the done-check and duplicate questions -- but it
+            # no longer manufactures a review card for every open task, so a
+            # healthy call against an already-carded queue creates nothing.
             self.assertEqual((status, scheduled["schema"], scheduled["created"]),
-                             (200, SCHEDULE_SCHEMA, 2))
+                             (200, SCHEDULE_SCHEMA, 0))
             _, _, claimed = request(
                 endpoint,
                 "/v1/task-cards/claim",
@@ -1638,7 +1644,7 @@ class TaskCardQueueProjectionTests(unittest.TestCase):
         self.cards = TaskCardService(
             self.database, clock=self.clock, token_factory=lambda: CLAIM_TOKEN
         )
-        self.cards.schedule(limit=3)
+        raise_review_cards(self.database, self.clock(), limit=3)
         self.app = TaskCardApplication(
             self.cards, {DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: QUEUE_VIEW_TOKEN}
         )
@@ -2098,7 +2104,7 @@ class TaskCardClaimConsumerIdentityTests(unittest.TestCase):
         self.cards = TaskCardService(
             self.database, clock=self.clock, token_factory=lambda: CLAIM_TOKEN
         )
-        self.cards.schedule()
+        raise_review_cards(self.database, self.clock())
 
     def _consumer_digest(self, card_id: int):
         with closing(sqlite3.connect(self.database)) as connection:

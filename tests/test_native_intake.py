@@ -19,6 +19,7 @@ from pathlib import Path
 from foxhound.candidate_inbox import CandidateInbox, SCHEMA_VERSION
 from foxhound.contracts import candidate_id_for, comparable_task_digest
 from foxhound.native_intake import main
+from review_card_fixture import raise_review_cards
 from foxhound.task_cards import CardRefusal, TaskCardService
 from foxhound.task_execution import TaskExecutionService, WorkflowStatus
 from foxhound.task_ledger import (
@@ -1088,7 +1089,7 @@ class NativeCandidateIntakeTests(unittest.TestCase):
         cards = TaskCardService(
             self.database, clock=lambda: NOW, token_factory=lambda: "a" * 43
         )
-        self.assertEqual(cards.schedule().created, 1)
+        self.assertEqual(raise_review_cards(self.database, NOW), 1)
         withdrawn = lifecycle_candidate(1, generation=2, state="withdrawn")
         self.inbox.import_feed(feed(1, withdrawn))
         self.intake()
@@ -1164,7 +1165,7 @@ class NativeCandidateIntakeTests(unittest.TestCase):
         cards = TaskCardService(
             self.database, clock=lambda: NOW, token_factory=lambda: "a" * 43
         )
-        self.assertEqual(cards.schedule().created, 1)
+        self.assertEqual(raise_review_cards(self.database, NOW), 1)
         claim = cards.claim_next(
             consumer_digest=hashlib.sha256(b"synthetic-consumer").hexdigest()
         )
@@ -1197,7 +1198,7 @@ class NativeCandidateIntakeTests(unittest.TestCase):
         cards = TaskCardService(
             self.database, clock=lambda: NOW, token_factory=lambda: "a" * 43
         )
-        self.assertEqual(cards.schedule().created, 1)
+        self.assertEqual(raise_review_cards(self.database, NOW), 1)
         claim = cards.claim_next(
             consumer_digest=hashlib.sha256(b"synthetic-consumer").hexdigest()
         )
