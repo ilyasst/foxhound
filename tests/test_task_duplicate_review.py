@@ -3,10 +3,8 @@
 
 from __future__ import annotations
 
-from foxhound import task_cards as cards_module
 from foxhound import migrate_database
 
-import pathlib
 import sqlite3
 import tempfile
 import unittest
@@ -589,17 +587,59 @@ class DuplicateSchedulingCollisionTests(DuplicateReviewCardTests):
 
         self.assertEqual((scheduled.created, scheduled.asked), (1, 1))
 
+    def test_a_snoozed_workflow_does_not_loop_the_question_across_passes(self):
+        """Raising on the narrow hold and retracting on the wide one is a loop.
+
+        The single-pass assertion above is satisfied on every pass of it, so
+        it cannot see this: the retraction releases the proposal's card
+        binding, restoring exactly the shape the selection looks for, and the
+        reader is sent a new copy of the same comparison every pass. Only
+        several passes show it.
+        """
+        self._workflow(1, "snoozed")
+
+        created = cancelled = 0
+        for _ in range(5):
+            created += self.cards.schedule_duplicate_proposals().created
+            created += self.cards.schedule().created
+            cancelled = self.connection.execute(
+                "SELECT count(*) FROM task_review_cards WHERE status='cancelled'"
+            ).fetchone()[0]
+
+        self.assertEqual((created, cancelled), (1, 0))
+        self.assertEqual(len(self._live_cards()), 1)
+
+    def test_live_work_still_retracts_a_duplicate_card_on_the_next_pass(self):
+        """Narrowing the retraction must not stop it happening at all."""
+        self.assertEqual(self.cards.schedule_duplicate_proposals().created, 1)
+        self.assertEqual(len(self._live_cards()), 1)
+
+        self._workflow(1, "running")
+        self.cards.schedule_duplicate_proposals()
+
+        self.assertEqual(self._live_cards(), [])
+
     def test_the_ordinary_card_path_still_waits_on_a_snooze(self):
         """Only the duplicate question was measured; do not widen the change."""
-        self._workflow(1, "snoozed")
-        held = self.connection.execute(
-            "SELECT COUNT(*) FROM task_execution_workflows "
-            "WHERE task_id=1 AND status='snoozed'").fetchone()[0]
-        self.assertEqual(held, 1)
-        self.assertIn(
-            "_EXECUTION_HOLDS",
-            (pathlib.Path(cards_module.__file__).read_text()
-             .split("def _ask_duplicate_proposals")[0]))
+        self._task(3, "note", "Review the synthetic rollout checklist")
+        self.connection.commit()
+        self.assertEqual(raise_review_cards(self.database, NOW), 3)
+        ordinary = self.connection.execute(
+            "SELECT id FROM task_review_cards WHERE task_id=3 "
+            "AND status IN ('pending','delivering','delivered','snoozed')"
+        ).fetchall()
+        self.assertEqual(len(ordinary), 1)
+
+        self._workflow(3, "snoozed")
+        self.cards.schedule()
+
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT status FROM task_review_cards WHERE id=?",
+                (int(ordinary[0][0]),),
+            ).fetchone()[0],
+            "cancelled",
+        )
 
     def test_the_recorded_versions_are_still_immutable(self):
         """Superseding is a state change; it must not license editing history."""

@@ -127,6 +127,15 @@ def _duplicate_execution_holds(task_id: str) -> str:
     )
 
 
+#: The hold that governs one card, according to the question it asks.
+_CARD_EXECUTION_HOLDS = (
+    "CASE WHEN EXISTS(SELECT 1 FROM task_duplicate_proposals AS proposal "
+    " WHERE proposal.card_id=c.id AND proposal.state='proposed') THEN "
+    + _duplicate_execution_holds("t.id")
+    + " ELSE " + _EXECUTION_HOLDS + " END"
+)
+
+
 class CardStatus(StrEnum):
     PENDING = "pending"
     DELIVERING = "delivering"
@@ -1539,7 +1548,7 @@ class TaskCardService:
             "FROM task_review_cards AS c JOIN tasks AS t ON t.id=c.task_id "
             "WHERE c.status IN ('pending','delivering','delivered','snoozed') "
             "AND (t.status!='open' OR t.version!=c.task_version "
-            "OR " + _EXECUTION_HOLDS + " "
+            "OR " + _CARD_EXECUTION_HOLDS + " "
             "OR COALESCE(c.source_revision,'')!=COALESCE("
             + _bound_source_revision("t.id") + ",'') OR EXISTS("
             " SELECT 1 FROM task_relations AS relation "
