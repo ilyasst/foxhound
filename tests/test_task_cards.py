@@ -971,6 +971,41 @@ class TaskCardTests(unittest.TestCase):
                 connection.execute("DELETE FROM task_review_card_events")
         self.assertEqual(self.cards.event_count(), before)
 
+    def test_card_renders_live_participants_and_advisory_confidence(self):
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "UPDATE tasks SET confidence=0.75 WHERE id=1"
+            )
+            connection.execute(
+                "INSERT INTO task_participants("
+                "task_id,position,kind,speaker_id,canonical_speaker_id,"
+                "speaker_registry_id) VALUES(1,0,'person','SPK_002','SPK_002',"
+                "'registry-synthetic')"
+            )
+            connection.execute(
+                "INSERT INTO speaker_registry_entries("
+                "speaker_registry_id,speaker_id,canonical_speaker_id,"
+                "display_name,updated_at) VALUES('registry-synthetic','SPK_002',"
+                "'SPK_002','Person B','2030-03-01T00:00:00Z')"
+            )
+            connection.commit()
+        self.cards.schedule(limit=1)
+        card = next(card for card in self.cards.due(limit=20) if card.task_id == 1)
+        body, _ = render_task_review_card(replace(card, status=CardStatus.DELIVERING))
+        self.assertIn("Participants:</b> Person B", body)
+        self.assertIn("Extraction confidence:</b> 75%", body)
+
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "UPDATE speaker_registry_entries SET display_name='Person C' "
+                "WHERE speaker_registry_id='registry-synthetic' AND speaker_id='SPK_002'"
+            )
+            connection.commit()
+        refreshed = next(
+            card for card in self.cards.due(limit=20) if card.task_id == 1
+        )
+        self.assertEqual(refreshed.participants, ("Person C",))
+
 
 if __name__ == "__main__":
     unittest.main()
