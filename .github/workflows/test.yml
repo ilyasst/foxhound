@@ -1,0 +1,64 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  suite:
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor from `requires-python`, and the version the deployed
+        # releases build their venv with. Linux only: every host that runs
+        # this is Linux, and the worker-resolution tests are sensitive to
+        # where a console script lands.
+        python-version: ["3.11", "3.13"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # Installing is not a convenience here, it is the point. Worker
+      # resolution looks for a console script beside `sys.executable` and
+      # falls back to a bare name when none is there, so a suite run against
+      # an uninstalled tree exercises the fallback and reports green while
+      # the deployed configuration fails. That is exactly how #438 shipped
+      # three broken assertions. See #456.
+      - name: Install the package
+        run: python -m pip install -e .
+
+      - name: Install test dependencies
+        run: python -m pip install pytest
+
+      # A guard on the step above. If `pip install -e .` is ever dropped or
+      # silently fails, the suite would still pass -- on the fallback path --
+      # and the check this workflow exists to provide would be gone with no
+      # failure to show for it.
+      - name: Verify the console scripts are on PATH
+        run: |
+          set -euo pipefail
+          command -v foxhound-task-worker
+          test -x "$(dirname "$(command -v python)")/foxhound-task-worker"
+
+      - name: Check public diff for operational identifiers
+        if: github.event_name == 'pull_request'
+        env:
+          FOXHOUND_PUBLIC_DIFF_PRIVATE_TERMS: ${{ secrets.PUBLIC_DIFF_PRIVATE_TERMS }}
+        run: |
+          set -euo pipefail
+          git diff --unified=0 --no-color \
+            "${{ github.event.pull_request.base.sha }}...${{ github.sha }}" |
+            python tools/check_public_diff.py
+
+      - name: Run the test suite
+        run: python -m pytest tests/ -q
