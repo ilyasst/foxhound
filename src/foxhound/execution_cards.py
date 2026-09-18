@@ -326,6 +326,26 @@ class ExecutionCardBrief:
 
 
 @dataclass(frozen=True)
+class ExecutionCardDeliverables:
+    """Prepared deliverables from one still-actionable review card.
+
+    Reading them is deliberately not an action on the card.  A chat surface
+    sends this text as a separate message so a reader can inspect or copy a
+    draft without losing the review controls underneath the original card.
+    """
+
+    disposition: ExecutionCardDisposition
+    card_id: int
+    card_version: int | None = None
+    text: str = field(default="", repr=False)
+    refusal: ExecutionCardRefusal | None = None
+
+    @property
+    def accepted(self) -> bool:
+        return self.disposition is not ExecutionCardDisposition.REFUSED
+
+
+@dataclass(frozen=True)
 class ExecutionCardDetail:
     """Bounded, non-mutating current-run projection for a queue reader."""
 
@@ -1319,6 +1339,56 @@ class ExecutionCardService:
             card_id,
             card_version=expected_version,
             text=task_brief(card),
+        )
+
+    def deliverables(
+        self, card_id: int, *, expected_version: int
+    ) -> ExecutionCardDeliverables:
+        """Return prepared drafts from an eligible delivered review card.
+
+        This is intentionally narrower than ``brief``: the button exists
+        only on Plan Review and Result Review cards that have deliverables,
+        and it is meaningful only while the reader still has that exact
+        delivered card.  The read neither resolves the card nor advances any
+        workflow state.
+        """
+        def refused(
+            reason: ExecutionCardRefusal,
+        ) -> ExecutionCardDeliverables:
+            return ExecutionCardDeliverables(
+                ExecutionCardDisposition.REFUSED, card_id, refusal=reason
+            )
+
+        if not _valid_identity(card_id, expected_version):
+            return refused(ExecutionCardRefusal.INVALID_ARGUMENT)
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                self._card_select() + " WHERE c.id=?", (card_id,)
+            ).fetchone()
+            refusal = _card_guard(row, expected_version)
+            if (
+                refusal is None
+                and row["status"] != ExecutionCardStatus.DELIVERED
+            ):
+                refusal = ExecutionCardRefusal.INVALID_STATE
+            if refusal is None and not _current_card(row):
+                refusal = ExecutionCardRefusal.STALE_VERSION
+            if refusal is not None:
+                return refused(refusal)
+            card = self._render_card(row)
+            if (
+                card.kind not in {
+                    ExecutionCardKind.PLAN_REVIEW,
+                    ExecutionCardKind.RESULT_REVIEW,
+                }
+                or not card.deliverables
+            ):
+                return refused(ExecutionCardRefusal.INVALID_STATE)
+        return ExecutionCardDeliverables(
+            ExecutionCardDisposition.UNCHANGED,
+            card_id,
+            card_version=expected_version,
+            text=card_deliverables(card),
         )
 
     def detail(
@@ -2393,7 +2463,7 @@ def parse_execution_review_callback(
         return None
     if parts[3] not in {
         "start", "snooze", "cancel", "approve", "revise", "discuss",
-        "comment_go",
+        "comment_go", "deliverables",
         "done", "reassign", "drop", "agent", "brief", OWNER_HOLD_ACTION,
         *REVIEW_SNOOZE_ACTIONS,
     }:
@@ -2938,6 +3008,8 @@ _ITEM_STEM = (
 #: identifiers only this machine can resolve and no capability of any kind.
 MAX_BRIEF_CHARS = 12_000
 MAX_BRIEF_BYTES = 24_000
+MAX_DELIVERABLES_CHARS = 12_000
+MAX_DELIVERABLES_BYTES = 24_000
 
 
 def task_brief(card: ExecutionReviewCard) -> str:
@@ -3021,6 +3093,54 @@ def task_brief(card: ExecutionReviewCard) -> str:
             size += width
         brief = "".join(fragments).rstrip() + suffix
     return brief
+
+
+def card_deliverables(card: ExecutionReviewCard) -> str:
+    """One bounded Markdown message containing a card's prepared drafts.
+
+    The transport, rather than the execution authority, chooses how Markdown
+    looks in its chat UI.  Keeping the source Markdown here preserves the
+    deliverable a reader was asked to review, while the bounded response keeps
+    a malicious or accidentally huge result from turning a tap into an
+    unbounded loopback response.
+    """
+    if card.kind not in {
+        ExecutionCardKind.PLAN_REVIEW,
+        ExecutionCardKind.RESULT_REVIEW,
+    } or not card.deliverables:
+        raise TaskLedgerError("execution card has no review deliverables")
+    lines = ["# Deliverables"]
+    for record in card.deliverables:
+        lines.extend(("", f"## {record.label or 'Prepared draft'}"))
+        if record.recipient:
+            lines.append(f"To: {record.recipient}")
+        if record.subject:
+            lines.append(f"Subject: {record.subject}")
+        if record.channel:
+            lines.append(f"Channel: {record.channel}")
+        lines.extend(("", record.text))
+    return _bounded_deliverables("\n".join(lines).strip())
+
+
+def _bounded_deliverables(value: str) -> str:
+    """Fit an outbound deliverables message within the read contract."""
+    suffix = "\n\n[…truncated. Open the task working folder for the rest.]"
+    if (
+        len(value) <= MAX_DELIVERABLES_CHARS
+        and len(value.encode("utf-8")) <= MAX_DELIVERABLES_BYTES
+    ):
+        return value
+    character_limit = MAX_DELIVERABLES_CHARS - len(suffix)
+    byte_limit = MAX_DELIVERABLES_BYTES - len(suffix.encode("utf-8"))
+    fragments: list[str] = []
+    size = 0
+    for character in value[:character_limit]:
+        width = len(character.encode("utf-8"))
+        if size + width > byte_limit:
+            break
+        fragments.append(character)
+        size += width
+    return "".join(fragments).rstrip() + suffix
 
 def _continues_lines(
     card: ExecutionReviewCard, *, html: bool
@@ -4013,6 +4133,11 @@ def _button_rows(
             (("✅ Mark as done", "done"),),
             stop_row,
         )
+    if (
+        kind in {ExecutionCardKind.PLAN_REVIEW, ExecutionCardKind.RESULT_REVIEW}
+        and card.deliverables
+    ):
+        rows += ((("📦 Deliverables", "deliverables"),),)
     if approvable:
         return rows + ((("📋 Task brief", "brief"),),)
     reduced = tuple(
