@@ -1870,18 +1870,46 @@ class ExecutionCardService:
         )
 
     def stats_scoped(self, *, consumer_digest: str) -> ExecutionCardScopedStats:
+        """Report the queue as it IS, counting a dead lease as pending.
+
+        A `delivering` row whose lease has expired is not on anyone's
+        screen: the send either never happened or was never acknowledged,
+        and `claim_next` will return it to `pending` the moment it is asked
+        for another card. Reporting it as `delivering` claims a place on a
+        surface that is actually empty.
+
+        That is not cosmetic. A consumer sizes its next batch by subtracting
+        `delivering` and `delivered` from the depth it wants on screen, and
+        stops before claiming when the answer is zero. The reaper that
+        revives these rows lives inside `claim_next`, so once enough dead
+        leases accumulate to fill that depth, the consumer stops claiming,
+        the reaper stops running, and neither side ever recovers. The queue
+        deadlocks with every card waiting and nothing being delivered.
+        """
         if not _valid_digest(consumer_digest):
             raise TaskLedgerError("execution card consumer digest is invalid")
+        now = self._now()
         with closing(self._connect()) as connection:
             row = connection.execute(
                 "SELECT "
-                "SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,"
-                "SUM(CASE WHEN status='delivering' AND consumer_digest=? THEN 1 ELSE 0 END) AS delivering,"
-                "SUM(CASE WHEN status='delivered' AND consumer_digest=? THEN 1 ELSE 0 END) AS delivered,"
-                "SUM(CASE WHEN status IN ('delivering','delivered') AND consumer_digest IS NOT NULL AND consumer_digest<>? THEN 1 ELSE 0 END) AS elsewhere,"
-                "SUM(CASE WHEN status IN ('pending','delivering','delivered') THEN 1 ELSE 0 END) AS active "
+                "SUM(CASE WHEN status='pending' OR "
+                "(status='delivering' AND claim_expires_at<=?) "
+                "THEN 1 ELSE 0 END) AS pending,"
+                "SUM(CASE WHEN status='delivering' AND consumer_digest=? "
+                "AND NOT (claim_expires_at<=?) "
+                "THEN 1 ELSE 0 END) AS delivering,"
+                "SUM(CASE WHEN status='delivered' AND consumer_digest=? "
+                "THEN 1 ELSE 0 END) AS delivered,"
+                "SUM(CASE WHEN status IN ('delivering','delivered') "
+                "AND consumer_digest IS NOT NULL AND consumer_digest<>? "
+                "AND NOT (status='delivering' AND claim_expires_at<=?) "
+                "THEN 1 ELSE 0 END) AS elsewhere,"
+                "SUM(CASE WHEN status IN "
+                "('pending','delivering','delivered') "
+                "THEN 1 ELSE 0 END) AS active "
                 "FROM execution_review_cards",
-                (consumer_digest, consumer_digest, consumer_digest),
+                (now, consumer_digest, now, consumer_digest,
+                 consumer_digest, now),
             ).fetchone()
         return ExecutionCardScopedStats(*(int(row[name] or 0) for name in (
             "pending", "delivering", "delivered", "elsewhere", "active"
