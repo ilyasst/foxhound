@@ -402,6 +402,12 @@ class ExecutionCardTests(unittest.TestCase):
             connection.execute(
                 "ALTER TABLE task_execution_results DROP COLUMN work_digest"
             )
+            # v42 added this; a database older than that has not
+            # got it yet.
+            connection.execute(
+                "ALTER TABLE task_execution_results DROP COLUMN "
+                "reader_instruction_sequence"
+            )
             connection.execute(
                 "ALTER TABLE task_execution_results DROP COLUMN "
                 "repository_references_json"
@@ -3625,6 +3631,130 @@ class ExecutionCardTests(unittest.TestCase):
             claim_token=next_run.token,
         ))
         self.assertGreater(discussed.workflow_version, before.version)
+
+    def _reader_events(self, task_id: int) -> list[str]:
+        import sqlite3 as _sqlite3
+        with closing(_sqlite3.connect(self.database)) as connection:
+            return [
+                row[0] for row in connection.execute(
+                    "SELECT kind FROM task_execution_events WHERE task_id=? "
+                    "ORDER BY sequence", (task_id,))
+            ]
+
+    def _delivery_rows(self, task_id: int) -> list[tuple]:
+        import sqlite3 as _sqlite3
+        with closing(_sqlite3.connect(self.database)) as connection:
+            return list(connection.execute(
+                "SELECT workflow_version,instruction_sequence "
+                "FROM execution_reader_instruction_deliveries "
+                "WHERE task_id=? ORDER BY workflow_version", (task_id,)))
+
+    def test_a_delivered_instruction_is_recorded_and_named_by_its_result(self):
+        """A run that was steered can be told from one that was not.
+
+        Without this the same three failures look identical: the instruction
+        was never selected, it was selected and disregarded, or it was acted
+        on and the work was lost before recording.
+        """
+        self._plan_review(1, "audit-plan")
+        self.cards.schedule()
+        claim = self._claim_and_deliver()
+        self.cards.submit_input(
+            claim.card.id,
+            expected_version=claim.card.version,
+            kind="discussion",
+            value="Check the synthetic constraint.",
+        )
+        run = self.execution.claim_next()
+
+        self.assertEqual(self._delivery_rows(1), [])
+        self.execution.reader_instruction(
+            1, expected_version=run.workflow_version, claim_token=run.token)
+
+        rows = self._delivery_rows(1)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], run.workflow_version)
+        self.assertEqual(self._reader_events(1)[-1],
+                         "reader_instruction_delivered")
+        self.assertEqual(
+            self.execution.delivered_reader_instruction_sequence(
+                1, expected_version=run.workflow_version),
+            rows[0][1],
+        )
+
+        self.execution.record_result(ExecutionResultEnvelope(
+            result_id="audit-result",
+            task_id=1,
+            task_version=1,
+            workflow_version=run.workflow_version,
+            phase="plan",
+            claim_token=run.token,
+            outcome="awaiting_plan",
+            summary="Synthetic revised plan.",
+            work_markdown="Synthetic revised work.",
+            reader_instruction_sequence=rows[0][1],
+        ))
+        import sqlite3 as _sqlite3
+        with closing(_sqlite3.connect(self.database)) as connection:
+            named = connection.execute(
+                "SELECT reader_instruction_sequence FROM "
+                "task_execution_results WHERE result_id=?",
+                ("audit-result",)).fetchone()[0]
+        self.assertEqual(named, rows[0][1])
+
+    def test_delivering_the_same_instruction_twice_is_one_delivery(self):
+        """A worker that rebuilds its payload must not log a second handoff."""
+        self._plan_review(2, "audit-twice")
+        self.cards.schedule()
+        claim = self._claim_and_deliver()
+        self.cards.submit_input(
+            claim.card.id,
+            expected_version=claim.card.version,
+            kind="discussion",
+            value="Synthetic direction.",
+        )
+        run = self.execution.claim_next()
+        for _ in range(3):
+            self.execution.reader_instruction(
+                2, expected_version=run.workflow_version,
+                claim_token=run.token)
+
+        self.assertEqual(len(self._delivery_rows(2)), 1)
+        self.assertEqual(
+            self._reader_events(2).count("reader_instruction_delivered"), 1)
+
+    def test_a_run_given_no_instruction_records_none(self):
+        """The whole point is the difference between none and one."""
+        self._plan_review(3, "audit-none")
+        run_version = self.execution.get(3).version
+        self.assertEqual(self._delivery_rows(3), [])
+        self.assertIsNone(
+            self.execution.delivered_reader_instruction_sequence(
+                3, expected_version=run_version))
+        self.assertNotIn("reader_instruction_delivered",
+                         self._reader_events(3))
+
+    def test_the_instruction_is_not_part_of_what_makes_a_result_the_same(self):
+        """Provenance must not move the content digest.
+
+        A result that says the same thing is the same answer whether or not a
+        reader prompted it; letting the instruction change the digest would
+        make the repeat guard blind exactly when a reader asked for a change.
+        """
+        base = dict(
+            result_id="digest-a", task_id=4, task_version=1,
+            workflow_version=1, phase="plan", claim_token="x" * 40,
+            outcome="awaiting_plan", summary="Same synthetic summary.",
+            work_markdown="Same synthetic work.",
+        )
+        from foxhound.task_execution import _validated_result
+        without = _validated_result(ExecutionResultEnvelope(**base))
+        with_one = _validated_result(ExecutionResultEnvelope(
+            **{**base, "reader_instruction_sequence": 7}))
+
+        self.assertEqual(without["content_digest"], with_one["content_digest"])
+        self.assertIsNone(without["reader_instruction_sequence"])
+        self.assertEqual(with_one["reader_instruction_sequence"], 7)
 
     def _assert_comment_and_go(
         self, task_id: int, expected_phase: WorkflowPhase

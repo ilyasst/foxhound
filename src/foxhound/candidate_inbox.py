@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 41
+SCHEMA_VERSION = 42
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -350,6 +350,13 @@ _SCHEMA_COLUMNS = {
         "work_digest",
         "repository_references_json",
         "repository_impact",
+        "reader_instruction_sequence",
+    ),
+    "execution_reader_instruction_deliveries": (
+        "task_id",
+        "workflow_version",
+        "instruction_sequence",
+        "occurred_at",
     ),
     "task_execution_events": (
         "sequence",
@@ -508,9 +515,20 @@ _SCHEMA_COLUMNS = {
 #: Every historical checkpoint derives from the current map by removing what
 #: was added after it, so a table or column added now has to be stripped here
 #: or the mid-migration checks demand it from a database that predates it.
+#: The delivery record and the result column that names it both arrive at
+#: v42, so every checkpoint at or below v41 has to be without them.
+_SCHEMA_V41_COLUMNS = {
+    name: tuple(column for column in columns if not (
+        name == "task_execution_results"
+        and column == "reader_instruction_sequence"
+    ))
+    for name, columns in _SCHEMA_COLUMNS.items()
+    if name != "execution_reader_instruction_deliveries"
+}
+
 _SCHEMA_V39_COLUMNS = {
     name: columns
-    for name, columns in _SCHEMA_COLUMNS.items()
+    for name, columns in _SCHEMA_V41_COLUMNS.items()
     if name not in {"effect_intents", "effect_receipts"}
 }
 
@@ -730,6 +748,7 @@ _SCHEMA_OBJECTS = {
     "native_intake_historical_refusals_no_delete": "trigger",
     "execution_reader_inputs_no_update": "trigger",
     "execution_reader_inputs_no_delete": "trigger",
+    "execution_reader_instruction_deliveries": "table",
     "task_owner_events_no_update": "trigger",
     "task_owner_events_no_delete": "trigger",
     "task_execution_owner_holds_one_active": "index",
@@ -2524,6 +2543,51 @@ _SCHEMA_V40 = (
 )
 
 
+# Which reader instruction a run was actually handed. Three failures were
+# indistinguishable without it -- the instruction was never selected, it was
+# selected and disregarded, or it was acted on and the work was lost before
+# recording -- and telling them apart meant diffing files on disk by hand.
+#
+# One row per (task, workflow version): a run is handed at most one
+# instruction, and handing it twice is the same delivery, not a second one.
+# The reader's words are NOT copied here; they already live in
+# `execution_reader_inputs` and belong in one place.
+_SCHEMA_V42_EXECUTION_EVENT_TABLE = _SCHEMA_V40_EXECUTION_EVENT_TABLE.replace(
+    "'revision_requested',"
+    "'result_unchanged'",
+    "'revision_requested',"
+    "'result_unchanged','reader_instruction_delivered'",
+)
+_SCHEMA_V42 = (
+    "ALTER TABLE task_execution_results ADD COLUMN "
+    "reader_instruction_sequence INTEGER REFERENCES "
+    "execution_reader_inputs(sequence);",
+    """CREATE TABLE execution_reader_instruction_deliveries (
+    task_id              INTEGER NOT NULL,
+    workflow_version     INTEGER NOT NULL CHECK(workflow_version >= 1),
+    instruction_sequence INTEGER NOT NULL,
+    occurred_at          TEXT NOT NULL,
+    PRIMARY KEY(task_id, workflow_version),
+    FOREIGN KEY(task_id) REFERENCES task_execution_workflows(task_id),
+    FOREIGN KEY(instruction_sequence)
+        REFERENCES execution_reader_inputs(sequence)
+);""",
+    "DROP TRIGGER task_execution_events_no_update;",
+    "DROP TRIGGER task_execution_events_no_delete;",
+    "ALTER TABLE task_execution_events RENAME TO task_execution_events_v41;",
+    _SCHEMA_V42_EXECUTION_EVENT_TABLE,
+    "INSERT INTO task_execution_events("
+    "sequence,task_id,kind,workflow_version,task_version,phase,status,"
+    "occurred_at,agent_profile_id,agent_profile_revision) "
+    "SELECT sequence,task_id,kind,workflow_version,task_version,phase,status,"
+    "occurred_at,agent_profile_id,agent_profile_revision "
+    "FROM task_execution_events_v41;",
+    "DROP TABLE task_execution_events_v41;",
+    _SCHEMA_V8[6],
+    _SCHEMA_V8[7],
+)
+
+
 _SCHEMA_V20 = (
     # SQLite cannot alter a CHECK in place, and three tables carry a foreign
     # key to this one. Renaming the card table would rewrite all three to
@@ -3607,6 +3671,38 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 41
+            if version == 41:
+                connection.execute("PRAGMA foreign_keys = OFF")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    columns = tuple(item["name"] for item in connection.execute(
+                        "PRAGMA table_info(task_execution_results)"
+                    ))
+                    # Replayable: a database that already carries the column,
+                    # the table or the widened CHECK must not be rebuilt.
+                    if "reader_instruction_sequence" not in columns:
+                        connection.execute(_SCHEMA_V42[0])
+                    connection.execute(
+                        _SCHEMA_V42[1].replace(
+                            "CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1))
+                    definition = connection.execute(
+                        "SELECT sql FROM sqlite_master WHERE type='table' "
+                        "AND name='task_execution_events'"
+                    ).fetchone()
+                    if definition is None:
+                        raise InboxError("candidate inbox schema is incomplete")
+                    widened = "'reader_instruction_delivered'"
+                    if widened not in definition["sql"]:
+                        for statement in _SCHEMA_V42[2:]:
+                            connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 42")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                finally:
+                    connection.execute("PRAGMA foreign_keys = ON")
+                version = 42
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:
