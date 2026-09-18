@@ -13,7 +13,7 @@ import os
 import re
 import secrets
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta, timezone
@@ -21,6 +21,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Callable, Sequence
 
+from .task_owner import normalized_aliases, reader_owned
 from .agent_profiles import (
     AgentProfile,
     AgentProfileError,
@@ -365,6 +366,7 @@ class TaskExecutionService:
         execution_slot_cap: int | None = None,
         plan_ready_cap: int | None = None,
         awaiting_reader_cap: int | None = None,
+        reader_aliases: object = None,
     ) -> None:
         if (isinstance(max_attempts, bool)
                 or not isinstance(max_attempts, int)
@@ -375,6 +377,17 @@ class TaskExecutionService:
         self._plan_ready_cap = _resolve_cap(plan_ready_cap, PLAN_READY_CAP)
         self._awaiting_reader_cap = _resolve_cap(
             awaiting_reader_cap, AWAITING_READER_CAP)
+        if reader_aliases is None:
+            self._reader_aliases: frozenset[str] = frozenset()
+        elif isinstance(reader_aliases, (str, bytes)) or not isinstance(
+            reader_aliases, Iterable
+        ):
+            raise ValueError("reader aliases are invalid")
+        else:
+            values = list(reader_aliases)
+            if any(not isinstance(alias, str) for alias in values):
+                raise ValueError("reader aliases are invalid")
+            self._reader_aliases = normalized_aliases(values)
         self.database_path = Path(database_path)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._token_factory = token_factory or (
@@ -495,7 +508,7 @@ class TaskExecutionService:
                 )
                 promoted = 0
                 waiting_rows = connection.execute(
-                    "SELECT w.*, ("
+                    "SELECT w.*," + _OWNER_COLUMNS + "("
                     " SELECT o.source_kind FROM task_candidate_bindings AS b "
                     " JOIN candidate_inbox AS o "
                     " ON o.candidate_id=b.candidate_id "
@@ -517,7 +530,8 @@ class TaskExecutionService:
                 for row in waiting_rows:
                     origin_kind = row["origin_kind"]
                     if _initial_status(
-                        origin_kind, self._planning_grants
+                        origin_kind, self._planning_grants, row,
+                        self._reader_aliases,
                     ) is not WorkflowStatus.QUEUED:
                         continue
                     version = int(row["version"]) + 1
@@ -551,7 +565,7 @@ class TaskExecutionService:
                 )
 
                 rows = connection.execute(
-                    "SELECT t.id,t.version,("
+                    "SELECT t.id,t.version," + _OWNER_COLUMNS + "("
                     " SELECT o.source_kind FROM task_candidate_bindings AS b "
                     " JOIN candidate_inbox AS o "
                     " ON o.candidate_id=b.candidate_id "
@@ -576,7 +590,8 @@ class TaskExecutionService:
                     task_id = int(row["id"])
                     task_version = int(row["version"])
                     status = _initial_status(
-                        row["origin_kind"], self._planning_grants)
+                        row["origin_kind"], self._planning_grants, row,
+                        self._reader_aliases)
                     if status.value in WORKING_STATUSES:
                         if plan_room is not None:
                             if plan_room == 0:
@@ -634,7 +649,7 @@ class TaskExecutionService:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 task = connection.execute(
-                    "SELECT t.status,t.version,("
+                    "SELECT t.status,t.version," + _OWNER_COLUMNS + "("
                     " SELECT o.source_kind FROM task_candidate_bindings AS b "
                     " JOIN candidate_inbox AS o "
                     " ON o.candidate_id=b.candidate_id "
@@ -669,7 +684,8 @@ class TaskExecutionService:
                 if row is None:
                     version = 1
                     status = _initial_status(
-                        task["origin_kind"], self._planning_grants
+                        task["origin_kind"], self._planning_grants, task,
+                        self._reader_aliases
                     )
                     profile = self._profile_for(task["origin_kind"])
                     connection.execute(
@@ -686,7 +702,8 @@ class TaskExecutionService:
                 else:
                     version = int(row["version"]) + 1
                     status = _initial_status(
-                        task["origin_kind"], self._planning_grants
+                        task["origin_kind"], self._planning_grants, task,
+                        self._reader_aliases
                     )
                     profile = self._profile_for(task["origin_kind"])
                     connection.execute(
@@ -2858,8 +2875,17 @@ def _cancel_superseded_start_cards(
         )
 
 
+#: Owner columns every selection feeding `_initial_status` must carry.
+_OWNER_COLUMNS = (
+    "t.owner,t.owner_kind,t.owner_ref_version,t.owner_provisional,"
+)
+
+
 def _initial_status(
-    origin_kind: object, granted: frozenset[str]
+    origin_kind: object,
+    granted: frozenset[str],
+    row: Mapping[str, object] | None = None,
+    reader_aliases: frozenset[str] = frozenset(),
 ) -> WorkflowStatus:
     """Whether this task must be asked about before it is planned.
 
@@ -2879,6 +2905,8 @@ def _initial_status(
     Everything after the plan is still gated.
     """
     if isinstance(origin_kind, str) and origin_kind in granted:
+        return WorkflowStatus.QUEUED
+    if row is not None and reader_owned(row, reader_aliases):
         return WorkflowStatus.QUEUED
     return WorkflowStatus.AWAITING_START
 
