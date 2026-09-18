@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from .worker_resolution import is_worker_command
+
 
 PROFILE_SCHEMA = "foxhound.agent-profile"
 PROFILE_SCHEMA_VERSION = 1
@@ -43,7 +45,6 @@ BUILT_IN_PROFILE_IDS = frozenset({"general"})
 
 _PROFILE_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 _REVISION_RE = re.compile(r"^[0-9a-f]{64}$")
-_COMMAND_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _APPROVED_TOOLSETS = frozenset({
     "browser", "file", "terminal", "vision", "web",
 })
@@ -111,7 +112,7 @@ class AgentProfile:
     def render_prompt(self, worker_command: str) -> str:
         if (
             not isinstance(worker_command, str)
-            or not _COMMAND_NAME_RE.fullmatch(worker_command)
+            or not is_worker_command(worker_command)
         ):
             raise AgentProfileError("agent worker command is invalid")
         return self.prompt_template.replace(WORKER_COMMAND_TOKEN, worker_command)
@@ -239,7 +240,7 @@ def render_bootstrap(worker_command: str = "foxhound-task-worker") -> str:
     """
     if (
         not isinstance(worker_command, str)
-        or not _COMMAND_NAME_RE.fullmatch(worker_command)
+        or not is_worker_command(worker_command)
     ):
         raise AgentProfileError("agent worker command is invalid")
     return BOOTSTRAP_PROMPT.replace(WORKER_COMMAND_TOKEN, worker_command)

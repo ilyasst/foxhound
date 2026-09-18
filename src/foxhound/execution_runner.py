@@ -62,12 +62,17 @@ from .task_ledger import TaskLedger, TaskLedgerError
 from .source_policy import action_grants as _action_grants
 from .source_policy import execution_grants as _execution_grants
 from .source_policy import planning_grants as _planning_grants
+from .worker_resolution import (
+    WorkerMismatch,
+    is_worker_command,
+    resolve_worker_command,
+    verify_worker,
+)
 
 
 NO_PROGRESS_EXIT_CODE = 70
 STARTUP_EXIT_CODE = 71
 TIMEOUT_EXIT_CODE = 124
-_COMMAND_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _RUNNER_SLOT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
 
@@ -135,7 +140,7 @@ class ExecutionRunnerConfig:
         profile = self.profile_registry.get(self.default_agent_profile)
         if profile is None or WorkflowPhase.PLAN.value not in profile.allowed_phases:
             raise ValueError("execution default agent profile is invalid")
-        if not _COMMAND_NAME_RE.fullmatch(self.worker_command):
+        if not is_worker_command(self.worker_command):
             raise ValueError("execution worker command is invalid")
         if (
             not isinstance(self.allowed_phases, tuple)
@@ -206,6 +211,17 @@ class ExecutionRunResult:
     @property
     def ok(self) -> bool:
         return self.exit_code == 0
+
+
+def _worker_command(config: "ExecutionRunnerConfig") -> str:
+    """The worker this runner means, as an absolute path where possible.
+
+    The agent resolves whatever it is handed in its own shell, not this
+    process's, so a bare name is a question answered somewhere the runner
+    cannot see -- and on a deployed host ``~/.local/bin`` wins it. Naming
+    the worker beside this interpreter removes the question. Issue #431.
+    """
+    return resolve_worker_command(config.worker_command)
 
 
 def agent_prompt(worker_command: str = "foxhound-task-worker") -> str:
@@ -383,7 +399,7 @@ def _run_claim(
         command = profile_argv(
             config.agent_command,
             profile,
-            worker_command=config.worker_command,
+            worker_command=_worker_command(config),
         )
     except ValueError:
         _fail_claim(service, claim, "startup_failed")
@@ -811,7 +827,7 @@ def _write_state(
         "task_run_directory": (
             None if archive is None else str(archive.run_directory)
         ),
-        "worker_command": config.worker_command,
+        "worker_command": _worker_command(config),
         # These are private run authority, not runner-only switches: the
         # worker records the result and therefore decides whether its phase
         # advances without a reader card.
@@ -1110,7 +1126,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             plan_ready_cap=args.plan_ready_cap,
             awaiting_reader_cap=args.awaiting_reader_cap,
         )
+        # Before anything is claimed. A worker that cannot parse the run
+        # state this runner writes fails every run at the agent's first tool
+        # call, and burns a claim each time; refusing here costs one poll.
+        verify_worker(
+            _worker_command(config),
+            run_state_schema_version=RUN_STATE_SCHEMA_VERSION,
+        )
         result = run_once(config)
+    except WorkerMismatch as exc:
+        print(
+            "foxhound execution runner: refusing to claim: " + str(exc),
+            file=sys.stderr,
+        )
+        return 78
     except (
         AgentProfileError,
         ValueError,

@@ -38,6 +38,12 @@ from .task_execution import (
 from .source_policy import action_grants as _action_grants
 from .source_policy import execution_grants as _execution_grants
 from . import forge_action
+from .release_revision import describe as _describe_revision
+from .worker_resolution import (
+    REPORT_SCHEMA,
+    REPORT_SCHEMA_VERSION,
+    is_worker_command,
+)
 from .workflow_policy import (
     CHECKPOINTS,
     WorkflowPolicy,
@@ -90,7 +96,6 @@ _RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _RESULT_NAME_RE = re.compile(r"^result-([0-9a-f]{32})\.json$")
 _PROFILE_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 _REVISION_RE = re.compile(r"^[0-9a-f]{64}$")
-_WORKER_COMMAND_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _RESULT_INPUTS = (
     "result-summary.txt",
     "result-work.md",
@@ -959,7 +964,7 @@ def load_run_state(path: str | os.PathLike[str]) -> ExecutionRunState:
         or not isinstance(profile_revision, str)
         or not _REVISION_RE.fullmatch(profile_revision)
         or not isinstance(worker_command, str)
-        or not _WORKER_COMMAND_RE.fullmatch(worker_command)
+        or not is_worker_command(worker_command)
     ):
         raise ExecutionWorkerConfigError("execution run state is invalid")
     try:
@@ -1834,6 +1839,24 @@ def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return value
 
 
+def _report() -> dict[str, Any]:
+    """Describe this worker well enough for a runner to accept or refuse it.
+
+    ``run_state_schema_version`` is the load-bearing field: it is the contract
+    between what a runner writes and what this worker can parse. The revision
+    is for a human reading a refusal, and does not gate anything.
+    """
+    return {
+        "schema": REPORT_SCHEMA,
+        "schema_version": REPORT_SCHEMA_VERSION,
+        "run_state_schema_version": RUN_STATE_SCHEMA_VERSION,
+        "work_context_schema_version": WORK_CONTEXT_SCHEMA_VERSION,
+        "worker_schema_version": WORKER_SCHEMA_VERSION,
+        "revision": _describe_revision(__file__),
+        "module": __file__,
+    }
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="foxhound-task-worker",
@@ -1888,11 +1911,20 @@ def _parser() -> argparse.ArgumentParser:
         "--outcome", required=True, help="result outcome for the current phase"
     )
     subcommands.add_parser("release")
+    # Answerable without a run. The runner uses it to check, before it
+    # claims anything, that the worker an agent would reach can read the
+    # run state it is about to write.
+    subcommands.add_parser("report")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.operation == "report":
+        # Deliberately outside the try below: this must answer for a worker
+        # that has no run to load, which is the only situation it is for.
+        print(json.dumps(_report(), sort_keys=True))
+        return 0
     try:
         worker = load_worker_from_environment()
         if args.operation == "context":

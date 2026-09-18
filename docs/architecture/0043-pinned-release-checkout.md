@@ -5,6 +5,11 @@ Status: accepted.
 Deployed units import a release checkout of this repository, held in detached
 HEAD at a named commit.  They never import a development tree.
 
+That held for every unit but one: the worker is run by the agent, not by
+the runner, and was located through the agent's `PATH` rather than from the
+release.  [ADR 0046](0046-worker-resolved-from-the-running-release.md)
+closes that, and is required reading alongside this one.
+
 ## Why the development tree must not be imported
 
 A unit whose `PYTHONPATH` points at a working tree runs whatever that tree

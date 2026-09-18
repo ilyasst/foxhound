@@ -162,6 +162,15 @@ the release selector and unit definitions private. A promotion changes that
 selector only after preflight succeeds, so every database component starts
 from one selected release with arguments rendered from the same document.
 
+`worker_command` follows the same principle, and needs to, because the worker
+is run by the agent rather than by the runner: a bare name is resolved to the
+matching console script beside the running interpreter, and it is that absolute
+path which reaches the agent's prompt and private run state. An absolute
+`worker_command` is honoured as given, for a layout where that is wrong. Either
+way the runner asks the worker what run-state schema it speaks before claiming
+any work, and refuses to claim when the answer does not match what it writes.
+See [ADR 0046](architecture/0046-worker-resolved-from-the-running-release.md).
+
 ## Gates a machine may stand down
 
 A task passes reader gates on its way through a workflow. Three of them are
