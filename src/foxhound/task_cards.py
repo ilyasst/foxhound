@@ -1699,12 +1699,7 @@ class TaskCardService:
             "COALESCE((SELECT job.title FROM task_fused_title_jobs AS job "
             "WHERE job.task_id=c.task_id AND job.state='ready'),t.text) AS text,"
             "t.owner,t.owner_kind,t.due,t.confidence,t.created_at AS task_created,"
-            "COALESCE((SELECT entry.display_name FROM speaker_registry_entries AS entry "
-            " WHERE entry.speaker_registry_id=t.owner_speaker_registry_id "
-            " AND entry.speaker_id=COALESCE(t.owner_canonical_speaker_id,"
-            " t.owner_speaker_id)),CASE WHEN t.owner_kind='unresolved' "
-            " OR (t.owner_kind='person' AND t.owner_speaker_id IS NOT NULL) "
-            " THEN '(unresolved speaker)' ELSE t.owner END) AS owner_display,"
+            + _owner_display("t") + " AS owner_display,"
             "(SELECT group_concat(CASE participant.kind "
             " WHEN 'unresolved' THEN '(unresolved speaker)' "
             " WHEN 'external' THEN '(external participant)' "
@@ -1766,7 +1761,8 @@ class TaskCardService:
             "ELSE d.left_task_id END AS duplicate_other_task_id,"
             "other.status AS duplicate_other_status,"
             "other.text AS duplicate_other_text,"
-            "other.owner AS duplicate_other_owner,"
+            + _owner_display("other") + " AS duplicate_other_owner,"
+            "other.owner_kind AS duplicate_other_owner_kind,"
             "other.due AS duplicate_other_due,"
             "COALESCE((SELECT min(h.created_at) "
             " FROM task_candidate_bindings AS b "
@@ -2254,6 +2250,35 @@ def _card(row) -> TaskReviewCard:
     )
 
 
+def _owner_display(task: str) -> str:
+    """SQL scalar for the name to show beside one task.
+
+    Parameterised by the task expression because a comparison card carries
+    two of them. Both sides have to read the same way: a card asking whether
+    two tasks are the same is answered partly on who owns each, and an owner
+    that resolves on one side and not on the other is not a comparison.
+
+    The registry's current name wins, because a label cached on the task is
+    whatever it was called when it was raised. Where the registry has no
+    entry the cached label is shown rather than withheld: it is the only
+    name anyone has, `canonical_owner_display` already strips a raw speaker
+    token out of it, and an owner the reader cannot read is the one fact
+    this line exists to carry.
+
+    An owner that is genuinely unassigned is named by
+    `canonical_owner_display`, from the kind, on the way out. Saying it here
+    as well would be the same rule written twice, in two vocabularies, free
+    to drift.
+    """
+    return (
+        "COALESCE((SELECT entry.display_name FROM speaker_registry_entries "
+        " AS entry WHERE entry.speaker_registry_id="
+        f"{task}.owner_speaker_registry_id AND entry.speaker_id=COALESCE("
+        f"{task}.owner_canonical_speaker_id,{task}.owner_speaker_id)),"
+        f"{task}.owner)"
+    )
+
+
 def _bound_source_revision(task_id: str) -> str:
     """SQL scalar for the accepted candidate revision of one task.
 
@@ -2303,7 +2328,10 @@ def _duplicate(row) -> CardDuplicateProposal | None:
         other_origin_record=str(row["duplicate_other_record"] or ""),
         other_origin_item=str(row["duplicate_other_item"] or ""),
         other_origin_sources=stored_origin_sources(row["duplicate_other_payload"]),
-        other_owner=_optional_text(row["duplicate_other_owner"]),
+        other_owner=canonical_owner_display(
+            _optional_text(row["duplicate_other_owner"]),
+            row["duplicate_other_owner_kind"],
+        ),
         other_due=_optional_text(row["duplicate_other_due"]),
         other_raised=_optional_text(row["duplicate_other_created"]),
         other_closed_at=_optional_text(row["duplicate_other_closed"]),
