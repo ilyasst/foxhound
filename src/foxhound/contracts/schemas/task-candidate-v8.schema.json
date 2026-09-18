@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/foxhound/contracts/task-candidate-v8.schema.json",
+  "title": "Foxhound structured task candidate",
+  "type": "object",
+  "required": ["schema", "schema_version", "candidate_id", "source", "task", "evidence", "lifecycle", "created_at"],
+  "properties": {
+    "schema": {"const": "foxhound.task-candidate"},
+    "schema_version": {"const": 8},
+    "candidate_id": {"type": "string", "pattern": "^tc_[0-9a-f]{64}$"},
+    "source": {"type": "object", "required": ["system", "kind", "record_id", "item_id", "revision"], "properties": {"system": {"const": "gw"}, "kind": {"enum": ["meeting", "email", "teams", "issue", "legacy", "review_request", "mention", "calendar", "alert"]}, "record_id": {"$ref": "#/$defs/opaqueId"}, "item_id": {"$ref": "#/$defs/opaqueId"}, "revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}, "additionalProperties": false},
+    "task": {"type": "object", "required": ["text", "owner", "owner_ref", "due", "object", "action", "confidence"], "properties": {"text": {"type": "string", "minLength": 1, "maxLength": 1000}, "project": {"type": "string", "minLength": 1, "maxLength": 200}, "owner": {"oneOf": [{"type": "string", "minLength": 1, "maxLength": 200}, {"type": "null"}]}, "owner_ref": {"oneOf": [{"$ref": "#/$defs/ownerRef"}, {"type": "null"}]}, "due": {"oneOf": [{"type": "string", "format": "date"}, {"type": "null"}]}, "object": {"type": "string", "minLength": 1, "maxLength": 200}, "action": {"enum": ["arrange", "complete", "create", "decide", "deliver", "investigate", "request", "review", "schedule", "send", "update"]}, "participants": {"type": "array", "maxItems": 20, "items": {"$ref": "#/$defs/speakerRef"}}, "confidence": {"type": "number", "minimum": 0, "maximum": 1}}, "additionalProperties": false},
+    "evidence": {"type": "object", "required": ["document_id", "locator"], "properties": {"document_id": {"$ref": "#/$defs/opaqueId"}, "locator": {"$ref": "#/$defs/opaqueId"}}, "additionalProperties": false},
+    "lifecycle": {"type": "object", "required": ["state", "generation", "changed_at"], "properties": {"state": {"enum": ["active", "withdrawn"]}, "generation": {"type": "integer", "minimum": 1}, "changed_at": {"type": "string", "format": "date-time"}}, "additionalProperties": false},
+    "created_at": {"type": "string", "format": "date-time"}
+  },
+  "$defs": {
+    "opaqueId": {"type": "string", "minLength": 1, "maxLength": 200, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$"},
+    "speakerId": {"type": "string", "pattern": "^SPK_[0-9]+$"},
+    "speakerRef": {"type": "object", "required": ["kind", "speaker_id", "canonical_speaker_id", "speaker_registry_id"], "properties": {"kind": {"enum": ["person", "unresolved", "external", "group"]}, "speaker_id": {"oneOf": [{"$ref": "#/$defs/speakerId"}, {"type": "null"}]}, "canonical_speaker_id": {"oneOf": [{"$ref": "#/$defs/speakerId"}, {"type": "null"}]}, "speaker_registry_id": {"oneOf": [{"$ref": "#/$defs/opaqueId"}, {"type": "null"}]}} , "additionalProperties": false},
+    "ownerRef": {"type": "object", "required": ["kind", "speaker_id", "canonical_speaker_id", "speaker_registry_id", "pinned", "provisional"], "properties": {"kind": {"enum": ["person", "unresolved", "external", "group"]}, "speaker_id": {"oneOf": [{"$ref": "#/$defs/speakerId"}, {"type": "null"}]}, "canonical_speaker_id": {"oneOf": [{"$ref": "#/$defs/speakerId"}, {"type": "null"}]}, "speaker_registry_id": {"oneOf": [{"$ref": "#/$defs/opaqueId"}, {"type": "null"}]}, "pinned": {"type": "boolean"}, "provisional": {"type": "boolean"}}, "additionalProperties": false}
+  },
+  "additionalProperties": false
+}

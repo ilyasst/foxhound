@@ -39,6 +39,59 @@ def report(database_path: str | Path) -> tuple[dict[str, object], ...]:
     return tuple(sorted(rows, key=lambda row: str(row["detector"])))
 
 
+def route_report(database_path: str | Path) -> tuple[dict[str, object], ...]:
+    """Report candidacy routes without task text or proposal bases."""
+    inbox = CandidateInbox(database_path)
+    if not inbox.database_path.is_file() or inbox.database_path.is_symlink():
+        raise InboxError("candidate inbox is not initialized")
+    connection = sqlite3.connect(inbox.database_path, timeout=5)
+    connection.row_factory = sqlite3.Row
+    try:
+        inbox._require_current_schema(connection)
+        return _route_lines(connection)
+    finally:
+        connection.close()
+
+
+def _route_lines(connection: sqlite3.Connection) -> tuple[dict[str, object], ...]:
+    """Content-free route outcomes, including structure-only recall."""
+    rows = connection.execute(
+        "SELECT route, count(*) AS proposed,"
+        "sum(state='confirmed') AS confirmed,sum(state='rejected') AS rejected "
+        "FROM task_duplicate_proposal_routes AS route "
+        "JOIN task_duplicate_proposals AS proposal ON proposal.id=route.proposal_id "
+        "GROUP BY route.route ORDER BY route.route"
+    ).fetchall()
+    lines = [_route_line(str(row["route"]), row) for row in rows]
+    only = connection.execute(
+        "SELECT count(*) AS proposed,"
+        "sum(state='confirmed') AS confirmed,sum(state='rejected') AS rejected "
+        "FROM task_duplicate_proposals AS proposal "
+        "WHERE EXISTS(SELECT 1 FROM task_duplicate_proposal_routes AS route "
+        " WHERE route.proposal_id=proposal.id AND route.route IN ('object','participant')) "
+        "AND NOT EXISTS(SELECT 1 FROM task_duplicate_proposal_routes AS route "
+        " WHERE route.proposal_id=proposal.id AND route.route IN ('words','reread'))"
+    ).fetchone()
+    lines.append(_route_line("structure_only", only))
+    return tuple(lines)
+
+
+def _route_line(route: str, row: sqlite3.Row) -> dict[str, object]:
+    proposed = int(row["proposed"] or 0)
+    confirmed = int(row["confirmed"] or 0)
+    rejected = int(row["rejected"] or 0)
+    labels = confirmed + rejected
+    return {
+        "route": route,
+        "proposed": proposed,
+        "confirmed": confirmed,
+        "rejected": rejected,
+        "awaiting": max(proposed - labels, 0),
+        "label_count": labels,
+        "confirm_rate": None if labels == 0 else round(confirmed / labels, 3),
+    }
+
+
 def _proposal_line(counts: proposals.ProposalCounts) -> dict[str, object]:
     settled = counts.confirmed + counts.rejected
     return {
@@ -94,11 +147,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     try:
         lines = report(arguments.database)
+        routes = route_report(arguments.database)
     except (InboxError, sqlite3.Error, ValueError):
         # The path and the exception can both be operational data.
         print(json.dumps({"accepted": False}, separators=(",", ":")))
         return 2
-    print(json.dumps({"accepted": True, "detectors": list(lines)},
+    print(json.dumps({"accepted": True, "detectors": list(lines), "routes": list(routes)},
                      sort_keys=True))
     return 0
 

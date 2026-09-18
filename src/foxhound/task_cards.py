@@ -260,6 +260,8 @@ class TaskReviewCard:
     text: str = field(repr=False)
     owner: str | None = field(repr=False)
     due: str | None = field(repr=False)
+    participants: tuple[str, ...] = field(default=(), repr=False)
+    confidence: float | None = field(default=None, repr=False)
     first_raised: str | None = field(default=None, repr=False)
     task_created: str | None = field(default=None, repr=False)
     last_mentioned: str | None = field(default=None, repr=False)
@@ -1653,7 +1655,25 @@ class TaskCardService:
             "c.source_revision,"
             "COALESCE((SELECT job.title FROM task_fused_title_jobs AS job "
             "WHERE job.task_id=c.task_id AND job.state='ready'),t.text) AS text,"
-            "t.owner,t.owner_kind,t.due,t.created_at AS task_created,"
+            "t.owner,t.owner_kind,t.due,t.confidence,t.created_at AS task_created,"
+            "COALESCE((SELECT entry.display_name FROM speaker_registry_entries AS entry "
+            " WHERE entry.speaker_registry_id=t.owner_speaker_registry_id "
+            " AND entry.speaker_id=COALESCE(t.owner_canonical_speaker_id,"
+            " t.owner_speaker_id)),CASE WHEN t.owner_kind='unresolved' "
+            " OR (t.owner_kind='person' AND t.owner_speaker_id IS NOT NULL) "
+            " THEN '(unresolved speaker)' ELSE t.owner END) AS owner_display,"
+            "(SELECT group_concat(CASE participant.kind "
+            " WHEN 'unresolved' THEN '(unresolved speaker)' "
+            " WHEN 'external' THEN '(external participant)' "
+            " WHEN 'group' THEN '(group participant)' "
+            " ELSE COALESCE((SELECT entry.display_name "
+            " FROM speaker_registry_entries AS entry "
+            " WHERE entry.speaker_registry_id=participant.speaker_registry_id "
+            " AND entry.speaker_id=COALESCE(participant.canonical_speaker_id,"
+            " participant.speaker_id)),'(unresolved speaker)') END,char(30)) "
+            " FROM task_participants AS participant "
+            " WHERE participant.task_id=t.id ORDER BY participant.position) "
+            " AS participants_display,"
             "(SELECT min(h.created_at) FROM task_candidate_bindings AS b "
             " JOIN candidate_revision_history AS h "
             " ON h.candidate_id=b.candidate_id WHERE b.task_id=c.task_id) "
@@ -1794,8 +1814,15 @@ def render_task_review_card(card: TaskReviewCard) -> tuple[str, dict]:
         ))
     if card.owner:
         lines.extend(("", f"👤 <b>Owner:</b> {html.escape(card.owner, quote=False)}"))
+    if card.participants:
+        lines.append(
+            "👥 <b>Participants:</b> "
+            + html.escape(", ".join(card.participants), quote=False)
+        )
     if card.due:
         lines.append(f"📅 <b>Due:</b> {html.escape(card.due, quote=False)}")
+    if card.confidence is not None:
+        lines.append(f"📊 <b>Extraction confidence:</b> {card.confidence:.0%}")
     first = "" if not card.first_raised else str(card.first_raised)[:10]
     if first:
         lines.append(f"📌 <b>First raised:</b> {html.escape(first, quote=False)}")
@@ -2069,8 +2096,10 @@ def _card(row) -> TaskReviewCard:
         version=int(row["version"]),
         due_at=row["due_at"],
         text=row["text"],
-        owner=canonical_owner_display(row["owner"], row["owner_kind"]),
+        owner=canonical_owner_display(row["owner_display"], row["owner_kind"]),
         due=row["due"],
+        participants=tuple(filter(None, str(row["participants_display"] or "").split(chr(30)))),
+        confidence=(None if row["confidence"] is None else float(row["confidence"])),
         first_raised=row["first_raised"],
         task_created=_optional_text(row["task_created"]),
         last_mentioned=row["last_mentioned"],

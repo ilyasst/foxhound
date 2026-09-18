@@ -576,6 +576,46 @@ class TaskCandidateContractTests(unittest.TestCase):
             expected_kinds,
         )
 
+    def test_version_8_carries_structured_fields_and_unresolved_participants(self):
+        document = fixture("meeting-candidate-v2.json")
+        document["schema_version"] = 8
+        document["task"]["owner_ref"] = {
+            "kind": "person", "speaker_id": "SPK_101",
+            "canonical_speaker_id": "SPK_001",
+            "speaker_registry_id": "registry-alpha", "pinned": False,
+            "provisional": False,
+        }
+        document["task"].update({
+            "object": "synthetic sample", "action": "review",
+            "participants": [{
+                "kind": "unresolved", "speaker_id": "SPK_404",
+                "canonical_speaker_id": None,
+                "speaker_registry_id": "registry-alpha",
+            }],
+            "confidence": 0.75,
+        })
+        document["lifecycle"] = {
+            "state": "active", "generation": 1,
+            "changed_at": "2030-01-01T00:00:00Z",
+        }
+
+        candidate = parse_task_candidate(document)
+
+        self.assertEqual(candidate.task.object, "synthetic sample")
+        self.assertEqual(candidate.task.participants[0].kind, "unresolved")
+        self.assertEqual(task_candidate_document(candidate), document)
+
+        invalid = copy.deepcopy(document)
+        invalid["task"]["participants"][0]["canonical_speaker_id"] = "SPK_404"
+        with self.assertRaisesRegex(ContractError, "unresolved"):
+            parse_task_candidate(invalid)
+
+        required_only = copy.deepcopy(document)
+        del required_only["task"]["participants"]
+        parsed = parse_task_candidate(required_only)
+        self.assertEqual(parsed.task.participants, ())
+        self.assertEqual(task_candidate_document(parsed), required_only)
+
 
 if __name__ == "__main__":
     unittest.main()
