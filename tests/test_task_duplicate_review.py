@@ -407,6 +407,67 @@ class DuplicateCardDetailTests(DuplicateReviewCardTests):
                          "2030-01-05", "2030-02-09"):
             self.assertIn(expected, text)
 
+    def _registered(self, speaker_id: str, display_name: str) -> None:
+        self.connection.execute(
+            "INSERT INTO speaker_registry_entries(speaker_registry_id,"
+            "speaker_id,canonical_speaker_id,display_name,updated_at) "
+            "VALUES('registry-A',?,?,?,?)",
+            (speaker_id, speaker_id, display_name, NOW.isoformat()),
+        )
+        self.connection.commit()
+
+    def test_the_registry_name_wins_on_both_sides(self) -> None:
+        """A label cached on a task is whatever it was called back then."""
+        for task_id, speaker in ((1, "SPK_10"), (2, "SPK_20")):
+            self.connection.execute(
+                "UPDATE tasks SET owner='Stale label',owner_speaker_id=?,"
+                "owner_canonical_speaker_id=? WHERE id=?",
+                (speaker, speaker, task_id),
+            )
+        self.connection.commit()
+        self._registered("SPK_10", "Person A")
+        self._registered("SPK_20", "Person B")
+
+        text = self._render()
+
+        self.assertIn("Person A", text)
+        self.assertIn("Person B", text)
+        self.assertNotIn("Stale label", text)
+
+    def test_an_unassigned_owner_reads_the_same_on_both_sides(self) -> None:
+        """Whichever side it sits on, an owner nobody set says so."""
+        self.connection.execute(
+            "UPDATE tasks SET owner=NULL,owner_kind='unresolved',"
+            "owner_speaker_id=NULL,owner_canonical_speaker_id=NULL")
+        self.connection.commit()
+
+        text = self._render()
+
+        self.assertEqual(text.count("(unassigned)"), 2)
+
+    def test_an_unregistered_speaker_still_shows_the_name_on_the_card(self) -> None:
+        """Withholding it left the open side of every comparison unreadable.
+
+        The carded side resolved through the registry and fell back to
+        "(unresolved speaker)"; the counterpart printed the task's own
+        label. So the two sides of one comparison disagreed about a fact the
+        comparison is answered on.
+
+        No registry entry is created here: that is the case, and it is the
+        ordinary one for a task raised from a source that names a person in
+        words rather than as a speaker.
+        """
+        self._enrich(1, owner="Person A", due=None,
+                     created="2030-01-05T09:00:00+00:00")
+        self._enrich(2, owner="Person B", due=None,
+                     created="2030-02-09T09:00:00+00:00")
+
+        text = self._render()
+
+        self.assertIn("Person A", text)
+        self.assertIn("Person B", text)
+        self.assertNotIn("unresolved speaker", text)
+
     def test_a_closed_counterpart_shows_when_it_closed(self) -> None:
         self._enrich(2, owner="Person B", due=None,
                      created="2030-02-09T09:00:00+00:00",
