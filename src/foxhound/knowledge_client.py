@@ -293,14 +293,18 @@ class GwKnowledgeClient:
                 raw = response.read(self._config.max_response_bytes + 1)
         except KnowledgeResponseError:
             raise
-        except (
-            OSError,
-            TimeoutError,
-            socket.timeout,
-            urllib.error.HTTPError,
-            urllib.error.URLError,
-        ):
-            raise KnowledgeTransportError("GW knowledge request failed") from None
+        except urllib.error.HTTPError as exc:
+            raise KnowledgeTransportError(
+                f"GW knowledge request failed: HTTP {exc.code}"
+            ) from None
+        except (TimeoutError, socket.timeout):
+            raise KnowledgeTransportError(
+                "GW knowledge request timed out"
+            ) from None
+        except (OSError, urllib.error.URLError):
+            raise KnowledgeTransportError(
+                "GW knowledge request failed"
+            ) from None
         if len(raw) > self._config.max_response_bytes:
             raise KnowledgeResponseError(
                 "GW knowledge response exceeds its size limit"

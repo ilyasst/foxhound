@@ -23,6 +23,9 @@ from .knowledge_client import (
     GwKnowledgeClient,
     KnowledgeClientConfig,
     KnowledgeClientError,
+    KnowledgeRequestError,
+    KnowledgeTransportError,
+    KnowledgeResponseError,
     KnowledgeSearchResult,
 )
 from .contracts import SourceSnapshotContractError
@@ -377,13 +380,43 @@ class ExecutionWorker:
         max_results_per_layer: int = 10,
     ) -> dict[str, Any]:
         state, service = self._active()
-        result = GwKnowledgeClient(self._knowledge_config).search(
-            query,
-            layers=layers,
-            context_lines=context_lines,
-            max_matches_per_document=max_matches_per_document,
-            max_results_per_layer=max_results_per_layer,
-        )
+        try:
+            result = GwKnowledgeClient(self._knowledge_config).search(
+                query,
+                layers=layers,
+                context_lines=context_lines,
+                max_matches_per_document=max_matches_per_document,
+                max_results_per_layer=max_results_per_layer,
+            )
+        except KnowledgeTransportError as exc:
+            return _search_error_document(
+                str(exc),
+                kind="transport",
+                details={
+                    "cause": "GW knowledge transport failed",
+                },
+            )
+        except KnowledgeRequestError as exc:
+            return _search_error_document(
+                str(exc),
+                kind="request",
+                details={
+                    "cause": "GW knowledge request is invalid",
+                },
+            )
+        except KnowledgeResponseError as exc:
+            return _search_error_document(
+                str(exc),
+                kind="response",
+                details={
+                    "cause": "GW knowledge response is invalid",
+                },
+            )
+        except KnowledgeClientError as exc:
+            return _search_error_document(
+                str(exc),
+                kind="unknown",
+            )
         self._renew(service, state)
         return _search_document(result)
 
@@ -1140,6 +1173,33 @@ def _search_document(result: KnowledgeSearchResult) -> dict[str, Any]:
             for layer in result.layers
         ],
     }
+
+
+def _search_error_document(
+    message: str,
+    *,
+    kind: str = "unknown",
+    details: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Return a structured search document that carries error diagnostics.
+
+    The agent gets a valid JSON response it can parse, rather than a stderr
+    message it cannot distinguish from other refusals.  The `error` field
+    carries the diagnostic text; the `layers` field is present but empty so
+    the response shape is identical to a success.
+    """
+    doc = {
+        "schema": WORKER_SEARCH_SCHEMA,
+        "schema_version": WORKER_SCHEMA_VERSION,
+        "error": {
+            "kind": kind,
+            "message": message,
+        },
+        "layers": [],
+    }
+    if details:
+        doc["error"]["details"] = dict(details)
+    return doc
 
 
 def _read_private_json(
