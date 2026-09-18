@@ -37,7 +37,10 @@ from foxhound.execution_runner import (
     run_once,
 )
 from foxhound.execution_worker import INSTRUCTIONS_NAME, load_run_state
-from foxhound.worker_resolution import WorkerMismatch
+from foxhound.worker_resolution import (
+    WorkerMismatch,
+    resolve_worker_command,
+)
 from foxhound.task_execution import (
     ExecutionOutcome,
     ExecutionResultEnvelope,
@@ -478,7 +481,16 @@ class ExecutionRunnerTests(unittest.TestCase):
         self.assertEqual(result.outcome, "released")
         self.assertEqual(
             tuple(launched["argv"]),
-            profile_argv("synthetic-agent run", specialist),
+            # Same resolution `run_once` performs. Leaving this to the
+            # bare default asserts whatever the machine happens to have
+            # on PATH, not what #438 made the runner do.
+            profile_argv(
+                "synthetic-agent run",
+                specialist,
+                worker_command=resolve_worker_command(
+                    "foxhound-task-worker"
+                ),
+            ),
         )
         # The instructions belong to this run, not to its arguments: another
         # user reading the process table learns the profile's limits, never
@@ -487,8 +499,11 @@ class ExecutionRunnerTests(unittest.TestCase):
         self.assertEqual(launched["instructions"], specialist.document())
         self.assertEqual(launched["instructions_mode"], 0o600)
         self.assertFalse(launched["instructions_path"].exists())
+        # The run state records the worker this run actually means,
+        # which is the resolved one for the same reason the prompt is.
         self.assertEqual(
-            launched["state"].worker_command, "foxhound-task-worker"
+            launched["state"].worker_command,
+            resolve_worker_command("foxhound-task-worker"),
         )
         self.assertIn("50", launched["argv"])
         self.assertIn("terminal,file", launched["argv"])
