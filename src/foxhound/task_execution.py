@@ -271,6 +271,9 @@ class ExecutionResultEnvelope:
     repository_impact: bool = field(default=True, repr=False)
     task_work_directory: str | None = field(default=None, repr=False)
     task_kb_file: str | None = field(default=None, repr=False)
+    #: Which reader instruction this run was handed, if any.
+    reader_instruction_sequence: int | None = field(
+        default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -1314,8 +1317,9 @@ class TaskExecutionService:
                     "questions_json,external_actions_json,deliverables_json,"
                     "repository_references_json,repository_impact,"
                     "created_at,agent_profile_id,agent_profile_revision,"
-                    "task_work_directory,task_kb_file,work_digest) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "task_work_directory,task_kb_file,work_digest,"
+                    "reader_instruction_sequence) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         result["result_id"], result["task_id"],
                         result["workflow_version"], result["task_version"],
@@ -1331,6 +1335,7 @@ class TaskExecutionService:
                         result["task_work_directory"],
                         result["task_kb_file"],
                         result["work_digest"],
+                        result["reader_instruction_sequence"],
                     ),
                 )
                 version = result["workflow_version"] + 1
@@ -1464,16 +1469,79 @@ class TaskExecutionService:
             if refusal is not None:
                 raise TaskLedgerError("execution claim is unavailable")
             value = connection.execute(
-                "SELECT i.value FROM execution_reader_inputs AS i "
+                "SELECT i.sequence,i.value FROM execution_reader_inputs AS i "
                 "WHERE i.task_id=? AND i.kind='discussion' "
                 "AND i.target_workflow_version<=? AND NOT EXISTS("
                 " SELECT 1 FROM task_execution_results AS r "
-                " WHERE r.task_id=i.task_id "
-                " AND r.workflow_version>=i.target_workflow_version"
+                " WHERE r.task_id=i.task_id AND ("
+                "  r.reader_instruction_sequence=i.sequence"
+                # The fallback. Results recorded before deliveries existed
+                # name no instruction, so for those the only thing that can
+                # say an instruction was answered is still the version it
+                # was aimed at. A recorded link is preferred wherever there
+                # is one, because version arithmetic cannot tell a run that
+                # answered an instruction from one that merely ran after it.
+                "  OR (r.reader_instruction_sequence IS NULL"
+                "      AND r.workflow_version>=i.target_workflow_version)"
+                " )"
                 ") ORDER BY i.sequence DESC LIMIT 1",
                 (task_id, expected_version),
             ).fetchone()
-        return None if value is None else str(value["value"])
+            if value is None:
+                return None
+            self._record_instruction_delivery(
+                connection, row, expected_version, int(value["sequence"]), now)
+        return str(value["value"])
+
+    @staticmethod
+    def _record_instruction_delivery(
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        workflow_version: int,
+        instruction_sequence: int,
+        now: str,
+    ) -> None:
+        """Note that this run was handed this instruction, exactly once.
+
+        Handing the same run its instruction twice is one delivery, not two:
+        a worker that rebuilds its payload after a retry must not produce a
+        second event. `INSERT OR IGNORE` on the primary key makes the second
+        attempt a no-op without a round trip to check first, which also makes
+        it safe against two processes arriving together.
+        """
+        task_id = int(row["task_id"])
+        cursor = connection.execute(
+            "INSERT OR IGNORE INTO execution_reader_instruction_deliveries("
+            "task_id,workflow_version,instruction_sequence,occurred_at) "
+            "VALUES(?,?,?,?)",
+            (task_id, workflow_version, instruction_sequence, now),
+        )
+        if cursor.rowcount:
+            # The event says a handoff happened, never what was said. The
+            # reader's words live in `execution_reader_inputs` and stay
+            # there; an event stream is read in places a discussion is not.
+            TaskExecutionService._event(
+                connection, task_id, "reader_instruction_delivered",
+                workflow_version, int(row["task_version"]),
+                WorkflowPhase(row["phase"]), WorkflowStatus(row["status"]),
+                now,
+            )
+        connection.commit()
+
+    def delivered_reader_instruction_sequence(
+        self, task_id: int, *, expected_version: int
+    ) -> int | None:
+        """The instruction this run was handed, for the result to name."""
+        if not _valid_identity(task_id, expected_version):
+            return None
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT instruction_sequence "
+                "FROM execution_reader_instruction_deliveries "
+                "WHERE task_id=? AND workflow_version=?",
+                (task_id, expected_version),
+            ).fetchone()
+        return None if row is None else int(row["instruction_sequence"])
 
     def readiness(self) -> ExecutionReadiness:
         now = self._now()
@@ -2526,6 +2594,7 @@ def _validated_result(envelope: ExecutionResultEnvelope) -> dict[str, object]:
         envelope.task_work_directory, "task work directory"
     )
     task_kb_file = _result_path(envelope.task_kb_file, "task KB file")
+    instruction = _result_instruction(envelope.reader_instruction_sequence)
     if (task_work_directory is None) != (task_kb_file is None):
         raise ValueError("execution result review paths are invalid")
     document = {
@@ -2553,6 +2622,11 @@ def _validated_result(envelope: ExecutionResultEnvelope) -> dict[str, object]:
         raise ValueError("execution result digest is invalid")
     return {
         **document,
+        # Provenance, not content. A result that says the same thing is the
+        # same answer whether or not a reader prompted it, so the digest --
+        # which exists to recognise a repeat -- must not move because the
+        # instruction did.
+        "reader_instruction_sequence": instruction,
         "work_digest": work_digest or None,
         "content_digest": digest,
         "questions_json": _canonical_json(questions),
@@ -2639,6 +2713,15 @@ def _repeats_an_earlier_answer(
         ),
     ).fetchone()
     return row is not None
+
+
+def _result_instruction(value: object) -> int | None:
+    """The reader-instruction sequence a result may name, if it names one."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError("execution result reader instruction is invalid")
+    return value
 
 
 def _result_path(value: object, label: str) -> str | None:
