@@ -609,6 +609,14 @@ def _terminal_result(
         and current.status in {
             WorkflowStatus.AWAITING_REVIEW,
             WorkflowStatus.COMPLETED,
+            # A granted advance queues the next phase instead of raising a
+            # card, so the run that produced the result ends `queued` and
+            # used to be reported as making no progress -- exit 70 on every
+            # successful run, on exactly the deployments that configure a
+            # grant. A new result is what separates the two: a release
+            # leaves `last_result_id` untouched, and the guard above
+            # already requires that it changed.
+            WorkflowStatus.QUEUED,
         }
     ):
         return "recorded"
@@ -804,6 +812,11 @@ def _write_state(
             None if archive is None else str(archive.run_directory)
         ),
         "worker_command": config.worker_command,
+        # These are private run authority, not runner-only switches: the
+        # worker records the result and therefore decides whether its phase
+        # advances without a reader card.
+        "execution_grants": list(config.execution_grants),
+        "action_grants": list(config.action_grants),
     }
     payload = (
         json.dumps(
