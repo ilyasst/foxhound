@@ -12,6 +12,21 @@ make it owner-only (`0600`), and do not commit it, paste it into issues, or
 send its rendered command lines to logs. It contains paths but never token
 values.
 
+Version 8 is current. Two things about it are worth knowing before an
+upgrade, because neither announces itself:
+
+- `card_service.task_work_root` is **required** once delivery is enabled, and
+  it is what switches result artifacts on. Without it the artifact routes are
+  present, authenticated, and permanently empty: every request is refused
+  with `artifacts_unavailable`, which a caller can tell apart from a result
+  that produced no files, and which the service also reports once at
+  start-up. A deployment left on an earlier version has the routes and never
+  serves a file through them.
+- Versions 6 and 7 added `workflow.execute_without_asking` and
+  `workflow.act_without_asking`. An empty list is what their absence meant,
+  so carrying them across as empty changes nothing about what runs
+  unattended.
+
 Version 5 covers every enabled component that reads or writes the shared
 database: the task-card service, scheduler, one or more runners, feed import,
 native intake, execution-card requeue, lifecycle-outcome export, fused task
@@ -22,7 +37,7 @@ and all paths are absolute.
 ```json
 {
   "schema": "foxhound.deployment-config",
-  "schema_version": 7,
+  "schema_version": 8,
   "database": "/srv/example/private-foxhound-state/foxhound.sqlite3",
   "agent_profile_directory": null,
   "card_service": {
@@ -39,7 +54,8 @@ and all paths are absolute.
     },
     "gw_endpoint": "http://<canonical IPv4 loopback address>:8787",
     "gw_alias": "example-operator",
-    "gw_token_file": "/srv/example/private-foxhound-state/gw.token"
+    "gw_token_file": "/srv/example/private-foxhound-state/gw.token",
+    "task_work_root": "/srv/example/private-task-work"
   },
   "workflow": {
     "default_agent_profile": "general",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from foxhound import migrate_database
 
+import contextlib
 import hashlib
 import hmac
 import http.client
@@ -285,6 +286,34 @@ class TaskCardServerTests(unittest.TestCase):
         self.assertFalse(stale["ok"])
         self.assertIsNone(stale["text"])
         self.assertEqual(stale["refusal"], "stale_version")
+
+    def test_a_deployment_without_an_artifact_root_says_so_distinctly(self):
+        """"Not enabled here" must not arrive as "this card is in a bad state".
+
+        Both used to be `invalid_state`, so a caller could not tell a
+        deployment that serves no files from a card that produced none, and
+        a reader was left waiting for an attachment that was never coming.
+        """
+        unconfigured = ExecutionCardService(
+            self.database, clock=self.clock,
+            token_factory=lambda: EXECUTION_DELIVERY_TOKEN,
+        )
+        self.assertFalse(unconfigured.serves_artifacts)
+        self.assertTrue(self.execution_cards.serves_artifacts)
+        app = TaskCardApplication(
+            self.cards, TOKEN, execution_cards=unconfigured,
+        )
+
+        refused = app.dispatch("execution_artifacts", request_document(
+            card_id=1, card_version=1,
+        ))
+
+        self.assertFalse(refused["ok"])
+        self.assertEqual(refused["refusal"], "artifacts_unavailable")
+        self.assertIsNone(refused["artifacts"])
+        # The same request against a configured deployment that simply has
+        # no files is an answer, not a refusal. That is the distinction.
+        self.assertNotEqual(refused["refusal"], "invalid_state")
 
     def test_execution_artifacts_are_listed_and_downloaded_by_record(self):
         workflow = self.execution.schedule(1, expected_task_version=1)
@@ -2226,6 +2255,45 @@ class TaskCardTokenRoleTests(unittest.TestCase):
             app.execution_tokens,
             {QUEUE_VIEW_ROLE: QUEUE_VIEW_TOKEN},
         )
+
+    def test_startup_reports_when_result_artifacts_are_unavailable(self):
+        """Configuration, said once, where an operator is already looking.
+
+        A deployment with no task work root refuses every artifact request
+        for its whole life. One refusal at a time looks like a card with no
+        files; said at start-up it reads as the decision it is.
+        """
+        root = Path(self.temporary.name)
+        task_path = root / "task.token"
+        task_path.write_text(TOKEN + "\n", encoding="utf-8")
+        task_path.chmod(0o600)
+        work_root = root / "task-work-cli"
+        work_root.mkdir(mode=0o700)
+
+        def run(*extra):
+            stream = io.StringIO()
+            with mock.patch("foxhound.task_card_server.serve"), \
+                    contextlib.redirect_stdout(stream):
+                self.assertEqual(
+                    main([
+                        "--database", str(self.database),
+                        "--token-file", str(task_path),
+                        "--bind", "127.0.0.1", "--port", "8790", *extra,
+                    ]),
+                    0,
+                )
+            return stream.getvalue()
+
+        without = run()
+        with_root = run("--task-work-root", str(work_root))
+
+        self.assertIn("result artifacts unavailable", without)
+        self.assertIn("deployment configuration version 8", without)
+        self.assertNotIn("result artifacts unavailable", with_root)
+        # The revision is still reported either way: this line is additional,
+        # not a replacement.
+        self.assertIn("revision", without)
+        self.assertIn("revision", with_root)
 
     def test_cli_role_mapped_task_policy_does_not_borrow_for_execution(self):
         root = Path(self.temporary.name)
