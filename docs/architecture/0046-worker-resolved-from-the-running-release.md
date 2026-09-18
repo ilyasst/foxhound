@@ -47,8 +47,20 @@ is resolved to `Path(sys.executable).parent / command` when an executable file
 is there, and that absolute path is what goes into the agent's prompt and into
 private run state. A release then names its own worker and the agent has
 nothing left to resolve. This mirrors what `deployment_config.execute_component`
-already does for components, and the interpreter path is used as given rather
-than resolved, so a deployment whose `current` symlink moves keeps following it.
+already does for components.
+
+The interpreter path is used as given rather than resolved, so what resolution
+follows is however the interpreter was invoked. In the deployed shape that
+means the release itself, not the selector: a console script installed by `pip`
+carries the interpreter's path in its shebang, recorded when the virtual
+environment was created, and that is the release directory's own path. Units
+start a console script, so the process sees the release path and the worker
+resolves inside that same release.
+
+The worker is therefore pinned to the exact release the runner is, and
+advancing the selector while a run is in flight cannot change which worker that
+run's agent reaches. That is the property we want: the agent has to keep
+talking to the worker that matches the run state its runner wrote.
 
 `worker_command` may now also be given as an absolute path, which is returned
 unchanged: a layout we did not anticipate keeps an escape hatch. Both forms are
