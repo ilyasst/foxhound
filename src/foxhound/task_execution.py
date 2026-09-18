@@ -13,6 +13,7 @@ import os
 import re
 import secrets
 import sqlite3
+from collections.abc import Mapping
 from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta, timezone
@@ -192,6 +193,7 @@ class WorkflowRefusal(StrEnum):
     STALE_WORKFLOW = "stale_workflow"
     CLAIM_MISMATCH = "claim_mismatch"
     RESULT_CONFLICT = "result_conflict"
+    RESULT_UNCHANGED = "result_unchanged"
     AGENT_PROFILE_UNAVAILABLE = "agent_profile_unavailable"
 
 
@@ -1262,6 +1264,28 @@ class TaskExecutionService:
                 if refusal is not None:
                     connection.rollback()
                     return _refused_row(result["task_id"], row, refusal)
+                if _repeats_an_earlier_answer(connection, result):
+                    # A pass that was asked to change something and produced
+                    # a byte-identical result did not answer the request. It
+                    # is the shape of work that was done and then lost before
+                    # recording, and presenting it to the reader as an answer
+                    # is what made that loss invisible.
+                    #
+                    # The claim stays live: the agent can re-read its own run
+                    # directory, find what it actually wrote, and record that
+                    # instead. A refusal it can act on is worth more than a
+                    # result nobody can trust.
+                    self._event(
+                        connection, result["task_id"], "result_unchanged",
+                        int(row["version"]), int(row["task_version"]),
+                        WorkflowPhase(row["phase"]),
+                        WorkflowStatus(row["status"]), now,
+                    )
+                    connection.commit()
+                    return _refused_row(
+                        result["task_id"], row,
+                        WorkflowRefusal.RESULT_UNCHANGED,
+                    )
                 target = _result_target(
                     WorkflowPhase(result["phase"]),
                     ExecutionOutcome(result["outcome"]),
@@ -2537,6 +2561,84 @@ def _validated_result(envelope: ExecutionResultEnvelope) -> dict[str, object]:
         "repository_references_json": _canonical_json(repository_references),
         "claim_token": envelope.claim_token,
     }
+
+
+#: The fields that are the agent's answer. Everything else on a result is
+#: bookkeeping: identifiers, the phase, the locations it was authored in, and
+#: the queue blurb.
+#:
+#: `questions` is deliberately absent. An agent re-asks a different set almost
+#: every pass, and letting a changed question list prove the answer changed is
+#: what a repeated report already looks like in practice: the same prose,
+#: recorded three passes running, under four distinct content digests.
+#:
+#: `outcome` is deliberately present. The same prose recorded as `completed`
+#: rather than `awaiting_plan` is a different answer -- the difference between
+#: proposing something and declaring it done -- and excluding it made a
+#: terminal outcome impossible to record over unchanged text.
+#:
+#: The deliverables, external actions and repository references are present
+#: because a correction that attaches the deliverable it forgot HAS changed
+#: its answer. Excluding them taught an agent to pad its wording to get past
+#: the guard, and told a reader "same answer" above an effect list that had
+#: changed completely.
+_ANSWER_COLUMNS = (
+    "outcome",
+    "summary",
+    "work_markdown",
+    "external_actions_json",
+    "deliverables_json",
+    "repository_references_json",
+    "repository_impact",
+)
+
+
+def _cycle_started_at(connection: sqlite3.Connection, task_id: int) -> int:
+    """The workflow version this task was most recently scheduled at.
+
+    A task that is cancelled and scheduled again, or dropped back into the
+    queue, begins a new cycle. Results from the cycle before it describe work
+    the reader already saw and closed, and comparing against them would refuse
+    a new cycle's opening result -- forever, since every retry would be refused
+    identically, until the claim expired and the workflow parked.
+    """
+    row = connection.execute(
+        "SELECT workflow_version FROM task_execution_events "
+        "WHERE task_id=? AND kind='scheduled' "
+        "ORDER BY sequence DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return 0 if row is None else int(row["workflow_version"])
+
+
+def _repeats_an_earlier_answer(
+    connection: sqlite3.Connection, result: Mapping[str, object]
+) -> bool:
+    """Whether this result says exactly what an earlier one in this cycle said.
+
+    Compared against every prior result in the cycle rather than only the most
+    recent. A pass that reproduces the one before last is the same failure as
+    one that reproduces the last, and checking only the newest let an X, Y, X
+    sequence through -- which is the shape the reports that prompted this
+    actually had.
+
+    Scoped to the same `task_version`, so editing the task always opens a
+    clean slate, and to the same phase, so planning and executing are never
+    held against each other.
+    """
+    predicate = " AND ".join(f"{column}=?" for column in _ANSWER_COLUMNS)
+    row = connection.execute(
+        "SELECT 1 FROM task_execution_results "
+        "WHERE task_id=? AND task_version=? AND phase=? "
+        "AND workflow_version>=? "
+        f"AND {predicate} LIMIT 1",
+        (
+            result["task_id"], result["task_version"], result["phase"],
+            _cycle_started_at(connection, int(result["task_id"])),
+            *(result[column] for column in _ANSWER_COLUMNS),
+        ),
+    ).fetchone()
+    return row is not None
 
 
 def _result_path(value: object, label: str) -> str | None:
