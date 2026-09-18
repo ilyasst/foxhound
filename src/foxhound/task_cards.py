@@ -50,6 +50,7 @@ SNOOZE_INTERVAL = timedelta(days=3)
 OPEN_REVIEW_INTERVAL = timedelta(days=7)
 CALLBACK_PREFIX = "fhc"
 CALLBACK_DATA_LIMIT = 64
+
 TASK_CARD_ACTIONS = frozenset({
     "done",
     "keep_open",
@@ -58,6 +59,40 @@ TASK_CARD_ACTIONS = frozenset({
     "duplicate_confirm",
     "duplicate_reject",
 })
+
+#: Workflow statuses that mean execution is finished with a task. Everything
+#: else counts as execution still holding it.
+#:
+#: Stated as the terminal set rather than the live one on purpose. A status
+#: added to the workflow later is then held by default, and the cost of that
+#: default is a card we did not raise. Enumerating the live statuses instead
+#: would let a new one fall through to this surface, where `done` and `drop`
+#: close the task and cancel the workflow underneath it.
+FINISHED_WORKFLOW_STATUSES = ("completed", "cancelled")
+
+_FINISHED_WORKFLOW_SQL = ",".join(
+    f"'{status}'" for status in FINISHED_WORKFLOW_STATUSES
+)
+
+#: A task whose workflow has not finished. Execution owns the question, asks
+#: it with the evidence attached, and offers controls that do not close the
+#: task as a side effect.
+_EXECUTION_HOLDS = (
+    "EXISTS(SELECT 1 FROM task_execution_workflows AS workflow "
+    " WHERE workflow.task_id=t.id "
+    f" AND workflow.status NOT IN ({_FINISHED_WORKFLOW_SQL}))"
+)
+
+#: A task whose workflow finished recently. Execution raises its own end card
+#: on completion, so carding the task the moment the workflow lets go asks the
+#: same question from two surfaces at once. The backlog waits one review
+#: interval before treating the task as dormant.
+_EXECUTION_JUST_RELEASED = (
+    "EXISTS(SELECT 1 FROM task_execution_workflows AS workflow "
+    " WHERE workflow.task_id=t.id "
+    f" AND workflow.status IN ({_FINISHED_WORKFLOW_SQL}) "
+    " AND COALESCE(workflow.completed_at,workflow.updated_at)>?)"
+)
 
 
 class CardStatus(StrEnum):
@@ -264,6 +299,12 @@ class TaskCardService:
                 refusal=CardRefusal.INVALID_ARGUMENT,
             )
         now = self._now()
+        # Anything execution finished before this is treated as dormant and
+        # may be carded again; anything after it is still execution's to
+        # answer. See `_EXECUTION_JUST_RELEASED`.
+        dormant_after = (
+            self._clock_value() - OPEN_REVIEW_INTERVAL
+        ).isoformat(timespec="seconds")
         with closing(self._connect()) as connection:
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("BEGIN IMMEDIATE")
@@ -274,6 +315,8 @@ class TaskCardService:
                     + _bound_source_revision("t.id") + " AS source_revision "
                     "FROM tasks AS t "
                     "WHERE t.status='open' "
+                    "AND NOT " + _EXECUTION_HOLDS + " "
+                    "AND NOT " + _EXECUTION_JUST_RELEASED + " "
                     "AND NOT EXISTS(SELECT 1 FROM task_relations AS relation "
                     " WHERE relation.subject_id=t.id AND relation.kind='duplicate_of' "
                     " AND relation.withdrawn_at IS NULL) "
@@ -307,7 +350,7 @@ class TaskCardService:
                     "             AND event.kind='delivered')"
                     " )) ) "
                     "ORDER BY t.created_at,t.id LIMIT ?",
-                    (now, limit),
+                    (dormant_after, now, limit),
                 ).fetchall()
                 for row in rows:
                     cursor = connection.execute(
@@ -1446,6 +1489,7 @@ class TaskCardService:
             "FROM task_review_cards AS c JOIN tasks AS t ON t.id=c.task_id "
             "WHERE c.status IN ('pending','delivering','delivered','snoozed') "
             "AND (t.status!='open' OR t.version!=c.task_version "
+            "OR " + _EXECUTION_HOLDS + " "
             "OR COALESCE(c.source_revision,'')!=COALESCE("
             + _bound_source_revision("t.id") + ",'') OR EXISTS("
             " SELECT 1 FROM task_relations AS relation "
