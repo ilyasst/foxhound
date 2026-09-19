@@ -4314,13 +4314,19 @@ def _button_rows(
             and card.failure_reason == "context_exhausted"
         ):
             # A measured context refusal cannot be repaired by repeating the
-            # same run. Keep discussion, reassignment, and closure available,
-            # but do not put a normal retry button beside this diagnosis.
-            return (
+            # same run, so this set carries no retry. Everything that is not
+            # a retry stays: a reader who has already done the work by hand
+            # still needs Done, and one who cannot act yet still needs
+            # Snooze. Drop abandons a task rather than settling it, and must
+            # not be the only way to close work that merely did not fit.
+            rows = (
                 (("✏️ Reduce scope", "discuss"),),
+                SNOOZE_BUTTON_ROW,
                 (("🗑 Drop", "drop"), ("👥 Reassign", "reassign")),
-                (("📋 Task brief", "brief"),),
             )
+            if approvable:
+                rows = ((("✅ Done", "done"),),) + rows
+            return rows + ((("📋 Task brief", "brief"),),)
         rows: tuple[tuple[tuple[str, str], ...], ...] = (
             (("✅ Done", "done"), ("▶️ Continue", "start")),
             (("🗑 Drop", "drop"), ("✏️ Update", "discuss")),

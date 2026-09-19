@@ -1991,6 +1991,12 @@ class ExecutionCardTests(unittest.TestCase):
         }
         self.assertNotIn("▶️ Continue", labels)
         self.assertIn("✏️ Reduce scope", labels)
+        # Withholding the retry must not withhold the ways to settle or
+        # defer the task; Drop abandons it and is not a substitute.
+        self.assertIn("✅ Done", labels)
+        self.assertIn("👥 Reassign", labels)
+        self.assertTrue(any("Snooze" in label or "⏰" in label
+                            for label in labels), labels)
 
     def test_a_workflow_that_gave_up_says_so_instead_of_going_quiet(self):
         """Parking is the retry limiter, and it used to be terminal and
