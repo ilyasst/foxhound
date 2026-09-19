@@ -1081,6 +1081,104 @@ class TaskExecutionTests(unittest.TestCase):
             (WorkflowStatus.QUEUED, WorkflowPhase.PLAN),
         )
 
+    def test_a_declared_kind_starts_at_execute_without_a_plan_event(self):
+        """Skipping a phase is explicit and avoids creating plan evidence."""
+        self._bind_origin(1, "issue")
+        service = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            execution_grants=["issue"],
+            skip_planning_for=["issue"],
+            profile_registry=self.service._profile_registry,
+        )
+
+        scheduled = service.schedule(1, expected_task_version=1)
+
+        self.assertEqual(
+            (scheduled.status, scheduled.phase),
+            (WorkflowStatus.QUEUED, WorkflowPhase.EXECUTE),
+        )
+        with closing(sqlite3.connect(self.database)) as connection:
+            events = connection.execute(
+                "SELECT phase FROM task_execution_events WHERE task_id=?",
+                (1,),
+            ).fetchall()
+            results = connection.execute(
+                "SELECT COUNT(*) FROM task_execution_results WHERE task_id=?",
+                (1,),
+            ).fetchone()[0]
+        self.assertEqual(events, [("execute",)])
+        self.assertEqual(results, 0)
+
+    def test_skip_planning_requires_execution_authority(self):
+        with self.assertRaisesRegex(ValueError, "execution grants: issue"):
+            TaskExecutionService(
+                self.database,
+                clock=self.clock,
+                skip_planning_for=["issue"],
+                profile_registry=self.service._profile_registry,
+            )
+
+    def test_a_skipped_workflow_does_not_consume_plan_queue_capacity(self):
+        self._bind_origin(1, "issue")
+        service = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            execution_grants=["issue"],
+            skip_planning_for=["issue"],
+            plan_ready_cap=0,
+            profile_registry=self.service._profile_registry,
+        )
+
+        result = service.schedule_new()
+
+        self.assertEqual((result.scheduled, result.capped), (1, 0))
+        self.assertEqual(service.get(1).phase, WorkflowPhase.EXECUTE)
+
+    def test_planning_without_execution_keeps_the_plan_for_reader_review(self):
+        self._bind_origin(1, "issue")
+        service = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            planning_grants=["issue"],
+            profile_registry=self.service._profile_registry,
+        )
+        scheduled = service.schedule(1, expected_task_version=1)
+        claim = service.claim_next()
+        self.assertIsNotNone(claim)
+
+        recorded = service.record_result(self._result(claim))
+
+        self.assertEqual(
+            (scheduled.phase, recorded.status, recorded.phase),
+            (
+                WorkflowPhase.PLAN,
+                WorkflowStatus.AWAITING_REVIEW,
+                WorkflowPhase.PLAN,
+            ),
+        )
+
+    def test_a_skip_declaration_does_not_rewrite_an_existing_plan(self):
+        self._bind_origin(1, "issue")
+        original = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            planning_grants=["issue"],
+            profile_registry=self.service._profile_registry,
+        ).schedule(1, expected_task_version=1)
+        self.assertEqual(original.phase, WorkflowPhase.PLAN)
+
+        replay = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            execution_grants=["issue"],
+            skip_planning_for=["issue"],
+            profile_registry=self.service._profile_registry,
+        ).schedule(1, expected_task_version=1)
+
+        self.assertEqual(replay.disposition, WorkflowDisposition.UNCHANGED)
+        self.assertEqual(replay.phase, WorkflowPhase.PLAN)
+
     def test_a_new_planning_grant_promotes_an_existing_start_gate(self):
         """A previously delivered Start card must not survive the grant."""
         self._bind_origin(1, "review_request")
