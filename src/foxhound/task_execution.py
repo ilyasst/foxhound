@@ -197,6 +197,17 @@ class WorkflowRefusal(StrEnum):
     AGENT_PROFILE_UNAVAILABLE = "agent_profile_unavailable"
 
 
+#: Statuses whose pin may be rebound. `running` is excluded deliberately: an
+#: agent mid-run holds a lease sized by the revision it started under, and
+#: rebinding beneath it is exactly what ADR 0024's fence protects.
+_ADOPTABLE_STATUSES = (
+    WorkflowStatus.QUEUED,
+    WorkflowStatus.PARKED,
+    WorkflowStatus.AWAITING_START,
+    WorkflowStatus.SNOOZED,
+    WorkflowStatus.AWAITING_REVIEW,
+)
+
 class WorkflowPriority(StrEnum):
     """The only reader-controlled ordering states for one ready workflow."""
 
@@ -312,6 +323,38 @@ class ExecutionReadiness:
     context_exhausted: int
     completed: int
     cancelled: int
+
+
+@dataclass(frozen=True)
+class ProfileAdoptionResult:
+    """Content-free outcome of one bounded profile-adoption pass.
+
+    Counts only. Which workflows moved is in the ledger and its events; a
+    report that named them would leak the queue's shape to anywhere this is
+    printed, and an operator deciding whether to run it again needs the
+    magnitudes, not the identities.
+    """
+
+    #: Workflows examined: pinned to a retired revision of an installed
+    #: profile, and eligible by status.
+    examined: int
+    #: Workflows rebound to the installed revision.
+    adopted: int
+    #: Eligible workflows left alone because the pass hit its limit.
+    remaining: int
+    #: Adoptions that moved a workflow to a **smaller** budget. Never
+    #: silent: a workflow that loses time because its profile was narrowed
+    #: is a decision, and the operator is told it happened.
+    narrowed: int
+    #: Workflows skipped because they are running. Rebinding under a live
+    #: claim is what ADR 0024's fence protects, and it stays protected.
+    skipped_running: int
+    #: Workflows whose retired revision could not be read, so the budget
+    #: change could not be compared. Adopted anyway -- the installed
+    #: revision is by definition the one the operator chose -- but counted.
+    unknown_budget: int
+    #: True when nothing was written.
+    dry_run: bool
 
 
 @dataclass(frozen=True)
@@ -1719,6 +1762,193 @@ class TaskExecutionService:
                 "context_exhausted", "completed", "cancelled",
             )
         ))
+
+    def adopt_installed_revision(
+        self, task_id: int, *, expected_version: int
+    ) -> WorkflowOperationResult:
+        """Rebind one workflow to the installed revision of its own profile.
+
+        This is not :meth:`select_agent`. That answers "which agent should do
+        this?" -- a choice between alternatives, fenced to before the work
+        starts. This answers a different question: the workflow is pinned to a
+        revision of the profile it already names, that revision is no longer
+        the installed one, and the pin is keeping it on a budget the operator
+        has replaced. The profile identity never changes here.
+
+        Valid for any workflow that is not ``running``. Rebinding under a live
+        claim is precisely what ADR 0024's fence protects -- an agent mid-run
+        holds a lease sized by the revision it started under -- and that
+        protection is unchanged.
+        """
+        if not _valid_identity(task_id, expected_version):
+            return _refused(task_id, WorkflowRefusal.INVALID_ARGUMENT)
+        stamp = self._clock_value()
+        now = stamp.astimezone(timezone.utc).isoformat(timespec="seconds")
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                result = self._adopt_one(
+                    connection, task_id,
+                    expected_version=expected_version, now=now,
+                )
+                if not result.accepted:
+                    connection.rollback()
+                    return result
+                connection.commit()
+                return result
+            except Exception:
+                connection.rollback()
+                raise
+
+    def _adopt_one(
+        self,
+        connection: sqlite3.Connection,
+        task_id: int,
+        *,
+        expected_version: int,
+        now: str,
+    ) -> WorkflowOperationResult:
+        """Apply one adoption inside the caller's transaction."""
+        row = self._workflow_with_task(connection, task_id)
+        refusal = _workflow_guard(row, expected_version, _ADOPTABLE_STATUSES)
+        if refusal is None:
+            refusal = _task_guard(row, int(row["task_version"]))
+        if refusal is not None:
+            return _refused_row(task_id, row, refusal)
+
+        installed = self._profile_registry.get(row["agent_profile_id"])
+        if installed is None:
+            return _refused_row(
+                task_id, row, WorkflowRefusal.AGENT_PROFILE_UNAVAILABLE
+            )
+        if row["phase"] not in installed.allowed_phases:
+            # The installed revision cannot run this workflow's phase, so
+            # adopting it would strand the work rather than unblock it.
+            return _refused_row(
+                task_id, row, WorkflowRefusal.AGENT_PROFILE_UNAVAILABLE
+            )
+        if row["agent_profile_revision"] == installed.revision:
+            return _operation(row, WorkflowDisposition.UNCHANGED)
+
+        version = expected_version + 1
+        updated = connection.execute(
+            "UPDATE task_execution_workflows SET version=?,"
+            "agent_profile_revision=?,updated_at=? "
+            "WHERE task_id=? AND version=? AND status!='running'",
+            (version, installed.revision, now, task_id, expected_version),
+        )
+        if updated.rowcount != 1:
+            return _refused_row(task_id, row, WorkflowRefusal.STALE_WORKFLOW)
+        TaskExecutionService._event(
+            connection,
+            task_id,
+            "agent_selected",
+            version,
+            int(row["task_version"]),
+            WorkflowPhase(row["phase"]),
+            WorkflowStatus(row["status"]),
+            now,
+        )
+        return WorkflowOperationResult(
+            WorkflowDisposition.APPLIED,
+            task_id,
+            version,
+            WorkflowStatus(row["status"]),
+            WorkflowPhase(row["phase"]),
+            agent_profile_id=installed.profile_id,
+            agent_profile_revision=installed.revision,
+        )
+
+    def adopt_installed_revisions(
+        self, *, limit: int = 100, dry_run: bool = True
+    ) -> ProfileAdoptionResult:
+        """Rebind eligible workflows to their profile's installed revision.
+
+        Bounded per pass and content-free in its report, because the operator
+        case is a queue of hundreds: rebinding many workflows at once changes
+        many versions and retires many cards, so a pass says how much it moved
+        rather than which work it touched.
+
+        Defaults to a dry run. The count an operator acts on and the act
+        itself should not be the same keystroke.
+        """
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise TaskLedgerError("adoption limit must be a positive integer")
+        stamp = self._clock_value()
+        now = stamp.astimezone(timezone.utc).isoformat(timespec="seconds")
+        examined = adopted = narrowed = unknown = skipped_running = 0
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                placeholders = ",".join("?" for _ in _ADOPTABLE_STATUSES)
+                rows = connection.execute(
+                    "SELECT w.task_id,w.version,w.status,w.phase,"
+                    "w.agent_profile_id,w.agent_profile_revision "
+                    "FROM task_execution_workflows AS w JOIN tasks AS t "
+                    "ON t.id=w.task_id "
+                    f"WHERE w.status IN ({placeholders}) "
+                    "AND t.status='open' AND t.version=w.task_version "
+                    "ORDER BY w.task_id",
+                    tuple(s.value for s in _ADOPTABLE_STATUSES),
+                ).fetchall()
+                skipped_running = int(connection.execute(
+                    "SELECT COUNT(*) FROM task_execution_workflows AS w "
+                    "JOIN tasks AS t ON t.id=w.task_id "
+                    "WHERE w.status='running' AND t.status='open'"
+                ).fetchone()[0])
+
+                for row in rows:
+                    installed = self._profile_registry.get(
+                        row["agent_profile_id"]
+                    )
+                    if installed is None:
+                        continue
+                    if row["agent_profile_revision"] == installed.revision:
+                        continue
+                    if row["phase"] not in installed.allowed_phases:
+                        continue
+                    examined += 1
+                    if adopted >= limit:
+                        continue
+                    try:
+                        retired = self._profile_registry.resolve(
+                            row["agent_profile_id"],
+                            row["agent_profile_revision"],
+                        )
+                    except AgentProfileError:
+                        retired = None
+                    if retired is None:
+                        unknown += 1
+                    elif (
+                        installed.max_turns < retired.max_turns
+                        or installed.timeout_seconds < retired.timeout_seconds
+                    ):
+                        narrowed += 1
+                    if dry_run:
+                        adopted += 1
+                        continue
+                    result = self._adopt_one(
+                        connection, int(row["task_id"]),
+                        expected_version=int(row["version"]), now=now,
+                    )
+                    if result.disposition is WorkflowDisposition.APPLIED:
+                        adopted += 1
+                if dry_run:
+                    connection.rollback()
+                else:
+                    connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return ProfileAdoptionResult(
+            examined=examined,
+            adopted=adopted,
+            remaining=max(examined - adopted, 0),
+            narrowed=narrowed,
+            skipped_running=skipped_running,
+            unknown_budget=unknown,
+            dry_run=dry_run,
+        )
 
     def profile_health(self) -> tuple[ExecutionProfileHealth, ...]:
         """Return aggregate workflow counts by exact profile revision."""
