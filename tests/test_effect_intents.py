@@ -180,13 +180,142 @@ class PersistentEffectExecutorTests(unittest.TestCase):
         self.assertEqual(tables, {"effect_intents", "effect_receipts"})
         self.assertEqual(version, SCHEMA_VERSION)
 
+    def test_inspect_confirms_completed_effect_after_crash(self):
+        """Crash after the write landed but before the receipt committed.
+
+        The adapter's inspect() reports 'completed', so execute() adopts it
+        instead of calling the adapter again and risking a duplicate.
+        """
+        intent = self._intent(suffix="d")
+        # First attempt: adapter executes and completes, but we simulate a
+        # crash by deleting the receipt row afterwards.
+        initial_adapter = _RecordingExecutor(self.database, "completed")
+        PersistentEffectExecutor(self.database, initial_adapter).execute(intent)
+        # Simulate the crash scenario: the external write landed but the
+        # local receipt commit died.  Delete the receipt row.
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "DELETE FROM effect_receipts WHERE intent_id=?",
+                (intent.intent_id,),
+            )
+            # Verify: intent exists, receipt does not
+            self.assertTrue(connection.execute(
+                "SELECT COUNT(*) FROM effect_intents WHERE intent_id=?",
+                (intent.intent_id,),
+            ).fetchone()[0] == 1)
+            self.assertTrue(connection.execute(
+                "SELECT COUNT(*) FROM effect_receipts WHERE intent_id=?",
+                (intent.intent_id,),
+            ).fetchone()[0] == 0)
+        # Retry with an adapter whose inspect() confirms the effect landed.
+        retry_adapter = _RecordingExecutor(
+            self.database, "completed", inspect_state="completed",
+        )
+        receipt = PersistentEffectExecutor(self.database, retry_adapter).execute(
+            intent,
+        )
+
+        self.assertEqual(receipt.state, "completed")
+        self.assertEqual(retry_adapter.calls, 0)
+        self.assertEqual(retry_adapter.inspect_calls, 1)
+        with closing(sqlite3.connect(self.database)) as connection:
+            stored = connection.execute(
+                "SELECT state FROM effect_receipts WHERE intent_id=?",
+                (intent.intent_id,),
+            ).fetchone()[0]
+        self.assertEqual(stored, "completed")
+
+    def test_inspect_reports_not_done_allows_retry(self):
+        """inspect() returns a non-completed receipt -> execute() proceeds."""
+        intent = self._intent(suffix="e")
+        # First attempt fails, leaving a failed receipt
+        failing_adapter = _RecordingExecutor(self.database, "failed")
+        PersistentEffectExecutor(self.database, failing_adapter).execute(intent)
+        # Retry with inspect() reporting the effect didn't land
+        retry_adapter = _RecordingExecutor(
+            self.database, "completed", inspect_state="prepared",
+        )
+        receipt = PersistentEffectExecutor(self.database, retry_adapter).execute(
+            intent,
+        )
+
+        self.assertEqual(receipt.state, "completed")
+        self.assertEqual(retry_adapter.calls, 1)
+        self.assertEqual(retry_adapter.inspect_calls, 1)
+
+    def test_inspect_cannot_answer_still_proceeds(self):
+        """When inspect() returns None, execute() proceeds to call the adapter.
+
+        The adapter's idempotency key or the external system's own dedup should
+        handle this case. The executor cannot prevent the call when the adapter
+        literally cannot determine the effect's state.
+        """
+        intent = self._intent(suffix="f")
+        # First attempt fails
+        failing_adapter = _RecordingExecutor(self.database, "failed")
+        PersistentEffectExecutor(self.database, failing_adapter).execute(intent)
+        # Retry with inspect() returning None (cannot answer)
+        retry_adapter = _RecordingExecutor(
+            self.database, "completed", inspect_state=None,
+        )
+        receipt = PersistentEffectExecutor(self.database, retry_adapter).execute(
+            intent,
+        )
+
+        self.assertEqual(receipt.state, "completed")
+        self.assertEqual(retry_adapter.calls, 1)
+        self.assertEqual(retry_adapter.inspect_calls, 1)
+
+    def test_cancel_records_a_receipt(self):
+        """A cancelled effect is recorded so an intent with no receipt no
+        longer conflates cancellation with a crash."""
+        intent = self._intent(suffix="a")
+        executor = PersistentEffectExecutor(self.database, _RecordingExecutor(
+            self.database, "completed",
+        ))
+        # Persist the intent first
+        executor._persist_intent(intent)
+        receipt = executor.cancel(intent)
+
+        self.assertEqual(receipt.state, "cancelled")
+        with closing(sqlite3.connect(self.database)) as connection:
+            stored = connection.execute(
+                "SELECT state FROM effect_receipts WHERE intent_id=?",
+                (intent.intent_id,),
+            ).fetchone()[0]
+        self.assertEqual(stored, "cancelled")
+
 
 class _RecordingExecutor:
-    def __init__(self, database: Path, state: str):
+    """Adapter mock that records calls and returns a configurable state.
+
+    Parameters:
+        database: database path for internal checks
+        state: state returned by ``execute()``
+        inspect_state: state returned by ``inspect()``. Pass ``None`` to make
+            ``inspect()`` return ``None`` (cannot answer).  Pass a string from
+            ``ATTEMPT_STATES`` to return a matching ``EffectReceipt``.
+            Defaults to ``None`` (cannot answer).
+    """
+    def __init__(
+        self,
+        database: Path,
+        state: str,
+        *,
+        inspect_state: str | None = None,
+    ):
         self.database = database
         self.state = state
+        self.inspect_state = inspect_state
         self.calls = 0
+        self.inspect_calls = 0
         self.intent_rows_when_called = 0
+
+    def prepare(self, intent: EffectIntent) -> EffectReceipt:
+        return EffectReceipt(intent.intent_id, "prepared", None, False)
+
+    def preflight(self, intent: EffectIntent) -> EffectReceipt:
+        return EffectReceipt(intent.intent_id, "prepared", None, False)
 
     def execute(self, intent: EffectIntent) -> EffectReceipt:
         self.calls += 1
@@ -198,6 +327,17 @@ class _RecordingExecutor:
         return EffectReceipt(
             intent.intent_id, self.state, f"receipt-{self.calls}", False,
         )
+
+    def inspect(self, intent: EffectIntent) -> EffectReceipt | None:
+        self.inspect_calls += 1
+        if self.inspect_state is None:
+            return None
+        return EffectReceipt(
+            intent.intent_id, self.inspect_state, None, False,
+        )
+
+    def cancel(self, intent: EffectIntent) -> EffectReceipt:
+        return EffectReceipt(intent.intent_id, "cancelled", None, False)
 
 
 def _now() -> datetime:
