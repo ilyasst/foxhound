@@ -548,7 +548,13 @@ class TaskExecutionService:
                     "SELECT COUNT(*) FROM tasks AS t "
                     "LEFT JOIN task_execution_workflows AS w "
                     "ON w.task_id=t.id WHERE t.status='open' "
-                    "AND w.task_id IS NULL AND NOT EXISTS("
+                    "AND (w.task_id IS NULL OR (w.task_version!=t.version "
+                    "AND EXISTS(SELECT 1 FROM task_candidate_bindings AS review "
+                    "JOIN candidate_inbox AS source "
+                    "ON source.candidate_id=review.candidate_id "
+                    "WHERE review.task_id=t.id AND review.relation='accepted' "
+                    "AND source.source_kind='review_request'))) "
+                    "AND NOT EXISTS("
                     " SELECT 1 FROM task_candidate_bindings AS b JOIN "
                     " task_candidate_lifecycle AS l ON l.candidate_id=b.candidate_id "
                     " WHERE b.task_id=t.id AND b.relation='accepted' "
@@ -644,7 +650,8 @@ class TaskExecutionService:
                 )
 
                 rows = connection.execute(
-                    "SELECT t.id,t.version," + _OWNER_COLUMNS + "("
+                    "SELECT t.id,t.version,w.task_id AS workflow_task_id,"
+                    "w.version AS workflow_version," + _OWNER_COLUMNS + "("
                     " SELECT o.source_kind FROM task_candidate_bindings AS b "
                     " JOIN candidate_inbox AS o "
                     " ON o.candidate_id=b.candidate_id "
@@ -652,7 +659,13 @@ class TaskExecutionService:
                     ") AS origin_kind FROM tasks AS t "
                     "LEFT JOIN task_execution_workflows AS w "
                     "ON w.task_id=t.id WHERE t.status='open' "
-                    "AND w.task_id IS NULL AND NOT EXISTS("
+                    "AND (w.task_id IS NULL OR (w.task_version!=t.version "
+                    "AND EXISTS(SELECT 1 FROM task_candidate_bindings AS review "
+                    "JOIN candidate_inbox AS source "
+                    "ON source.candidate_id=review.candidate_id "
+                    "WHERE review.task_id=t.id AND review.relation='accepted' "
+                    "AND source.source_kind='review_request'))) "
+                    "AND NOT EXISTS("
                     " SELECT 1 FROM task_candidate_bindings AS blocked JOIN "
                     " task_candidate_lifecycle AS l "
                     " ON l.candidate_id=blocked.candidate_id "
@@ -691,24 +704,44 @@ class TaskExecutionService:
                                 continue
                             waiting_room -= 1
                     profile = self._profile_for(row["origin_kind"])
-                    connection.execute(
-                        "INSERT INTO task_execution_workflows("
-                        "task_id,task_version,status,phase,version,due_at,"
-                        "failure_count,created_at,updated_at,agent_profile_id,"
-                        "agent_profile_revision) "
-                        "VALUES(?,?,?,?,1,NULL,0,?,?,?,?)",
-                        (
-                            task_id, task_version, status.value, phase.value,
-                            now, now,
-                            profile.profile_id,
-                            profile.revision,
-                        ),
-                    )
+                    if row["workflow_task_id"] is None:
+                        version = 1
+                        connection.execute(
+                            "INSERT INTO task_execution_workflows("
+                            "task_id,task_version,status,phase,version,due_at,"
+                            "failure_count,created_at,updated_at,agent_profile_id,"
+                            "agent_profile_revision) "
+                            "VALUES(?,?,?,?,?,NULL,0,?,?,?,?)",
+                            (
+                                task_id, task_version, status.value, phase.value,
+                                version, now, now,
+                                profile.profile_id,
+                                profile.revision,
+                            ),
+                        )
+                    else:
+                        version = int(row["workflow_version"]) + 1
+                        connection.execute(
+                            "UPDATE task_execution_workflows SET task_version=?,"
+                            "status=?,phase=?,version=?,due_at=NULL,"
+                            "claim_token_digest=NULL,claimed_at=NULL,"
+                            "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
+                            "failure_count=0,last_failure_reason=NULL,"
+                            "last_failure_exit_code=NULL,last_failure_run_id=NULL,"
+                            "last_failure_at=NULL,next_attempt_at=NULL,"
+                            "parked_at=NULL,last_result_id=NULL,updated_at=?,"
+                            "completed_at=NULL,agent_profile_id=?,"
+                            "agent_profile_revision=? WHERE task_id=?",
+                            (
+                                task_version, status.value, phase.value, version,
+                                now, profile.profile_id, profile.revision, task_id,
+                            ),
+                        )
                     self._event(
                         connection,
                         task_id,
                         "scheduled",
-                        1,
+                        version,
                         task_version,
                         phase,
                         status,
