@@ -260,12 +260,8 @@ def validate(source: Path) -> dict[str, Any]:
         for revision in entry.history:
             _load_revision(root, profile_id, revision)
             resolvable += 1
-    pending = sorted(
-        profile_id
-        for profile_id, draft in drafts.items()
-        if profile_id not in catalog
-        or compose(root, draft).revision != catalog[profile_id].revision
-    )
+    pending_inputs = _pending_inputs(root, catalog, drafts)
+    pending = sorted(pending_inputs)
     return {
         "ok": True,
         "profiles": len(catalog),
@@ -273,9 +269,111 @@ def validate(source: Path) -> dict[str, Any]:
         "resolvable_revisions": resolvable,
         "drafts": len(drafts),
         "pending": pending,
+        "pending_inputs": pending_inputs,
         "unpublished_files": _unreferenced(root, catalog),
         "missing_drafts": sorted(set(catalog) - set(drafts)),
     }
+
+
+def _pending_inputs(
+    root: Path,
+    catalog: Mapping[str, CatalogEntry],
+    drafts: Mapping[str, ProfileDraft],
+) -> dict[str, dict[str, list[str]]]:
+    result: dict[str, dict[str, list[str]]] = {}
+    for profile_id, draft in drafts.items():
+        if profile_id not in catalog or (
+            compose(root, draft).revision != catalog[profile_id].revision
+        ):
+            result[profile_id] = {
+                "shared": list(draft.shared),
+                "role": [draft.role],
+                "overlays": list(draft.overlays),
+            }
+    return result
+
+
+def mirror(source: Path, target: Path) -> dict[str, Any]:
+    """Fast-forward one editable store, including every published input.
+
+    Revisions alone do not reproduce a store: its drafts refer to shared and
+    overlay fragments.  Copy those inputs before advancing the catalog so a
+    destination can validate the same effective revisions as its source.
+    """
+    root = _store_root(source)
+    destination = _store_root(target)
+    catalog = _load_catalog(root)
+    destination_catalog = _load_catalog(destination)
+    _require_fast_forward(destination_catalog, catalog)
+    drafts = load_drafts(root)
+    # Refuse a source that cannot reproduce itself before writing anything.
+    # Copying an unpublished draft edit leaves the destination pending too,
+    # and discovering that after the copy would have already replaced the
+    # destination's own drafts with no catalog advance to show for it.
+    if _pending_inputs(root, catalog, drafts):
+        raise ProfileStoreError("source agent profile inputs are pending")
+    for profile_id, draft in drafts.items():
+        _copy_fragment_set(root, destination, draft, profile_id)
+    revisions = 0
+    for profile_id, entry in catalog.items():
+        for revision in entry.history:
+            _write_revision(destination, _load_revision(root, profile_id, revision))
+            revisions += 1
+    pending = _pending_inputs(destination, catalog, load_drafts(destination))
+    if pending:
+        raise ProfileStoreError("mirrored agent profile inputs are pending")
+    _write_catalog(destination, catalog)
+    validate(destination)
+    return {
+        "ok": True,
+        "profiles": len(catalog),
+        "revisions": revisions,
+        "pending": [],
+    }
+
+
+def _require_fast_forward(
+    destination: Mapping[str, CatalogEntry], source: Mapping[str, CatalogEntry]
+) -> None:
+    """Refuse histories which contain a revision the source never offered."""
+    for profile_id, entry in destination.items():
+        incoming = source.get(profile_id)
+        if incoming is None or not set(entry.history) <= set(incoming.history):
+            raise ProfileStoreError("agent profile histories diverged")
+
+
+def _copy_fragment_set(
+    source: Path, target: Path, draft: ProfileDraft, profile_id: str
+) -> None:
+    for name in draft.shared:
+        _copy_fragment(
+            source / SHARED_DIRECTORY / name,
+            target / SHARED_DIRECTORY / name,
+        )
+    _copy_fragment(
+        source / DRAFTS_DIRECTORY / profile_id / draft.role,
+        target / DRAFTS_DIRECTORY / profile_id / draft.role,
+    )
+    _copy_file(
+        source / DRAFTS_DIRECTORY / profile_id / POLICY_NAME,
+        target / DRAFTS_DIRECTORY / profile_id / POLICY_NAME,
+        maximum=MAX_MANIFEST_BYTES,
+    )
+    for name in draft.overlays:
+        _copy_fragment(
+            source / OVERLAYS_DIRECTORY / name,
+            target / OVERLAYS_DIRECTORY / name,
+        )
+
+
+def _copy_fragment(source: Path, target: Path) -> None:
+    _read_fragment(source)
+    _copy_file(source, target, maximum=MAX_FRAGMENT_BYTES)
+
+
+def _copy_file(source: Path, target: Path, *, maximum: int) -> None:
+    _ensure_directory(target.parent)
+    _write_file(target, _read_bytes(source, maximum=maximum, owner_only=False))
 
 
 def list_profiles(source: Path) -> dict[str, Any]:
@@ -809,6 +907,8 @@ def _parser() -> argparse.ArgumentParser:
         state.add_argument("--profile", required=True)
     installation = commands.add_parser("install")
     installation.add_argument("--target", type=Path, required=True)
+    mirroring = commands.add_parser("mirror")
+    mirroring.add_argument("--target", type=Path, required=True)
     doctor = commands.add_parser("doctor")
     doctor.add_argument("--target", type=Path)
     removal = commands.add_parser("delete")
@@ -839,6 +939,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         )
     if args.command == "install":
         return install(args.source, args.target)
+    if args.command == "mirror":
+        return mirror(args.source, args.target)
     if args.command == "doctor":
         return diagnose(args.source, args.target)
     if args.command == "delete":

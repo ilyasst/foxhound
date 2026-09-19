@@ -1964,6 +1964,40 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertNotIn("Why it stopped", body)
         self.assertIn("Stopped after 3 failed attempt", body)
 
+    def test_context_exhaustion_card_holds_retry_for_scope_reduction(self):
+        self._schedule_workflow(1)
+        started = self.execution.start_action(
+            1, expected_version=self.execution.get(1).version, action="start"
+        )
+        claim = self.execution.claim_next()
+        self.assertIsNotNone(claim)
+        parked = self.execution.fail(
+            1,
+            expected_version=claim.workflow_version,
+            claim_token=claim.token,
+            reason="context_exhausted",
+        )
+        self.assertEqual(parked.status, WorkflowStatus.PARKED)
+
+        self.assertEqual(self.cards.schedule().created, 1)
+        card = self.cards.claim_next().card
+        body, keyboard = render_execution_review_card(card)
+
+        self.assertIn("did not fit the runtime context window", body)
+        self.assertIn("reduce its scope or split it", body)
+        labels = {
+            button["text"]
+            for row in keyboard["inline_keyboard"] for button in row
+        }
+        self.assertNotIn("▶️ Continue", labels)
+        self.assertIn("✏️ Reduce scope", labels)
+        # Withholding the retry must not withhold the ways to settle or
+        # defer the task; Drop abandons it and is not a substitute.
+        self.assertIn("✅ Done", labels)
+        self.assertIn("👥 Reassign", labels)
+        self.assertTrue(any("Snooze" in label or "⏰" in label
+                            for label in labels), labels)
+
     def test_a_workflow_that_gave_up_says_so_instead_of_going_quiet(self):
         """Parking is the retry limiter, and it used to be terminal and
         silent: the task stayed open, its workflow was abandoned, and no

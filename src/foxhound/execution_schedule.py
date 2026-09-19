@@ -26,6 +26,7 @@ def run_schedule(
     default_agent_profile: str = "general",
     profile_routes: Mapping[str, str] | None = None,
     plan_without_asking: Sequence[str] | None = None,
+    skip_planning_for: Sequence[str] | None = None,
     plan_ready_cap: int | None = None,
     awaiting_reader_cap: int | None = None,
     reader_aliases: Sequence[str] | None = None,
@@ -38,6 +39,7 @@ def run_schedule(
         default_profile_id=default_agent_profile,
         profile_routes=profile_routes,
         planning_grants=plan_without_asking,
+        skip_planning_for=skip_planning_for,
         plan_ready_cap=plan_ready_cap,
         awaiting_reader_cap=awaiting_reader_cap,
         reader_aliases=reader_aliases,
@@ -65,6 +67,16 @@ def _parser() -> argparse.ArgumentParser:
             "let this machine plan tasks from SOURCE_KIND without asking "
             "first; repeat for each kind. Omitted means every task is "
             "asked about, which is the default and the cautious answer."
+        ),
+    )
+    parser.add_argument(
+        "--skip-planning-for",
+        action="append",
+        metavar="SOURCE_KIND",
+        help=(
+            "begin new tasks from SOURCE_KIND at execute; repeat for each "
+            "kind. Each kind also needs --execute-without-asking in the "
+            "deployment configuration. Omitted retains the plan phase."
         ),
     )
     parser.add_argument(
@@ -110,6 +122,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             default_agent_profile=args.default_agent_profile,
             profile_routes=_profile_routes(args.profile_route),
             plan_without_asking=args.plan_without_asking,
+            skip_planning_for=args.skip_planning_for,
             plan_ready_cap=args.plan_ready_cap,
             awaiting_reader_cap=args.awaiting_reader_cap,
             reader_aliases=args.reader_alias,

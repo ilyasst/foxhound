@@ -75,6 +75,16 @@ STARTUP_EXIT_CODE = 71
 TIMEOUT_EXIT_CODE = 124
 _RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _RUNNER_SLOT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
+# A gateway refusal with a measured request size is authoritative evidence
+# that the current run cannot fit a served context window. It is deliberately
+# narrower than words such as "context" or a long duration: those are normal
+# parts of many successful runs and must never change retry policy.
+_CONTEXT_FILTER_REFUSAL = re.compile(
+    rb"\bcontext\s+filter\s*:\s*.*?\bneeds\s+~?\d+\s+tokens?\s*,\s*"
+    rb"skipping\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_CONTEXT_EVIDENCE_BYTES = 256 * 1024
 
 
 class ExecutionRunnerError(RuntimeError):
@@ -593,12 +603,18 @@ def _run_claim(
                     process, profile.kill_grace_seconds,
                     sleep=sleep, clock=clock
                 )
+                reason = (
+                    "context_exhausted"
+                    if _context_window_exhausted(
+                        directory / TRANSCRIPT_NAME, transcript
+                    ) else "timeout"
+                )
                 return _failure_result(
                     service,
                     claim,
                     initial,
-                    reason="timeout",
-                    outcome="timeout",
+                    reason=reason,
+                    outcome=reason,
                     exit_code=TIMEOUT_EXIT_CODE,
                     forced=forced,
                 )
@@ -704,6 +720,30 @@ def _open_transcript(directory: Path):
         )
 
     return open(directory / TRANSCRIPT_NAME, "wb", opener=opener)
+
+
+def _context_window_exhausted(path: Path, transcript: object) -> bool:
+    """Whether a timed-out run recorded the gateway's measured refusal.
+
+    The runner has already established no result was recorded. The only extra
+    evidence considered here is the gateway's exact context-filter line with
+    a numeric request size, so no duration or free-form agent prose is used as
+    a proxy for context exhaustion. Reading only the tail is both bounded and
+    appropriate: the refusal is the final attempted operation before a run
+    begins trying to compress or reaches its supervision timeout.
+    """
+    if transcript is None:
+        return False
+    try:
+        transcript.flush()
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            if size > _CONTEXT_EVIDENCE_BYTES:
+                handle.seek(size - _CONTEXT_EVIDENCE_BYTES)
+            evidence = handle.read(_CONTEXT_EVIDENCE_BYTES)
+    except (AttributeError, OSError):
+        return False
+    return _CONTEXT_FILTER_REFUSAL.search(evidence) is not None
 
 
 def _fail_claim(

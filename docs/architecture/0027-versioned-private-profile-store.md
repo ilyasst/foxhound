@@ -76,6 +76,17 @@ disabling, enabling, installation, permission diagnostics, deletion, and
 migration. Their output carries identifiers, states, revisions, and counts
 only: never prompt text, fragment content, or store paths.
 
+An editable store can mirror another editable store only as a fast-forward:
+the destination may not name a revision absent from the source. Before the
+catalog advances, the mirror copies every revision and each draft input it
+references, including shared and overlay fragments. It then validates the
+destination. This matters because a revision is compiled from those inputs;
+copying catalog history alone could make byte-identical drafts render a
+different prompt on the receiving host. Validation reports the shared, role,
+and overlay inputs responsible for any remaining unpublished draft. A source
+whose own drafts are unpublished is refused before anything is written, so a
+store that cannot reproduce itself never half-replaces another one's drafts.
+
 The repository holds the format, the commands, and their tests, plus a visibly
 fictional example source store in `examples/agent-profile-store/`. Real
 fragments, policies, catalogs, profile identities, and deployment paths stay in
@@ -92,6 +103,9 @@ the approved private store.
   be republished and reinstalled, and each gets a new revision.
 - A deployment now has two steps, publish and install, and must reinstall
   before a new revision can be selected.
+- A fast-forward mirror reproduces both the immutable revisions and their
+  editable inputs; a genuinely divergent history remains an operator
+  reconciliation, never an automatic overwrite.
 
 ## Failure and rollback
 

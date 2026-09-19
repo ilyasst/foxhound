@@ -64,9 +64,14 @@ and reviewed role prompts can direct agents through the safer builder.
 The supervisor polls the workflow and renews its lease independently of the
 agent. A durable result or release terminates any remaining child process.
 Startup errors, unexpected process exit, timeout, interruption, and lease
-failure enter the ledger's bounded retry policy. A concurrent durable result
-wins over process-failure reporting. The run-state capability is removed from
-the final receipt; if the supervisor disappears, the bounded lease expires.
+failure enter the ledger's bounded retry policy. A timeout whose private
+transcript contains the gateway's exact, measured context-filter refusal is
+recorded instead as `context_exhausted`: the workflow parks without an
+automatic retry because unchanged input cannot fit the same window. The
+diagnostic reads only a bounded transcript tail and never infers exhaustion
+from duration or agent prose. A concurrent durable result wins over
+process-failure reporting. The run-state capability is removed from the final
+receipt; if the supervisor disappears, the bounded lease expires.
 
 The runner is deliberately one-shot. A host scheduler may invoke it, but
 Foxhound does not install or configure that scheduler. An idle invocation does

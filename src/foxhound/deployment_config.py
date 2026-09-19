@@ -41,7 +41,7 @@ from .task_execution import TaskExecutionService, WorkflowPhase
 
 
 DEPLOYMENT_SCHEMA = "foxhound.deployment-config"
-DEPLOYMENT_SCHEMA_VERSION = 10
+DEPLOYMENT_SCHEMA_VERSION = 11
 MAX_CONFIG_BYTES = 64 * 1024
 
 
@@ -109,6 +109,10 @@ class WorkflowConfig:
     #: Kinds whose recorded plan runs without a card. Defaults to empty so a
     #: configuration written before this key existed keeps asking.
     execute_without_asking: tuple[str, ...] = ()
+    #: Kinds whose new workflows start at execute, rather than spending an
+    #: unattended agent run recording a plan. Each also needs execution
+    #: authority; this is intentionally not inferred from that authority.
+    skip_planning_for: tuple[str, ...] = ()
     #: Kinds whose reviewed external action runs without a card. Separate
     #: from the key above, and defaulting to empty for the same reason.
     act_without_asking: tuple[str, ...] = ()
@@ -134,6 +138,8 @@ class WorkflowConfig:
             result.extend(("--profile-route", f"{source_kind}={profile_id}"))
         for kind in self.plan_without_asking:
             result.extend(("--plan-without-asking", kind))
+        for kind in self.skip_planning_for:
+            result.extend(("--skip-planning-for", kind))
         for alias in self.reader_aliases:
             result.extend(("--reader-alias", alias))
         return result
@@ -412,7 +418,7 @@ def _parse_document(document: object) -> DeploymentConfig:
     version = document.get("schema_version")
     if (
         document.get("schema") != DEPLOYMENT_SCHEMA
-        or version not in {1, 2, 3, 4, 5, 6, 7, 8, 9, DEPLOYMENT_SCHEMA_VERSION}
+        or version not in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, DEPLOYMENT_SCHEMA_VERSION}
         or isinstance(version, bool)
     ):
         raise DeploymentConfigError("deployment configuration version is invalid")
@@ -528,6 +534,8 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
     if version >= 9:
         fields = fields | {"reader_aliases"}
     if version >= 10:
+        fields = fields | {"skip_planning_for"}
+    if version >= 11:
         fields = fields | {"agent_profile_routes"}
     document = _object(value, fields)
     profile = document["default_agent_profile"]
@@ -537,8 +545,9 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
     )
     act_grants = document["act_without_asking"] if version >= 7 else []
     aliases = document["reader_aliases"] if version >= 9 else []
+    skipped = document["skip_planning_for"] if version >= 10 else []
     routes = _profile_routes(
-        document["agent_profile_routes"] if version >= 10 else []
+        document["agent_profile_routes"] if version >= 11 else []
     )
     caps = tuple(document[key] for key in (
         "execution_slot_cap", "plan_ready_cap", "awaiting_reader_cap"
@@ -549,6 +558,7 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
         or not _grant_list(execute_grants)
         or not _grant_list(act_grants)
         or not _grant_list(aliases)
+        or not _grant_list(skipped)
         or any(isinstance(cap, bool) or not isinstance(cap, int) for cap in caps)
     ):
         raise DeploymentConfigError("workflow configuration is invalid")
@@ -560,6 +570,7 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
         execute_without_asking=tuple(execute_grants),
         act_without_asking=tuple(act_grants),
         reader_aliases=tuple(aliases),
+        skip_planning_for=tuple(skipped),
     )
 
 
@@ -656,12 +667,7 @@ def _parse_database_consumers(
     if version >= 5:
         fields.add("duplicate_card_schedule")
     optional_fields = {"task_card_requeue"} if version >= 5 else set()
-    if not isinstance(value, Mapping):
-        raise DeploymentConfigError("deployment configuration shape is invalid")
-    keys = set(value)
-    if keys != fields and keys != fields | optional_fields:
-        raise DeploymentConfigError("deployment configuration shape is invalid")
-    document = value
+    document = _object(value, fields, optional_fields)
     candidate = _parse_candidate_feed_import(document["candidate_feed_import"])
     intake = _parse_native_intake_run(document["native_intake_run"])
     task_requeue = (
@@ -779,8 +785,20 @@ def _parse_duplicate_card_schedule(value: object) -> int | None:
     return None if document is None else _positive_int(document["limit"])
 
 
-def _object(value: object, fields: set[str]) -> Mapping[str, object]:
-    if not isinstance(value, Mapping) or set(value) != fields:
+def _object(value: object, fields: set[str],
+            optional: set[str] | None = None) -> Mapping[str, object]:
+    """One shape check for every section of the document.
+
+    `optional` is a range rather than a second exact shape: a field in it may
+    be present or absent independently of the others.  A section that declares
+    one optional field and not another is still a valid section, and treating
+    the optional set as all-or-nothing would refuse it while reporting only
+    that the shape was wrong.
+    """
+    if not isinstance(value, Mapping):
+        raise DeploymentConfigError("deployment configuration shape is invalid")
+    keys = set(value)
+    if not fields <= keys <= fields | (optional or set()):
         raise DeploymentConfigError("deployment configuration shape is invalid")
     return value
 
@@ -846,8 +864,24 @@ def _validate_profile_routing(
 def _validate_runtime(config: DeploymentConfig) -> None:
     _private_database(config.database)
     registry = load_registry(config.agent_profile_directory)
-    planning_grants(config.workflow.plan_without_asking)
-    execution_grants(config.workflow.execute_without_asking)
+    plans = planning_grants(config.workflow.plan_without_asking)
+    executions = execution_grants(config.workflow.execute_without_asking)
+    skipped = execution_grants(
+        config.workflow.skip_planning_for,
+        label="skip-planning declarations",
+    )
+    missing_execution_grants = skipped - executions
+    if missing_execution_grants:
+        raise DeploymentConfigError(
+            "skip-planning declarations lack execution grants: "
+            + ", ".join(sorted(missing_execution_grants))
+        )
+    missing_planning_grants = skipped - plans
+    if missing_planning_grants:
+        raise DeploymentConfigError(
+            "skip-planning declarations lack planning grants: "
+            + ", ".join(sorted(missing_planning_grants))
+        )
     action_grants(config.workflow.act_without_asking)
     source_kind_grants(
         (source_kind for source_kind, _profile in config.workflow.agent_profile_routes),
@@ -860,6 +894,7 @@ def _validate_runtime(config: DeploymentConfig) -> None:
         default_profile_id=config.workflow.default_agent_profile,
         planning_grants=config.workflow.plan_without_asking,
         execution_grants=config.workflow.execute_without_asking,
+        skip_planning_for=config.workflow.skip_planning_for,
         action_grants=config.workflow.act_without_asking,
         execution_slot_cap=config.workflow.execution_slot_cap,
         plan_ready_cap=config.workflow.plan_ready_cap,
