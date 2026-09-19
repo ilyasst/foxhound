@@ -426,7 +426,7 @@ class ExecutionWorkerTests(unittest.TestCase):
                 },
                 "worker_operations": [
                     "context", "search", "draft", "record", "release",
-                    "thread",
+                    "act.worktree", "thread",
                 ],
                 "external_effects_allowed": False,
             },
@@ -446,17 +446,66 @@ class ExecutionWorkerTests(unittest.TestCase):
         self.assertNotIn(CLAIM_TOKEN, repr(load_run_state(self.state_path)))
 
     def test_worker_capabilities_follow_the_phase_gate(self):
-        self.assertNotIn(
-            "act.worktree", _worker_operations(WorkflowPhase.PLAN)
-        )
-        self.assertIn(
-            "act.worktree", _worker_operations(WorkflowPhase.EXECUTE)
-        )
+        for phase in WorkflowPhase:
+            with self.subTest(phase=phase):
+                self.assertIn("act.worktree", _worker_operations(phase))
         external = _worker_operations(WorkflowPhase.EXTERNAL_ACTION)
-        self.assertIn("act.worktree", external)
         self.assertIn("act.pull-request", external)
         self.assertIn("act.comment", external)
         self.assertIn("act.review", external)
+
+    def test_a_working_tree_does_not_unlock_any_external_effect(self):
+        """The gate is the effect, not the edit.
+
+        A working tree is now available while planning. Nothing that reaches
+        outside the run directory may follow it there, or the phase boundary
+        has moved rather than the convenience.
+        """
+        for phase in (WorkflowPhase.PLAN, WorkflowPhase.EXECUTE):
+            with self.subTest(phase=phase):
+                operations = _worker_operations(phase)
+                self.assertIn("act.worktree", operations)
+                self.assertNotIn("act.pull-request", operations)
+                self.assertNotIn("act.comment", operations)
+                self.assertNotIn("act.review", operations)
+
+    def test_planning_prepares_a_working_tree_of_its_own(self):
+        """A planning run that must write gets a tree inside its run directory.
+
+        Refusing this is what sent a planning run looking for somewhere else
+        writable, and the only such place on a host is a shared checkout.
+        """
+        self._bind_origin("issue")
+        prepared = self.run_directory / "repo-record-1-item-1"
+
+        with (
+            mock.patch(
+                "foxhound.execution_worker.forge_action.prepare_worktree",
+                return_value=(prepared, "foxhound/issue-item-1", "main"),
+            ) as prepare,
+            knowledge_server() as endpoint,
+        ):
+            worker = self._worker(endpoint)
+            self.assertEqual(
+                worker.context()["workflow"]["phase"], "plan"
+            )
+            result = worker.act_worktree()
+
+        self.assertEqual(result["repository"], "record-1")
+        self.assertEqual(result["issue"], "item-1")
+        self.assertEqual(result["path"], str(prepared))
+        self.assertEqual(result["branch"], "foxhound/issue-item-1")
+        self.assertEqual(result["base"], "main")
+        self.assertEqual(
+            prepare.call_args.kwargs["parent"], self.run_directory
+        )
+
+    def test_a_working_tree_still_requires_an_origin_to_name(self):
+        with knowledge_server() as endpoint:
+            with self.assertRaisesRegex(
+                ExecutionWorkerClaimError, "no origin"
+            ):
+                self._worker(endpoint).act_worktree()
 
     def test_context_omits_local_clients_missing_from_the_runner(self):
         with (
