@@ -38,6 +38,7 @@ from .task_execution import (
 from .source_policy import action_grants as _action_grants
 from .source_policy import execution_grants as _execution_grants
 from . import forge_action
+from . import forge_thread
 from .release_revision import describe as _describe_revision
 from .worker_resolution import (
     REPORT_SCHEMA,
@@ -142,6 +143,11 @@ def _worker_operations(phase: WorkflowPhase) -> list[str]:
     if phase is WorkflowPhase.EXTERNAL_ACTION:
         operations.append("act.pull-request")
         operations.extend(("act.comment", "act.review"))
+    # Read-only thread access is available in plan and execute, not just
+    # external_action: the point is to read review feedback *before* repeating
+    # the work, and by external_action the work is already done.
+    if phase in (WorkflowPhase.PLAN, WorkflowPhase.EXECUTE):
+        operations.append("thread")
     return operations
 
 
@@ -580,6 +586,61 @@ class ExecutionWorker:
         # must not be extended by the attempt itself.
         self._renew(service, state)
         return result
+
+    def read_thread(self) -> dict[str, Any]:
+        """Read comments and review state on this task's own forge thread.
+
+        Read-only: performs no write, requires no approval gate. Available
+        in `plan` and `execute` so an agent can learn what a prior review
+        said before repeating the work. The target comes from the task's
+        binding, so the agent cannot redirect it to another thread.
+
+        For an issue-origin task, returns comments on the issue. For a
+        review_request task, returns reviews and comments on the pull
+        request.
+        """
+        state, service = self._active()
+        origin = TaskLedger(state.database_path).origin(state.task_id)
+        if origin is None:
+            raise ExecutionWorkerClaimError(
+                "this task has no origin, so it names no thread to read")
+        if origin.system != "gw":
+            raise ExecutionWorkerClaimError(
+                "thread reading is only available for forge-bound tasks")
+
+        repository = origin.record_id
+        try:
+            if origin.kind == "issue":
+                thread_result = forge_thread.read_issue_thread(
+                    repository=repository,
+                    number=origin.item_id,
+                )
+            elif origin.kind == "review_request":
+                # The item_id for a review_request contains the PR number
+                # followed by a state separator (e.g., "7/<when>").
+                pr_number = origin.item_id.split("/", 1)[0]
+                thread_result = forge_thread.read_pull_request_thread(
+                    repository=repository,
+                    number=pr_number,
+                )
+            else:
+                raise ExecutionWorkerClaimError(
+                    f"thread reading is not available for {origin.kind!r}")
+        except forge_thread.ForgeThreadError as exc:
+            raise ExecutionWorkerClaimError(str(exc)) from exc
+
+        self._renew(service, state)
+        return {
+            "kind": thread_result.kind,
+            "repository": thread_result.repository,
+            "number": thread_result.number,
+            "url": thread_result.url,
+            "comments": thread_result.comments,
+            "reviews": thread_result.reviews,
+            "truncated": thread_result.truncated,
+            "comment_count": len(thread_result.comments),
+            "review_count": len(thread_result.reviews),
+        }
 
     def record(self, draft_name: str) -> dict[str, Any]:
         state = load_run_state(self._state_path)
@@ -1905,6 +1966,8 @@ def _parser() -> argparse.ArgumentParser:
     comment.add_argument(
         "--body-file", required=True,
         help="file beside the run state holding the status update")
+    thread = subcommands.add_parser(
+        "thread", help="read comments and reviews on this task's own thread")
     record = subcommands.add_parser("record")
     record.add_argument("draft")
     draft = subcommands.add_parser(
@@ -1951,6 +2014,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = worker.act_pull_request(
                 head=args.head, title=args.title, body_file=args.body_file,
                 repository=args.repository)
+        elif args.operation == "thread":
+            result = worker.read_thread()
         elif args.operation == "draft":
             result = worker.draft(outcome=args.outcome)
         elif args.operation == "record":

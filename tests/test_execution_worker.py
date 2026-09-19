@@ -425,7 +425,8 @@ class ExecutionWorkerTests(unittest.TestCase):
                     ],
                 },
                 "worker_operations": [
-                    "context", "search", "draft", "record", "release"
+                    "context", "search", "draft", "record", "release",
+                    "thread",
                 ],
                 "external_effects_allowed": False,
             },
@@ -1682,6 +1683,245 @@ class ResultLocationTests(unittest.TestCase):
             execution_worker._locate_result(order, "result-summary.txt"),
             self.task / "result-summary.txt",
         )
+
+
+class ThreadReadTests(unittest.TestCase):
+    """Tests for the read_thread operation on the execution worker."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.root.chmod(0o700)
+        self.database = self.root / "foxhound.sqlite3"
+        migrate_database(self.database)
+        with closing(sqlite3.connect(self.database)) as connection:
+            now = "2030-01-02T03:04:05+00:00"
+            connection.execute(
+                "INSERT INTO tasks(id,status,text,owner,due,version,created_at,"
+                "updated_at,closed_at) VALUES(1,'open','Synthetic task',"
+                "'Person A',NULL,1,?,?,NULL)",
+                (now, now),
+            )
+            connection.commit()
+        service = TaskExecutionService(
+            self.database, token_factory=lambda: CLAIM_TOKEN
+        )
+        scheduled = service.schedule(1, expected_task_version=1)
+        service.start_action(
+            1, expected_version=scheduled.version, action="start"
+        )
+        self.claim = service.claim_next()
+        self.assertIsNotNone(self.claim)
+        self.run_directory = self.root / f"run-{RUN_ID}"
+        self.knowledge_root = self.root / "knowledge"
+        self.knowledge_root.mkdir()
+        self.run_directory.mkdir(mode=0o700)
+        self.state_path = self.run_directory / "run-state.json"
+        self._write_state()
+        self._write_instructions()
+
+    def _write_state(self, *, schema_version: int = 5, **kw) -> None:
+        document = {
+            "schema": "foxhound.execution-run-state",
+            "schema_version": schema_version,
+            "run_id": RUN_ID,
+            "database_path": str(self.database),
+            "task_id": 1,
+            "task_version": 1,
+            "workflow_version": self.claim.workflow_version,
+            "phase": self.claim.phase.value,
+            "claim_token": CLAIM_TOKEN,
+            "lease_seconds": self.claim.lease_seconds,
+            "agent_profile_id": self.claim.agent_profile_id,
+            "agent_profile_revision": self.claim.agent_profile_revision,
+            "knowledge_root": str(self.knowledge_root),
+            "worker_command": WORKER_COMMAND,
+            "task_work_directory": None,
+            "task_kb_file": None,
+            "task_run_directory": None,
+        }
+        if schema_version >= 5:
+            document.update({
+                "execution_grants": [],
+                "action_grants": [],
+            })
+        document.update(kw)
+        self.state_path.write_text(json.dumps(document), encoding="utf-8")
+        self.state_path.chmod(0o600)
+
+    def _write_instructions(self) -> None:
+        path = self.run_directory / INSTRUCTIONS_NAME
+        path.write_text(json.dumps(general_profile().document()), encoding="utf-8")
+        path.chmod(0o600)
+
+    def _bind_origin(self, kind: str, item_id: str = "42") -> None:
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "INSERT INTO candidate_inbox(candidate_id,source_system,"
+                "source_kind,source_record_id,source_item_id,source_revision,"
+                "payload_json,created_at,first_imported_at,updated_at) "
+                "VALUES('candidate-1','gw',?,"
+                "'github.com/example-org/example-repo',?,?,'{}',"
+                "'2030-01-02T03:04:05+00:00','2030-01-02T03:04:05+00:00',"
+                "'2030-01-02T03:04:05+00:00')",
+                (kind, item_id, "a" * 64),
+            )
+            connection.execute(
+                "INSERT INTO task_candidate_bindings(candidate_id,"
+                "source_revision,task_id,relation,decided_at) "
+                "VALUES('candidate-1',?,1,'accepted',?)",
+                ("a" * 64, "2030-01-02T03:04:05+00:00"),
+            )
+            connection.commit()
+
+    def _worker(self, endpoint: str) -> ExecutionWorker:
+        return ExecutionWorker(self.state_path, KnowledgeClientConfig(
+            endpoint=endpoint, alias="primary", token=TOKEN
+        ))
+
+    def test_thread_operation_is_available_in_plan(self):
+        from foxhound.execution_worker import _worker_operations
+        ops = _worker_operations(WorkflowPhase.PLAN)
+        self.assertIn("thread", ops)
+
+    def test_thread_operation_is_available_in_execute(self):
+        from foxhound.execution_worker import _worker_operations
+        ops = _worker_operations(WorkflowPhase.EXECUTE)
+        self.assertIn("thread", ops)
+
+    def test_thread_operation_is_not_available_in_external_action(self):
+        from foxhound.execution_worker import _worker_operations
+        ops = _worker_operations(WorkflowPhase.EXTERNAL_ACTION)
+        self.assertNotIn("thread", ops)
+
+    def test_no_origin_refuses_thread_read(self):
+        with (\
+            mock.patch(
+                "foxhound.execution_worker._local_today",
+                return_value="2030-01-02",
+            ),
+            knowledge_server() as endpoint,
+        ):
+            worker = self._worker(endpoint)
+            with self.assertRaises(ExecutionWorkerClaimError) as caught:
+                worker.read_thread()
+        self.assertIn("no origin", str(caught.exception))
+
+    def test_no_prior_thread_returns_empty(self):
+        # A task with no prior comments returns an empty thread
+        self._bind_origin("issue")
+        issue_data = {
+            "number": 42,
+            "url": "https://github.com/example-org/example-repo/issues/42",
+            "state": "open",
+            "comments": {"nodes": [], "pageInfo": {"hasNextPage": False}},
+        }
+
+        def fake_run(*args, **kw):
+            if args[:2] == ("gh", "api"):
+                return (0, json.dumps(issue_data), "")
+            return (1, "", "unexpected")
+
+        with (\
+            mock.patch("foxhound.execution_worker._local_today",
+                       return_value="2030-01-02"),
+            mock.patch("foxhound.forge_thread._run", fake_run),
+            knowledge_server() as endpoint,
+        ):
+            worker = self._worker(endpoint)
+            result = worker.read_thread()
+
+        self.assertEqual(result["kind"], "issue")
+        self.assertEqual(result["number"], 42)
+        self.assertEqual(result["comments"], [])
+        self.assertFalse(result["truncated"])
+
+    def test_thread_with_review_comments(self):
+        # A task with review comments returns them
+        self._bind_origin("issue")
+        issue_data = {
+            "number": 42,
+            "url": "https://github.com/example-org/example-repo/issues/42",
+            "state": "open",
+            "comments": {
+                "nodes": [
+                    {
+                        "author": {"login": "reviewer-a"},
+                        "body": "The implementation adds a module the issue asked not to add.",
+                        "createdAt": "2030-01-02T10:00:00Z",
+                    },
+                ],
+                "pageInfo": {"hasNextPage": False},
+            },
+        }
+
+        def fake_run(*args, **kw):
+            if args[:2] == ("gh", "api"):
+                return (0, json.dumps(issue_data), "")
+            return (1, "", "unexpected")
+
+        with (\
+            mock.patch("foxhound.execution_worker._local_today",
+                       return_value="2030-01-02"),
+            mock.patch("foxhound.forge_thread._run", fake_run),
+            knowledge_server() as endpoint,
+        ):
+            worker = self._worker(endpoint)
+            result = worker.read_thread()
+
+        self.assertEqual(result["kind"], "issue")
+        self.assertEqual(len(result["comments"]), 1)
+        self.assertEqual(result["comments"][0]["author"], "reviewer-a")
+        self.assertEqual(result["comment_count"], 1)
+
+    def test_pr_thread_with_reviews(self):
+        # A review_request task reads PR reviews
+        self._bind_origin("review_request", item_id="7/2030-01-02")
+        pr_data = {
+            "number": 7,
+            "url": "https://github.com/example-org/example-repo/pull/7",
+            "state": "open",
+            "reviews": {
+                "nodes": [
+                    {
+                        "author": {"login": "reviewer-a"},
+                        "state": "COMMENTED",
+                        "body": "Please rebase on main.",
+                        "createdAt": "2030-01-02T10:00:00Z",
+                    },
+                ],
+            },
+            "comments": {
+                "nodes": [
+                    {
+                        "author": {"login": "author-x"},
+                        "body": "I will address the feedback.",
+                        "createdAt": "2030-01-02T11:00:00Z",
+                    },
+                ],
+            },
+        }
+
+        def fake_run(*args, **kw):
+            if args[:2] == ("gh", "api"):
+                return (0, json.dumps(pr_data), "")
+            return (1, "", "unexpected")
+
+        with (\
+            mock.patch("foxhound.execution_worker._local_today",
+                       return_value="2030-01-02"),
+            mock.patch("foxhound.forge_thread._run", fake_run),
+            knowledge_server() as endpoint,
+        ):
+            worker = self._worker(endpoint)
+            result = worker.read_thread()
+
+        self.assertEqual(result["kind"], "pull-request")
+        self.assertEqual(result["number"], 7)
+        self.assertEqual(len(result["reviews"]), 1)
+        self.assertEqual(result["reviews"][0]["author"], "reviewer-a")
+        self.assertEqual(result["review_count"], 1)
 
 
 if __name__ == "__main__":
