@@ -994,7 +994,7 @@ def load_run_state(path: str | os.PathLike[str]) -> ExecutionRunState:
         document,
         base_fields | (
             archive_fields if version in {4, 5, RUN_STATE_SCHEMA_VERSION} else set()
-        ) | (grant_fields if version == RUN_STATE_SCHEMA_VERSION else set())
+        ) | (grant_fields if version in {5, RUN_STATE_SCHEMA_VERSION} else set())
         | (root_fields if version == RUN_STATE_SCHEMA_VERSION else set()),
         "execution run state",
     )
@@ -1126,7 +1126,11 @@ def _deployment_roots(value: object) -> dict[str, str]:
         ):
             raise ExecutionWorkerConfigError("execution run state is invalid")
         path = Path(raw_path)
-        if not path.is_absolute() or not path.is_dir():
+        # Absoluteness is a property of the recorded value; existence is not.
+        # The runner already refuses to start with a root that is not a
+        # directory, and a mount that drops mid-run must not make the run's
+        # own state unreadable.
+        if not path.is_absolute():
             raise ExecutionWorkerConfigError("execution run state is invalid")
         roots[name] = str(path)
     return dict(sorted(roots.items()))

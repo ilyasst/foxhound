@@ -70,8 +70,11 @@ DIRECTORY_MODE = 0o700
 FILE_MODE = 0o600
 
 _FRAGMENT_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,63}\.md$")
+# A filesystem path, not a URL: the lookbehind also rejects a preceding "/"
+# or ":" so that "https://example.com/docs" is left alone while "/srv/example"
+# and "~/state" are caught.
 _ABSOLUTE_PATH = re.compile(
-    r"(?<![A-Za-z0-9_.-])(?:~[\\/]|/[A-Za-z0-9_.-]+(?:/|$)|[A-Za-z]:[\\/])"
+    r"(?<![A-Za-z0-9_.:/\\-])(?:~[\\/]|/[A-Za-z0-9_.-]+(?:/|$)|[A-Za-z]:[\\/])"
 )
 _POLICY_FIELDS = (
     "display_name", "runtime", "toolsets", "max_turns", "timeout_seconds",

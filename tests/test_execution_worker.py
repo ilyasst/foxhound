@@ -427,6 +427,7 @@ class ExecutionWorkerTests(unittest.TestCase):
                         "status",
                     ],
                 },
+                "deployment_roots": {},
                 "worker_operations": [
                     "context", "search", "draft", "record", "release",
                     "thread",

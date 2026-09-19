@@ -198,6 +198,20 @@ class ProfileStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ProfileStoreError, "symbolic deployment root"):
             publish(self.source, ["example-scout"])
 
+    def test_prompt_guard_allows_a_url_and_catches_a_home_path(self):
+        """A URL path is not a machine path; the guard must tell them apart."""
+        self.write_shared(
+            "hermes.md",
+            SHARED_TEXT + "Cite https://example.com/docs/guide when reporting.\n",
+        )
+        self.assertEqual(validate(self.source)["ok"], True)
+
+        self.write_shared(
+            "hermes.md", SHARED_TEXT + "Read ~/state/example before starting.\n"
+        )
+        with self.assertRaisesRegex(ProfileStoreError, "absolute path"):
+            validate(self.source)
+
     def test_shared_change_republishes_every_active_profile(self):
         self.write_draft("example-clerk", display_name="Example Clerk")
         publish(self.source, ["example-scout", "example-clerk"])
