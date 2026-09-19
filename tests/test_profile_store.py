@@ -31,12 +31,15 @@ from foxhound.profile_store import (
     POLICY_NAME,
     SHARED_DIRECTORY,
     ProfileStoreError,
+    compose,
     delete,
     diagnose,
     initialize,
     install,
     list_profiles,
+    load_drafts,
     main,
+    mirror,
     migrate,
     publish,
     set_state,
@@ -211,6 +214,39 @@ class ProfileStoreTests(unittest.TestCase):
         )
         for profile_id, revision in first.items():
             self.assertTrue(self.revision_path(profile_id, revision).is_file())
+
+    def test_mirror_copies_changed_shared_fragments_before_validation(self):
+        publish(self.source, ["example-scout"])
+        replica = self.root / "replica"
+        initialize(replica)
+        mirror(self.source, replica)
+
+        revised = SHARED_TEXT + "Revised shared guidance.\n"
+        self.write_shared("hermes.md", revised)
+        publish(self.source, ["example-scout"])
+
+        report = mirror(self.source, replica)
+
+        self.assertEqual(report["pending"], [])
+        self.assertEqual(validate(replica)["pending"], [])
+        self.assertEqual(
+            compose_prompt(self.source), compose_prompt(replica)
+        )
+
+    def test_mirror_refuses_a_genuinely_divergent_history(self):
+        publish(self.source, ["example-scout"])
+        replica = self.root / "replica"
+        initialize(replica)
+        mirror(self.source, replica)
+        (replica / SHARED_DIRECTORY / "hermes.md").write_text(
+            SHARED_TEXT + "Replica-only guidance.\n", encoding="utf-8"
+        )
+        publish(replica, ["example-scout"])
+        self.write_shared("hermes.md", SHARED_TEXT + "Source-only guidance.\n")
+        publish(self.source, ["example-scout"])
+
+        with self.assertRaises(ProfileStoreError):
+            mirror(self.source, replica)
 
     def test_publication_preserves_the_preceding_revision_exactly(self):
         publish(self.source, ["example-scout"])
@@ -479,6 +515,9 @@ class ProfileStoreTests(unittest.TestCase):
         self.assertEqual(report["profiles"], 1)
         self.assertEqual(report["drafts"], 2)
         self.assertEqual(report["pending"], ["example-clerk", "example-scout"])
+        self.assertEqual(
+            report["pending_inputs"]["example-scout"]["shared"], ["hermes.md"]
+        )
         self.assertEqual(report["missing_drafts"], [])
         self.assertEqual(
             list_profiles(self.source)["profiles"][0]["profile_id"],
@@ -654,6 +693,11 @@ class ProfileStoreTests(unittest.TestCase):
 def install_into(test: ProfileStoreTests, target: Path) -> Path:
     install(test.source, target)
     return target
+
+
+def compose_prompt(source: Path) -> str:
+    draft = load_drafts(source)["example-scout"]
+    return compose(source, draft).prompt_template
 
 
 if __name__ == "__main__":
