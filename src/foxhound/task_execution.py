@@ -346,6 +346,24 @@ class ExecutionProfileHealth:
     running: int
     parked: int
     available: bool
+    #: Whether this is the revision the registry currently offers for this
+    #: profile. Distinct from `available`, and the distinction is the point:
+    #: a retired revision kept in the store resolves exactly and runs
+    #: perfectly, so `available` is true for it. What it does not do is
+    #: carry the budget the operator has since installed.
+    #:
+    #: A profile's revision fixes its timeout and turn limit, so a workflow
+    #: pinned to a retired one is held to a budget that was replaced. On one
+    #: deployment the installed repository profile allowed 3300 seconds and
+    #: 120 turns while the overwhelming majority of workflows were pinned to
+    #: revisions allowing 2400 and 80, or 1800 and 50 -- and every one of
+    #: them reported as available, because every one of them was. Runs
+    #: terminated at the retired timeout and transcripts ended at the
+    #: retired turn limit, with nothing anywhere naming the cause.
+    #:
+    #: False for a profile the registry no longer offers at all, where
+    #: `available` already says the stronger thing.
+    current: bool = False
 
 
 class TaskExecutionService:
@@ -1644,6 +1662,13 @@ class TaskExecutionService:
                 available = True
             except AgentProfileError:
                 available = False
+            try:
+                self._profile_registry.resolve_current(
+                    row["agent_profile_id"], row["agent_profile_revision"]
+                )
+                current = True
+            except AgentProfileError:
+                current = False
             health.append(ExecutionProfileHealth(
                 agent_profile_id=str(row["agent_profile_id"]),
                 agent_profile_revision=str(row["agent_profile_revision"]),
@@ -1652,8 +1677,25 @@ class TaskExecutionService:
                 running=int(row["running"] or 0),
                 parked=int(row["parked"] or 0),
                 available=available,
+                current=current,
             ))
         return tuple(health)
+
+    def superseded_profile_revisions(
+        self,
+    ) -> tuple[ExecutionProfileHealth, ...]:
+        """Health rows whose profile is installed under a newer revision.
+
+        The answer to "how much of this queue is not getting the budget I
+        installed?". Only rows whose profile ID is still offered appear: a
+        profile the registry has dropped entirely is a different problem,
+        reported by `available`, and conflating the two would hide it.
+        """
+        return tuple(
+            row for row in self.profile_health()
+            if not row.current
+            and self._profile_registry.get(row.agent_profile_id) is not None
+        )
 
     def event_count(self) -> int:
         with closing(self._connect()) as connection:
