@@ -969,6 +969,98 @@ class TaskCardServerTests(unittest.TestCase):
                 self.assertEqual(state, expected_state)
                 self.assertEqual(relation_count, expected_relations)
 
+    def test_resolve_route_accepts_duplicate_actions_over_http(self):
+        """The resolve endpoint (claim + deliver + act in one shot) must also
+        accept duplicate_confirm and duplicate_reject, not just the four base
+        actions.  Regression for issue #364: the resolve gate was never
+        widened when duplicate review landed, so a duplicate-review card
+        delivered to a queue_view consumer could never be resolved."""
+        for action, expected_state, expected_relations in (
+            ("duplicate_confirm", "confirmed", 1),
+            ("duplicate_reject", "rejected", 0),
+        ):
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as root:
+                database = Path(root) / "foxhound.sqlite3"
+                migrate_database(database)
+                with closing(sqlite3.connect(database)) as connection, connection:
+                    connection.row_factory = sqlite3.Row
+                    for text in (
+                        "Prepare the synthetic rollout checklist",
+                        "Draft the synthetic rollout checklist",
+                    ):
+                        connection.execute(
+                            "INSERT INTO tasks(status,text,owner,version,created_at,"
+                            "updated_at,owner_ref_version,owner_kind,"
+                            "owner_speaker_id,owner_canonical_speaker_id,"
+                            "owner_speaker_registry_id,owner_pinned,"
+                            "owner_provisional) VALUES('open',?,'Person A',1,"
+                            "?,?,1,'person','SPK_1','SPK_1','registry-A',0,0)",
+                            (text, NOW.isoformat(), NOW.isoformat()),
+                        )
+                    proposal = task_duplicate_proposals.propose(
+                        connection,
+                        task_id_a=1,
+                        task_id_b=2,
+                        basis="Same synthetic deliverable and confirmed owner.",
+                        detector="synthetic-detector",
+                        now=NOW.isoformat(),
+                    )
+
+                cards = TaskCardService(
+                    database,
+                    clock=self.clock,
+                    token_factory=lambda: CLAIM_TOKEN,
+                )
+                cards.schedule_duplicate_proposals()
+                queue_token = "q" * 43
+                app = TaskCardApplication(
+                    cards, {DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: queue_token}
+                )
+
+                with running_server(app) as endpoint:
+                    status, _, body = request(
+                        endpoint,
+                        "/v1/task-cards/resolve",
+                        request_document(
+                            card_id=cards.due(limit=1)[0].id,
+                            card_version=1,
+                            action=action,
+                        ),
+                        token=queue_token,
+                    )
+
+                self.assertEqual(status, 200)
+                self.assertEqual(body["status"], "resolved")
+                self.assertEqual(body["ok"], True)
+                self.assertEqual(body["resolution"]["card_status"], "cancelled")
+                with closing(sqlite3.connect(database)) as connection:
+                    state = connection.execute(
+                        "SELECT state FROM task_duplicate_proposals WHERE id=?",
+                        (proposal.proposal_id,),
+                    ).fetchone()[0]
+                    relation_count = connection.execute(
+                        "SELECT count(*) FROM task_relations"
+                    ).fetchone()[0]
+                self.assertEqual(state, expected_state)
+                self.assertEqual(relation_count, expected_relations)
+
+                # Unknown action strings are still refused.
+                cards.schedule_duplicate_proposals()
+                # No new card will appear for the now-confirmed/rejected pair,
+                # so verify that an unknown action hits the gate.
+                with running_server(app) as endpoint:
+                    status, _, body = request(
+                        endpoint,
+                        "/v1/task-cards/resolve",
+                        request_document(
+                            card_id=999,
+                            card_version=1,
+                            action="invented_action",
+                        ),
+                        token=queue_token,
+                    )
+                self.assertEqual(body["error"]["code"], "invalid_request")
+
     def test_authenticated_stats_are_exact_and_do_not_write(self):
         before = (self.cards.count(), self.cards.event_count())
         with running_server(self.app) as endpoint:
