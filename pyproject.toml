@@ -31,6 +31,7 @@ foxhound-task-duplicate-card-schedule = "foxhound.task_duplicate_card_schedule:m
 foxhound-task-duplicate-quality = "foxhound.task_duplicate_quality:main"
 foxhound-task-structure-status = "foxhound.task_structure_status:main"
 foxhound-task-local-duplicate-eval = "foxhound.task_duplicate_semantic:main"
+foxhound-task-duplicate-queue-diagnostic = "foxhound.task_duplicate_queue_diagnostic:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
