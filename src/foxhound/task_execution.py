@@ -86,6 +86,9 @@ MAX_WORK_MARKDOWN_CHARS = 131_072
 MAX_WORK_DIGEST_CHARS = 800
 MAX_COLLECTION_ITEMS = 20
 MAX_QUESTION_CHARS = 1_000
+#: A derived sentence or three about why one attempt stopped, bounded to
+#: match the column that stores it. See `failure_digest.py`.
+MAX_FAILURE_DIGEST_CHARS = 800
 
 # Agent processes are scarce independently of planned work.  The runner claim
 # transaction enforces this cap, so two hosts (or two local slots) cannot both
@@ -333,6 +336,19 @@ class ExecutionScheduleResult:
     #: Eligible candidates held back by `plan_ready_cap` or
     #: `awaiting_reader_cap`. Non-zero means admission is closed, not idle.
     capped: int = 0
+
+
+@dataclass(frozen=True)
+class PendingFailureDigest:
+    """One failed attempt whose transcript has not been summarised yet."""
+
+    task_id: int
+    #: The workflow version that was claimed and failed, which is also the
+    #: run directory's attempt. Not the version the failure created.
+    workflow_version: int
+    phase: WorkflowPhase
+    run_id: str
+    reason: str | None
 
 
 @dataclass(frozen=True)
@@ -1696,6 +1712,120 @@ class TaskExecutionService:
             if not row.current
             and self._profile_registry.get(row.agent_profile_id) is not None
         )
+
+    def failures_awaiting_digest(
+        self, *, limit: int = 20
+    ) -> tuple[PendingFailureDigest, ...]:
+        """Failed attempts whose transcript has not been summarised yet.
+
+        A workflow qualifies when its last attempt failed, that failure
+        named a run, and no digest exists for the attempt. The attempt is
+        the workflow version that was claimed -- one below the version the
+        failure created, because `_defer_failure` increments it.
+
+        Ordered oldest first so a backlog drains in the order it arrived
+        rather than re-summarising whatever failed most recently.
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1_000:
+            raise ValueError("failure digest limit is invalid")
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT w.task_id,w.version,w.phase,w.last_failure_run_id,"
+                "w.last_failure_reason,w.last_failure_at "
+                "FROM task_execution_workflows AS w "
+                "JOIN tasks AS t ON t.id=w.task_id "
+                "WHERE t.status='open' AND w.last_failure_run_id IS NOT NULL "
+                "AND w.version>1 AND NOT EXISTS("
+                " SELECT 1 FROM execution_failure_digests AS d "
+                " WHERE d.task_id=w.task_id AND d.workflow_version=w.version-1"
+                ") ORDER BY w.last_failure_at,w.task_id LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return tuple(
+            PendingFailureDigest(
+                task_id=int(row["task_id"]),
+                # The attempt that failed, not the version its failure
+                # created. Keyed on the wrong one, a digest would describe
+                # a run nobody can find and the next failure would look
+                # already summarised.
+                workflow_version=int(row["version"]) - 1,
+                phase=WorkflowPhase(row["phase"]),
+                run_id=str(row["last_failure_run_id"]),
+                reason=row["last_failure_reason"],
+            )
+            for row in rows
+        )
+
+    def record_failure_digest(
+        self,
+        task_id: int,
+        *,
+        workflow_version: int,
+        phase: WorkflowPhase | str,
+        run_id: str | None,
+        digest: str,
+    ) -> bool:
+        """Store one attempt's failure digest, once.
+
+        Returns whether a row was written. A second attempt for the same
+        (task, attempt) is a no-op rather than an error: the background pass
+        is re-runnable by design, and two passes arriving together must not
+        make one of them fail.
+        """
+        if not _valid_identity(task_id, workflow_version):
+            return False
+        text = digest.strip() if isinstance(digest, str) else ""
+        if not text or len(text) > MAX_FAILURE_DIGEST_CHARS:
+            return False
+        if run_id is not None and not _RUN_ID_RE.fullmatch(str(run_id)):
+            return False
+        phase_value = WorkflowPhase(phase).value
+        now = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = connection.execute(
+                    "INSERT OR IGNORE INTO execution_failure_digests("
+                    "task_id,workflow_version,phase,run_id,digest,created_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (task_id, workflow_version, phase_value, run_id, text, now),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return bool(cursor.rowcount)
+
+    def failure_digest(
+        self, task_id: int, *, phase: WorkflowPhase | str | None = None
+    ) -> str | None:
+        """The most recent failure digest for this task's current phase.
+
+        Scoped to a phase because a failure in `execute` says nothing about
+        a `plan` pass that succeeded, and showing a reader the wrong
+        phase's cause is worse than showing none.
+        """
+        if isinstance(task_id, bool) or not isinstance(task_id, int) or task_id < 1:
+            return None
+        with closing(self._connect()) as connection:
+            if phase is None:
+                row = connection.execute(
+                    "SELECT phase FROM task_execution_workflows WHERE task_id=?",
+                    (task_id,),
+                ).fetchone()
+                if row is None:
+                    return None
+                phase_value = str(row["phase"])
+            else:
+                phase_value = WorkflowPhase(phase).value
+            found = connection.execute(
+                "SELECT digest FROM execution_failure_digests "
+                "WHERE task_id=? AND phase=? "
+                "ORDER BY workflow_version DESC LIMIT 1",
+                (task_id, phase_value),
+            ).fetchone()
+        return None if found is None else str(found["digest"])
 
     def event_count(self) -> int:
         with closing(self._connect()) as connection:

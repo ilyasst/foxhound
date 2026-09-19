@@ -112,6 +112,9 @@ REVIEW_DIRECT_ACTIONS = {
 SNOOZE_BUTTON_ROW = (("🕓 Snooze", "snooze"),)
 READER_INPUT_KINDS = {"discussion", "reassignment"}
 MAX_DISCUSSION_CHARS = 16_000
+#: Matches the storage bound in `failure_digest`. Stated here too so the
+#: renderer cannot be surprised by a longer row.
+MAX_FAILURE_DIGEST_CARD_CHARS = 800
 MAX_OWNER_CHARS = 200
 OWNER_HOLD_INTERVAL = timedelta(days=21)
 MAX_OWNER_HOLD_CHECKS = 100
@@ -265,6 +268,13 @@ class ExecutionReviewCard:
     failure_reason: str = field(default="", repr=False)
     failure_exit_code: int | None = field(default=None, repr=False)
     failure_run_id: str | None = field(default=None, repr=False)
+    #: Why the last attempt stopped, in the summariser's words. A reason
+    #: and an exit code say how the process ended, which cannot tell an
+    #: exhausted turn budget from a saturated backend from a refused
+    #: worker operation -- and those need different answers from the
+    #: reader. Empty is normal and common: the summary is derived from a
+    #: remote model and the card must read correctly without it.
+    failure_digest: str = field(default="", repr=False)
     task_work_directory: str = field(default="", repr=False)
     task_kb_file: str = field(default="", repr=False)
     origin_sources: tuple["CardSourceEvidence", ...] = field(
@@ -2366,6 +2376,15 @@ class ExecutionCardService:
             "t.status AS task_status_current,t.version AS task_version_current,"
             "w.status AS workflow_status_current,"
             "w.failure_count AS workflow_failure_count,"
+            "("
+            # The attempt that failed is one below the version its failure
+            # created, and the digest is scoped to the phase the workflow
+            # is in now: an `execute` failure says nothing about a `plan`
+            # pass that succeeded.
+            " SELECT d.digest FROM execution_failure_digests AS d "
+            " WHERE d.task_id=w.task_id AND d.phase=w.phase "
+            " ORDER BY d.workflow_version DESC LIMIT 1"
+            ") AS workflow_failure_digest,"
             "w.last_failure_reason AS workflow_failure_reason,"
             "w.last_failure_exit_code AS workflow_failure_exit_code,"
             "w.last_failure_run_id AS workflow_failure_run_id,"
@@ -2845,6 +2864,9 @@ def _card(
             failure_reason=str(row["workflow_failure_reason"] or ""),
             failure_exit_code=row["workflow_failure_exit_code"],
             failure_run_id=row["workflow_failure_run_id"],
+            failure_digest=_bounded_failure_digest(
+                row["workflow_failure_digest"]
+            ),
             agent_profile_id=profile_id,
             agent_profile_revision=profile_revision,
             agent_display_name=profile_name,
@@ -3289,6 +3311,19 @@ def card_deliverables(card: ExecutionReviewCard) -> str:
     return _bounded_deliverables("\n".join(lines).strip())
 
 
+def _bounded_failure_digest(value: object) -> str:
+    """A stored digest, or "" for anything that is not one.
+
+    The column bounds this already; re-bounding here means a card cannot
+    be broken by a row written before that bound existed, and means a
+    NULL and a blank reach the renderer as the same thing.
+    """
+    if not isinstance(value, str):
+        return ""
+    text = " ".join(value.split()).strip()
+    return text[:MAX_FAILURE_DIGEST_CARD_CHARS]
+
+
 def _bounded_deliverables(value: str) -> str:
     """Fit an outbound deliverables message within the read contract."""
     suffix = "\n\n[…truncated. Open the task working folder for the rest.]"
@@ -3426,6 +3461,15 @@ def _start_card_lines(
             reference = f"Run diagnostic: {card.failure_run_id}"
             lines.append(
                 f"<code>{_escape(reference)}</code>" if html else reference
+            )
+        if card.failure_digest:
+            # The difference between a reader who can judge whether to
+            # retry and one who is guessing. A reason and an exit code say
+            # the process stopped; this says what stopped it.
+            lines.append("")
+            lines.append(
+                f"🔍 <b>Why it stopped:</b> {_escape(card.failure_digest)}"
+                if html else f"🔍 Why it stopped: {card.failure_digest}"
             )
         explanation = (
             "Continue tries again. The runs so far left nothing recorded."
