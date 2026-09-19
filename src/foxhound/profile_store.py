@@ -49,6 +49,7 @@ from .agent_profiles import (
     parse_catalog,
     parse_profile,
     _PROFILE_ID_RE,
+    _REVISION_RE,
     _canonical_bytes,
     _private_directory,
     _private_subdirectory,
@@ -295,12 +296,20 @@ def _pending_inputs(
     root: Path,
     catalog: Mapping[str, CatalogEntry],
     drafts: Mapping[str, ProfileDraft],
-) -> dict[str, dict[str, list[str]]]:
-    result: dict[str, dict[str, list[str]]] = {}
+) -> dict[str, dict[str, Any]]:
+    """Drafts that no longer render to their catalog entry, and what they render to.
+
+    The reported ``revision`` is what publishing this draft would produce right
+    now.  It is the value an operator passes back to ``publish --expect`` to be
+    told, rather than to discover later, that the draft changed underneath the
+    edit they made.
+    """
+    result: dict[str, dict[str, Any]] = {}
     for profile_id, draft in drafts.items():
         revision = compose(root, draft).revision
         if profile_id not in catalog or revision != catalog[profile_id].revision:
             result[profile_id] = {
+                "revision": revision,
                 "shared": list(draft.shared),
                 "role": [draft.role],
                 "overlays": list(draft.overlays),
@@ -424,12 +433,21 @@ def publish(
     profile_ids: Sequence[str] = (),
     *,
     all_active: bool = False,
+    expect: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Compile the selected drafts and advance the catalog atomically."""
+    """Compile the selected drafts and advance the catalog atomically.
+
+    ``expect`` maps a profile to the revision its draft rendered to when the
+    operator last looked.  A store is editable by more than one operator and
+    holds no lock, so a draft can be replaced between an edit and the publish
+    that was meant to ship it; publishing then reports success for content
+    nobody reviewed.  A stated expectation turns that into a refusal.
+    """
     root = _store_root(source)
     catalog = _load_catalog(root)
     drafts = load_drafts(root)
     selected = _publication_targets(catalog, drafts, profile_ids, all_active)
+    _require_expected_drafts(root, drafts, selected, expect)
     published: list[dict[str, Any]] = []
     unchanged: list[str] = []
     updated = dict(catalog)
@@ -462,6 +480,44 @@ def publish(
     if published:
         _write_catalog(root, updated)
     return {"ok": True, "published": published, "unchanged": unchanged}
+
+
+def _expectations(values: Sequence[str] | None) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for value in values or ():
+        profile_id, separator, revision = value.partition("=")
+        if not separator or profile_id in result:
+            raise ProfileStoreError("agent profile expectation is invalid")
+        result[profile_id] = revision
+    return result
+
+
+def _require_expected_drafts(
+    root: Path,
+    drafts: Mapping[str, ProfileDraft],
+    selected: Sequence[str],
+    expect: Mapping[str, str] | None,
+) -> None:
+    """Refuse a publish whose draft no longer matches what was reviewed."""
+    if not expect:
+        return
+    unknown = sorted(set(expect) - set(selected))
+    if unknown:
+        raise ProfileStoreError(
+            f"agent profile expectation names an unpublished profile ({unknown[0]})"
+        )
+    for profile_id in selected:
+        expected = expect.get(profile_id)
+        if expected is None:
+            continue
+        if not isinstance(expected, str) or _REVISION_RE.fullmatch(expected) is None:
+            raise ProfileStoreError("agent profile expectation is invalid")
+        actual = compose(root, drafts[profile_id]).revision
+        if actual != expected:
+            raise ProfileStoreError(
+                "agent profile draft changed since it was reviewed "
+                f"(profile {profile_id}, expected {expected}, found {actual})"
+            )
 
 
 def _publication_targets(
@@ -961,6 +1017,11 @@ def _parser() -> argparse.ArgumentParser:
     publication = commands.add_parser("publish")
     publication.add_argument("--profile", action="append", default=[])
     publication.add_argument("--all-active", action="store_true")
+    publication.add_argument(
+        "--expect", action="append", default=[], metavar="PROFILE=REVISION",
+        help="publish only while this profile's draft still renders to this "
+             "revision (repeatable); validate reports the value to pass",
+    )
     for name in ("disable", "enable"):
         state = commands.add_parser(name)
         state.add_argument("--profile", required=True)
@@ -988,7 +1049,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         return list_profiles(args.source)
     if args.command == "publish":
         return publish(
-            args.source, args.profile, all_active=args.all_active
+            args.source, args.profile, all_active=args.all_active,
+            expect=_expectations(args.expect),
         )
     if args.command in {"disable", "enable"}:
         return set_state(
