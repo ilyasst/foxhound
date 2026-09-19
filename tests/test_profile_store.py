@@ -190,6 +190,14 @@ class ProfileStoreTests(unittest.TestCase):
                 self.assertNotIn(published[0]["revision"], digests)
                 digests.add(published[0]["revision"])
 
+    def test_validate_and_publish_refuse_absolute_prompt_paths(self):
+        self.write_shared("hermes.md", "Read /srv/example/private-data.\n")
+
+        with self.assertRaisesRegex(ProfileStoreError, "example-scout.*hermes.md"):
+            validate(self.source)
+        with self.assertRaisesRegex(ProfileStoreError, "symbolic deployment root"):
+            publish(self.source, ["example-scout"])
+
     def test_shared_change_republishes_every_active_profile(self):
         self.write_draft("example-clerk", display_name="Example Clerk")
         publish(self.source, ["example-scout", "example-clerk"])
@@ -254,6 +262,18 @@ class ProfileStoreTests(unittest.TestCase):
         )
         self.assertEqual(validate(replica)["pending"], [])
 
+    def test_mirror_preserves_an_unpublished_destination_draft(self):
+        publish(self.source, ["example-scout"])
+        replica = self.root / "replica"
+        initialize(replica)
+        mirror(self.source, replica)
+        role = replica / DRAFTS_DIRECTORY / "example-scout" / "role.md"
+        role.write_text("# Local edit\nKeep this draft.\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(ProfileStoreError, "example-scout.*role.md"):
+            mirror(self.source, replica)
+        self.assertIn("Keep this draft", role.read_text(encoding="utf-8"))
+
     def test_mirror_refuses_a_genuinely_divergent_history(self):
         publish(self.source, ["example-scout"])
         replica = self.root / "replica"
@@ -268,6 +288,20 @@ class ProfileStoreTests(unittest.TestCase):
 
         with self.assertRaises(ProfileStoreError):
             mirror(self.source, replica)
+
+    def test_doctor_reports_per_profile_fast_forward_or_divergence(self):
+        publish(self.source, ["example-scout"])
+        replica = self.root / "replica"
+        initialize(replica)
+        mirror(self.source, replica)
+        self.write_shared("hermes.md", SHARED_TEXT + "Revised.\n")
+        publish(self.source, ["example-scout"])
+
+        report = diagnose(self.source, replica)
+
+        self.assertEqual(report["comparison"], {"profiles": [{
+            "profile_id": "example-scout", "status": "source_ahead", "ahead": 1,
+        }]})
 
     def test_publication_preserves_the_preceding_revision_exactly(self):
         publish(self.source, ["example-scout"])

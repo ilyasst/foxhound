@@ -199,6 +199,7 @@ class ExecutionWorkerTests(unittest.TestCase):
         schema_version: int = 3,
         execution_grants: tuple[str, ...] = (),
         action_grants: tuple[str, ...] = (),
+        deployment_roots: dict[str, str] | None = None,
     ) -> None:
         document = {
             "schema": "foxhound.execution-run-state",
@@ -227,6 +228,8 @@ class ExecutionWorkerTests(unittest.TestCase):
                 "execution_grants": list(execution_grants),
                 "action_grants": list(action_grants),
             })
+        if schema_version >= 6:
+            document["deployment_roots"] = deployment_roots or {}
         self.state_path.write_text(json.dumps(document), encoding="utf-8")
         self.state_path.chmod(0o600)
 
@@ -391,7 +394,7 @@ class ExecutionWorkerTests(unittest.TestCase):
         self.assertNotIn(CLAIM_TOKEN, rendered)
         self.assertNotIn(str(self.database), rendered)
         self.assertEqual(context["task"]["text"], "Synthetic task")
-        self.assertEqual(context["schema_version"], 6)
+        self.assertEqual(context["schema_version"], 7)
         self.assertEqual(context["runtime"]["today"], "2030-01-02")
         self.assertEqual(context["runtime"]["today_weekday"], "Wednesday")
         self.assertEqual(
@@ -930,6 +933,18 @@ class ExecutionWorkerTests(unittest.TestCase):
 
         with self.assertRaises(ExecutionWorkerConfigError):
             load_run_state(self.state_path)
+
+    def test_schema_six_state_carries_named_deployment_roots(self):
+        shared = self.root / "shared"
+        shared.mkdir()
+        self._write_state(
+            schema_version=6,
+            deployment_roots={"shared_state": str(shared)},
+        )
+
+        state = load_run_state(self.state_path)
+
+        self.assertEqual(state.deployment_roots, {"shared_state": str(shared)})
 
     def test_result_path_is_confined_to_the_immediate_run_directory(self):
         draft = self._write_draft()

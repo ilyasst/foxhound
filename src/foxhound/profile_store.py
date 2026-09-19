@@ -70,6 +70,9 @@ DIRECTORY_MODE = 0o700
 FILE_MODE = 0o600
 
 _FRAGMENT_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,63}\.md$")
+_ABSOLUTE_PATH = re.compile(
+    r"(?<![A-Za-z0-9_.-])(?:~[\\/]|/[A-Za-z0-9_.-]+(?:/|$)|[A-Za-z]:[\\/])"
+)
 _POLICY_FIELDS = (
     "display_name", "runtime", "toolsets", "max_turns", "timeout_seconds",
     "claim_lease_seconds", "heartbeat_seconds", "kill_grace_seconds",
@@ -145,16 +148,18 @@ def _fragment_name(value: object) -> str:
 def compose(source: Path, draft: ProfileDraft) -> AgentProfile:
     """Compile one draft and its fragments into an effective profile."""
     parts = [
-        _read_fragment(source / SHARED_DIRECTORY / name)
+        _read_fragment(source / SHARED_DIRECTORY / name, draft.profile_id, name)
         for name in draft.shared
     ]
     parts.append(
         _read_fragment(
-            source / DRAFTS_DIRECTORY / draft.profile_id / draft.role
+            source / DRAFTS_DIRECTORY / draft.profile_id / draft.role,
+            draft.profile_id,
+            draft.role,
         )
     )
     parts.extend(
-        _read_fragment(source / OVERLAYS_DIRECTORY / name)
+        _read_fragment(source / OVERLAYS_DIRECTORY / name, draft.profile_id, name)
         for name in draft.overlays
     )
     return _effective_profile(draft.profile_id, draft.policy, parts)
@@ -176,7 +181,9 @@ def _effective_profile(
     return parse_profile(document)
 
 
-def _read_fragment(path: Path) -> str:
+def _read_fragment(
+    path: Path, profile_id: str = "unknown", fragment: str | None = None
+) -> str:
     raw = _read_bytes(path, maximum=MAX_FRAGMENT_BYTES, owner_only=False)
     try:
         text = raw.decode("utf-8")
@@ -186,6 +193,12 @@ def _read_fragment(path: Path) -> str:
         ) from None
     if not text.strip() or any(_is_control(item) for item in text):
         raise ProfileStoreError("agent profile prompt fragment is invalid")
+    if _ABSOLUTE_PATH.search(text):
+        raise ProfileStoreError(
+            "agent profile prompt fragment has an absolute path "
+            f"(profile {profile_id}, fragment {fragment or path.name}); use a symbolic "
+            "deployment root from capabilities.deployment_roots"
+        )
     return text
 
 
@@ -282,9 +295,8 @@ def _pending_inputs(
 ) -> dict[str, dict[str, list[str]]]:
     result: dict[str, dict[str, list[str]]] = {}
     for profile_id, draft in drafts.items():
-        if profile_id not in catalog or (
-            compose(root, draft).revision != catalog[profile_id].revision
-        ):
+        revision = compose(root, draft).revision
+        if profile_id not in catalog or revision != catalog[profile_id].revision:
             result[profile_id] = {
                 "shared": list(draft.shared),
                 "role": [draft.role],
@@ -305,6 +317,7 @@ def mirror(source: Path, target: Path) -> dict[str, Any]:
     catalog = _load_catalog(root)
     destination_catalog = _load_catalog(destination)
     _require_fast_forward(destination_catalog, catalog)
+    _refuse_local_draft_overwrite(destination, destination_catalog)
     drafts = load_drafts(root)
     # Refuse a source that cannot reproduce itself before writing anything.
     # Copying an unpublished draft edit leaves the destination pending too,
@@ -330,6 +343,18 @@ def mirror(source: Path, target: Path) -> dict[str, Any]:
         "revisions": revisions,
         "pending": [],
     }
+
+
+def _refuse_local_draft_overwrite(
+    root: Path, catalog: Mapping[str, CatalogEntry]
+) -> None:
+    """Keep an unpublished destination edit from being replaced by a sync."""
+    for profile_id, inputs in _pending_inputs(root, catalog, load_drafts(root)).items():
+        if profile_id in catalog:
+            raise ProfileStoreError(
+                "mirror would overwrite an unpublished agent profile draft "
+                f"(profile {profile_id}, fragment {inputs['role'][0]})"
+            )
 
 
 def _require_fast_forward(
@@ -541,7 +566,38 @@ def diagnose(source: Path, target: Path | None = None) -> dict[str, Any]:
         installed_catalog = _load_catalog(installed)
         report["target"] = _permissions(installed, installed_catalog)
         report["target"]["current"] = installed_catalog == catalog
+        report["comparison"] = _catalog_comparison(catalog, installed_catalog)
     return report
+
+
+def _catalog_comparison(
+    source: Mapping[str, CatalogEntry], target: Mapping[str, CatalogEntry]
+) -> dict[str, object]:
+    """Machine-readable per-profile history relationship for drift monitors."""
+    profiles: list[dict[str, object]] = []
+    for profile_id in sorted(set(source) | set(target)):
+        left = source.get(profile_id)
+        right = target.get(profile_id)
+        left_history = () if left is None else left.history
+        right_history = () if right is None else right.history
+        if left_history == right_history:
+            status, ahead = "same", 0
+        elif len(left_history) >= len(right_history) and (
+            left_history[:len(right_history)] == right_history
+        ):
+            status, ahead = "source_ahead", len(left_history) - len(right_history)
+        elif len(right_history) >= len(left_history) and (
+            right_history[:len(left_history)] == left_history
+        ):
+            status, ahead = "target_ahead", len(right_history) - len(left_history)
+        else:
+            status, ahead = "diverged", 0
+        profiles.append({
+            "profile_id": profile_id,
+            "status": status,
+            "ahead": ahead,
+        })
+    return {"profiles": profiles}
 
 
 def _permissions(

@@ -437,6 +437,12 @@ content. See [ADR 0023](docs/architecture/0023-agent-profile-registry.md).
 See [ADR 0026](docs/architecture/0026-shared-private-agent-profiles.md) for the
 shared private-profile deployment contract.
 
+Profile fragments must not hardcode a filesystem path. The worker publishes
+each configured machine root under `capabilities.deployment_roots`, keyed by a
+stable symbolic name. Profile guidance refers to that symbolic name; a root
+not configured on a host is absent. The runtime values do not alter a profile
+revision, so the same reviewed prompt stays portable.
+
 That directory can hold one flat manifest per profile, or the versioned store
 described below.
 
