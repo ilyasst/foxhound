@@ -416,6 +416,19 @@ def _historical_general_profiles() -> tuple[AgentProfile, ...]:
             kill_grace_seconds=30,
             allowed_phases=_PHASES,
         ),
+        AgentProfile(
+            profile_id="general",
+            display_name="General",
+            runtime="hermes",
+            prompt_template=_GENERAL_PROMPT_TEMPLATE_V12,
+            toolsets=("terminal", "file", "web"),
+            max_turns=80,
+            timeout_seconds=2_700,
+            claim_lease_seconds=3_300,
+            heartbeat_seconds=60,
+            kill_grace_seconds=30,
+            allowed_phases=_PHASES,
+        ),
     )
 
 
@@ -1035,17 +1048,28 @@ _GENERAL_PROMPT_TEMPLATE_V12 = _GENERAL_PROMPT_TEMPLATE_V11.replace(
 )
 
 
-_GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V12
+_GENERAL_PROMPT_TEMPLATE_V13 = _GENERAL_PROMPT_TEMPLATE_V12.replace(
+    f"Call `{WORKER_COMMAND_TOKEN} act worktree [--repository LOCATOR]` only when `context` lists `act.worktree`. A task may legitimately span several repositories.",
+    "\n".join((
+        f"Call `{WORKER_COMMAND_TOKEN} act worktree [--repository LOCATOR]` only when `context` lists `act.worktree`. A task may legitimately span several repositories.",
+        "That working tree is the only repository this run may write to, and it is available in every phase, planning included. Take one as soon as the work needs to change a file, run a suite against a modification, or check that a proposal builds.",
+        "Every other checkout on this host is read only for you, however convenient it looks and whoever appears to own it. A checkout outside your run directory is long lived and shared: other work holds branches off it, carries uncommitted changes in it, and shares its stash. Do not `cd` into one to commit, switch its branch, reset it, or stash in it. Read it freely.",
+        "In `plan`, a working tree is for verifying what you are about to propose, not for delivering it. The reviewable output of planning is still the plan.",
+    )),
+)
+
+
+_GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V13
 
 # A built-in profile is a release artifact.  Keep its fingerprints beside the
 # prompt so changing the prompt or policy without publishing a new profile
 # revision fails at every runner and scheduler startup, rather than leaving a
 # stale test in a different file to discover the mismatch later.
 GENERAL_PROFILE_RELEASE_REVISION = (
-    "ff86e18c5665b5613b4966d7664fc71a3c8e427bf2e70248e59b80e84190700b"
+    "aebb138882a0c6c66be45a8c05d7c4aac726f88954f9f8217a2e37ff776e77c9"
 )
 GENERAL_PROFILE_RELEASE_PROMPT_SHA256 = (
-    "7f536c67589aa76e92ca8a632980dc26287fa4b33f207c7108f995abc6079f3e"
+    "a28cf00e1baa76eaa618aa55440519cdb2fa8ab1a441d5b87c66bfdaed4aa758"
 )
 
 
