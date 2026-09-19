@@ -79,6 +79,7 @@ class DeliveryHealthTests(unittest.TestCase):
         self.assertEqual(health.execution_cards.active, 0)
         self.assertIsNone(health.last_successful_delivery_age_seconds)
         self.assertEqual(health.workflows.ready, 0)
+        self.assertEqual(health.workflows.context_exhausted, 0)
         self.assertEqual(health.superseded_profiles.workflows, 0)
         self.assertEqual(health.superseded_profiles.revisions, 0)
 

@@ -154,6 +154,9 @@ FAILURE_REASONS = frozenset({
     "claim_expired",
     "lease_failed",
     "result_invalid",
+    #: The runtime refused the request because its measured context did not
+    #: fit any served window. Retrying unchanged cannot make it fit.
+    "context_exhausted",
 })
 
 
@@ -310,6 +313,10 @@ class ExecutionReadiness:
     expired: int
     awaiting_review: int
     parked: int
+    #: Parked workflows whose measured context did not fit a served window.
+    #: This is a subset of ``parked``, kept separate so operators can count
+    #: unsatisfiable work rather than infer it from busy runner slots.
+    context_exhausted: int
     completed: int
     cancelled: int
 
@@ -930,8 +937,12 @@ class TaskExecutionService:
                     # decision to abandon the work, and a reader who never
                     # answers the card should still have it attempted.
                     "ON t.id=w.task_id "
-                    "WHERE w.status IN ('queued','parked') "
-                    "AND (w.next_attempt_at IS NULL OR w.next_attempt_at<=?) "
+                    "WHERE ("
+                    " (w.status='queued' AND (w.next_attempt_at IS NULL "
+                    "  OR w.next_attempt_at<=?))"
+                    " OR (w.status='parked' AND w.next_attempt_at IS NOT NULL "
+                    "     AND w.next_attempt_at<=?)"
+                    ") "
                     f"AND w.phase IN ({placeholders}) "
                     "AND t.status='open' AND t.version=w.task_version "
                     f"ORDER BY {_SOURCE_QUEUE_ORDER_SQL}"
@@ -939,7 +950,7 @@ class TaskExecutionService:
                     "WHEN 'raised' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END,"
                     "CASE WHEN w.failure_count=0 THEN 0 ELSE 1 END,"
                     "w.updated_at,w.task_id LIMIT ?",
-                    (now, *(phase.value for phase in phases),
+                    (now, now, *(phase.value for phase in phases),
                      MAX_CLAIM_SCAN),
                 ).fetchall()
                 row = None
@@ -1639,6 +1650,8 @@ class TaskExecutionService:
                 "claim_expires_at<=?)) AS expired,"
                 "SUM(status='awaiting_review') AS awaiting_review,"
                 "SUM(status='parked') AS parked,"
+                "SUM(status='parked' AND "
+                "last_failure_reason='context_exhausted') AS context_exhausted,"
                 "SUM(status='completed') AS completed,"
                 "SUM(status='cancelled') AS cancelled "
                 "FROM task_execution_workflows",
@@ -1649,7 +1662,7 @@ class TaskExecutionService:
             for name in (
                 "awaiting_start", "snoozed", "ready", "cooling",
                 "running", "expired", "awaiting_review", "parked",
-                "completed", "cancelled",
+                "context_exhausted", "completed", "cancelled",
             )
         ))
 
@@ -1990,7 +2003,16 @@ class TaskExecutionService:
         now = stamp.isoformat(timespec="seconds")
         failures = int(row["failure_count"]) + 1
         version = int(row["version"]) + 1
-        if failures >= self._max_attempts:
+        if reason == "context_exhausted":
+            # This is an explicit refusal from the runtime's context filter,
+            # not a slow run. The next attempt would re-read the same material
+            # and exceed the same measured ceiling, so it must wait for a
+            # reader to reduce or split the work instead of cycling overnight.
+            status = WorkflowStatus.PARKED
+            next_attempt = None
+            parked = now
+            kind = "parked"
+        elif failures >= self._max_attempts:
             # Parked, and due to try again later. A run of failures is often
             # something passing — a forge that was unreachable, a machine
             # under load — and giving up permanently on the third one turns
