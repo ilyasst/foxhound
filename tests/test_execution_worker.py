@@ -1268,7 +1268,8 @@ class ExecutionWorkerTests(unittest.TestCase):
             return_value=object(),
         ):
             with self.assertRaisesRegex(
-                ExecutionWorkerDraftError, "await an approved follow-through"
+                ExecutionWorkerDraftError,
+                "write JSON false to result-repository-impact.json",
             ):
                 _repository_result(
                     state,
@@ -1338,6 +1339,85 @@ class ExecutionWorkerTests(unittest.TestCase):
                 "repository_impact": False,
             }, self.run_directory)
         self.assertEqual(result["repository_references"], [])
+
+    def test_draft_allows_an_analysis_only_repository_result_to_complete(self):
+        self._write_result_inputs()
+        self._write_result_input("result-repository-impact.json", False)
+        state = replace(
+            load_run_state(self.state_path), phase=WorkflowPhase.EXECUTE,
+        )
+        origin = SimpleNamespace(
+            kind="review_request",
+            record_id="github.com/example-org/example-repo",
+            item_id="42",
+        )
+        with knowledge_server() as endpoint:
+            worker = self._worker(endpoint)
+            with (
+                mock.patch.object(
+                    worker, "_active", return_value=(
+                        state,
+                        SimpleNamespace(
+                            delivered_reader_instruction_sequence=(
+                                lambda *_args, **_kwargs: None
+                            ),
+                        ),
+                    ),
+                ),
+                mock.patch(
+                    "foxhound.execution_worker._repository_origin",
+                    return_value=origin,
+                ),
+                mock.patch.object(worker, "_renew"),
+            ):
+                ready = worker.draft(outcome="completed")
+
+        document = json.loads(
+            (self.run_directory / ready["draft"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(document["outcome"], "completed")
+        self.assertFalse(document["repository_impact"])
+
+    def test_draft_preserves_a_structured_origin_follow_through_action(self):
+        self._write_result_inputs()
+        action = {
+            "action": "Post the prepared update",
+            "target": "https://github.com/example-org/example-repo/issues/42",
+        }
+        self._write_result_input("result-external-actions.json", [action])
+        state = replace(
+            load_run_state(self.state_path), phase=WorkflowPhase.EXECUTE,
+        )
+        origin = SimpleNamespace(
+            kind="issue",
+            record_id="github.com/example-org/example-repo",
+            item_id="42",
+        )
+        with knowledge_server() as endpoint:
+            worker = self._worker(endpoint)
+            with (
+                mock.patch.object(
+                    worker, "_active", return_value=(
+                        state,
+                        SimpleNamespace(
+                            delivered_reader_instruction_sequence=(
+                                lambda *_args, **_kwargs: None
+                            ),
+                        ),
+                    ),
+                ),
+                mock.patch(
+                    "foxhound.execution_worker._repository_origin",
+                    return_value=origin,
+                ),
+                mock.patch.object(worker, "_renew"),
+            ):
+                ready = worker.draft(outcome="awaiting_external")
+
+        document = json.loads(
+            (self.run_directory / ready["draft"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(document["external_actions"], [action])
 
     def test_github_external_completion_needs_worker_receipt(self):
         state = SimpleNamespace(

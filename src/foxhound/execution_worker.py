@@ -1436,6 +1436,13 @@ def _read_result_text(path: Path, *, label: str) -> str:
 def _read_optional_string_array(
     path: Path, *, label: str
 ) -> list[object]:
+    """Read result lines and structured action records.
+
+    Most result collections are short display lines.  External actions may
+    instead be records so an execute-phase handoff can name its exact target.
+    Keep that distinction here: accepting only strings makes the documented
+    origin-targeted action impossible to express.
+    """
     try:
         path.lstat()
     except FileNotFoundError:
@@ -1696,7 +1703,9 @@ def _repository_result(
     if state.phase is WorkflowPhase.EXECUTE and repository_impact:
         if outcome == "completed":
             raise ExecutionWorkerDraftError(
-                "repository execution must await an approved follow-through"
+                "repository execution must await an approved follow-through; "
+                "for analysis-only work write JSON false to "
+                "result-repository-impact.json"
             )
         if (outcome == "awaiting_external"
                 and not _has_origin_follow_through_action(actions, origin)):

@@ -1035,17 +1035,26 @@ _GENERAL_PROMPT_TEMPLATE_V12 = _GENERAL_PROMPT_TEMPLATE_V11.replace(
 )
 
 
-_GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V12
+_GENERAL_PROMPT_TEMPLATE_V13 = _GENERAL_PROMPT_TEMPLATE_V12.replace(
+    "Repository follow-through is required only when execution changes or advances repository work. Planning, research, and an honest non-repository result remain valid without a forge update; for such a repository-origin execution, write JSON `false` to owner-only `result-repository-impact.json` and explain the bounded result in the deliverables. Omit the file for repository-impacting work: its safe default is `true`.",
+    "Repository follow-through is required only when execution changes or advances repository work. Planning, research, and an honest non-repository result remain valid without a forge update; for such a repository-origin execution, write JSON `false` to owner-only `result-repository-impact.json` before `draft --outcome completed`, and explain the bounded result in the deliverables. Omit the file for repository-impacting work: its safe default is `true`; without the explicit `false`, `completed` is correctly refused pending follow-through.",
+).replace(
+    "In `execute`, do not post the update. Put its complete draft in the reviewable result and list posting it as a structured external action with an exact `target` URL for `task.origin`, so the reader can approve the exact external write.",
+    "In `execute`, do not post the update. Put its complete draft in the reviewable result and list posting it in `result-external-actions.json` as a JSON object, for example `{\"action\":\"Post the prepared update\",\"target\":\"https://github.com/OWNER/REPO/issues/NUMBER\"}`. Its `target` must be the exact URL for `task.origin`; a plain-string action description cannot request the follow-through. This lets the reader approve the exact external write.",
+)
+
+
+_GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V13
 
 # A built-in profile is a release artifact.  Keep its fingerprints beside the
 # prompt so changing the prompt or policy without publishing a new profile
 # revision fails at every runner and scheduler startup, rather than leaving a
 # stale test in a different file to discover the mismatch later.
 GENERAL_PROFILE_RELEASE_REVISION = (
-    "ff86e18c5665b5613b4966d7664fc71a3c8e427bf2e70248e59b80e84190700b"
+    "603dc13f6f6458085e712d173027fd89821c2f6b4fa000b5adf2d8453e5103bf"
 )
 GENERAL_PROFILE_RELEASE_PROMPT_SHA256 = (
-    "7f536c67589aa76e92ca8a632980dc26287fa4b33f207c7108f995abc6079f3e"
+    "ff3c0c6e00a5133d3532971a384c5c914706ef8d180d13eddaf80755bd92f515"
 )
 
 
