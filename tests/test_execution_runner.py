@@ -317,6 +317,78 @@ class ExecutionRunnerTests(unittest.TestCase):
         )
         return launched["kwargs"]["env"]
 
+    def test_the_agent_is_not_asked_to_suppress_its_tool_previews(self):
+        """A transcript of the closing text alone explains nothing.
+
+        Quiet mode emits only the final response, so a run that acted
+        twenty times and a run that never acted at all leave transcripts
+        that differ by their prose. The previews are the record of what
+        the run did, and the transcript exists to hold exactly that.
+        """
+        self._ready()
+        launched = {}
+
+        def popen(argv, **kwargs):
+            launched.update(argv=argv, kwargs=kwargs)
+            return FakeProcess(exit_code=0)
+
+        run_once(
+            self._config(),
+            base_environment={"PATH": "/usr/bin"},
+            popen=popen,
+            run_id_factory=lambda: "a" * 32,
+            terminate=self._terminator,
+        )
+        self.assertNotIn("--quiet", launched["argv"])
+        self.assertNotIn("-Q", launched["argv"])
+
+    def test_an_inherited_terminal_setting_cannot_reinstate_escapes(self):
+        """The runner decides this, not whatever it inherited.
+
+        Those previews are drawn for a terminal. The transcript is a file,
+        and a capable `TERM` inherited from an interactive supervisor fills
+        it with colour escapes and carriage-return redraw that no pager and
+        no diff can read.
+        """
+        environment = self._launch_environment(
+            {"PATH": "/usr/bin", "TERM": "xterm-256color"}
+        )
+        self.assertEqual(environment["TERM"], "dumb")
+        self.assertEqual(environment["NO_COLOR"], "1")
+
+    def test_a_child_that_renders_for_a_terminal_writes_a_readable_file(self):
+        """The behaviour the settings buy, proven against a real process.
+
+        A child that decides how to render by looking at its environment --
+        as a terminal user interface does -- must leave a transcript with
+        no escape byte in it.
+        """
+        environment = self._launch_environment({"PATH": "/usr/bin"})
+
+        program = (
+            "import os, sys\n"
+            "plain = os.environ.get('TERM') == 'dumb' "
+            "or os.environ.get('NO_COLOR')\n"
+            "sys.stdout.write('tool call\\n' if plain "
+            "else '\\x1b[32mtool call\\x1b[0m\\r\\n')\n"
+        )
+        transcript = self.root / "escape-check.log"
+        with open(transcript, "wb") as handle:
+            subprocess.run(
+                [sys.executable, "-c", program],
+                env=environment,
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                check=True,
+                timeout=30,
+            )
+
+        captured = transcript.read_bytes()
+        self.assertIn(b"tool call", captured)
+        self.assertNotIn(b"\x1b", captured)
+        self.assertNotIn(b"\r", captured)
+
     def test_an_inherited_buffering_setting_cannot_reinstate_buffering(self):
         """The runner decides this, not whatever it inherited.
 
@@ -985,7 +1057,6 @@ class ExecutionRunnerTests(unittest.TestCase):
                 "synthetic-hermes",
                 "--local",
                 "chat",
-                "--quiet",
                 "--query",
                 agent_prompt("synthetic-worker"),
                 "--max-turns",
