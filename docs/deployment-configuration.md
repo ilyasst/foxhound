@@ -32,7 +32,9 @@ database: the task-card service, scheduler, one or more runners, feed import,
 native intake, execution-card requeue, lifecycle-outcome export, fused task
 titles, and duplicate-card scheduling. It is intentionally strict: every field
 below is required when that component is enabled, unknown fields are rejected,
-and all paths are absolute.
+and all paths are absolute. The one exception is noted with the component it
+applies to: `task_card_requeue` may be omitted while a deployment written
+before it existed is brought forward.
 
 ```json
 {
