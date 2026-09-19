@@ -441,6 +441,22 @@ def _run_claim(
             else json.dumps(config.workflow_policy, sort_keys=True)
         ),
         "HERMES_CRON_SESSION": "1",
+        # The agent's stdout is a file, not a terminal, so a Python agent
+        # block-buffers it at 8 KiB. A run that ends by being killed --
+        # which the profile timeout always does, after the kill grace --
+        # loses whatever is still in that buffer. The transcript then holds
+        # only the unbuffered stderr line an agent happens to emit at
+        # startup, and a run that worked for its whole budget is
+        # indistinguishable from one that never began.
+        #
+        # `_open_transcript` exists to "keep what the agent said, so a
+        # failed run can be explained". Buffering defeated it in exactly
+        # the failure it was written for: runs whose transcripts held one
+        # stderr line had, in the same wall-clock window, made hundreds of
+        # model calls. Set from this dict rather than inherited, so an
+        # ambient value cannot reinstate buffering. Inert for a non-Python
+        # `agent_command`.
+        "PYTHONUNBUFFERED": "1",
     })
     process: subprocess.Popen | None = None
     transcript = None
