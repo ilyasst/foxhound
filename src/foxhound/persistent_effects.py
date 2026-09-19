@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Callable
 
 from .candidate_inbox import CandidateInbox, InboxError, SCHEMA_VERSION
-from .effect_intents import EffectExecutor, EffectIntent, EffectReceipt
+from .effect_intents import ATTEMPT_STATES, EffectExecutor, EffectIntent, EffectReceipt
 
 
 _TERMINAL_STATES = frozenset({"completed", "failed", "cancelled"})
@@ -52,6 +52,17 @@ class PersistentEffectExecutor:
         completed = self._completed_receipt(intent)
         if completed is not None:
             return completed
+        # Consult the adapter before attempting a retry: if it can confirm
+        # the effect already landed externally, adopt that answer instead of
+        # calling execute() again and risking a duplicate.
+        inspection = self._executor.inspect(intent)
+        if inspection is not None:
+            self._validate_terminal_or_progress_receipt(intent, inspection)
+            if inspection.state == "completed":
+                self._record_receipt(inspection)
+                return inspection
+            # inspect() returned a non-completed receipt (prepared/running/failed/
+            # cancelled). The effect did not land externally, so proceed.
         try:
             receipt = self._executor.execute(intent)
             self._validate_terminal_receipt(intent, receipt)
@@ -63,11 +74,14 @@ class PersistentEffectExecutor:
         self._record_receipt(receipt)
         return receipt
 
-    def inspect(self, intent: EffectIntent) -> EffectReceipt:
+    def inspect(self, intent: EffectIntent) -> EffectReceipt | None:
         return self._executor.inspect(intent)
 
     def cancel(self, intent: EffectIntent) -> EffectReceipt:
-        return self._executor.cancel(intent)
+        receipt = self._executor.cancel(intent)
+        self._validate_terminal_or_progress_receipt(intent, receipt)
+        self._record_receipt(receipt)
+        return receipt
 
     def _persist_intent(self, intent: EffectIntent) -> None:
         now = self._now()
@@ -182,6 +196,19 @@ class PersistentEffectExecutor:
             and row["idempotency_key"] == intent.idempotency_key
             and bool(row["freshness_required"]) == intent.freshness_required
         )
+
+    @staticmethod
+    def _validate_terminal_or_progress_receipt(
+        intent: EffectIntent, receipt: object,
+    ) -> None:
+        if (
+            not isinstance(receipt, EffectReceipt)
+            or receipt.intent_id != intent.intent_id
+            or receipt.state not in ATTEMPT_STATES
+        ):
+            raise PersistentEffectError(
+                "effect adapter returned an invalid receipt"
+            )
 
     @staticmethod
     def _validate_terminal_receipt(
