@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 46
+SCHEMA_VERSION = 47
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -394,6 +394,10 @@ _SCHEMA_COLUMNS = {
         "result_id", "ordinal", "relative_path", "name", "size_bytes",
         "content_digest", "run_directory",
     ),
+    "execution_failure_digests": (
+        "task_id", "workflow_version", "phase", "run_id", "digest",
+        "created_at",
+    ),
     "task_execution_events": (
         "sequence",
         "task_id",
@@ -557,7 +561,11 @@ _SCHEMA_COLUMNS = {
 _SCHEMA_V42_COLUMNS = {
     name: columns
     for name, columns in _SCHEMA_COLUMNS.items()
-    if name not in {"task_duplicate_assessments", "execution_result_artifacts"}
+    if name not in {
+        "task_duplicate_assessments",
+        "execution_result_artifacts",
+        "execution_failure_digests",
+    }
 }
 
 _SCHEMA_V41_COLUMNS = {
@@ -829,6 +837,7 @@ _SCHEMA_OBJECTS = {
     "execution_reader_inputs_no_update": "trigger",
     "execution_reader_inputs_no_delete": "trigger",
     "execution_reader_instruction_deliveries": "table",
+    "execution_failure_digests": "table",
     "task_owner_events_no_update": "trigger",
     "task_owner_events_no_delete": "trigger",
     "task_execution_owner_holds_one_active": "index",
@@ -2807,6 +2816,39 @@ END;
 """,
 )
 
+# Why a run without a result stopped, in a few sentences, for the attempt it
+# describes. The ledger already records HOW a process ended -- a reason and an
+# exit code -- and that classification cannot distinguish an exhausted turn
+# budget from a saturated backend from a refused worker operation, which imply
+# completely different next actions. The cause was written down exactly once,
+# in a transcript on disk that nothing read.
+#
+# One row per (task, workflow version): that pair is one attempt, because
+# `claim_next` increments the version and `renew` does not. Phase is carried
+# because a failure in `execute` says nothing about a `plan` pass that
+# succeeded, and a reader shown the wrong phase's cause is worse off than one
+# shown none. `run_id` records which transcript it came from, so a digest can
+# be traced to its evidence.
+#
+# Derived and best-effort. The absence of a row is a normal state and carries
+# no meaning beyond "we have no digest": the model is remote, and a failure to
+# summarise a failure must never become a second failure.
+_SCHEMA_V47 = (
+    """CREATE TABLE IF NOT EXISTS execution_failure_digests (
+    task_id          INTEGER NOT NULL,
+    workflow_version INTEGER NOT NULL CHECK(workflow_version >= 1),
+    phase            TEXT NOT NULL CHECK(phase IN (
+                         'plan','execute','external_action'
+                     )),
+    run_id           TEXT CHECK(run_id IS NULL OR
+                         (length(run_id) = 32 AND run_id GLOB '[0-9a-f]*')),
+    digest           TEXT NOT NULL CHECK(length(digest) BETWEEN 1 AND 800),
+    created_at       TEXT NOT NULL,
+    PRIMARY KEY(task_id, workflow_version),
+    FOREIGN KEY(task_id) REFERENCES task_execution_workflows(task_id)
+);""",
+)
+
 _SCHEMA_V46 = (
     """CREATE TABLE IF NOT EXISTS execution_result_artifacts (
     result_id       TEXT NOT NULL REFERENCES task_execution_results(result_id),
@@ -4082,6 +4124,16 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 46
+            if version == 46:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    connection.execute(_SCHEMA_V47[0])
+                    connection.execute("PRAGMA user_version = 47")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 47
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:

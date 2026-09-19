@@ -1924,6 +1924,46 @@ class ExecutionCardTests(unittest.TestCase):
             )
         return self.execution.get(task_id)
 
+    def test_a_parked_card_says_why_the_last_attempt_stopped(self):
+        """A reason and an exit code say the process ended, not what ended it.
+
+        `process_exit` covers an exhausted turn budget, a request no
+        backend would serve, and a refused worker operation, and those need
+        different answers from the reader. The card offers "Continue tries
+        again" and could not say whether trying again could possibly work.
+        """
+        task_id = 1
+        parked = self._park(task_id)
+        self.assertEqual(parked.status, WorkflowStatus.PARKED)
+        self.execution.record_failure_digest(
+            task_id,
+            workflow_version=parked.version,
+            phase=parked.phase,
+            run_id=None,
+            digest="The run was editing one file and stopped at its turn limit.",
+        )
+
+        self.assertEqual(self.cards.schedule().created, 1)
+        card = self.cards.claim_next().card
+        body, _keyboard = render_execution_review_card(card)
+
+        self.assertIn("Why it stopped", body)
+        self.assertIn("stopped at its turn limit", body)
+
+    def test_a_parked_card_reads_correctly_with_no_digest(self):
+        """The common case. The summary is derived from a remote model, so
+        absent is normal and must cost the reader nothing.
+        """
+        parked = self._park(1)
+        self.assertEqual(parked.status, WorkflowStatus.PARKED)
+        self.assertEqual(self.cards.schedule().created, 1)
+        card = self.cards.claim_next().card
+        body, _keyboard = render_execution_review_card(card)
+
+        self.assertEqual(card.failure_digest, "")
+        self.assertNotIn("Why it stopped", body)
+        self.assertIn("Stopped after 3 failed attempt", body)
+
     def test_a_workflow_that_gave_up_says_so_instead_of_going_quiet(self):
         """Parking is the retry limiter, and it used to be terminal and
         silent: the task stayed open, its workflow was abandoned, and no
