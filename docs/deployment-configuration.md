@@ -237,6 +237,29 @@ task-card delivery is available. Its endpoint is a canonical loopback HTTP
 gateway selected in the private deployment document. The worker asks for the
 `thinking_no` capability and prints aggregate counts only.
 
+## Failure digests
+
+`foxhound-failure-digest` is a one-shot pass that explains runs which ended
+without a result. It takes `--database` and `--run-root`; the run root must be
+the one the runner writes to, because that is where the transcripts are. Run it
+from a private timer, after the runner.
+
+For each failed attempt without a digest it reads the **tail** of that run's
+transcript, asks the capability gateway for the `light` capability, and stores a
+few sentences against the attempt. The card for a parked workflow then states
+the cause beside the attempt count, so a reader deciding whether to continue can
+see whether continuing could work.
+
+Everything fails open. A pruned run root, an absent transcript, a busy or
+unconfigured gateway, and a reply that does not fit are all skipped rows: the
+pass exits 0 and prints counts. Set `FOXHOUND_DIGEST=0` to disable summarising
+entirely — a deployment with no gateway behaves exactly as it did before this
+existed, minus the digests. `FOXHOUND_DIGEST_ENDPOINT` overrides the gateway,
+shared with the other derived summaries.
+
+The pass is re-runnable: one digest per attempt, and a second pass over the same
+attempt does nothing.
+
 ## Duplicate review cards
 
 `duplicate-card-schedule` is a bounded one-shot database consumer. Run it from
