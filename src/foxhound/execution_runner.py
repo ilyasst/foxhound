@@ -249,7 +249,6 @@ def hermes_argv(
     argv = [
         *base,
         "chat",
-        "--quiet",
         "--query",
         agent_prompt(worker_command),
         "--max-turns",
@@ -285,7 +284,6 @@ def profile_argv(
     return (
         *base,
         "chat",
-        "--quiet",
         "--query",
         agent_prompt(worker_command),
         "--max-turns",
@@ -457,6 +455,17 @@ def _run_claim(
         # ambient value cannot reinstate buffering. Inert for a non-Python
         # `agent_command`.
         "PYTHONUNBUFFERED": "1",
+        # The transcript is a file that a person reads to explain a failed
+        # run, so it carries the agent's tool previews -- `--quiet` is not
+        # passed, because a transcript of the closing text alone cannot
+        # distinguish a run that acted twenty times from one that never
+        # acted at all. Those previews are drawn for a terminal. Declare
+        # there is none: without this the file fills with colour escapes
+        # and carriage-return redraw, which no pager and no diff can read.
+        # Set from this dict rather than inherited, for the same reason as
+        # the line above.
+        "NO_COLOR": "1",
+        "TERM": "dumb",
     })
     process: subprocess.Popen | None = None
     transcript = None
