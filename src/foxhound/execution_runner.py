@@ -130,6 +130,7 @@ class ExecutionRunnerConfig:
     execution_slot_cap: int | None = None
     plan_ready_cap: int | None = None
     awaiting_reader_cap: int | None = None
+    profile_routes: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if (
@@ -185,6 +186,15 @@ class ExecutionRunnerConfig:
             _action_grants(self.action_grants)
         except ValueError as exc:
             raise ValueError("execution action grants are invalid") from exc
+        if (
+            not isinstance(self.profile_routes, Mapping)
+            or any(
+                not isinstance(kind, str) or not kind
+                or not isinstance(profile_id, str) or not profile_id
+                for kind, profile_id in self.profile_routes.items()
+            )
+        ):
+            raise ValueError("execution agent profile routes are invalid")
         if self.workflow_policy is not None:
             try:
                 parse_workflow_policy(self.workflow_policy)
@@ -342,6 +352,7 @@ def run_once(
         planning_grants=config.planning_grants,
         execution_grants=config.execution_grants,
         action_grants=config.action_grants,
+        profile_routes=config.profile_routes,
         execution_slot_cap=config.execution_slot_cap,
         plan_ready_cap=config.plan_ready_cap,
         awaiting_reader_cap=config.awaiting_reader_cap,
@@ -1053,6 +1064,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--agent-command", default="hermes")
     parser.add_argument("--agent-profile-directory", type=Path)
     parser.add_argument("--default-agent-profile", default="general")
+    parser.add_argument(
+        "--profile-route", action="append", metavar="SOURCE_KIND=PROFILE",
+    )
     parser.add_argument("--worker-command", default="foxhound-task-worker")
     parser.add_argument(
         "--runner-slot", default="default",
@@ -1161,6 +1175,16 @@ def _diagnosis(exc: BaseException) -> str:
     return " <- ".join(names)
 
 
+def _profile_routes(values: Sequence[str] | None) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for value in values or ():
+        kind, separator, profile_id = value.partition("=")
+        if not separator or not kind or not profile_id or kind in result:
+            raise ValueError("execution agent profile routes are invalid")
+        result[kind] = profile_id
+    return result
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -1173,6 +1197,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             agent_command=args.agent_command,
             profile_registry=load_registry(args.agent_profile_directory),
             default_agent_profile=args.default_agent_profile,
+            profile_routes=_profile_routes(args.profile_route),
             worker_command=args.worker_command,
             runner_slot=args.runner_slot,
             planning_grants=tuple(args.plan_without_asking or ()),

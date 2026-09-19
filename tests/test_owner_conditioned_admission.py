@@ -224,7 +224,9 @@ class DeploymentConfigAliasTests(unittest.TestCase):
 
     def _current(self, **extra: object) -> dict[str, object]:
         """The same document with every key the current version requires."""
-        return self._document(skip_planning_for=[], **extra)
+        return self._document(
+            skip_planning_for=[], agent_profile_routes=[], **extra
+        )
 
     def test_aliases_are_read_at_the_current_version(self):
         workflow = _parse_workflow(

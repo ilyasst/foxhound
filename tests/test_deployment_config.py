@@ -14,6 +14,7 @@ from unittest import mock
 
 from foxhound.database_lifecycle import migrate_database
 from foxhound import deployment_config
+from foxhound.agent_profiles import AgentProfile, WORKER_COMMAND_TOKEN
 from foxhound.deployment_config import (
     DeploymentConfigError,
     execute_component,
@@ -62,7 +63,7 @@ class DeploymentConfigTests(unittest.TestCase):
     def _document(self) -> dict[str, object]:
         return {
             "schema": "foxhound.deployment-config",
-            "schema_version": 10,
+            "schema_version": 11,
             "database": str(self.database),
             "agent_profile_directory": None,
             "card_service": {
@@ -80,6 +81,7 @@ class DeploymentConfigTests(unittest.TestCase):
             },
             "workflow": {
                 "default_agent_profile": "general",
+                "agent_profile_routes": [],
                 "plan_without_asking": ["issue"],
                 "execute_without_asking": ["issue"],
                 "skip_planning_for": ["issue"],
@@ -209,6 +211,7 @@ class DeploymentConfigTests(unittest.TestCase):
     def test_version_one_configuration_remains_valid_without_card_gw_settings(self) -> None:
         document = self._document()
         document["schema_version"] = 1
+        del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
         del document["card_service"]["task_work_root"]  # type: ignore[index]
         del document["workflow"]["act_without_asking"]  # type: ignore[index]
         del document["workflow"]["execute_without_asking"]  # type: ignore[index]
@@ -227,6 +230,7 @@ class DeploymentConfigTests(unittest.TestCase):
     def test_version_two_configuration_remains_valid(self) -> None:
         document = self._document()
         document["schema_version"] = 2
+        del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
         del document["card_service"]["task_work_root"]  # type: ignore[index]
         del document["workflow"]["act_without_asking"]  # type: ignore[index]
         del document["workflow"]["execute_without_asking"]  # type: ignore[index]
@@ -245,6 +249,7 @@ class DeploymentConfigTests(unittest.TestCase):
     def test_version_three_configuration_remains_valid_without_title_worker(self) -> None:
         document = self._document()
         document["schema_version"] = 3
+        del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
         del document["card_service"]["task_work_root"]  # type: ignore[index]
         del document["workflow"]["act_without_asking"]  # type: ignore[index]
         del document["workflow"]["execute_without_asking"]  # type: ignore[index]
@@ -265,6 +270,7 @@ class DeploymentConfigTests(unittest.TestCase):
     ) -> None:
         document = self._document()
         document["schema_version"] = 4
+        del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
         del document["card_service"]["task_work_root"]  # type: ignore[index]
         del document["workflow"]["act_without_asking"]  # type: ignore[index]
         del document["workflow"]["execute_without_asking"]  # type: ignore[index]
@@ -283,6 +289,7 @@ class DeploymentConfigTests(unittest.TestCase):
         """A file written before the key existed keeps asking, silently."""
         document = self._document()
         document["schema_version"] = 5
+        del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
         del document["card_service"]["task_work_root"]  # type: ignore[index]
         del document["workflow"]["act_without_asking"]  # type: ignore[index]
         del document["workflow"]["execute_without_asking"]  # type: ignore[index]
@@ -343,6 +350,7 @@ class DeploymentConfigTests(unittest.TestCase):
         document = self._document()
         document["schema_version"] = 9
         del document["workflow"]["skip_planning_for"]  # type: ignore[index]
+        del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
         self._write_config(document)
 
         config = load_deployment_config(self.config_path)
@@ -351,6 +359,62 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertNotIn(
             "--skip-planning-for", config.argv("execution-schedule")
         )
+
+    def test_routes_multiple_source_kinds_to_installed_profiles(self) -> None:
+        directory = self.root / "profiles"
+        directory.mkdir(mode=0o700)
+        profile = AgentProfile(
+            profile_id="example-repository-agent",
+            display_name="Example Repository Agent",
+            runtime="hermes",
+            prompt_template=f"First call {WORKER_COMMAND_TOKEN} context.",
+            toolsets=("terminal",),
+            max_turns=50,
+            timeout_seconds=1_800,
+            claim_lease_seconds=2_700,
+            heartbeat_seconds=60,
+            kill_grace_seconds=30,
+            allowed_phases=("plan", "execute", "external_action"),
+        )
+        manifest = directory / f"{profile.profile_id}.json"
+        manifest.write_text(json.dumps(profile.document()), encoding="utf-8")
+        manifest.chmod(0o600)
+        document = self._document()
+        document["agent_profile_directory"] = str(directory)
+        document["workflow"]["agent_profile_routes"] = [  # type: ignore[index]
+            {
+                "selector": {"source_kind": "issue"},
+                "profile_id": profile.profile_id,
+            },
+            {
+                "selector": {"source_kind": "review_request"},
+                "profile_id": profile.profile_id,
+            },
+        ]
+        self._write_config(document)
+
+        config = load_deployment_config(self.config_path)
+
+        self.assertEqual(
+            config.workflow.agent_profile_routes,
+            (("issue", profile.profile_id), ("review_request", profile.profile_id)),
+        )
+        argv = config.argv("execution-runner:primary")
+        self.assertEqual(argv.count("--profile-route"), 2)
+        self.assertIn(f"issue={profile.profile_id}", argv)
+
+    def test_route_to_unavailable_or_phase_incapable_profile_is_refused(self) -> None:
+        document = self._document()
+        document["workflow"]["agent_profile_routes"] = [  # type: ignore[index]
+            {
+                "selector": {"source_kind": "issue"},
+                "profile_id": "missing-profile",
+            },
+        ]
+        self._write_config(document)
+
+        with self.assertRaises(DeploymentConfigError):
+            load_deployment_config(self.config_path)
 
     def test_an_unknown_granted_kind_is_refused(self) -> None:
         document = self._document()
@@ -387,6 +451,7 @@ class DeploymentConfigTests(unittest.TestCase):
         """A file written for the previous key keeps asking about actions."""
         document = self._document()
         document["schema_version"] = 6
+        del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
         del document["card_service"]["task_work_root"]  # type: ignore[index]
         del document["workflow"]["act_without_asking"]  # type: ignore[index]
         del document["workflow"]["skip_planning_for"]  # type: ignore[index]

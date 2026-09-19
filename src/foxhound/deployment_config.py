@@ -22,7 +22,12 @@ from urllib.parse import urlsplit
 from .agent_profiles import AgentProfileError, load_registry
 from .execution_runner import ExecutionRunnerConfig
 from .execution_worker import ExecutionWorkerConfigError, load_knowledge_config
-from .source_policy import action_grants, execution_grants, planning_grants
+from .source_policy import (
+    action_grants,
+    execution_grants,
+    planning_grants,
+    source_kind_grants,
+)
 from .task_bootstrap import TaskBootstrapConfigError, _private_database
 from .task_card_server import (
     DRIP_ROLE,
@@ -32,11 +37,11 @@ from .task_card_server import (
     is_canonical_loopback,
     load_role_tokens,
 )
-from .task_execution import TaskExecutionService
+from .task_execution import TaskExecutionService, WorkflowPhase
 
 
 DEPLOYMENT_SCHEMA = "foxhound.deployment-config"
-DEPLOYMENT_SCHEMA_VERSION = 10
+DEPLOYMENT_SCHEMA_VERSION = 11
 MAX_CONFIG_BYTES = 64 * 1024
 
 
@@ -96,6 +101,7 @@ class CardServiceConfig:
 @dataclass(frozen=True)
 class WorkflowConfig:
     default_agent_profile: str
+    agent_profile_routes: tuple[tuple[str, str], ...]
     plan_without_asking: tuple[str, ...]
     execution_slot_cap: int
     plan_ready_cap: int
@@ -128,6 +134,8 @@ class WorkflowConfig:
         ]
         if profile_directory is not None:
             result.extend(("--agent-profile-directory", str(profile_directory)))
+        for source_kind, profile_id in self.agent_profile_routes:
+            result.extend(("--profile-route", f"{source_kind}={profile_id}"))
         for kind in self.plan_without_asking:
             result.extend(("--plan-without-asking", kind))
         for kind in self.skip_planning_for:
@@ -183,6 +191,8 @@ class ExecutionRunnerDeploymentConfig:
         ]
         if profile_directory is not None:
             result.extend(("--agent-profile-directory", str(profile_directory)))
+        for source_kind, profile_id in workflow.agent_profile_routes:
+            result.extend(("--profile-route", f"{source_kind}={profile_id}"))
         for option, path in (
             ("--knowledge-root", self.knowledge_root),
             ("--task-work-root", self.task_work_root),
@@ -408,7 +418,7 @@ def _parse_document(document: object) -> DeploymentConfig:
     version = document.get("schema_version")
     if (
         document.get("schema") != DEPLOYMENT_SCHEMA
-        or version not in {1, 2, 3, 4, 5, 6, 7, 8, 9, DEPLOYMENT_SCHEMA_VERSION}
+        or version not in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, DEPLOYMENT_SCHEMA_VERSION}
         or isinstance(version, bool)
     ):
         raise DeploymentConfigError("deployment configuration version is invalid")
@@ -525,6 +535,8 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
         fields = fields | {"reader_aliases"}
     if version >= 10:
         fields = fields | {"skip_planning_for"}
+    if version >= 11:
+        fields = fields | {"agent_profile_routes"}
     document = _object(value, fields)
     profile = document["default_agent_profile"]
     grants = document["plan_without_asking"]
@@ -534,6 +546,9 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
     act_grants = document["act_without_asking"] if version >= 7 else []
     aliases = document["reader_aliases"] if version >= 9 else []
     skipped = document["skip_planning_for"] if version >= 10 else []
+    routes = _profile_routes(
+        document["agent_profile_routes"] if version >= 11 else []
+    )
     caps = tuple(document[key] for key in (
         "execution_slot_cap", "plan_ready_cap", "awaiting_reader_cap"
     ))
@@ -549,6 +564,7 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
         raise DeploymentConfigError("workflow configuration is invalid")
     return WorkflowConfig(
         profile,
+        routes,
         tuple(grants),
         *caps,
         execute_without_asking=tuple(execute_grants),
@@ -556,6 +572,32 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
         reader_aliases=tuple(aliases),
         skip_planning_for=tuple(skipped),
     )
+
+
+def _profile_routes(value: object) -> tuple[tuple[str, str], ...]:
+    """Parse extensible route entries; source kind is the first selector."""
+    if not isinstance(value, list):
+        raise DeploymentConfigError("workflow agent profile routes are invalid")
+    routes: list[tuple[str, str]] = []
+    for entry in value:
+        if not isinstance(entry, Mapping):
+            raise DeploymentConfigError("workflow agent profile routes are invalid")
+        document = _object(entry, {"selector", "profile_id"})
+        selector = document["selector"]
+        profile_id = document["profile_id"]
+        if not isinstance(selector, Mapping):
+            raise DeploymentConfigError("workflow agent profile routes are invalid")
+        selector = _object(selector, {"source_kind"})
+        source_kind = selector["source_kind"]
+        if (
+            not isinstance(source_kind, str) or not source_kind
+            or not isinstance(profile_id, str) or not profile_id
+        ):
+            raise DeploymentConfigError("workflow agent profile routes are invalid")
+        routes.append((source_kind, profile_id))
+    if len({source_kind for source_kind, _profile in routes}) != len(routes):
+        raise DeploymentConfigError("workflow agent profile routes are invalid")
+    return tuple(routes)
 
 
 def _grant_list(value: object) -> bool:
@@ -799,6 +841,26 @@ def _role_paths(
     return tuple(sorted(result))
 
 
+def _validate_profile_routing(
+    registry: object, workflow: WorkflowConfig
+) -> None:
+    """Refuse an unrunnable route before a scheduler can claim work."""
+    if not hasattr(registry, "get"):
+        raise DeploymentConfigError("workflow agent profile routing is invalid")
+    profile_ids = (
+        workflow.default_agent_profile,
+        *(profile_id for _source_kind, profile_id in workflow.agent_profile_routes),
+    )
+    for profile_id in profile_ids:
+        profile = registry.get(profile_id)
+        if profile is None or any(
+            phase.value not in profile.allowed_phases for phase in WorkflowPhase
+        ):
+            raise DeploymentConfigError(
+                "workflow agent profile routing is unavailable"
+            )
+
+
 def _validate_runtime(config: DeploymentConfig) -> None:
     _private_database(config.database)
     registry = load_registry(config.agent_profile_directory)
@@ -821,6 +883,11 @@ def _validate_runtime(config: DeploymentConfig) -> None:
             + ", ".join(sorted(missing_planning_grants))
         )
     action_grants(config.workflow.act_without_asking)
+    source_kind_grants(
+        (source_kind for source_kind, _profile in config.workflow.agent_profile_routes),
+        label="workflow agent profile routes",
+    )
+    _validate_profile_routing(registry, config.workflow)
     TaskExecutionService(
         config.database,
         profile_registry=registry,
@@ -833,6 +900,7 @@ def _validate_runtime(config: DeploymentConfig) -> None:
         plan_ready_cap=config.workflow.plan_ready_cap,
         awaiting_reader_cap=config.workflow.awaiting_reader_cap,
         reader_aliases=config.workflow.reader_aliases,
+        profile_routes=dict(config.workflow.agent_profile_routes),
     )
     for runner in config.execution_runners:
         if runner.enabled:
@@ -866,6 +934,7 @@ def _validate_runtime(config: DeploymentConfig) -> None:
                 execution_slot_cap=config.workflow.execution_slot_cap,
                 plan_ready_cap=config.workflow.plan_ready_cap,
                 awaiting_reader_cap=config.workflow.awaiting_reader_cap,
+                profile_routes=dict(config.workflow.agent_profile_routes),
             )
     cards = config.card_service
     if not cards.enabled:

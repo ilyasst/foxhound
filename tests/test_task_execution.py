@@ -161,7 +161,10 @@ class TaskExecutionTests(unittest.TestCase):
             max_attempts=3,
             profile_registry=AgentProfileRegistry((
                 general_profile(),
-                _profile("sigint", phases=("plan", "execute", "external_action")),
+                _profile(
+                    "repository-agent",
+                    phases=("plan", "execute", "external_action"),
+                ),
             )),
         )
 
@@ -926,7 +929,7 @@ class TaskExecutionTests(unittest.TestCase):
                 profile_registry=AgentProfileRegistry((
                     general_profile(),
                     _profile(
-                        "sigint",
+                        "repository-agent",
                         phases=("plan", "execute", "external_action"),
                     ),
                 )),
@@ -977,28 +980,47 @@ class TaskExecutionTests(unittest.TestCase):
         refused = self.service.schedule(1, expected_task_version=2)
         self.assertEqual(refused.refusal, WorkflowRefusal.INVALID_STATE)
 
-    def test_repository_work_starts_on_an_agent_that_can_do_it(self):
-        """A single default sends every kind of work to the same agent. One
-        pull-request review went to the compatibility profile, produced
-        nothing recordable three times, and parked with the review written.
-
-        A compatibility-only library instance may still fall back while the
-        production scheduler is responsible for installing SigInt.
-        """
-        from foxhound.agent_profiles import AgentProfile, AgentProfileRegistry
-        from foxhound.task_execution import SOURCE_KIND_PROFILES
-
-        self.assertEqual(SOURCE_KIND_PROFILES.get("review_request"), "sigint")
-        self.assertEqual(SOURCE_KIND_PROFILES.get("issue"), "sigint")
-        # A meeting action has no preference and keeps the default.
-        self.assertIsNone(SOURCE_KIND_PROFILES.get("meeting"))
-
+    def test_source_kind_route_selects_its_declared_profile(self):
         general = self.service._profile_registry.get("general")
+        repository = self.service._profile_registry.get("repository-agent")
         service = TaskExecutionService(
             self.database, clock=self.clock,
-            profile_registry=AgentProfileRegistry([general]))
+            profile_registry=AgentProfileRegistry([general, repository]),
+            profile_routes={"issue": repository.profile_id},
+        )
         self.assertEqual(
-            service._profile_for("review_request").profile_id, "general")
+            service._profile_for("issue").profile_id, repository.profile_id
+        )
+        self.assertEqual(
+            service._profile_for("meeting").profile_id, general.profile_id
+        )
+        self._bind_origin(1, "issue")
+        scheduled = service.schedule(1, expected_task_version=1)
+        self.assertEqual(scheduled.agent_profile_id, repository.profile_id)
+        # Routing applies when the workflow is created. Reopening the same
+        # service with a different route must not rebind the durable choice.
+        changed = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            profile_registry=AgentProfileRegistry([general, repository]),
+            profile_routes={"issue": general.profile_id},
+        )
+        self.assertEqual(changed.get(1).agent_profile_id, repository.profile_id)
+
+    def test_a_route_to_an_uninstalled_profile_is_refused_at_startup(self):
+        """A missing catalog is a configuration fault, not a scheduling one.
+
+        The machine that renders the scheduler's command line is not the one
+        that installs the private catalog, so the two can disagree. Saying so
+        once at startup beats one failed pass per timer tick.
+        """
+        general = self.service._profile_registry.get("general")
+        with self.assertRaisesRegex(ValueError, "routed agent profile"):
+            TaskExecutionService(
+                self.database, clock=self.clock,
+                profile_registry=AgentProfileRegistry([general]),
+                profile_routes={"issue": "not-installed"},
+            )
 
     def test_an_enrolled_repository_issue_is_planned_without_being_asked(self):
         """The gate asks a question already answered by enrolling the repo.
@@ -1739,7 +1761,8 @@ class TaskExecutionTests(unittest.TestCase):
             profile_registry=AgentProfileRegistry((
                 general_profile(),
                 _profile(
-                    "sigint", phases=("plan", "execute", "external_action")
+                    "repository-agent",
+                    phases=("plan", "execute", "external_action"),
                 ),
             )),
             execution_grants=list(kinds),

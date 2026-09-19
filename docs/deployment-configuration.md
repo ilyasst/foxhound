@@ -12,8 +12,15 @@ make it owner-only (`0600`), and do not commit it, paste it into issues, or
 send its rendered command lines to logs. It contains paths but never token
 values.
 
-Version 10 is current. Three things about it are worth knowing before an
-upgrade, because neither announces itself:
+Version 11 is current. Four things about it are worth knowing before an
+upgrade, because none of them announces itself:
+
+- Version 11 makes profile routing a deployment choice. `default_agent_profile`
+  remains the required fallback, while each `agent_profile_routes` entry names
+  a selector and an installed profile. The initial selector is `source_kind`;
+  the entry shape leaves room for additional selectors without replacing the
+  routing list. Older documents migrate to an empty route list, so every task
+  uses their already-declared default until routes are added deliberately.
 
 - `card_service.task_work_root` is **required** once delivery is enabled, and
   it is what switches result artifacts on. Without it the artifact routes are
@@ -42,7 +49,7 @@ before it existed is brought forward.
 ```json
 {
   "schema": "foxhound.deployment-config",
-  "schema_version": 10,
+  "schema_version": 11,
   "database": "/srv/example/private-foxhound-state/foxhound.sqlite3",
   "agent_profile_directory": null,
   "card_service": {
@@ -64,6 +71,11 @@ before it existed is brought forward.
   },
   "workflow": {
     "default_agent_profile": "general",
+    "agent_profile_routes": [{
+      "selector": {"source_kind": "issue"},
+      "profile_id": "example-repository-agent"
+    }],
+    "reader_aliases": [],
     "plan_without_asking": ["issue"],
     "execute_without_asking": ["issue"],
     "skip_planning_for": ["issue"],
@@ -131,7 +143,7 @@ Set a disabled `card_service`, runner, or database consumer to exactly
 to be declared separately; enabled slots must have distinct names. The
 workflow section remains required because it owns the shared policy and
 limits. Earlier versions remain readable for a controlled transition, but
-only version 10 can declare the complete deployment boundary.
+only version 11 can declare the complete deployment boundary.
 
 `task_card_requeue` may be omitted from an existing version 5 document during
 the transition. Rendering `task-card-requeue` then refuses safely; add it with
