@@ -38,6 +38,19 @@ the run. It cannot traverse out of the run, name run state or instructions,
 follow symlinks, or exceed bounded item and byte limits. Unlisted files are not
 copied.
 
+For deployments that configure the private Hermes session database, the runner
+also gives each runtime session a Foxhound-unique source tag and, after the
+runtime exits, copies that one structured session lineage to
+`runs/<phase>-<id>/runtime-session.json`. This is deliberately a database
+record rather than a reconstruction of terminal output: it includes the
+runtime's tool-call arguments, tool-result/error records, provider status, and
+session accounting. The task log names that file, so the reader follows the
+ledger rather than extracting a session identifier from a transcript. It is
+private evidence, never a result artifact or a delivery candidate. Foxhound
+keeps the newest records within a deployment-configured per-task byte budget
+(30 MiB by default), retaining the current record even when it alone exceeds
+that budget.
+
 The worker adds the working-folder and KB-file paths to the append-only result
 record. Review cards show those locations before the detailed work. They also
 show the source issue and verified Markdown, pull-request, issue, and commit
@@ -56,7 +69,8 @@ check needed to review the result.
 
 - Review cards remain summaries while pointing to durable evidence.
 - A failed run retains its transcript and any explicitly declared working
-  files, allowing a later pass to continue from what was learned.
+  files, plus its structured runtime record when configured, allowing a later
+  pass to continue from what was learned.
 - KB search can find the task description, result, questions, deliverables,
   and work record without indexing raw run state.
 - The ledger schema advances to version 17 and run-state schema to version 4.

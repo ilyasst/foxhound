@@ -12,15 +12,8 @@ make it owner-only (`0600`), and do not commit it, paste it into issues, or
 send its rendered command lines to logs. It contains paths but never token
 values.
 
-Version 11 is current. Four things about it are worth knowing before an
+Version 12 is current. Five things about it are worth knowing before an
 upgrade, because none of them announces itself:
-
-- Version 11 makes profile routing a deployment choice. `default_agent_profile`
-  remains the required fallback, while each `agent_profile_routes` entry names
-  a selector and an installed profile. The initial selector is `source_kind`;
-  the entry shape leaves room for additional selectors without replacing the
-  routing list. Older documents migrate to an empty route list, so every task
-  uses their already-declared default until routes are added deliberately.
 
 - `card_service.task_work_root` is **required** once delivery is enabled, and
   it is what switches result artifacts on. Without it the artifact routes are
@@ -36,6 +29,19 @@ upgrade, because none of them announces itself:
 - Version 10 adds `workflow.skip_planning_for`. It is a separate list because
   removing an ask does not remove a phase; each listed kind must also be in
   both `workflow.plan_without_asking` and `workflow.execute_without_asking`.
+- Version 11 makes profile routing a deployment choice. `default_agent_profile`
+  remains the required fallback, while each `agent_profile_routes` entry names
+  a selector and an installed profile. The initial selector is `source_kind`;
+  the entry shape leaves room for additional selectors without replacing the
+  routing list. Older documents migrate to an empty route list, so every task
+  uses their already-declared default until routes are added deliberately.
+- Version 12 copies the runtime's structured session record into each task
+  run. When `task_work_root` and `task_kb_root` are configured, set
+  `runtime_session_database` to the private Hermes `state.db`; it is read-only
+  input, while the copied `runtime-session.json` is Foxhound-owned task
+  evidence. `runtime_log_retention_bytes` is the per-task history limit and
+  defaults to 30 MiB. These logs can contain private tool arguments and
+  results: they are not artifacts and must never be committed or delivered.
 
 Version 5 covers every enabled component that reads or writes the shared
 database: the task-card service, scheduler, one or more runners, feed import,
@@ -49,7 +55,7 @@ before it existed is brought forward.
 ```json
 {
   "schema": "foxhound.deployment-config",
-  "schema_version": 11,
+  "schema_version": 12,
   "database": "/srv/example/private-foxhound-state/foxhound.sqlite3",
   "agent_profile_directory": null,
   "card_service": {
@@ -82,7 +88,8 @@ before it existed is brought forward.
     "act_without_asking": ["issue"],
     "execution_slot_cap": 2,
     "plan_ready_cap": 10,
-    "awaiting_reader_cap": 20
+    "awaiting_reader_cap": 20,
+    "reader_aliases": []
   },
   "execution_runners": [{
     "enabled": true,
@@ -95,7 +102,9 @@ before it existed is brought forward.
     "runner_slot": "primary",
     "knowledge_root": null,
     "task_work_root": null,
-    "task_kb_root": null
+    "task_kb_root": null,
+    "runtime_session_database": null,
+    "runtime_log_retention_bytes": 31457280
   }],
   "database_consumers": {
     "candidate_feed_import": {

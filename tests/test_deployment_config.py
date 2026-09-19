@@ -60,10 +60,16 @@ class DeploymentConfigTests(unittest.TestCase):
         path.chmod(0o600)
         return path
 
+    def _drop_runtime_log_keys(self, document: dict[str, object]) -> None:
+        """Remove the keys a document written before version 12 never had."""
+        for runner in document["execution_runners"]:  # type: ignore[index]
+            del runner["runtime_session_database"]
+            del runner["runtime_log_retention_bytes"]
+
     def _document(self) -> dict[str, object]:
         return {
             "schema": "foxhound.deployment-config",
-            "schema_version": 11,
+            "schema_version": 12,
             "database": str(self.database),
             "agent_profile_directory": None,
             "card_service": {
@@ -103,6 +109,8 @@ class DeploymentConfigTests(unittest.TestCase):
                 "knowledge_root": None,
                 "task_work_root": None,
                 "task_kb_root": None,
+                "runtime_session_database": None,
+                "runtime_log_retention_bytes": None,
             }, {
                 "enabled": True,
                 "run_root": str(self.root / "runs-secondary"),
@@ -115,6 +123,8 @@ class DeploymentConfigTests(unittest.TestCase):
                 "knowledge_root": None,
                 "task_work_root": None,
                 "task_kb_root": None,
+                "runtime_session_database": None,
+                "runtime_log_retention_bytes": None,
             }],
             "database_consumers": {
                 "candidate_feed_import": {
@@ -211,6 +221,7 @@ class DeploymentConfigTests(unittest.TestCase):
     def test_version_one_configuration_remains_valid_without_card_gw_settings(self) -> None:
         document = self._document()
         document["schema_version"] = 1
+        self._drop_runtime_log_keys(document)
         del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
         del document["card_service"]["task_work_root"]  # type: ignore[index]
         del document["workflow"]["act_without_asking"]  # type: ignore[index]
@@ -230,6 +241,7 @@ class DeploymentConfigTests(unittest.TestCase):
     def test_version_two_configuration_remains_valid(self) -> None:
         document = self._document()
         document["schema_version"] = 2
+        self._drop_runtime_log_keys(document)
         del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
         del document["card_service"]["task_work_root"]  # type: ignore[index]
         del document["workflow"]["act_without_asking"]  # type: ignore[index]
@@ -249,6 +261,7 @@ class DeploymentConfigTests(unittest.TestCase):
     def test_version_three_configuration_remains_valid_without_title_worker(self) -> None:
         document = self._document()
         document["schema_version"] = 3
+        self._drop_runtime_log_keys(document)
         del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
         del document["card_service"]["task_work_root"]  # type: ignore[index]
         del document["workflow"]["act_without_asking"]  # type: ignore[index]
@@ -270,6 +283,7 @@ class DeploymentConfigTests(unittest.TestCase):
     ) -> None:
         document = self._document()
         document["schema_version"] = 4
+        self._drop_runtime_log_keys(document)
         del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
         del document["card_service"]["task_work_root"]  # type: ignore[index]
         del document["workflow"]["act_without_asking"]  # type: ignore[index]
@@ -289,6 +303,7 @@ class DeploymentConfigTests(unittest.TestCase):
         """A file written before the key existed keeps asking, silently."""
         document = self._document()
         document["schema_version"] = 5
+        self._drop_runtime_log_keys(document)
         del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
         del document["card_service"]["task_work_root"]  # type: ignore[index]
         del document["workflow"]["act_without_asking"]  # type: ignore[index]
@@ -349,6 +364,7 @@ class DeploymentConfigTests(unittest.TestCase):
     def test_version_nine_configuration_retains_its_plan_phase(self) -> None:
         document = self._document()
         document["schema_version"] = 9
+        self._drop_runtime_log_keys(document)
         del document["workflow"]["skip_planning_for"]  # type: ignore[index]
         del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
         self._write_config(document)
@@ -416,6 +432,28 @@ class DeploymentConfigTests(unittest.TestCase):
         with self.assertRaises(DeploymentConfigError):
             load_deployment_config(self.config_path)
 
+    def test_the_private_runtime_record_is_routed_to_task_evidence(self) -> None:
+        document = self._document()
+        runtime_database = self.root / "hermes-state.db"
+        runtime_database.touch(mode=0o600)
+        for runner in document["execution_runners"]:  # type: ignore[index]
+            runner["task_work_root"] = str(self.task_work_root)
+            runner["task_kb_root"] = str(self.root / "task-kb")
+            runner["runtime_session_database"] = str(runtime_database)
+            runner["runtime_log_retention_bytes"] = 31
+        self._write_config(document)
+
+        config = load_deployment_config(self.config_path)
+        argv = config.argv("execution-runner:primary")
+
+        self.assertEqual(
+            argv[argv.index("--runtime-session-database") + 1],
+            str(runtime_database),
+        )
+        self.assertEqual(
+            argv[argv.index("--runtime-log-retention-bytes") + 1], "31"
+        )
+
     def test_an_unknown_granted_kind_is_refused(self) -> None:
         document = self._document()
         document["workflow"]["execute_without_asking"] = [  # type: ignore[index]
@@ -451,6 +489,7 @@ class DeploymentConfigTests(unittest.TestCase):
         """A file written for the previous key keeps asking about actions."""
         document = self._document()
         document["schema_version"] = 6
+        self._drop_runtime_log_keys(document)
         del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
         del document["card_service"]["task_work_root"]  # type: ignore[index]
         del document["workflow"]["act_without_asking"]  # type: ignore[index]

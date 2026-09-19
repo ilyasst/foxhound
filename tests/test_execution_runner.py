@@ -39,6 +39,7 @@ from foxhound.execution_runner import (
     run_once,
 )
 from foxhound.execution_worker import INSTRUCTIONS_NAME, load_run_state
+from foxhound.runtime_session_log import RUNTIME_SESSION_LOG_NAME
 from foxhound.worker_resolution import (
     WorkerMismatch,
     resolve_worker_command,
@@ -219,6 +220,55 @@ class ExecutionRunnerTests(unittest.TestCase):
         self.assertFalse((evidence / INSTRUCTIONS_NAME).exists())
         self.assertTrue((task_directory / "README.md").is_file())
         self.assertTrue((kb_root / "T1-synthetic-task.md").is_file())
+
+    def test_an_unavailable_runtime_record_does_not_fail_the_run(self):
+        """The structured log is evidence about a run, not part of one.
+
+        It is copied from a `finally` block, so a raise there would replace
+        the result the run already recorded and skip deliverable
+        publication. A runtime that never opened a session for this tag --
+        a startup failure, a moved database -- must cost the evidence and
+        nothing else.
+        """
+        self._ready()
+        work_root = self.root / "Project Alpha" / "Tasks"
+        kb_root = self.root / "Project Alpha KB" / "Tasks"
+        runtime_database = self.root / "runtime.sqlite3"
+        with closing(sqlite3.connect(runtime_database)) as connection:
+            connection.execute(
+                "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, "
+                "parent_session_id TEXT)"
+            )
+            connection.execute("CREATE TABLE messages (id INTEGER PRIMARY "
+                               "KEY, session_id TEXT)")
+            connection.commit()
+
+        def popen(_argv, **kwargs):
+            handle = kwargs["stdout"]
+            handle.write(b"synthetic failed run\n")
+            handle.flush()
+            return FakeProcess(exit_code=1)
+
+        result = run_once(
+            self._config(
+                task_work_root=work_root,
+                task_kb_root=kb_root,
+                runtime_session_database=runtime_database,
+            ),
+            popen=popen,
+            run_id_factory=lambda: "e" * 32,
+            terminate=self._terminator,
+        )
+
+        self.assertEqual(result.outcome, "process_exit")
+        task_directory = work_root / "T1-synthetic-task"
+        evidence = task_directory / "runs" / ("plan-" + "e" * 32)
+        self.assertEqual(
+            (evidence / "agent-output.log").read_text(encoding="utf-8"),
+            "synthetic failed run\n",
+        )
+        self.assertFalse((evidence / RUNTIME_SESSION_LOG_NAME).exists())
+        self.assertTrue((task_directory / "README.md").is_file())
 
     def test_runner_records_and_scrubs_capability_without_shell_or_output(self):
         self._ready()
@@ -641,6 +691,7 @@ class ExecutionRunnerTests(unittest.TestCase):
                 worker_command=resolve_worker_command(
                     "foxhound-task-worker"
                 ),
+                source="foxhound-" + "2" * 32,
             ),
         )
         # The instructions belong to this run, not to its arguments: another
