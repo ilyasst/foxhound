@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 48
+SCHEMA_VERSION = 49
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -753,6 +753,11 @@ _SCHEMA_V11_COLUMNS = {
     )
     for name, columns in _SCHEMA_V14_COLUMNS.items()
 }
+
+# V49 appends this durable delivery-only marker.  It must be added after the
+# historical schemas above are captured, otherwise a database migrating from
+# V10 would be asked to have a column that did not exist at that point.
+_SCHEMA_COLUMNS["execution_review_cards"] += ("summary_only",)
 
 # The versioned maps above are used to validate historical schemas while they
 # migrate.  V45 is additive, so remove its tables and task columns from every
@@ -2849,6 +2854,20 @@ _SCHEMA_V47 = (
 );""",
 )
 
+# A summary is a delivery record, not a workflow gate.  Keeping this bit on
+# the existing execution-card row lets the established private transport
+# deliver the same bounded presentation, while the distinct active-card index
+# ensures a queued summary can never suppress a reader-action card.
+_SCHEMA_V49 = (
+    "ALTER TABLE execution_review_cards ADD COLUMN summary_only INTEGER "
+    "NOT NULL DEFAULT 0 CHECK(summary_only IN (0,1));",
+    "DROP INDEX execution_review_cards_one_active;",
+    "CREATE UNIQUE INDEX execution_review_cards_one_active "
+    "ON execution_review_cards(task_id) "
+    "WHERE status IN ('pending','delivering','delivered') "
+    "AND summary_only=0;",
+)
+
 
 # Context exhaustion is a separate terminal condition for one attempt. The
 # workflow table has a closed reason vocabulary, so admitting it requires a
@@ -4189,6 +4208,28 @@ class CandidateInbox:
                     connection.execute("PRAGMA legacy_alter_table = OFF")
                     connection.execute("PRAGMA foreign_keys = ON")
                 version = 48
+            if version == 48:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    columns = {
+                        row["name"] for row in connection.execute(
+                            "PRAGMA table_info(execution_review_cards)"
+                        )
+                    }
+                    # Historical migration rehearsals may preserve a later
+                    # additive column while setting an earlier user_version.
+                    # Keep this upgrade replayable just as the preceding
+                    # additive migrations are.
+                    if "summary_only" not in columns:
+                        connection.execute(_SCHEMA_V49[0])
+                    for statement in _SCHEMA_V49[1:]:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 49")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 49
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:

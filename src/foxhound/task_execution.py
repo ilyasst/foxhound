@@ -1571,6 +1571,29 @@ class TaskExecutionService:
                       artifact["content_digest"], artifact["run_directory"])
                      for index, artifact in enumerate(result["artifacts"])],
                 )
+                if advance is not None:
+                    # This is intentionally not a workflow gate.  The
+                    # existing delivery protocol can carry the bounded result
+                    # summary, but the row is marked summary-only so the
+                    # transport settles it immediately after acknowledgement.
+                    # In particular, the auto-granted transition below does
+                    # not wait for a reader or for a prior summary delivery.
+                    connection.execute(
+                        "INSERT INTO execution_review_cards("
+                        "task_id,task_version,workflow_version,kind,phase,"
+                        "result_id,status,version,created_at,updated_at,"
+                        "work_revision_id,summary_only) "
+                        "VALUES(?,?,?,?,?,?,'pending',1,?,?,"
+                        "(SELECT r.id FROM work_revisions AS r "
+                        " JOIN work_items AS w ON w.id=r.work_item_id "
+                        " WHERE w.task_id=? ORDER BY r.id DESC LIMIT 1),1)",
+                        (
+                            result["task_id"], result["task_version"],
+                            result["workflow_version"] + 1,
+                            "result_review", recorded_phase,
+                            result["result_id"], now, now, result["task_id"],
+                        ),
+                    )
                 version = result["workflow_version"] + 1
                 completed = (
                     now if target is WorkflowStatus.COMPLETED else None

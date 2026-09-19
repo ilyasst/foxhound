@@ -408,6 +408,17 @@ class TaskExecutionTests(unittest.TestCase):
                 "ALTER TABLE execution_review_cards DROP COLUMN "
                 "work_revision_id"
             )
+            # v49 made automatic-run summaries explicitly non-blocking.
+            connection.execute("DROP INDEX execution_review_cards_one_active")
+            connection.execute(
+                "ALTER TABLE execution_review_cards DROP COLUMN "
+                "summary_only"
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX execution_review_cards_one_active "
+                "ON execution_review_cards(task_id) "
+                "WHERE status IN ('pending','delivering','delivered')"
+            )
             connection.execute("PRAGMA user_version = 11")
             connection.commit()
 
@@ -1806,6 +1817,23 @@ class TaskExecutionTests(unittest.TestCase):
         workflow = service.get(1)
         self.assertEqual(workflow.status, WorkflowStatus.QUEUED)
         self.assertEqual(workflow.phase, WorkflowPhase.EXECUTE)
+        cards = ExecutionCardService(
+            self.database, clock=self.clock, token_factory=lambda: TOKEN
+        )
+        summary = cards.claim_next()
+        self.assertTrue(summary.card.summary_only)
+        delivered = cards.complete_delivery(
+            summary.card.id,
+            expected_version=summary.card.version,
+            claim_token=summary.token,
+            transport="synthetic",
+            delivery_ref="summary-1",
+        )
+        self.assertEqual(delivered.card_status, ExecutionCardStatus.RESOLVED)
+        # Delivery is informational: it neither waits for nor impersonates a
+        # reader action, and the auto-granted workflow is still runnable.
+        self.assertEqual(service.get(1).status, WorkflowStatus.QUEUED)
+        self.assertEqual(service.get(1).phase, WorkflowPhase.EXECUTE)
 
     def test_an_ungranted_kind_still_waits_for_a_reader(self):
         self._bind_origin(1, "issue")

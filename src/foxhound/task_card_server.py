@@ -760,6 +760,7 @@ class TaskCardApplication:
                     "card_id": claim.card.id,
                     "card_version": claim.card.version,
                     "kind": claim.card.kind.value,
+                    "informational": claim.card.summary_only,
                     "phase": claim.card.phase.value,
                     "claim_token": claim.token,
                     "expires_at": claim.expires_at,

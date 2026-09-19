@@ -268,6 +268,7 @@ class ExecutionReviewCard:
     failure_reason: str = field(default="", repr=False)
     failure_exit_code: int | None = field(default=None, repr=False)
     failure_run_id: str | None = field(default=None, repr=False)
+    summary_only: bool = False
     #: Why the last attempt stopped, in the summariser's words. A reason
     #: and an exit code say how the process ended, which cannot tell an
     #: exhausted turn budget from a saturated backend from a refused
@@ -527,7 +528,8 @@ class ExecutionCardService:
                     "AND NOT EXISTS("
                     " SELECT 1 FROM execution_review_cards AS active "
                     " WHERE active.task_id=w.task_id AND active.status IN "
-                    " ('pending','delivering','delivered')"
+                    " ('pending','delivering','delivered') "
+                    " AND active.summary_only=0"
                     ") AND ("
                     # `parked` is included deliberately. It means the
                     # agent gave up after repeated failure, and that is
@@ -811,22 +813,27 @@ class ExecutionCardService:
                     )
                 held = connection.execute(
                     "SELECT count(*) FROM execution_review_cards "
-                    "WHERE status IN ('delivering','delivered') AND consumer_digest=?",
+                    "WHERE status IN ('delivering','delivered') AND consumer_digest=? AND summary_only=0",
                     (consumer_digest,),
                 ).fetchone()[0]
-                if held >= ceiling:
+                summary = connection.execute(
+                    self._card_select()
+                    + " WHERE c.status='pending' AND c.summary_only=1 "
+                    "ORDER BY c.created_at,c.id LIMIT 1"
+                ).fetchone()
+                if held >= ceiling and summary is None:
                     connection.commit()
                     return ClaimAtCeiling(int(held), ceiling)
                 row = connection.execute(
                     self._card_select()
-                    + " WHERE c.status='pending' "
+                    + " WHERE c.status='pending' AND c.summary_only=0 "
                     "ORDER BY CASE c.kind "
                     "WHEN 'result_review' THEN 0 "
                     "WHEN 'plan_review' THEN 1 "
                     "WHEN 'external_review' THEN 1 "
                     "WHEN 'start' THEN 2 "
                     "ELSE 3 END,c.created_at,c.id LIMIT 1"
-                ).fetchone()
+                ).fetchone() or summary
                 if row is None:
                     connection.commit()
                     return None
@@ -927,19 +934,17 @@ class ExecutionCardService:
                     return _refused_row(
                         card_id, row, ExecutionCardRefusal.CLAIM_MISMATCH
                     )
+                summary_only = bool(row["summary_only"])
                 connection.execute(
-                    "UPDATE execution_review_cards SET status='delivered',"
+                    "UPDATE execution_review_cards SET status=?,"
                     "claim_token_digest=NULL,claim_expires_at=NULL,transport=?,"
-                    "delivery_ref=?,delivered_at=?,updated_at=?,"
-                    "superseded_delivery_ref=NULL,superseded_transport=NULL "
-                    "WHERE id=? AND version=?",
+                    "delivery_ref=?,delivered_at=?,resolution=?,resolved_at=?,"
+                    "updated_at=?,superseded_delivery_ref=NULL,"
+                    "superseded_transport=NULL WHERE id=? AND version=?",
                     (
-                        transport,
-                        delivery_ref,
-                        now,
-                        now,
-                        card_id,
-                        expected_version,
+                        ExecutionCardStatus.RESOLVED if summary_only else ExecutionCardStatus.DELIVERED,
+                        transport, delivery_ref, now, "done" if summary_only else None,
+                        now if summary_only else None, now, card_id, expected_version,
                     ),
                 )
                 self._event(
@@ -952,15 +957,23 @@ class ExecutionCardService:
                     action=None,
                     now=now,
                 )
+                if summary_only:
+                    self._event(connection, card_id=card_id,
+                                task_id=int(row["task_id"]), kind="resolved",
+                                card_version=expected_version,
+                                workflow_version=int(row["workflow_version"]),
+                                action=None, now=now)
                 connection.commit()
                 values = dict(row)
                 values.update(
-                    status=ExecutionCardStatus.DELIVERED,
+                    status=(ExecutionCardStatus.RESOLVED if summary_only else ExecutionCardStatus.DELIVERED),
                     claim_token_digest=None,
                     claim_expires_at=None,
                     transport=transport,
                     delivery_ref=delivery_ref,
                     delivered_at=now,
+                    resolution="done" if summary_only else None,
+                    resolved_at=now if summary_only else None,
                     superseded_delivery_ref=None,
                     superseded_transport=None,
                 )
@@ -2742,6 +2755,10 @@ def _kind_for_workflow(row: Mapping[str, object]) -> ExecutionCardKind:
 def _current_card(row: Mapping[str, object]) -> bool:
     try:
         kind = ExecutionCardKind(row["kind"])
+        if bool(row["summary_only"]):
+            return (row["result_id"] is not None
+                    and row["result_task_id"] == row["task_id"]
+                    and row["result_task_version"] == row["task_version"])
         if (
             row["task_status_current"] != TaskStatus.OPEN
             or int(row["task_version_current"]) != int(row["task_version"])
@@ -2902,6 +2919,7 @@ def _card(
                 if row["result_outcome"] is None
                 else ExecutionOutcome(row["result_outcome"])
             ),
+            summary_only=bool(row["summary_only"]),
             revisions=max(0, int(row["revision_count"] or 0)),
             revision_note=str(row["revision_note"] or ""),
             unchanged_from_previous=bool(row["unchanged_from_previous"]),
@@ -3672,6 +3690,14 @@ def _repository_review_line(card: ExecutionReviewCard, *, html: bool) -> str:
 
 
 def _card_lines(card: ExecutionReviewCard) -> list[str]:
+    if card.summary_only:
+        return [
+            *_heading_lines(card, html=False),
+            "",
+            "Run summary:",
+            f"Outcome: {card.outcome}",
+            f"Summary: {card.summary}",
+        ]
     if card.kind is ExecutionCardKind.START:
         return _start_card_lines(card, html=False)
     if card.kind is ExecutionCardKind.EXTERNAL_REVIEW:
@@ -3898,6 +3924,14 @@ def _drafted(values: Sequence[CardRecord]) -> list[str]:
 
 
 def _html_card_lines(card: ExecutionReviewCard) -> list[str]:
+    if card.summary_only:
+        return [
+            *_heading_lines(card, html=True),
+            "",
+            "<b>Run summary:</b>",
+            *_labelled_html_lines("Outcome", str(card.outcome)),
+            *_labelled_html_lines("Summary", card.summary),
+        ]
     if card.kind is ExecutionCardKind.START:
         return _start_card_lines(card, html=True)
     if card.kind is ExecutionCardKind.EXTERNAL_REVIEW:
@@ -4307,6 +4341,8 @@ def _escape(value: str) -> str:
 def _button_rows(
     card: ExecutionReviewCard, *, approvable: bool
 ) -> tuple[tuple[tuple[str, str], ...], ...]:
+    if card.summary_only:
+        return ()
     kind = card.kind
     if kind is ExecutionCardKind.START:
         if (

@@ -44,9 +44,14 @@ not change `last_result_id`. A run that recorded one is reported as
 
 ## Consequences
 
-The grant applies at the moment of recording, so no card is created and
-none has to be retired. Reconciling workflows that were already waiting when
-policy changed is a separate concern, and stays in scheduling.
+The grant applies at the moment of recording, so no reader-action card is
+created and none has to be retired. The recorded result also creates one
+delivery-only run summary. It has no controls, does not occupy the active
+reader-card index or a consumer's actionable-card ceiling, and settles on a
+successful delivery acknowledgement without changing workflow state. A
+gateway may deliver that summary even while an actionable card is visible.
+Reconciling workflows that were already waiting when policy changed is a
+separate concern, and stays in scheduling.
 
 The runner and the worker must be the same build. This paragraph once noted
 that `worker_command` was a bare name resolved through `PATH` by the agent,

@@ -696,6 +696,12 @@ fit, approval and completion are absent from the keyboard and forged
 affirmative callbacks are refused. See
 [ADR 0016](docs/architecture/0016-execution-review-cards.md).
 
+An automatically granted phase still emits one delivery-only **Run summary**
+after its result is recorded. The summary has no controls, never delays the
+next phase, and settles immediately after successful delivery. It has its own
+delivery capacity, so it can arrive while the gateway is already showing an
+actionable card.
+
 The authenticated loopback card service exposes execution cards through a
 separate `/v1/execution-cards/*` route family. A trusted local gateway can read
 aggregate stats, read the bounded non-mutating `queue_view` projection at
