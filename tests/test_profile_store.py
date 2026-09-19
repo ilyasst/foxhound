@@ -233,6 +233,27 @@ class ProfileStoreTests(unittest.TestCase):
             compose_prompt(self.source), compose_prompt(replica)
         )
 
+    def test_mirror_refuses_an_unpublished_source_before_writing(self):
+        publish(self.source, ["example-scout"])
+        replica = self.root / "replica"
+        initialize(replica)
+        mirror(self.source, replica)
+        mirrored = (replica / SHARED_DIRECTORY / "hermes.md").read_text(
+            encoding="utf-8"
+        )
+        self.write_shared("hermes.md", SHARED_TEXT + "Unpublished edit.\n")
+
+        with self.assertRaises(ProfileStoreError):
+            mirror(self.source, replica)
+
+        self.assertEqual(
+            (replica / SHARED_DIRECTORY / "hermes.md").read_text(
+                encoding="utf-8"
+            ),
+            mirrored,
+        )
+        self.assertEqual(validate(replica)["pending"], [])
+
     def test_mirror_refuses_a_genuinely_divergent_history(self):
         publish(self.source, ["example-scout"])
         replica = self.root / "replica"

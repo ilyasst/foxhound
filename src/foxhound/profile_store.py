@@ -306,6 +306,12 @@ def mirror(source: Path, target: Path) -> dict[str, Any]:
     destination_catalog = _load_catalog(destination)
     _require_fast_forward(destination_catalog, catalog)
     drafts = load_drafts(root)
+    # Refuse a source that cannot reproduce itself before writing anything.
+    # Copying an unpublished draft edit leaves the destination pending too,
+    # and discovering that after the copy would have already replaced the
+    # destination's own drafts with no catalog advance to show for it.
+    if _pending_inputs(root, catalog, drafts):
+        raise ProfileStoreError("source agent profile inputs are pending")
     for profile_id, draft in drafts.items():
         _copy_fragment_set(root, destination, draft, profile_id)
     revisions = 0

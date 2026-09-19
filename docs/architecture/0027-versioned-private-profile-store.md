@@ -83,7 +83,9 @@ references, including shared and overlay fragments. It then validates the
 destination. This matters because a revision is compiled from those inputs;
 copying catalog history alone could make byte-identical drafts render a
 different prompt on the receiving host. Validation reports the shared, role,
-and overlay inputs responsible for any remaining unpublished draft.
+and overlay inputs responsible for any remaining unpublished draft. A source
+whose own drafts are unpublished is refused before anything is written, so a
+store that cannot reproduce itself never half-replaces another one's drafts.
 
 The repository holds the format, the commands, and their tests, plus a visibly
 fictional example source store in `examples/agent-profile-store/`. Real
