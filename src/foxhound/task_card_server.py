@@ -56,7 +56,13 @@ from .task_cards import (
     render_task_review_card,
 )
 from .task_ledger import TaskLedgerError
-from .task_execution import TaskExecutionService, WorkflowOperationResult
+from .task_execution import (
+    WORKFLOW_BOARD_STATUSES,
+    TaskExecutionService,
+    WorkflowBoard,
+    WorkflowBoardDetail,
+    WorkflowOperationResult,
+)
 
 
 log = logging.getLogger("foxhound.task_card_server")
@@ -98,6 +104,8 @@ EXECUTION_AGENT_SELECTION_SCHEMA = (
 )
 EXECUTION_PRIORITY_SCHEMA = "foxhound.execution-workflow-service.priority"
 EXECUTION_PRIORITY_SCHEMA_VERSION = 1
+WORKFLOW_BOARD_SCHEMA = "foxhound.execution-workflow-service.board"
+WORKFLOW_DETAIL_SCHEMA = "foxhound.execution-workflow-service.detail"
 
 # ADR 0036 decision 1: every accepted bearer token is configured with
 # exactly one role from this closed set. A single legacy token with no
@@ -140,6 +148,8 @@ ROUTES = {
     "/v1/execution-cards/detail": "execution_detail",
     "/v1/execution-cards/queue": "execution_queue",
     "/v1/execution-cards/resolve": "execution_resolve",
+    "/v1/execution-workflows/board": "workflow_board",
+    "/v1/execution-workflows/detail": "workflow_detail",
     "/v1/execution-workflows/priority": "execution_priority",
 }
 
@@ -698,6 +708,35 @@ class TaskCardApplication:
                     "resolution": None,
                 }
             return _execution_resolve_document(result)
+        if operation == "workflow_board":
+            request = _strict_request(payload, required={"limit"}, optional=set())
+            identity = self.resolve_execution_consumer(authorization)
+            if identity is None or identity.role != QUEUE_VIEW_ROLE:
+                raise TaskCardServerRequestError(
+                    "role_forbidden", "workflow board requires the queue_view role",
+                    HTTPStatus.FORBIDDEN,
+                )
+            return _workflow_board_document(
+                self._execution_workflows().board(
+                    limit=_integer(request["limit"], minimum=1, maximum=100)
+                )
+            )
+        if operation == "workflow_detail":
+            request = _strict_request(
+                payload, required={"task_id", "workflow_version"}, optional=set()
+            )
+            identity = self.resolve_execution_consumer(authorization)
+            if identity is None or identity.role != QUEUE_VIEW_ROLE:
+                raise TaskCardServerRequestError(
+                    "role_forbidden", "workflow detail requires the queue_view role",
+                    HTTPStatus.FORBIDDEN,
+                )
+            return _workflow_detail_document(
+                self._execution_workflows().board_detail(
+                    _integer(request["task_id"], minimum=1),
+                    expected_version=_integer(request["workflow_version"], minimum=1),
+                )
+            )
         if operation == "execution_priority":
             request = _strict_request(
                 payload,
@@ -1696,6 +1735,49 @@ def _execution_detail_document(result: ExecutionCardDetail) -> dict[str, Any]:
                     "work_digest", "deliverables", "failure_reason",
                     "failure_exit_code", "failure_run_id"):
             document[key] = None if key != "deliverables" else []
+    return document
+
+
+def _workflow_board_document(result: WorkflowBoard) -> dict[str, Any]:
+    return {
+        "schema": WORKFLOW_BOARD_SCHEMA,
+        "schema_version": SERVICE_VERSION,
+        "ok": True,
+        "columns": [
+            {"status": status, "total": result.totals[status]}
+            for status in WORKFLOW_BOARD_STATUSES
+        ],
+        "workflows": [
+            {
+                "task_id": entry.task_id,
+                "workflow_version": entry.workflow_version,
+                "board_status": entry.board_status,
+                "phase": entry.phase.value,
+                "task": entry.task,
+                "owner": entry.owner,
+                "agent": entry.agent,
+                "state_since": entry.state_since,
+            }
+            for entry in result.entries
+        ],
+    }
+
+
+def _workflow_detail_document(result: WorkflowBoardDetail) -> dict[str, Any]:
+    document = {
+        "schema": WORKFLOW_DETAIL_SCHEMA,
+        "schema_version": SERVICE_VERSION,
+        "ok": result.accepted,
+        "task_id": result.task_id,
+        "workflow_version": result.workflow_version,
+        "status": None if result.status is None else result.status.value,
+        "phase": None if result.phase is None else result.phase.value,
+        "updated_at": result.updated_at,
+        "summary": result.summary if result.accepted else "",
+        "work_digest": result.work_digest if result.accepted else "",
+        "deliverables": list(result.deliverables) if result.accepted else [],
+        "refusal": None if result.refusal is None else result.refusal.value,
+    }
     return document
 
 
