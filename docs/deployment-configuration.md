@@ -12,8 +12,8 @@ make it owner-only (`0600`), and do not commit it, paste it into issues, or
 send its rendered command lines to logs. It contains paths but never token
 values.
 
-Version 10 is current. Two things about it are worth knowing before an
-upgrade, because neither announces itself:
+Version 12 is current. Five things about it are worth knowing before an
+upgrade, because none of them announces itself:
 
 - `card_service.task_work_root` is **required** once delivery is enabled, and
   it is what switches result artifacts on. Without it the artifact routes are
@@ -26,7 +26,16 @@ upgrade, because neither announces itself:
   `workflow.act_without_asking`. An empty list is what their absence meant,
   so carrying them across as empty changes nothing about what runs
   unattended.
-- Version 10 copies the runtime's structured session record into each task
+- Version 10 adds `workflow.skip_planning_for`. It is a separate list because
+  removing an ask does not remove a phase; each listed kind must also be in
+  both `workflow.plan_without_asking` and `workflow.execute_without_asking`.
+- Version 11 makes profile routing a deployment choice. `default_agent_profile`
+  remains the required fallback, while each `agent_profile_routes` entry names
+  a selector and an installed profile. The initial selector is `source_kind`;
+  the entry shape leaves room for additional selectors without replacing the
+  routing list. Older documents migrate to an empty route list, so every task
+  uses their already-declared default until routes are added deliberately.
+- Version 12 copies the runtime's structured session record into each task
   run. When `task_work_root` and `task_kb_root` are configured, set
   `runtime_session_database` to the private Hermes `state.db`; it is read-only
   input, while the copied `runtime-session.json` is Foxhound-owned task
@@ -39,12 +48,14 @@ database: the task-card service, scheduler, one or more runners, feed import,
 native intake, execution-card requeue, lifecycle-outcome export, fused task
 titles, and duplicate-card scheduling. It is intentionally strict: every field
 below is required when that component is enabled, unknown fields are rejected,
-and all paths are absolute.
+and all paths are absolute. The one exception is noted with the component it
+applies to: `task_card_requeue` may be omitted while a deployment written
+before it existed is brought forward.
 
 ```json
 {
   "schema": "foxhound.deployment-config",
-  "schema_version": 10,
+  "schema_version": 12,
   "database": "/srv/example/private-foxhound-state/foxhound.sqlite3",
   "agent_profile_directory": null,
   "card_service": {
@@ -66,8 +77,14 @@ and all paths are absolute.
   },
   "workflow": {
     "default_agent_profile": "general",
+    "agent_profile_routes": [{
+      "selector": {"source_kind": "issue"},
+      "profile_id": "example-repository-agent"
+    }],
+    "reader_aliases": [],
     "plan_without_asking": ["issue"],
     "execute_without_asking": ["issue"],
+    "skip_planning_for": ["issue"],
     "act_without_asking": ["issue"],
     "execution_slot_cap": 2,
     "plan_ready_cap": 10,
@@ -135,7 +152,7 @@ Set a disabled `card_service`, runner, or database consumer to exactly
 to be declared separately; enabled slots must have distinct names. The
 workflow section remains required because it owns the shared policy and
 limits. Earlier versions remain readable for a controlled transition, but
-only version 7 can declare the complete deployment boundary.
+only version 11 can declare the complete deployment boundary.
 
 `task_card_requeue` may be omitted from an existing version 5 document during
 the transition. Rendering `task-card-requeue` then refuses safely; add it with
@@ -212,6 +229,16 @@ produces no external effect.
 instead of waiting for a card. Grant it for a source where the decision to
 work every task was already made when the source was enrolled, and where a
 plan card would therefore have one plausible answer.
+
+`skip_planning_for` removes the plan phase entirely for newly scheduled tasks,
+so their first agent run is `execute` and no plan result is recorded. It is
+separate from both grants: adding either grant alone never removes a phase.
+Every listed kind must also be granted both `plan_without_asking` and
+`execute_without_asking`. Both are required because the plan phase carries the
+reader's start gate as well as the plan itself: a kind that is still asked
+about before planning would otherwise lose that question too, with no
+declaration saying so. Existing workflow rows are never rewritten when the
+declaration changes.
 
 `act_without_asking` skips the external-action gate. A reviewed external
 action runs instead of waiting for a second card. This is the strongest of

@@ -13,6 +13,8 @@ import unittest
 from unittest import mock
 
 from foxhound.database_lifecycle import migrate_database
+from foxhound import deployment_config
+from foxhound.agent_profiles import AgentProfile, WORKER_COMMAND_TOKEN
 from foxhound.deployment_config import (
     DeploymentConfigError,
     execute_component,
@@ -58,10 +60,16 @@ class DeploymentConfigTests(unittest.TestCase):
         path.chmod(0o600)
         return path
 
+    def _drop_runtime_log_keys(self, document: dict[str, object]) -> None:
+        """Remove the keys a document written before version 12 never had."""
+        for runner in document["execution_runners"]:  # type: ignore[index]
+            del runner["runtime_session_database"]
+            del runner["runtime_log_retention_bytes"]
+
     def _document(self) -> dict[str, object]:
         return {
             "schema": "foxhound.deployment-config",
-            "schema_version": 8,
+            "schema_version": 12,
             "database": str(self.database),
             "agent_profile_directory": None,
             "card_service": {
@@ -79,9 +87,12 @@ class DeploymentConfigTests(unittest.TestCase):
             },
             "workflow": {
                 "default_agent_profile": "general",
+                "agent_profile_routes": [],
                 "plan_without_asking": ["issue"],
                 "execute_without_asking": ["issue"],
+                "skip_planning_for": ["issue"],
                 "act_without_asking": ["issue"],
+                "reader_aliases": [],
                 "execution_slot_cap": 2,
                 "plan_ready_cap": 10,
                 "awaiting_reader_cap": 20,
@@ -98,6 +109,8 @@ class DeploymentConfigTests(unittest.TestCase):
                 "knowledge_root": None,
                 "task_work_root": None,
                 "task_kb_root": None,
+                "runtime_session_database": None,
+                "runtime_log_retention_bytes": None,
             }, {
                 "enabled": True,
                 "run_root": str(self.root / "runs-secondary"),
@@ -110,6 +123,8 @@ class DeploymentConfigTests(unittest.TestCase):
                 "knowledge_root": None,
                 "task_work_root": None,
                 "task_kb_root": None,
+                "runtime_session_database": None,
+                "runtime_log_retention_bytes": None,
             }],
             "database_consumers": {
                 "candidate_feed_import": {
@@ -157,6 +172,9 @@ class DeploymentConfigTests(unittest.TestCase):
         schedule = config.argv("execution-schedule")
         self.assertEqual(schedule[0], "foxhound-execution-schedule")
         self.assertNotIn("--execution-slot-cap", schedule)
+        self.assertEqual(
+            schedule[schedule.index("--skip-planning-for") + 1], "issue"
+        )
         runner = config.argv("execution-runner:primary")
         self.assertEqual(runner[0], "foxhound-execution-runner")
         self.assertIn("--execution-slot-cap", runner)
@@ -203,9 +221,13 @@ class DeploymentConfigTests(unittest.TestCase):
     def test_version_one_configuration_remains_valid_without_card_gw_settings(self) -> None:
         document = self._document()
         document["schema_version"] = 1
+        self._drop_runtime_log_keys(document)
+        del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
         del document["card_service"]["task_work_root"]  # type: ignore[index]
         del document["workflow"]["act_without_asking"]  # type: ignore[index]
         del document["workflow"]["execute_without_asking"]  # type: ignore[index]
+        del document["workflow"]["skip_planning_for"]  # type: ignore[index]
+        del document["workflow"]["reader_aliases"]  # type: ignore[index]
         document["execution_runner"] = document.pop("execution_runners")[0]
         document.pop("database_consumers")
         for key in ("gw_endpoint", "gw_alias", "gw_token_file"):
@@ -219,9 +241,13 @@ class DeploymentConfigTests(unittest.TestCase):
     def test_version_two_configuration_remains_valid(self) -> None:
         document = self._document()
         document["schema_version"] = 2
+        self._drop_runtime_log_keys(document)
+        del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
         del document["card_service"]["task_work_root"]  # type: ignore[index]
         del document["workflow"]["act_without_asking"]  # type: ignore[index]
         del document["workflow"]["execute_without_asking"]  # type: ignore[index]
+        del document["workflow"]["skip_planning_for"]  # type: ignore[index]
+        del document["workflow"]["reader_aliases"]  # type: ignore[index]
         document["execution_runner"] = document.pop("execution_runners")[0]
         document.pop("database_consumers")
         self._write_config(document)
@@ -235,9 +261,13 @@ class DeploymentConfigTests(unittest.TestCase):
     def test_version_three_configuration_remains_valid_without_title_worker(self) -> None:
         document = self._document()
         document["schema_version"] = 3
+        self._drop_runtime_log_keys(document)
+        del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
         del document["card_service"]["task_work_root"]  # type: ignore[index]
         del document["workflow"]["act_without_asking"]  # type: ignore[index]
         del document["workflow"]["execute_without_asking"]  # type: ignore[index]
+        del document["workflow"]["skip_planning_for"]  # type: ignore[index]
+        del document["workflow"]["reader_aliases"]  # type: ignore[index]
         del document["database_consumers"]["fused_task_titles"]  # type: ignore[index]
         del document["database_consumers"]["duplicate_card_schedule"]  # type: ignore[index]
         del document["database_consumers"]["task_card_requeue"]  # type: ignore[index]
@@ -253,9 +283,13 @@ class DeploymentConfigTests(unittest.TestCase):
     ) -> None:
         document = self._document()
         document["schema_version"] = 4
+        self._drop_runtime_log_keys(document)
+        del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
         del document["card_service"]["task_work_root"]  # type: ignore[index]
         del document["workflow"]["act_without_asking"]  # type: ignore[index]
         del document["workflow"]["execute_without_asking"]  # type: ignore[index]
+        del document["workflow"]["skip_planning_for"]  # type: ignore[index]
+        del document["workflow"]["reader_aliases"]  # type: ignore[index]
         del document["database_consumers"]["duplicate_card_schedule"]  # type: ignore[index]
         del document["database_consumers"]["task_card_requeue"]  # type: ignore[index]
         self._write_config(document)
@@ -269,9 +303,13 @@ class DeploymentConfigTests(unittest.TestCase):
         """A file written before the key existed keeps asking, silently."""
         document = self._document()
         document["schema_version"] = 5
+        self._drop_runtime_log_keys(document)
+        del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
         del document["card_service"]["task_work_root"]  # type: ignore[index]
         del document["workflow"]["act_without_asking"]  # type: ignore[index]
         del document["workflow"]["execute_without_asking"]  # type: ignore[index]
+        del document["workflow"]["skip_planning_for"]  # type: ignore[index]
+        del document["workflow"]["reader_aliases"]  # type: ignore[index]
         self._write_config(document)
 
         config = load_deployment_config(self.config_path)
@@ -292,10 +330,110 @@ class DeploymentConfigTests(unittest.TestCase):
             argv[argv.index("--execute-without-asking") + 1], "issue"
         )
 
-    def test_version_ten_routes_the_private_runtime_record_to_task_evidence(self) -> None:
+    def test_a_skip_declaration_reaches_execution_scheduling(self) -> None:
+        self._write_config(self._document())
+
+        config = load_deployment_config(self.config_path)
+
+        self.assertEqual(config.workflow.skip_planning_for, ("issue",))
+        schedule = config.argv("execution-schedule")
+        self.assertEqual(
+            schedule[schedule.index("--skip-planning-for") + 1], "issue"
+        )
+
+    def test_a_skip_without_execution_authority_names_the_missing_grant(self) -> None:
         document = self._document()
-        document["schema_version"] = 10
-        document["workflow"]["reader_aliases"] = []  # type: ignore[index]
+        document["workflow"]["execute_without_asking"] = []  # type: ignore[index]
+        self._write_config(document)
+
+        with self.assertRaisesRegex(
+            DeploymentConfigError, "execution grants: issue"
+        ):
+            load_deployment_config(self.config_path)
+
+    def test_a_skip_without_planning_authority_names_the_missing_grant(self) -> None:
+        document = self._document()
+        document["workflow"]["plan_without_asking"] = []  # type: ignore[index]
+        self._write_config(document)
+
+        with self.assertRaisesRegex(
+            DeploymentConfigError, "planning grants: issue"
+        ):
+            load_deployment_config(self.config_path)
+
+    def test_version_nine_configuration_retains_its_plan_phase(self) -> None:
+        document = self._document()
+        document["schema_version"] = 9
+        self._drop_runtime_log_keys(document)
+        del document["workflow"]["skip_planning_for"]  # type: ignore[index]
+        del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
+        self._write_config(document)
+
+        config = load_deployment_config(self.config_path)
+
+        self.assertEqual(config.workflow.skip_planning_for, ())
+        self.assertNotIn(
+            "--skip-planning-for", config.argv("execution-schedule")
+        )
+
+    def test_routes_multiple_source_kinds_to_installed_profiles(self) -> None:
+        directory = self.root / "profiles"
+        directory.mkdir(mode=0o700)
+        profile = AgentProfile(
+            profile_id="example-repository-agent",
+            display_name="Example Repository Agent",
+            runtime="hermes",
+            prompt_template=f"First call {WORKER_COMMAND_TOKEN} context.",
+            toolsets=("terminal",),
+            max_turns=50,
+            timeout_seconds=1_800,
+            claim_lease_seconds=2_700,
+            heartbeat_seconds=60,
+            kill_grace_seconds=30,
+            allowed_phases=("plan", "execute", "external_action"),
+        )
+        manifest = directory / f"{profile.profile_id}.json"
+        manifest.write_text(json.dumps(profile.document()), encoding="utf-8")
+        manifest.chmod(0o600)
+        document = self._document()
+        document["agent_profile_directory"] = str(directory)
+        document["workflow"]["agent_profile_routes"] = [  # type: ignore[index]
+            {
+                "selector": {"source_kind": "issue"},
+                "profile_id": profile.profile_id,
+            },
+            {
+                "selector": {"source_kind": "review_request"},
+                "profile_id": profile.profile_id,
+            },
+        ]
+        self._write_config(document)
+
+        config = load_deployment_config(self.config_path)
+
+        self.assertEqual(
+            config.workflow.agent_profile_routes,
+            (("issue", profile.profile_id), ("review_request", profile.profile_id)),
+        )
+        argv = config.argv("execution-runner:primary")
+        self.assertEqual(argv.count("--profile-route"), 2)
+        self.assertIn(f"issue={profile.profile_id}", argv)
+
+    def test_route_to_unavailable_or_phase_incapable_profile_is_refused(self) -> None:
+        document = self._document()
+        document["workflow"]["agent_profile_routes"] = [  # type: ignore[index]
+            {
+                "selector": {"source_kind": "issue"},
+                "profile_id": "missing-profile",
+            },
+        ]
+        self._write_config(document)
+
+        with self.assertRaises(DeploymentConfigError):
+            load_deployment_config(self.config_path)
+
+    def test_the_private_runtime_record_is_routed_to_task_evidence(self) -> None:
+        document = self._document()
         runtime_database = self.root / "hermes-state.db"
         runtime_database.touch(mode=0o600)
         for runner in document["execution_runners"]:  # type: ignore[index]
@@ -339,6 +477,7 @@ class DeploymentConfigTests(unittest.TestCase):
     def test_the_two_grants_are_independent(self) -> None:
         document = self._document()
         document["workflow"]["plan_without_asking"] = []  # type: ignore[index]
+        document["workflow"]["skip_planning_for"] = []  # type: ignore[index]
         self._write_config(document)
 
         config = load_deployment_config(self.config_path)
@@ -350,8 +489,12 @@ class DeploymentConfigTests(unittest.TestCase):
         """A file written for the previous key keeps asking about actions."""
         document = self._document()
         document["schema_version"] = 6
+        self._drop_runtime_log_keys(document)
+        del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
         del document["card_service"]["task_work_root"]  # type: ignore[index]
         del document["workflow"]["act_without_asking"]  # type: ignore[index]
+        del document["workflow"]["skip_planning_for"]  # type: ignore[index]
+        del document["workflow"]["reader_aliases"]  # type: ignore[index]
         self._write_config(document)
 
         config = load_deployment_config(self.config_path)
@@ -386,6 +529,7 @@ class DeploymentConfigTests(unittest.TestCase):
         """Either knob alone, in either direction."""
         document = self._document()
         document["workflow"]["execute_without_asking"] = []  # type: ignore[index]
+        document["workflow"]["skip_planning_for"] = []  # type: ignore[index]
         self._write_config(document)
 
         config = load_deployment_config(self.config_path)
@@ -578,6 +722,60 @@ class DeploymentConfigTests(unittest.TestCase):
 
         with self.assertRaises(DeploymentConfigError):
             load_deployment_config(self.config_path)
+
+
+class ObjectShapeTests(unittest.TestCase):
+    """The one shape check every section of the document goes through.
+
+    Exercised directly because the document declares a single optional field
+    today, and the behaviour worth pinning is what happens with more than one:
+    an optional set is a range, not a second exact shape.
+    """
+
+    REQUIRED = {"alpha", "beta"}
+    OPTIONAL = {"gamma", "delta"}
+
+    def _check(self, document):
+        return deployment_config._object(document, set(self.REQUIRED),
+                                         set(self.OPTIONAL))
+
+    def test_required_only_is_valid(self) -> None:
+        document = {"alpha": 1, "beta": 2}
+        self.assertEqual(self._check(document), document)
+
+    def test_every_optional_field_is_valid(self) -> None:
+        document = {"alpha": 1, "beta": 2, "gamma": 3, "delta": 4}
+        self.assertEqual(self._check(document), document)
+
+    def test_a_partial_optional_subset_is_valid(self) -> None:
+        """All-or-nothing handling refused this while reporting only 'invalid'."""
+        for optional in sorted(self.OPTIONAL):
+            document = {"alpha": 1, "beta": 2, optional: 3}
+            with self.subTest(optional=optional):
+                self.assertEqual(self._check(document), document)
+
+    def test_a_missing_required_field_is_refused(self) -> None:
+        with self.assertRaises(DeploymentConfigError):
+            self._check({"alpha": 1, "gamma": 3})
+
+    def test_an_unknown_field_is_refused(self) -> None:
+        with self.assertRaises(DeploymentConfigError):
+            self._check({"alpha": 1, "beta": 2, "epsilon": 5})
+
+    def test_an_unknown_field_beside_an_optional_one_is_refused(self) -> None:
+        with self.assertRaises(DeploymentConfigError):
+            self._check({"alpha": 1, "beta": 2, "gamma": 3, "epsilon": 5})
+
+    def test_a_non_mapping_is_refused(self) -> None:
+        for value in ([], "alpha", 7, None):
+            with self.subTest(value=value):
+                with self.assertRaises(DeploymentConfigError):
+                    self._check(value)
+
+    def test_no_optional_set_means_an_exact_shape(self) -> None:
+        with self.assertRaises(DeploymentConfigError):
+            deployment_config._object({"alpha": 1, "beta": 2, "gamma": 3},
+                                      set(self.REQUIRED))
 
 
 if __name__ == "__main__":

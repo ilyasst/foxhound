@@ -51,13 +51,6 @@ REVIEW_SNOOZE_ACTIONS = frozenset({
 #: button, and one dead button teaches a reader that none of them are
 #: trustworthy. So it is answered here too, as the nearest choice.
 _SNOOZE_ACTIONS = frozenset({"snooze", *REVIEW_SNOOZE_ACTIONS})
-#: The agent a kind of work starts on, when that machine has it installed.
-#: Repository work is routed to SigInt by the runtime profile catalog.
-SOURCE_KIND_PROFILES = {
-    "issue": "sigint",
-    "review_request": "sigint",
-}
-
 #: Source ordering is stronger than a reader's bounded queue preference.
 #: Pull-request reviews lead the queue, repository issues trail it, and
 #: communication plus every other non-issue source remain in the middle tier.
@@ -154,6 +147,9 @@ FAILURE_REASONS = frozenset({
     "claim_expired",
     "lease_failed",
     "result_invalid",
+    #: The runtime refused the request because its measured context did not
+    #: fit any served window. Retrying unchanged cannot make it fit.
+    "context_exhausted",
 })
 
 
@@ -310,6 +306,10 @@ class ExecutionReadiness:
     expired: int
     awaiting_review: int
     parked: int
+    #: Parked workflows whose measured context did not fit a served window.
+    #: This is a subset of ``parked``, kept separate so operators can count
+    #: unsatisfiable work rather than infer it from busy runner slots.
+    context_exhausted: int
     completed: int
     cancelled: int
 
@@ -396,11 +396,13 @@ class TaskExecutionService:
         default_profile_id: str = "general",
         planning_grants: object = None,
         execution_grants: object = None,
+        skip_planning_for: object = None,
         action_grants: object = None,
         execution_slot_cap: int | None = None,
         plan_ready_cap: int | None = None,
         awaiting_reader_cap: int | None = None,
         reader_aliases: object = None,
+        profile_routes: Mapping[str, str] | None = None,
     ) -> None:
         if (isinstance(max_attempts, bool)
                 or not isinstance(max_attempts, int)
@@ -438,6 +440,30 @@ class TaskExecutionService:
         ):
             raise ValueError("default agent profile is unavailable")
         self._profile_registry = registry
+        if profile_routes is None:
+            profile_routes = {}
+        if (
+            not isinstance(profile_routes, Mapping)
+            or any(
+                not isinstance(kind, str) or not kind
+                or not isinstance(profile_id, str) or not profile_id
+                for kind, profile_id in profile_routes.items()
+            )
+        ):
+            raise ValueError("agent profile routes are invalid")
+        # Resolve every route now rather than at the first task that uses it.
+        # A scheduler started against a catalog that lacks a routed profile
+        # would otherwise fail one pass at a time, reporting a scheduling
+        # failure for what is a configuration problem -- and the machine that
+        # rendered its command line is not the one that installs the catalog.
+        for routed in sorted(set(profile_routes.values())):
+            candidate = registry.get(routed)
+            if candidate is None or any(
+                phase.value not in candidate.allowed_phases
+                for phase in WorkflowPhase
+            ):
+                raise ValueError("routed agent profile is unavailable")
+        self._profile_routes = dict(profile_routes)
         # Task IDs the last claim deferred because their pinned profile could
         # not be resolved.  Read by the runner so a queue that is quietly
         # shedding work says so instead of just looking idle.
@@ -449,6 +475,33 @@ class TaskExecutionService:
         # Independent of planning authority above. A machine that has
         # said a kind may be planned has not said its plan may be run.
         self._execution_grants = _execution_grants(execution_grants)
+        # This declaration removes a phase rather than merely its reader
+        # gate, so it needs execution authority.  It is deliberately not
+        # inferred from either grant list: an operator may want unattended
+        # planning while retaining the reviewable plan as the reader input.
+        self._skip_planning_for = _execution_grants(
+            skip_planning_for, label="skip-planning declarations"
+        )
+        missing_execution_grants = (
+            self._skip_planning_for - self._execution_grants
+        )
+        if missing_execution_grants:
+            raise ValueError(
+                "skip-planning declarations lack execution grants: "
+                + ", ".join(sorted(missing_execution_grants))
+            )
+        # And the planning grant, because the plan phase carries the reader's
+        # start gate. Without this, adding a kind here would also delete the
+        # card that asks whether to begin at all, turning an asked source
+        # into an unattended one with no declaration saying so.
+        missing_planning_grants = (
+            self._skip_planning_for - self._planning_grants
+        )
+        if missing_planning_grants:
+            raise ValueError(
+                "skip-planning declarations lack planning grants: "
+                + ", ".join(sorted(missing_planning_grants))
+            )
         # Independent again. Executing a plan and performing an effect
         # other people can see are not the same permission.
         self._action_grants = _action_grants(action_grants)
@@ -457,24 +510,16 @@ class TaskExecutionService:
     def _profile_for(self, origin_kind: object) -> AgentProfile:
         """Which agent a task of this kind starts on.
 
-        A default that ignores what the task is sends repository work to a
-        compatibility profile. One review of a pull request went to
-        `general`, produced nothing recordable three times, and parked —
-        with the review already written.
-
-        Falls back to the configured default when a preferred profile is not
-        installed. The production scheduler validates that SigInt is installed
-        before accepting repository work; this keeps the library usable on
-        compatibility-only test and migration hosts.
+        An unmapped kind uses the declared default. A mapped profile is
+        validated when deployment configuration loads, so this selection is
+        deterministic and never falls back to another profile.
         """
-        preferred = SOURCE_KIND_PROFILES.get(origin_kind)
-        if preferred:
+        preferred = self._profile_routes.get(origin_kind)
+        if preferred is not None:
             profile = self._profile_registry.get(preferred)
-            if profile is not None and all(
-                phase.value in profile.allowed_phases
-                for phase in WorkflowPhase
-            ):
-                return profile
+            if profile is None:
+                raise TaskLedgerError("routed agent profile is unavailable")
+            return profile
         return self._default_profile
 
     def schedule_new(self, *, limit: int = 100) -> ExecutionScheduleResult:
@@ -623,16 +668,23 @@ class TaskExecutionService:
                         break
                     task_id = int(row["id"])
                     task_version = int(row["version"])
+                    phase = _initial_phase(
+                        row["origin_kind"], self._skip_planning_for
+                    )
                     status = _initial_status(
                         row["origin_kind"], self._planning_grants, row,
-                        self._reader_aliases)
-                    if status.value in WORKING_STATUSES:
+                        self._reader_aliases,
+                    )
+                    if (
+                        phase is WorkflowPhase.PLAN
+                        and status.value in WORKING_STATUSES
+                    ):
                         if plan_room is not None:
                             if plan_room == 0:
                                 capped += 1
                                 continue
                             plan_room -= 1
-                    else:
+                    elif status.value not in WORKING_STATUSES:
                         if waiting_room is not None:
                             if waiting_room == 0:
                                 capped += 1
@@ -644,9 +696,10 @@ class TaskExecutionService:
                         "task_id,task_version,status,phase,version,due_at,"
                         "failure_count,created_at,updated_at,agent_profile_id,"
                         "agent_profile_revision) "
-                        "VALUES(?,?,?,'plan',1,NULL,0,?,?,?,?)",
+                        "VALUES(?,?,?,?,1,NULL,0,?,?,?,?)",
                         (
-                            task_id, task_version, status.value, now, now,
+                            task_id, task_version, status.value, phase.value,
+                            now, now,
                             profile.profile_id,
                             profile.revision,
                         ),
@@ -657,7 +710,7 @@ class TaskExecutionService:
                         "scheduled",
                         1,
                         task_version,
-                        WorkflowPhase.PLAN,
+                        phase,
                         status,
                         now,
                     )
@@ -717,9 +770,12 @@ class TaskExecutionService:
                     return _operation(row, WorkflowDisposition.UNCHANGED)
                 if row is None:
                     version = 1
+                    phase = _initial_phase(
+                        task["origin_kind"], self._skip_planning_for
+                    )
                     status = _initial_status(
                         task["origin_kind"], self._planning_grants, task,
-                        self._reader_aliases
+                        self._reader_aliases,
                     )
                     profile = self._profile_for(task["origin_kind"])
                     connection.execute(
@@ -727,22 +783,26 @@ class TaskExecutionService:
                         "task_id,task_version,status,phase,version,due_at,"
                         "failure_count,created_at,updated_at,agent_profile_id,"
                         "agent_profile_revision) "
-                        "VALUES(?,?,?,'plan',?,NULL,0,?,?,?,?)",
+                        "VALUES(?,?,?,?,?,NULL,0,?,?,?,?)",
                         (
-                            task_id, expected_task_version, status.value, version,
-                            now, now, profile.profile_id, profile.revision,
+                            task_id, expected_task_version, status.value,
+                            phase.value, version, now, now,
+                            profile.profile_id, profile.revision,
                         ),
                     )
                 else:
                     version = int(row["version"]) + 1
+                    phase = _initial_phase(
+                        task["origin_kind"], self._skip_planning_for
+                    )
                     status = _initial_status(
                         task["origin_kind"], self._planning_grants, task,
-                        self._reader_aliases
+                        self._reader_aliases,
                     )
                     profile = self._profile_for(task["origin_kind"])
                     connection.execute(
                         "UPDATE task_execution_workflows SET task_version=?,"
-                        "status=?,phase='plan',version=?,"
+                        "status=?,phase=?,version=?,"
                         "due_at=NULL,claim_token_digest=NULL,claimed_at=NULL,"
                         "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
                         "failure_count=0,last_failure_reason=NULL,"
@@ -752,13 +812,14 @@ class TaskExecutionService:
                         "completed_at=NULL,agent_profile_id=?,"
                         "agent_profile_revision=? WHERE task_id=?",
                         (
-                            expected_task_version, status.value, version, now,
+                            expected_task_version, status.value, phase.value,
+                            version, now,
                             profile.profile_id, profile.revision, task_id,
                         ),
                     )
                 self._event(
                     connection, task_id, "scheduled", version,
-                    expected_task_version, WorkflowPhase.PLAN,
+                    expected_task_version, phase,
                     status, now,
                 )
                 updated_row = connection.execute(
@@ -930,8 +991,12 @@ class TaskExecutionService:
                     # decision to abandon the work, and a reader who never
                     # answers the card should still have it attempted.
                     "ON t.id=w.task_id "
-                    "WHERE w.status IN ('queued','parked') "
-                    "AND (w.next_attempt_at IS NULL OR w.next_attempt_at<=?) "
+                    "WHERE ("
+                    " (w.status='queued' AND (w.next_attempt_at IS NULL "
+                    "  OR w.next_attempt_at<=?))"
+                    " OR (w.status='parked' AND w.next_attempt_at IS NOT NULL "
+                    "     AND w.next_attempt_at<=?)"
+                    ") "
                     f"AND w.phase IN ({placeholders}) "
                     "AND t.status='open' AND t.version=w.task_version "
                     f"ORDER BY {_SOURCE_QUEUE_ORDER_SQL}"
@@ -939,7 +1004,7 @@ class TaskExecutionService:
                     "WHEN 'raised' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END,"
                     "CASE WHEN w.failure_count=0 THEN 0 ELSE 1 END,"
                     "w.updated_at,w.task_id LIMIT ?",
-                    (now, *(phase.value for phase in phases),
+                    (now, now, *(phase.value for phase in phases),
                      MAX_CLAIM_SCAN),
                 ).fetchall()
                 row = None
@@ -1639,6 +1704,8 @@ class TaskExecutionService:
                 "claim_expires_at<=?)) AS expired,"
                 "SUM(status='awaiting_review') AS awaiting_review,"
                 "SUM(status='parked') AS parked,"
+                "SUM(status='parked' AND "
+                "last_failure_reason='context_exhausted') AS context_exhausted,"
                 "SUM(status='completed') AS completed,"
                 "SUM(status='cancelled') AS cancelled "
                 "FROM task_execution_workflows",
@@ -1649,7 +1716,7 @@ class TaskExecutionService:
             for name in (
                 "awaiting_start", "snoozed", "ready", "cooling",
                 "running", "expired", "awaiting_review", "parked",
-                "completed", "cancelled",
+                "context_exhausted", "completed", "cancelled",
             )
         ))
 
@@ -1990,7 +2057,16 @@ class TaskExecutionService:
         now = stamp.isoformat(timespec="seconds")
         failures = int(row["failure_count"]) + 1
         version = int(row["version"]) + 1
-        if failures >= self._max_attempts:
+        if reason == "context_exhausted":
+            # This is an explicit refusal from the runtime's context filter,
+            # not a slow run. The next attempt would re-read the same material
+            # and exceed the same measured ceiling, so it must wait for a
+            # reader to reduce or split the work instead of cycling overnight.
+            status = WorkflowStatus.PARKED
+            next_attempt = None
+            parked = now
+            kind = "parked"
+        elif failures >= self._max_attempts:
             # Parked, and due to try again later. A run of failures is often
             # something passing — a forge that was unreachable, a machine
             # under load — and giving up permanently on the third one turns
@@ -3081,6 +3157,15 @@ def _initial_status(
     if row is not None and reader_owned(row, reader_aliases):
         return WorkflowStatus.QUEUED
     return WorkflowStatus.AWAITING_START
+
+
+def _initial_phase(
+    origin_kind: object, skip_planning_for: frozenset[str]
+) -> WorkflowPhase:
+    """Choose the first phase for a newly-created workflow only."""
+    if isinstance(origin_kind, str) and origin_kind in skip_planning_for:
+        return WorkflowPhase.EXECUTE
+    return WorkflowPhase.PLAN
 
 
 def _bounded_text(

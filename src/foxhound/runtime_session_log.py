@@ -55,9 +55,7 @@ def write_runtime_session_log(
         raise RuntimeSessionLogError("runtime session record is unavailable") from exc
     try:
         sessions = _rows(connection, "sessions", "source = ?", (source,))
-        if len(sessions) != 1:
-            raise RuntimeSessionLogError("runtime session record is unavailable")
-        session = sessions[0]
+        session = _tagged_root(sessions)
         session_id = session.get("id")
         if not isinstance(session_id, str) or not session_id:
             raise RuntimeSessionLogError("runtime session record is invalid")
@@ -119,6 +117,28 @@ def rotate_runtime_session_logs(
         total -= size
         removed.append(path)
     return tuple(removed)
+
+
+def _tagged_root(sessions: list[dict[str, Any]]) -> dict[str, Any]:
+    """The one session the tag was applied to, not its continuations.
+
+    The runtime carries a session's source onto the child it opens when a
+    conversation is compressed, so a tag that is unique per run can still
+    match several rows. The run's own session is the one with no parent
+    inside the tagged set; the lineage walk below picks the rest up.
+    """
+    if not sessions:
+        raise RuntimeSessionLogError("runtime session record is unavailable")
+    identifiers = {
+        row.get("id") for row in sessions if isinstance(row.get("id"), str)
+    }
+    roots = [
+        row for row in sessions
+        if row.get("parent_session_id") not in identifiers
+    ]
+    if len(roots) != 1:
+        raise RuntimeSessionLogError("runtime session record is unavailable")
+    return roots[0]
 
 
 def _session_lineage(connection: sqlite3.Connection, session_id: str) -> list[dict[str, Any]]:

@@ -8,6 +8,7 @@ import unittest
 
 from foxhound.runtime_session_log import (
     RUNTIME_SESSION_LOG_NAME,
+    RuntimeSessionLogError,
     rotate_runtime_session_logs,
     write_runtime_session_log,
 )
@@ -38,6 +39,46 @@ class RuntimeSessionLogTests(unittest.TestCase):
                 "INSERT INTO messages VALUES "
                 "(1, 'session-a', 'assistant', '{\"arguments\":{\"path\":\"x\"}}', NULL, NULL), "
                 "(2, 'session-b', 'tool', NULL, 'terminal', 'synthetic failure')"
+            )
+
+    def test_a_compression_child_inheriting_the_tag_is_not_ambiguous(self) -> None:
+        """The runtime copies a session's source onto its compression child,
+        so a tag unique to one run still matches more than one row."""
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "UPDATE sessions SET source='foxhound-a' WHERE id='session-b'"
+            )
+        destination = self.root / "task" / "runs" / "plan-shared"
+        destination.mkdir(parents=True)
+
+        path = write_runtime_session_log(
+            self.database,
+            source="foxhound-a",
+            destination=destination,
+            turn_budget=80,
+        )
+
+        document = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            [row["id"] for row in document["sessions"]],
+            ["session-a", "session-b"],
+        )
+
+    def test_two_unrelated_sessions_sharing_a_tag_are_refused(self) -> None:
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "INSERT INTO sessions VALUES "
+                "('session-c', 'foxhound-a', NULL, 1, 0, 'complete')"
+            )
+        destination = self.root / "task" / "runs" / "plan-ambiguous"
+        destination.mkdir(parents=True)
+
+        with self.assertRaises(RuntimeSessionLogError):
+            write_runtime_session_log(
+                self.database,
+                source="foxhound-a",
+                destination=destination,
+                turn_budget=80,
             )
 
     def test_copies_the_structured_session_and_its_compression_child(self) -> None:

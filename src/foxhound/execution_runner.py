@@ -84,6 +84,16 @@ STARTUP_EXIT_CODE = 71
 TIMEOUT_EXIT_CODE = 124
 _RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _RUNNER_SLOT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
+# A gateway refusal with a measured request size is authoritative evidence
+# that the current run cannot fit a served context window. It is deliberately
+# narrower than words such as "context" or a long duration: those are normal
+# parts of many successful runs and must never change retry policy.
+_CONTEXT_FILTER_REFUSAL = re.compile(
+    rb"\bcontext\s+filter\s*:\s*.*?\bneeds\s+~?\d+\s+tokens?\s*,\s*"
+    rb"skipping\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_CONTEXT_EVIDENCE_BYTES = 256 * 1024
 
 
 class ExecutionRunnerError(RuntimeError):
@@ -133,6 +143,7 @@ class ExecutionRunnerConfig:
     execution_slot_cap: int | None = None
     plan_ready_cap: int | None = None
     awaiting_reader_cap: int | None = None
+    profile_routes: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if (
@@ -188,6 +199,15 @@ class ExecutionRunnerConfig:
             _action_grants(self.action_grants)
         except ValueError as exc:
             raise ValueError("execution action grants are invalid") from exc
+        if (
+            not isinstance(self.profile_routes, Mapping)
+            or any(
+                not isinstance(kind, str) or not kind
+                or not isinstance(profile_id, str) or not profile_id
+                for kind, profile_id in self.profile_routes.items()
+            )
+        ):
+            raise ValueError("execution agent profile routes are invalid")
         if self.workflow_policy is not None:
             try:
                 parse_workflow_policy(self.workflow_policy)
@@ -365,6 +385,7 @@ def run_once(
         planning_grants=config.planning_grants,
         execution_grants=config.execution_grants,
         action_grants=config.action_grants,
+        profile_routes=config.profile_routes,
         execution_slot_cap=config.execution_slot_cap,
         plan_ready_cap=config.plan_ready_cap,
         awaiting_reader_cap=config.awaiting_reader_cap,
@@ -616,12 +637,18 @@ def _run_claim(
                     process, profile.kill_grace_seconds,
                     sleep=sleep, clock=clock
                 )
+                reason = (
+                    "context_exhausted"
+                    if _context_window_exhausted(
+                        directory / TRANSCRIPT_NAME, transcript
+                    ) else "timeout"
+                )
                 return _failure_result(
                     service,
                     claim,
                     initial,
-                    reason="timeout",
-                    outcome="timeout",
+                    reason=reason,
+                    outcome=reason,
                     exit_code=TIMEOUT_EXIT_CODE,
                     forced=forced,
                 )
@@ -661,19 +688,34 @@ def _run_claim(
         if archive is not None:
             preserve_run_files(directory, archive.run_directory)
             if config.runtime_session_database is not None:
-                write_runtime_session_log(
-                    config.runtime_session_database,
-                    source="foxhound-" + run_id,
-                    destination=archive.run_directory,
-                    turn_budget=profile.max_turns,
-                )
-                rotate_runtime_session_logs(
-                    archive.working_directory,
-                    retain_bytes=config.runtime_log_retention_bytes,
-                    current_directory=archive.run_directory,
-                )
-                clear_missing_runtime_logs(archive)
-                record_runtime_log(archive, RUNTIME_SESSION_LOG_NAME)
+                # This block runs in a `finally`, so an exception here would
+                # replace the result the run already recorded -- turning a
+                # completed run into a runner-level failure, and skipping
+                # the deliverable publication below. The record is evidence
+                # about a run, not part of it: a runtime that never opened a
+                # session, a database mid-write, or a path that has moved
+                # must cost the evidence and nothing else. Same reason the
+                # publication below suppresses its own error.
+                with contextlib.suppress(
+                    RuntimeSessionLogError, TaskArchiveError
+                ):
+                    write_runtime_session_log(
+                        config.runtime_session_database,
+                        source="foxhound-" + run_id,
+                        destination=archive.run_directory,
+                        turn_budget=profile.max_turns,
+                    )
+                    rotate_runtime_session_logs(
+                        archive.working_directory,
+                        retain_bytes=config.runtime_log_retention_bytes,
+                        current_directory=archive.run_directory,
+                    )
+                    record_runtime_log(archive, RUNTIME_SESSION_LOG_NAME)
+                # Outside the suppression above: whether or not this run's
+                # record was written, the ledger must not keep pointing at
+                # one that rotation has removed.
+                with contextlib.suppress(TaskArchiveError):
+                    clear_missing_runtime_logs(archive)
             # Then again, flattened, at the top of the task folder. The run
             # directory is the record; the folder is what the reader opens.
             with contextlib.suppress(TaskArchiveError):
@@ -741,6 +783,30 @@ def _open_transcript(directory: Path):
         )
 
     return open(directory / TRANSCRIPT_NAME, "wb", opener=opener)
+
+
+def _context_window_exhausted(path: Path, transcript: object) -> bool:
+    """Whether a timed-out run recorded the gateway's measured refusal.
+
+    The runner has already established no result was recorded. The only extra
+    evidence considered here is the gateway's exact context-filter line with
+    a numeric request size, so no duration or free-form agent prose is used as
+    a proxy for context exhaustion. Reading only the tail is both bounded and
+    appropriate: the refusal is the final attempted operation before a run
+    begins trying to compress or reaches its supervision timeout.
+    """
+    if transcript is None:
+        return False
+    try:
+        transcript.flush()
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            if size > _CONTEXT_EVIDENCE_BYTES:
+                handle.seek(size - _CONTEXT_EVIDENCE_BYTES)
+            evidence = handle.read(_CONTEXT_EVIDENCE_BYTES)
+    except (AttributeError, OSError):
+        return False
+    return _CONTEXT_FILTER_REFUSAL.search(evidence) is not None
 
 
 def _fail_claim(
@@ -1061,6 +1127,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--agent-command", default="hermes")
     parser.add_argument("--agent-profile-directory", type=Path)
     parser.add_argument("--default-agent-profile", default="general")
+    parser.add_argument(
+        "--profile-route", action="append", metavar="SOURCE_KIND=PROFILE",
+    )
     parser.add_argument("--worker-command", default="foxhound-task-worker")
     parser.add_argument(
         "--runner-slot", default="default",
@@ -1183,6 +1252,16 @@ def _diagnosis(exc: BaseException) -> str:
     return " <- ".join(names)
 
 
+def _profile_routes(values: Sequence[str] | None) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for value in values or ():
+        kind, separator, profile_id = value.partition("=")
+        if not separator or not kind or not profile_id or kind in result:
+            raise ValueError("execution agent profile routes are invalid")
+        result[kind] = profile_id
+    return result
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -1195,6 +1274,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             agent_command=args.agent_command,
             profile_registry=load_registry(args.agent_profile_directory),
             default_agent_profile=args.default_agent_profile,
+            profile_routes=_profile_routes(args.profile_route),
             worker_command=args.worker_command,
             runner_slot=args.runner_slot,
             planning_grants=tuple(args.plan_without_asking or ()),
