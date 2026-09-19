@@ -329,6 +329,16 @@ class DeploymentConfigTests(unittest.TestCase):
         ):
             load_deployment_config(self.config_path)
 
+    def test_a_skip_without_planning_authority_names_the_missing_grant(self) -> None:
+        document = self._document()
+        document["workflow"]["plan_without_asking"] = []  # type: ignore[index]
+        self._write_config(document)
+
+        with self.assertRaisesRegex(
+            DeploymentConfigError, "planning grants: issue"
+        ):
+            load_deployment_config(self.config_path)
+
     def test_version_nine_configuration_retains_its_plan_phase(self) -> None:
         document = self._document()
         document["schema_version"] = 9
@@ -365,6 +375,7 @@ class DeploymentConfigTests(unittest.TestCase):
     def test_the_two_grants_are_independent(self) -> None:
         document = self._document()
         document["workflow"]["plan_without_asking"] = []  # type: ignore[index]
+        document["workflow"]["skip_planning_for"] = []  # type: ignore[index]
         self._write_config(document)
 
         config = load_deployment_config(self.config_path)

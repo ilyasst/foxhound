@@ -222,9 +222,13 @@ class DeploymentConfigAliasTests(unittest.TestCase):
             "act_without_asking": [],
         } | extra
 
+    def _current(self, **extra: object) -> dict[str, object]:
+        """The same document with every key the current version requires."""
+        return self._document(skip_planning_for=[], **extra)
+
     def test_aliases_are_read_at_the_current_version(self):
         workflow = _parse_workflow(
-            self._document(reader_aliases=[READER, OTHER]),
+            self._current(reader_aliases=[READER, OTHER]),
             version=DEPLOYMENT_SCHEMA_VERSION,
         )
         self.assertEqual(workflow.reader_aliases, (READER, OTHER))
@@ -240,13 +244,13 @@ class DeploymentConfigAliasTests(unittest.TestCase):
     def test_a_duplicated_alias_is_refused(self):
         with self.assertRaises(DeploymentConfigError):
             _parse_workflow(
-                self._document(reader_aliases=[READER, READER]),
+                self._current(reader_aliases=[READER, READER]),
                 version=DEPLOYMENT_SCHEMA_VERSION,
             )
 
     def test_each_alias_reaches_the_scheduler(self):
         workflow = _parse_workflow(
-            self._document(reader_aliases=[READER, OTHER]),
+            self._current(reader_aliases=[READER, OTHER]),
             version=DEPLOYMENT_SCHEMA_VERSION,
         )
         argv = workflow.schedule_argv(Path("/srv/example/db.sqlite3"), None)

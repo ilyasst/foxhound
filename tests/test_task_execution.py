@@ -1087,6 +1087,7 @@ class TaskExecutionTests(unittest.TestCase):
         service = TaskExecutionService(
             self.database,
             clock=self.clock,
+            planning_grants=["issue"],
             execution_grants=["issue"],
             skip_planning_for=["issue"],
             profile_registry=self.service._profile_registry,
@@ -1119,11 +1120,24 @@ class TaskExecutionTests(unittest.TestCase):
                 profile_registry=self.service._profile_registry,
             )
 
+    def test_skip_planning_requires_planning_authority(self):
+        """The plan phase carries the start gate, so skipping it needs the
+        grant that already removed that gate."""
+        with self.assertRaisesRegex(ValueError, "planning grants: issue"):
+            TaskExecutionService(
+                self.database,
+                clock=self.clock,
+                execution_grants=["issue"],
+                skip_planning_for=["issue"],
+                profile_registry=self.service._profile_registry,
+            )
+
     def test_a_skipped_workflow_does_not_consume_plan_queue_capacity(self):
         self._bind_origin(1, "issue")
         service = TaskExecutionService(
             self.database,
             clock=self.clock,
+            planning_grants=["issue"],
             execution_grants=["issue"],
             skip_planning_for=["issue"],
             plan_ready_cap=0,
@@ -1171,6 +1185,7 @@ class TaskExecutionTests(unittest.TestCase):
         replay = TaskExecutionService(
             self.database,
             clock=self.clock,
+            planning_grants=["issue"],
             execution_grants=["issue"],
             skip_planning_for=["issue"],
             profile_registry=self.service._profile_registry,

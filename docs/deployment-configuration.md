@@ -28,7 +28,7 @@ upgrade, because neither announces itself:
   unattended.
 - Version 10 adds `workflow.skip_planning_for`. It is a separate list because
   removing an ask does not remove a phase; each listed kind must also be in
-  `workflow.execute_without_asking`.
+  both `workflow.plan_without_asking` and `workflow.execute_without_asking`.
 
 Version 5 covers every enabled component that reads or writes the shared
 database: the task-card service, scheduler, one or more runners, feed import,
@@ -212,8 +212,12 @@ plan card would therefore have one plausible answer.
 `skip_planning_for` removes the plan phase entirely for newly scheduled tasks,
 so their first agent run is `execute` and no plan result is recorded. It is
 separate from both grants: adding either grant alone never removes a phase.
-Every listed kind must also be granted `execute_without_asking`. Existing
-workflow rows are never rewritten when the declaration changes.
+Every listed kind must also be granted both `plan_without_asking` and
+`execute_without_asking`. Both are required because the plan phase carries the
+reader's start gate as well as the plan itself: a kind that is still asked
+about before planning would otherwise lose that question too, with no
+declaration saying so. Existing workflow rows are never rewritten when the
+declaration changes.
 
 `act_without_asking` skips the external-action gate. A reviewed external
 action runs instead of waiting for a second card. This is the strongest of

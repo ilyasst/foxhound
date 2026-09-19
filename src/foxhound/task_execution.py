@@ -472,6 +472,18 @@ class TaskExecutionService:
                 "skip-planning declarations lack execution grants: "
                 + ", ".join(sorted(missing_execution_grants))
             )
+        # And the planning grant, because the plan phase carries the reader's
+        # start gate. Without this, adding a kind here would also delete the
+        # card that asks whether to begin at all, turning an asked source
+        # into an unattended one with no declaration saying so.
+        missing_planning_grants = (
+            self._skip_planning_for - self._planning_grants
+        )
+        if missing_planning_grants:
+            raise ValueError(
+                "skip-planning declarations lack planning grants: "
+                + ", ".join(sorted(missing_planning_grants))
+            )
         # Independent again. Executing a plan and performing an effect
         # other people can see are not the same permission.
         self._action_grants = _action_grants(action_grants)
@@ -651,7 +663,7 @@ class TaskExecutionService:
                     )
                     status = _initial_status(
                         row["origin_kind"], self._planning_grants, row,
-                        self._reader_aliases, phase=phase,
+                        self._reader_aliases,
                     )
                     if (
                         phase is WorkflowPhase.PLAN
@@ -753,7 +765,7 @@ class TaskExecutionService:
                     )
                     status = _initial_status(
                         task["origin_kind"], self._planning_grants, task,
-                        self._reader_aliases, phase=phase,
+                        self._reader_aliases,
                     )
                     profile = self._profile_for(task["origin_kind"])
                     connection.execute(
@@ -775,7 +787,7 @@ class TaskExecutionService:
                     )
                     status = _initial_status(
                         task["origin_kind"], self._planning_grants, task,
-                        self._reader_aliases, phase=phase,
+                        self._reader_aliases,
                     )
                     profile = self._profile_for(task["origin_kind"])
                     connection.execute(
@@ -3112,8 +3124,6 @@ def _initial_status(
     granted: frozenset[str],
     row: Mapping[str, object] | None = None,
     reader_aliases: frozenset[str] = frozenset(),
-    *,
-    phase: WorkflowPhase = WorkflowPhase.PLAN,
 ) -> WorkflowStatus:
     """Whether this task must be asked about before it is planned.
 
@@ -3132,8 +3142,6 @@ def _initial_status(
     costs one agent pass and yields a card that can actually be judged.
     Everything after the plan is still gated.
     """
-    if phase is WorkflowPhase.EXECUTE:
-        return WorkflowStatus.QUEUED
     if isinstance(origin_kind, str) and origin_kind in granted:
         return WorkflowStatus.QUEUED
     if row is not None and reader_owned(row, reader_aliases):

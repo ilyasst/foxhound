@@ -802,7 +802,7 @@ def _role_paths(
 def _validate_runtime(config: DeploymentConfig) -> None:
     _private_database(config.database)
     registry = load_registry(config.agent_profile_directory)
-    planning_grants(config.workflow.plan_without_asking)
+    plans = planning_grants(config.workflow.plan_without_asking)
     executions = execution_grants(config.workflow.execute_without_asking)
     skipped = execution_grants(
         config.workflow.skip_planning_for,
@@ -813,6 +813,12 @@ def _validate_runtime(config: DeploymentConfig) -> None:
         raise DeploymentConfigError(
             "skip-planning declarations lack execution grants: "
             + ", ".join(sorted(missing_execution_grants))
+        )
+    missing_planning_grants = skipped - plans
+    if missing_planning_grants:
+        raise DeploymentConfigError(
+            "skip-planning declarations lack planning grants: "
+            + ", ".join(sorted(missing_planning_grants))
         )
     action_grants(config.workflow.act_without_asking)
     TaskExecutionService(
