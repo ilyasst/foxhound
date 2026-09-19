@@ -66,10 +66,15 @@ class DeploymentConfigTests(unittest.TestCase):
             del runner["runtime_session_database"]
             del runner["runtime_log_retention_bytes"]
 
+    def _drop_deployment_root_keys(self, document: dict[str, object]) -> None:
+        """Remove the key a document written before version 13 never had."""
+        for runner in document["execution_runners"]:  # type: ignore[index]
+            runner.pop("deployment_roots", None)
+
     def _document(self) -> dict[str, object]:
         return {
             "schema": "foxhound.deployment-config",
-            "schema_version": 12,
+            "schema_version": 13,
             "database": str(self.database),
             "agent_profile_directory": None,
             "card_service": {
@@ -107,6 +112,7 @@ class DeploymentConfigTests(unittest.TestCase):
                 "worker_command": "foxhound-task-worker",
                 "runner_slot": "primary",
                 "knowledge_root": None,
+                "deployment_roots": {},
                 "task_work_root": None,
                 "task_kb_root": None,
                 "runtime_session_database": None,
@@ -121,6 +127,7 @@ class DeploymentConfigTests(unittest.TestCase):
                 "worker_command": "foxhound-task-worker",
                 "runner_slot": "secondary",
                 "knowledge_root": None,
+                "deployment_roots": {},
                 "task_work_root": None,
                 "task_kb_root": None,
                 "runtime_session_database": None,
@@ -218,10 +225,50 @@ class DeploymentConfigTests(unittest.TestCase):
                 command[command.index("--database") + 1], str(self.database)
             )
 
+    def test_deployment_roots_reach_the_runner_command(self) -> None:
+        """A configured root must survive into the launched runner's argv."""
+        document = self._document()
+        document["execution_runners"][0]["deployment_roots"] = {
+            "sync_drive": "/srv/example/drive",
+        }
+        self._write_config(document)
+
+        config = load_deployment_config(self.config_path)
+        runner = next(r for r in config.execution_runners if r.enabled)
+        argv = runner.argv(Path("/srv/example/db.sqlite3"), None, config.workflow)
+
+        index = argv.index("--deployment-root")
+        self.assertEqual(argv[index + 1], "sync_drive=/srv/example/drive")
+
+    def test_deployment_roots_refuse_an_unusable_name_or_path(self) -> None:
+        for roots in (
+            {"Sync Drive": "/srv/example/drive"},
+            {"sync_drive": "relative/path"},
+        ):
+            with self.subTest(roots=roots):
+                document = self._document()
+                document["execution_runners"][0]["deployment_roots"] = roots
+                self._write_config(document)
+                with self.assertRaises(DeploymentConfigError):
+                    load_deployment_config(self.config_path)
+
+    def test_version_twelve_configuration_remains_valid_without_roots(self) -> None:
+        document = self._document()
+        document["schema_version"] = 12
+        self._drop_deployment_root_keys(document)
+        self._write_config(document)
+
+        config = load_deployment_config(self.config_path)
+        runner = next(r for r in config.execution_runners if r.enabled)
+        self.assertEqual(dict(runner.deployment_roots), {})
+        argv = runner.argv(Path("/srv/example/db.sqlite3"), None, config.workflow)
+        self.assertNotIn("--deployment-root", argv)
+
     def test_version_one_configuration_remains_valid_without_card_gw_settings(self) -> None:
         document = self._document()
         document["schema_version"] = 1
         self._drop_runtime_log_keys(document)
+        self._drop_deployment_root_keys(document)
         del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
         del document["card_service"]["task_work_root"]  # type: ignore[index]
         del document["workflow"]["act_without_asking"]  # type: ignore[index]
@@ -242,6 +289,7 @@ class DeploymentConfigTests(unittest.TestCase):
         document = self._document()
         document["schema_version"] = 2
         self._drop_runtime_log_keys(document)
+        self._drop_deployment_root_keys(document)
         del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
         del document["card_service"]["task_work_root"]  # type: ignore[index]
         del document["workflow"]["act_without_asking"]  # type: ignore[index]
@@ -262,6 +310,7 @@ class DeploymentConfigTests(unittest.TestCase):
         document = self._document()
         document["schema_version"] = 3
         self._drop_runtime_log_keys(document)
+        self._drop_deployment_root_keys(document)
         del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
         del document["card_service"]["task_work_root"]  # type: ignore[index]
         del document["workflow"]["act_without_asking"]  # type: ignore[index]
@@ -284,6 +333,7 @@ class DeploymentConfigTests(unittest.TestCase):
         document = self._document()
         document["schema_version"] = 4
         self._drop_runtime_log_keys(document)
+        self._drop_deployment_root_keys(document)
         del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
         del document["card_service"]["task_work_root"]  # type: ignore[index]
         del document["workflow"]["act_without_asking"]  # type: ignore[index]
@@ -304,6 +354,7 @@ class DeploymentConfigTests(unittest.TestCase):
         document = self._document()
         document["schema_version"] = 5
         self._drop_runtime_log_keys(document)
+        self._drop_deployment_root_keys(document)
         del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
         del document["card_service"]["task_work_root"]  # type: ignore[index]
         del document["workflow"]["act_without_asking"]  # type: ignore[index]
@@ -365,6 +416,7 @@ class DeploymentConfigTests(unittest.TestCase):
         document = self._document()
         document["schema_version"] = 9
         self._drop_runtime_log_keys(document)
+        self._drop_deployment_root_keys(document)
         del document["workflow"]["skip_planning_for"]  # type: ignore[index]
         del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
         self._write_config(document)
@@ -490,6 +542,7 @@ class DeploymentConfigTests(unittest.TestCase):
         document = self._document()
         document["schema_version"] = 6
         self._drop_runtime_log_keys(document)
+        self._drop_deployment_root_keys(document)
         del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
         del document["card_service"]["task_work_root"]  # type: ignore[index]
         del document["workflow"]["act_without_asking"]  # type: ignore[index]

@@ -9,8 +9,9 @@ arguments can start the supported commands.
 from __future__ import annotations
 
 import argparse
+import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
@@ -41,7 +42,8 @@ from .task_execution import TaskExecutionService, WorkflowPhase
 
 
 DEPLOYMENT_SCHEMA = "foxhound.deployment-config"
-DEPLOYMENT_SCHEMA_VERSION = 12
+DEPLOYMENT_SCHEMA_VERSION = 13
+_DEPLOYMENT_ROOT_NAME = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 MAX_CONFIG_BYTES = 64 * 1024
 
 
@@ -156,6 +158,10 @@ class ExecutionRunnerDeploymentConfig:
     worker_command: str | None = None
     runner_slot: str | None = None
     knowledge_root: Path | None = None
+    #: Named machine roots the worker publishes to the agent.  Deployment
+    #: configuration, not profile policy: the same reviewed prompt names the
+    #: root and each host resolves it.
+    deployment_roots: Mapping[str, Path] = field(default_factory=dict)
     task_work_root: Path | None = None
     task_kb_root: Path | None = None
     runtime_session_database: Path | None = None
@@ -195,6 +201,8 @@ class ExecutionRunnerDeploymentConfig:
             result.extend(("--agent-profile-directory", str(profile_directory)))
         for source_kind, profile_id in workflow.agent_profile_routes:
             result.extend(("--profile-route", f"{source_kind}={profile_id}"))
+        for name, root in sorted(self.deployment_roots.items()):
+            result.extend(("--deployment-root", f"{name}={root}"))
         for option, path in (
             ("--knowledge-root", self.knowledge_root),
             ("--task-work-root", self.task_work_root),
@@ -424,7 +432,7 @@ def _parse_document(document: object) -> DeploymentConfig:
     if (
         document.get("schema") != DEPLOYMENT_SCHEMA
         or version not in {
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, DEPLOYMENT_SCHEMA_VERSION
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, DEPLOYMENT_SCHEMA_VERSION
         }
         or isinstance(version, bool)
     ):
@@ -634,6 +642,8 @@ def _parse_execution_runner(
     }
     if version >= 12:
         fields.update({"runtime_session_database", "runtime_log_retention_bytes"})
+    if version >= 13:
+        fields.add("deployment_roots")
     document = _object(value, fields)
     strings = tuple(document[key] for key in (
         "gw_endpoint", "gw_alias", "agent_command", "worker_command", "runner_slot"
@@ -669,6 +679,10 @@ def _parse_execution_runner(
         worker_command=strings[3],
         runner_slot=strings[4],
         knowledge_root=_optional_absolute_path(document["knowledge_root"]),
+        deployment_roots=(
+            _deployment_roots(document["deployment_roots"])
+            if version >= 13 else {}
+        ),
         task_work_root=_optional_absolute_path(document["task_work_root"]),
         task_kb_root=_optional_absolute_path(document["task_kb_root"]),
         runtime_session_database=runtime_database,
@@ -861,6 +875,23 @@ def _positive_int(value: object) -> int:
 
 def _optional_absolute_path(value: object) -> Path | None:
     return None if value is None else _absolute_path(value)
+
+
+def _deployment_roots(value: object) -> dict[str, Path]:
+    """Symbolic name to absolute root, rejecting a name a profile cannot use."""
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise DeploymentConfigError("execution runner configuration is invalid")
+    roots: dict[str, Path] = {}
+    for name, raw in value.items():
+        if (
+            not isinstance(name, str)
+            or _DEPLOYMENT_ROOT_NAME.fullmatch(name) is None
+        ):
+            raise DeploymentConfigError("execution runner configuration is invalid")
+        roots[name] = _absolute_path(raw)
+    return roots
 
 
 def _role_paths(

@@ -101,6 +101,7 @@ before it existed is brought forward.
     "worker_command": "foxhound-task-worker",
     "runner_slot": "primary",
     "knowledge_root": null,
+    "deployment_roots": {},
     "task_work_root": null,
     "task_kb_root": null,
     "runtime_session_database": null,
@@ -247,6 +248,24 @@ grep -h '^ExecStart=' ~/.config/systemd/user/foxhound-*.service{,.d/*.conf} \
 Any output is a unit to repoint. Prefer an interpreter owned by a deployed
 component or by a service that is itself deployed; if a host genuinely has no
 such interpreter, that is the thing to fix, not the unit.
+
+## Deployment roots
+
+`deployment_roots` maps a stable symbolic name to an absolute directory on this
+machine, for example `{"sync_drive": "/srv/example/drive"}`. The runner passes
+each one to the worker, which publishes them to the agent as
+`capabilities.deployment_roots`.
+
+They exist so a profile prompt never names a path. A profile revision renders
+identically on every host, and a path does not: the reviewed prompt names the
+root, and each host resolves it. A name absent here is absent in the work
+context, so an agent can tell "not configured on this host" from "configured
+and empty". The values are runtime facts and do not enter the profile revision.
+
+A store fragment that names a path instead is refused by `validate` and
+`publish`; see [ADR 0043](architecture/0043-pinned-release-checkout.md) for the
+order that requires, because the store is brought into compliance before the
+release that enforces it is promoted.
 
 ## Gates a machine may stand down
 
