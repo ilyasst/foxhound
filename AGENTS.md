@@ -70,8 +70,10 @@ After the repository bootstrap, all changes follow this workflow:
 5. Inspect the complete staged diff and commit metadata, then push the branch
    and open a sanitized pull request targeting `main`. Link the issue and state
    how the acceptance criteria were verified using synthetic evidence.
-6. Merge only after required checks and review pass. Prefer squash merging
-   unless preserving separate commits has a concrete benefit.
+6. Merge only after a full local suite run passes and review passes. The
+   automated checks on the pull request do not substitute for the local run
+   while they cannot start; see "Running the tests" below. Prefer squash
+   merging unless preserving separate commits has a concrete benefit.
 7. Confirm the merge, delete the remote branch, remove the worktree, delete the
    local branch, and prune stale worktree references.
 
@@ -110,6 +112,35 @@ workflow after bootstrap.
   publication-safety review is complete, and the issue/branch/worktree cleanup
   has been performed.
 
+## Running the tests
+
+The full suite is the merge gate. It takes about two minutes, so there is no
+reason to run a subset and guess.
+
+```sh
+python3 -m venv .venv
+.venv/bin/pip install -e .          # not optional -- see below
+.venv/bin/pip install pytest
+.venv/bin/python -m pytest tests/ -q
+```
+
+**Install the package first.** `resolve_worker_command` looks for a console
+script beside `sys.executable` and falls back to a bare name when none is
+there, so a suite run against an uninstalled tree takes the fallback and
+passes while every developer checkout and every deployed release fails. A run
+that skipped the install would have reported green on the commit that broke
+production. Confirm with `command -v foxhound-task-worker` before trusting a
+green result.
+
+Run it in the worktree the change lives in, with its own virtual environment.
+`git stash` is shared across every worktree of this repository, so never use
+it to "temporarily undo" a change and compare — add a throwaway worktree
+instead:
+
+```sh
+git worktree add /tmp/verify-main origin/main --detach
+```
+
 ## Deploying
 
 `main` moving does not move production.  Units import a pinned release, and
@@ -139,6 +170,10 @@ git config core.hooksPath tools/hooks
 It runs `tools/check_public_diff.py` over the staged diff before every
 commit, and separately refuses to commit on `main`. See `CONFIDENTIALITY.md`
 for what the guard does, how to run it by hand, and — read this part even if
-you skip the rest — an explicit list of what it cannot detect. There is no
-CI running any of this; GitHub Actions billing is unavailable for this
-account, so a workflow-based check would never run. Do not add one.
+you skip the rest — an explicit list of what it cannot detect.
+
+A GitHub Actions workflow runs the same guard and the test suite on every
+pull request, but **it cannot start**: Actions billing is unavailable for
+this account. A red check therefore means *not run*, not *failed*, and a
+check that is red or absent is never evidence that a change is good. Run the
+suite yourself; see the section below.
