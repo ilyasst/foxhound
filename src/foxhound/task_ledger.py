@@ -695,11 +695,84 @@ class TaskLedger:
                         )
                         candidates_after_close += 1
                         continue
+                    previous = self._bound_candidate(connection, binding)
+                    review_head_changed = _review_head_changed(
+                        previous, candidate
+                    )
                     desired_owner = (
                         _row_owner_values(task)
                         if bool(task["owner_pinned"])
                         else _candidate_owner_values(candidate)
                     )
+                    if (
+                        candidate.source.kind == "review_request"
+                        and not review_head_changed
+                    ):
+                        # Pull-request title and body edits are source
+                        # metadata, not a request to re-review unchanged
+                        # code.  Keep the durable task current without
+                        # advancing its version, so its sole workflow remains
+                        # valid.  A missing head on a legacy producer is also
+                        # deliberately conservative: it cannot prove a code
+                        # change and therefore cannot restart a review.
+                        connection.execute(
+                            "UPDATE tasks SET text=?,owner=?,due=?,object=?,"
+                            "action=?,confidence=?,updated_at=?,"
+                            "owner_ref_version=?,owner_kind=?,"
+                            "owner_speaker_id=?,owner_canonical_speaker_id=?,"
+                            "owner_speaker_registry_id=?,owner_pinned=?,"
+                            "owner_provisional=? WHERE id=?",
+                            (
+                                candidate.task.text,
+                                desired_owner[0],
+                                candidate.task.due,
+                                *_candidate_structure_values(candidate),
+                                now,
+                                *desired_owner[1:],
+                                int(binding["task_id"]),
+                            ),
+                        )
+                        _replace_participants(
+                            connection, int(binding["task_id"]), candidate
+                        )
+                        connection.execute(
+                            "UPDATE task_candidate_bindings SET "
+                            "source_revision=?,decided_at=? "
+                            "WHERE candidate_id=?",
+                            (
+                                candidate.source.revision,
+                                now,
+                                candidate.candidate_id,
+                            ),
+                        )
+                        connection.execute(
+                            "UPDATE task_candidate_lifecycle SET "
+                            "source_revision=?,changed_at=?,decided_at=? "
+                            "WHERE candidate_id=?",
+                            (
+                                candidate.source.revision,
+                                candidate.lifecycle.changed_at,
+                                now,
+                                candidate.candidate_id,
+                            ),
+                        )
+                        connection.execute(
+                            "INSERT INTO task_events("
+                            "task_id,kind,task_version,candidate_id,"
+                            "source_revision,from_status,to_status,occurred_at) "
+                            "VALUES(?,'candidate_revised',?,?,?,?,?,?)",
+                            (
+                                int(binding["task_id"]),
+                                int(task["version"]),
+                                candidate.candidate_id,
+                                candidate.source.revision,
+                                None,
+                                None,
+                                now,
+                            ),
+                        )
+                        tasks_revised += 1
+                        continue
                     if (
                         task["text"] == candidate.task.text
                         and task["due"] == candidate.task.due
@@ -708,6 +781,7 @@ class TaskLedger:
                         == _candidate_structure_values(candidate)
                         and _stored_participants(connection, int(task["id"]))
                         == _candidate_participants(candidate)
+                        and not review_head_changed
                     ):
                         # A producer may enrich the evidence for an already
                         # accepted task without changing the work itself.
@@ -1804,6 +1878,7 @@ class TaskLedger:
 
 
 _USE_CANDIDATE_OWNER = object()
+_REVIEW_HEAD_OID_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 def _candidate_owner_values(
@@ -1935,6 +2010,31 @@ def _valid_native_identity(
         and isinstance(cursor, int)
         and 0 <= cursor <= _MAX_SQLITE_INTEGER
     )
+
+
+def _review_head_oid(candidate: TaskCandidate) -> str | None:
+    """Return GW's explicit pull-request head revision when available.
+
+    Candidate ``source.revision`` is a digest of all candidate content, so it
+    changes for a title or body edit too.  The exact 40-hex ``diff`` extract
+    is deliberately narrower: GW emits it only for the current pull-request
+    head.  Old producers lack this item and therefore cannot trigger an
+    automatic re-review merely by changing their general digest.
+    """
+    if candidate.source.kind != "review_request":
+        return None
+    values = [
+        source.extract for source in candidate.evidence.sources
+        if source.role == "diff" and _REVIEW_HEAD_OID_RE.fullmatch(source.extract)
+    ]
+    return values[0] if len(values) == 1 else None
+
+
+def _review_head_changed(before: TaskCandidate, after: TaskCandidate) -> bool:
+    """Whether two revisions prove a pull-request code change."""
+    old = _review_head_oid(before)
+    new = _review_head_oid(after)
+    return old is not None and new is not None and old != new
 
 
 def _valid_effective_owner(value: object) -> bool:

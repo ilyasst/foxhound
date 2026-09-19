@@ -21,7 +21,11 @@ from foxhound.contracts import candidate_id_for, comparable_task_digest
 from foxhound.native_intake import main
 from review_card_fixture import raise_review_cards
 from foxhound.task_cards import CardRefusal, TaskCardService
-from foxhound.task_execution import TaskExecutionService, WorkflowStatus
+from foxhound.task_execution import (
+    TaskExecutionService,
+    WorkflowRefusal,
+    WorkflowStatus,
+)
 from foxhound.task_ledger import (
     BootstrapDisposition,
     BootstrapRefusal,
@@ -207,6 +211,56 @@ def cumulative_candidate(index: int, kind: str) -> dict:
         "state": "active",
         "generation": 1,
         "changed_at": "2030-02-01T12:00:00Z",
+    }
+    item["source"]["revision"] = hashlib.sha256(
+        json.dumps(item, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return item
+
+
+def review_candidate(
+    head_oid: str,
+    *,
+    title: str = "Review synthetic change",
+    generation: int = 1,
+) -> dict:
+    """A current-shape pull request with GW's explicit head evidence."""
+    item = cumulative_candidate(42, "review_request")
+    item["source"].update({
+        "record_id": "example.com/acme/widget",
+        "item_id": "42",
+    })
+    item["candidate_id"] = candidate_id_for(
+        system="gw",
+        kind="review_request",
+        record_id=item["source"]["record_id"],
+        item_id=item["source"]["item_id"],
+    )
+    item["task"]["text"] = title
+    item["lifecycle"].update({
+        "generation": generation,
+        "changed_at": f"2030-02-{generation:02d}T12:00:00Z",
+    })
+    item["evidence"] = {
+        "document_id": item["source"]["record_id"],
+        "locator": "example.com/acme/widget/pull/42",
+        "sources": [
+            {
+                "name": "pull-request-42.md",
+                "role": "title",
+                "extract": title,
+            },
+            {
+                "name": "pull-request-42.md",
+                "role": "body",
+                "extract": "Synthetic review evidence.",
+            },
+            {
+                "name": "pull-request-42-head.txt",
+                "role": "diff",
+                "extract": head_oid,
+            },
+        ],
     }
     item["source"]["revision"] = hashlib.sha256(
         json.dumps(item, sort_keys=True).encode("utf-8")
@@ -870,6 +924,64 @@ class NativeCandidateIntakeTests(unittest.TestCase):
                 self.assertEqual(task.version, 1)
                 stored = self.inbox.get(enriched["candidate_id"])
                 self.assertEqual(stored.evidence.sources[0].role, role)
+
+    def test_review_metadata_change_preserves_its_current_workflow(self):
+        self.activate()
+        initial = review_candidate("a" * 40, title="Review synthetic change")
+        self.inbox.import_feed(feed(0, initial))
+        self.intake()
+        execution = TaskExecutionService(self.database, clock=lambda: NOW)
+        scheduled = execution.schedule(1, expected_task_version=1)
+
+        edited = review_candidate(
+            "a" * 40, title="Retitled synthetic change", generation=2
+        )
+        self.inbox.import_feed(feed(1, edited))
+        result = self.intake()
+
+        task = self.ledger.get(1)
+        workflow = execution.get(1)
+        self.assertEqual(result.tasks_revised, 1)
+        self.assertEqual(
+            (task.text, task.version), ("Retitled synthetic change", 1)
+        )
+        self.assertEqual(
+            (workflow.task_version, workflow.version),
+            (1, scheduled.version),
+        )
+
+    def test_review_head_updates_coalesce_to_one_latest_workflow(self):
+        self.activate()
+        initial = review_candidate("a" * 40)
+        self.inbox.import_feed(feed(0, initial))
+        self.intake()
+        execution = TaskExecutionService(self.database, clock=lambda: NOW)
+        stale = execution.schedule(1, expected_task_version=1)
+
+        second = review_candidate("b" * 40, generation=2)
+        latest = review_candidate("c" * 40, generation=3)
+        self.inbox.import_feed(feed(1, second, latest))
+        result = self.intake()
+
+        self.assertEqual(result.tasks_revised, 2)
+        self.assertEqual(self.ledger.get(1).version, 3)
+        refreshed = execution.schedule_new()
+        workflow = execution.get(1)
+        self.assertEqual(refreshed.scheduled, 1)
+        self.assertEqual(workflow.task_version, 3)
+        refused = execution.start_action(
+            1, expected_version=stale.version, action="start"
+        )
+        self.assertEqual(refused.refusal, WorkflowRefusal.STALE_WORKFLOW)
+        with closing(sqlite3.connect(self.database)) as connection:
+            workflow_count = connection.execute(
+                "SELECT COUNT(*) FROM task_execution_workflows WHERE task_id=1"
+            ).fetchone()[0]
+            binding = connection.execute(
+                "SELECT source_revision FROM task_candidate_bindings"
+            ).fetchone()[0]
+        self.assertEqual(workflow_count, 1)
+        self.assertEqual(binding, latest["source"]["revision"])
 
     def test_withdrawal_before_binding_advances_without_creating_a_task(self):
         self.activate()
