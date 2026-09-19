@@ -611,6 +611,139 @@ class TaskExecutionTests(unittest.TestCase):
         self.assertFalse(unavailable[0].available)
         self.assertNotIn("Synthetic task", repr(unavailable))
 
+    def test_a_retired_revision_is_available_but_not_current(self):
+        """`available` says it resolves, not that it carries the budget.
+
+        A revision kept in the store for replay resolves exactly and runs
+        perfectly, so a workflow pinned to it reports healthy while being
+        held to a timeout and turn limit the operator has replaced. That is
+        how a deployment ran the bulk of its queue on two thirds of the
+        budget it had configured, with nothing naming the cause.
+        """
+        retired = _profile(phases=("plan", "execute"))
+        current = parse_profile({
+            **{
+                "schema": "foxhound.agent-profile",
+                "schema_version": 1,
+                "profile_id": retired.profile_id,
+                "display_name": "Synthetic Specialist",
+                "runtime": "hermes",
+                "prompt_template": f"Use {WORKER_COMMAND_TOKEN} context.",
+                "toolsets": ["terminal", "file"],
+                "heartbeat_seconds": 60,
+                "kill_grace_seconds": 30,
+                "allowed_phases": ["plan", "execute"],
+            },
+            # The raise an operator makes, and the whole reason the
+            # distinction matters. The lease grows with it because the
+            # profile guard requires it to exceed timeout + kill grace.
+            "max_turns": 120,
+            "timeout_seconds": 3_300,
+            "claim_lease_seconds": 3_600,
+        })
+        self.assertNotEqual(retired.revision, current.revision)
+
+        # Schedule and pin the workflow to the retired revision.
+        pinning = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            profile_registry=AgentProfileRegistry(
+                (general_profile(), retired)
+            ),
+        )
+        scheduled = pinning.schedule(1, expected_task_version=1)
+        selected = pinning.select_agent(
+            1,
+            expected_version=scheduled.version,
+            profile_id=retired.profile_id,
+            profile_revision=retired.revision,
+        )
+        self.assertTrue(selected.accepted)
+
+        # The operator then installs a larger revision of the same profile.
+        # The retired one stays resolvable, as replay requires.
+        after = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            profile_registry=AgentProfileRegistry(
+                (general_profile(), current),
+                historical_profiles=(retired,),
+            ),
+        )
+        health = {
+            row.agent_profile_revision: row for row in after.profile_health()
+        }
+        pinned = health[retired.revision]
+        self.assertTrue(pinned.available)
+        self.assertFalse(pinned.current)
+
+        superseded = after.superseded_profile_revisions()
+        self.assertEqual(
+            [row.agent_profile_revision for row in superseded],
+            [retired.revision],
+        )
+        self.assertEqual(superseded[0].workflows, 1)
+        self.assertNotIn("Synthetic task", repr(superseded))
+
+    def test_current_revision_is_not_reported_as_superseded(self):
+        """The report must be empty when nothing is behind, or it is noise."""
+        profile = _profile(phases=("plan", "execute"))
+        service = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            profile_registry=AgentProfileRegistry(
+                (general_profile(), profile)
+            ),
+        )
+        scheduled = service.schedule(1, expected_task_version=1)
+        self.assertTrue(service.select_agent(
+            1,
+            expected_version=scheduled.version,
+            profile_id=profile.profile_id,
+            profile_revision=profile.revision,
+        ).accepted)
+        health = {
+            row.agent_profile_revision: row for row in service.profile_health()
+        }
+        self.assertTrue(health[profile.revision].current)
+        self.assertEqual(service.superseded_profile_revisions(), ())
+
+    def test_a_dropped_profile_is_not_reported_as_merely_superseded(self):
+        """Two different faults, and conflating them hides the worse one.
+
+        A profile the registry no longer offers at all cannot be moved to a
+        newer revision, because there is none. `available` already reports
+        it; listing it as superseded would suggest a remedy that does not
+        exist.
+        """
+        dropped = _profile(phases=("plan", "execute"))
+        pinning = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            profile_registry=AgentProfileRegistry(
+                (general_profile(), dropped)
+            ),
+        )
+        scheduled = pinning.schedule(1, expected_task_version=1)
+        self.assertTrue(pinning.select_agent(
+            1,
+            expected_version=scheduled.version,
+            profile_id=dropped.profile_id,
+            profile_revision=dropped.revision,
+        ).accepted)
+
+        after = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            profile_registry=AgentProfileRegistry((general_profile(),)),
+        )
+        health = {
+            row.agent_profile_revision: row for row in after.profile_health()
+        }
+        self.assertFalse(health[dropped.revision].available)
+        self.assertFalse(health[dropped.revision].current)
+        self.assertEqual(after.superseded_profile_revisions(), ())
+
     def test_claim_refuses_changed_missing_or_phase_ineligible_profile(self):
         specialist = _profile(phases=("plan",))
         registry = AgentProfileRegistry((general_profile(), specialist))

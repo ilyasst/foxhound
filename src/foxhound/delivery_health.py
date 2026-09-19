@@ -18,13 +18,39 @@ from .task_ledger import TaskLedgerError
 
 
 HEALTH_SCHEMA = "foxhound.delivery-health"
-HEALTH_SCHEMA_VERSION = 1
+# 2 adds `superseded_profiles`. A consumer reading version 1 sees every
+# field it did before; the addition is why the version moved rather than
+# something a reader has to infer from a missing key.
+HEALTH_SCHEMA_VERSION = 2
 MAX_THRESHOLD_SECONDS = 7 * 24 * 60 * 60
 MAX_RECENT_FAILURES = 10_000
 
 
 class DeliveryHealthError(RuntimeError):
     """Delivery health could not read a compatible private database."""
+
+
+@dataclass(frozen=True)
+class SupersededProfileHealth:
+    """Workflows held to a budget their profile no longer installs.
+
+    A profile's revision fixes its timeout and turn limit, and a workflow
+    keeps the revision it was scheduled under for life (ADR 0024). So an
+    operator who raises a budget changes nothing for work already queued,
+    and no existing report says so: `profile_health` marks a retired
+    revision `available`, which is true -- it resolves and runs -- while
+    saying nothing about the budget it carries.
+    """
+
+    #: Distinct retired revisions still pinned by at least one workflow.
+    revisions: int
+    #: Workflows pinned to one of them.
+    workflows: int
+    #: Of those, how many could adopt the installed revision now: not
+    #: `running`, so nothing is rebound under a live claim.
+    ready: int
+    parked: int
+    running: int
 
 
 @dataclass(frozen=True)
@@ -67,6 +93,7 @@ class DeliveryHealth:
     failure_window_seconds: int
     last_successful_delivery_age_seconds: int | None
     workflows: ExecutionReadiness
+    superseded_profiles: SupersededProfileHealth
     alerts: tuple[str, ...]
 
     @property
@@ -87,6 +114,7 @@ class DeliveryHealth:
                 "last_successful_delivery_age_seconds": self.last_successful_delivery_age_seconds,
             },
             "workflows": asdict(self.workflows),
+            "superseded_profiles": asdict(self.superseded_profiles),
         }
 
 
@@ -112,9 +140,9 @@ def collect_delivery_health(
             recent_failures, last_delivery = _delivery_events(
                 connection, now - timedelta(seconds=policy.failure_window_seconds)
             )
-        workflows = TaskExecutionService(
-            database, clock=lambda: now
-        ).readiness()
+        execution = TaskExecutionService(database, clock=lambda: now)
+        workflows = execution.readiness()
+        superseded = execution.superseded_profile_revisions()
     except (TaskBootstrapConfigError, TaskLedgerError, OSError, ValueError) as exc:
         raise DeliveryHealthError("delivery health is unavailable") from exc
 
@@ -145,6 +173,13 @@ def collect_delivery_health(
         failure_window_seconds=policy.failure_window_seconds,
         last_successful_delivery_age_seconds=last_age,
         workflows=workflows,
+        superseded_profiles=SupersededProfileHealth(
+            revisions=len(superseded),
+            workflows=sum(row.workflows for row in superseded),
+            ready=sum(row.workflows - row.running for row in superseded),
+            parked=sum(row.parked for row in superseded),
+            running=sum(row.running for row in superseded),
+        ),
         alerts=tuple(alerts),
     )
 
