@@ -12,7 +12,7 @@ make it owner-only (`0600`), and do not commit it, paste it into issues, or
 send its rendered command lines to logs. It contains paths but never token
 values.
 
-Version 8 is current. Two things about it are worth knowing before an
+Version 10 is current. Two things about it are worth knowing before an
 upgrade, because neither announces itself:
 
 - `card_service.task_work_root` is **required** once delivery is enabled, and
@@ -26,6 +26,13 @@ upgrade, because neither announces itself:
   `workflow.act_without_asking`. An empty list is what their absence meant,
   so carrying them across as empty changes nothing about what runs
   unattended.
+- Version 10 copies the runtime's structured session record into each task
+  run. When `task_work_root` and `task_kb_root` are configured, set
+  `runtime_session_database` to the private Hermes `state.db`; it is read-only
+  input, while the copied `runtime-session.json` is Foxhound-owned task
+  evidence. `runtime_log_retention_bytes` is the per-task history limit and
+  defaults to 30 MiB. These logs can contain private tool arguments and
+  results: they are not artifacts and must never be committed or delivered.
 
 Version 5 covers every enabled component that reads or writes the shared
 database: the task-card service, scheduler, one or more runners, feed import,
@@ -37,7 +44,7 @@ and all paths are absolute.
 ```json
 {
   "schema": "foxhound.deployment-config",
-  "schema_version": 8,
+  "schema_version": 10,
   "database": "/srv/example/private-foxhound-state/foxhound.sqlite3",
   "agent_profile_directory": null,
   "card_service": {
@@ -64,7 +71,8 @@ and all paths are absolute.
     "act_without_asking": ["issue"],
     "execution_slot_cap": 2,
     "plan_ready_cap": 10,
-    "awaiting_reader_cap": 20
+    "awaiting_reader_cap": 20,
+    "reader_aliases": []
   },
   "execution_runners": [{
     "enabled": true,
@@ -77,7 +85,9 @@ and all paths are absolute.
     "runner_slot": "primary",
     "knowledge_root": null,
     "task_work_root": null,
-    "task_kb_root": null
+    "task_kb_root": null,
+    "runtime_session_database": null,
+    "runtime_log_retention_bytes": 31457280
   }],
   "database_consumers": {
     "candidate_feed_import": {

@@ -110,10 +110,41 @@ def prepare_task_archive(
         "run": run_directory.name,
         "outcome": None,
         "summary": "",
+        "runtime_log": None,
     })
     paths = TaskArchivePaths(task_directory, task_file, run_directory)
     _publish_log(paths, log)
     return paths
+
+
+def record_runtime_log(paths: TaskArchivePaths, log_name: str) -> None:
+    """Point the task ledger at a private structured runtime record."""
+    if not isinstance(log_name, str) or not log_name or "/" in log_name:
+        raise TaskArchiveError("task runtime log is invalid")
+    log = _read_log(paths.working_directory)
+    for entry in reversed(log.get("runs", [])):
+        if isinstance(entry, dict) and entry.get("run") == paths.run_directory.name:
+            entry["runtime_log"] = log_name
+            _publish_log(paths, log)
+            return
+    raise TaskArchiveError("task runtime log is unavailable")
+
+
+def clear_missing_runtime_logs(paths: TaskArchivePaths) -> None:
+    """Do not leave the task ledger pointing at a rotated runtime record."""
+    log = _read_log(paths.working_directory)
+    changed = False
+    for entry in log.get("runs", []):
+        if not isinstance(entry, dict) or not entry.get("runtime_log"):
+            continue
+        path = paths.working_directory / "runs" / str(entry.get("run")) / str(
+            entry["runtime_log"]
+        )
+        if not path.is_file() or path.is_symlink():
+            entry["runtime_log"] = None
+            changed = True
+    if changed:
+        _publish_log(paths, log)
 
 
 def _task_basename(
@@ -483,6 +514,8 @@ def _render_task_document(log: Mapping[str, object]) -> str:
                 f"- {entry.get('stamp')} — {entry.get('phase')} — {outcome}"
                 f" — `runs/{entry.get('run')}`"
             )
+            if entry.get("runtime_log"):
+                line += f" — `runs/{entry.get('run')}/{entry['runtime_log']}`"
             lines.append(f"{line}\n  {note}" if note else line)
         if len(runs) > MAX_HISTORY_RUNS:
             lines.append(

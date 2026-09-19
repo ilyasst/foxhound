@@ -36,7 +36,7 @@ from .task_execution import TaskExecutionService
 
 
 DEPLOYMENT_SCHEMA = "foxhound.deployment-config"
-DEPLOYMENT_SCHEMA_VERSION = 9
+DEPLOYMENT_SCHEMA_VERSION = 10
 MAX_CONFIG_BYTES = 64 * 1024
 
 
@@ -144,6 +144,8 @@ class ExecutionRunnerDeploymentConfig:
     knowledge_root: Path | None = None
     task_work_root: Path | None = None
     task_kb_root: Path | None = None
+    runtime_session_database: Path | None = None
+    runtime_log_retention_bytes: int | None = None
 
     def argv(
         self,
@@ -181,9 +183,12 @@ class ExecutionRunnerDeploymentConfig:
             ("--knowledge-root", self.knowledge_root),
             ("--task-work-root", self.task_work_root),
             ("--task-kb-root", self.task_kb_root),
+            ("--runtime-session-database", self.runtime_session_database),
         ):
             if path is not None:
                 result.extend((option, str(path)))
+        if self.runtime_log_retention_bytes is not None:
+            result.extend(("--runtime-log-retention-bytes", str(self.runtime_log_retention_bytes)))
         for kind in workflow.plan_without_asking:
             result.extend(("--plan-without-asking", kind))
         for kind in workflow.execute_without_asking:
@@ -402,7 +407,7 @@ def _parse_document(document: object) -> DeploymentConfig:
     version = document.get("schema_version")
     if (
         document.get("schema") != DEPLOYMENT_SCHEMA
-        or version not in {1, 2, 3, 4, 5, 6, 7, 8, DEPLOYMENT_SCHEMA_VERSION}
+        or version not in {1, 2, 3, 4, 5, 6, 7, 8, 9, DEPLOYMENT_SCHEMA_VERSION}
         or isinstance(version, bool)
     ):
         raise DeploymentConfigError("deployment configuration version is invalid")
@@ -418,9 +423,9 @@ def _parse_document(document: object) -> DeploymentConfig:
         },
     )
     runners = (
-        _parse_execution_runners(root["execution_runners"])
+        _parse_execution_runners(root["execution_runners"], version=int(version))
         if version >= 3
-        else (_parse_execution_runner(root["execution_runner"]),)
+        else (_parse_execution_runner(root["execution_runner"], version=int(version)),)
     )
     return DeploymentConfig(
         database=_absolute_path(root["database"]),
@@ -556,7 +561,9 @@ def _grant_list(value: object) -> bool:
     )
 
 
-def _parse_execution_runner(value: object) -> ExecutionRunnerDeploymentConfig:
+def _parse_execution_runner(
+    value: object, *, version: int
+) -> ExecutionRunnerDeploymentConfig:
     if not isinstance(value, Mapping):
         raise DeploymentConfigError("execution runner configuration is invalid")
     enabled = value.get("enabled")
@@ -565,15 +572,33 @@ def _parse_execution_runner(value: object) -> ExecutionRunnerDeploymentConfig:
     if not enabled:
         _object(value, {"enabled"})
         return ExecutionRunnerDeploymentConfig(enabled=False)
-    document = _object(value, {
+    fields = {
         "enabled", "run_root", "gw_endpoint", "gw_alias", "gw_token_file",
         "agent_command", "worker_command", "runner_slot", "knowledge_root",
         "task_work_root", "task_kb_root",
-    })
+    }
+    if version >= 10:
+        fields.update({"runtime_session_database", "runtime_log_retention_bytes"})
+    document = _object(value, fields)
     strings = tuple(document[key] for key in (
         "gw_endpoint", "gw_alias", "agent_command", "worker_command", "runner_slot"
     ))
     if any(not isinstance(item, str) for item in strings):
+        raise DeploymentConfigError("execution runner configuration is invalid")
+    runtime_database = (
+        _optional_absolute_path(document["runtime_session_database"])
+        if version >= 10 else None
+    )
+    retention = (
+        document["runtime_log_retention_bytes"] if version >= 10 else None
+    )
+    if retention is not None and (
+        isinstance(retention, bool) or not isinstance(retention, int) or retention < 1
+    ):
+        raise DeploymentConfigError("execution runner configuration is invalid")
+    if (document["task_work_root"] is None) != (document["task_kb_root"] is None):
+        raise DeploymentConfigError("execution runner configuration is invalid")
+    if version >= 10 and document["task_work_root"] is not None and runtime_database is None:
         raise DeploymentConfigError("execution runner configuration is invalid")
     return ExecutionRunnerDeploymentConfig(
         enabled=True,
@@ -587,15 +612,19 @@ def _parse_execution_runner(value: object) -> ExecutionRunnerDeploymentConfig:
         knowledge_root=_optional_absolute_path(document["knowledge_root"]),
         task_work_root=_optional_absolute_path(document["task_work_root"]),
         task_kb_root=_optional_absolute_path(document["task_kb_root"]),
+        runtime_session_database=runtime_database,
+        runtime_log_retention_bytes=retention,
     )
 
 
 def _parse_execution_runners(
     value: object,
+    *,
+    version: int,
 ) -> tuple[ExecutionRunnerDeploymentConfig, ...]:
     if not isinstance(value, list) or not value:
         raise DeploymentConfigError("execution runner configuration is invalid")
-    runners = tuple(_parse_execution_runner(item) for item in value)
+    runners = tuple(_parse_execution_runner(item, version=version) for item in value)
     slots = [runner.runner_slot for runner in runners if runner.enabled]
     if len(slots) != len(set(slots)):
         raise DeploymentConfigError("execution runner configuration is invalid")
@@ -828,6 +857,12 @@ def _validate_runtime(config: DeploymentConfig) -> None:
                 knowledge_root=runner.knowledge_root,
                 task_work_root=runner.task_work_root,
                 task_kb_root=runner.task_kb_root,
+                runtime_session_database=runner.runtime_session_database,
+                runtime_log_retention_bytes=(
+                    runner.runtime_log_retention_bytes
+                    if runner.runtime_log_retention_bytes is not None
+                    else 30 * 1024 * 1024
+                ),
                 execution_slot_cap=config.workflow.execution_slot_cap,
                 plan_ready_cap=config.workflow.plan_ready_cap,
                 awaiting_reader_cap=config.workflow.awaiting_reader_cap,

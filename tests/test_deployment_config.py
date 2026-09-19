@@ -292,6 +292,30 @@ class DeploymentConfigTests(unittest.TestCase):
             argv[argv.index("--execute-without-asking") + 1], "issue"
         )
 
+    def test_version_ten_routes_the_private_runtime_record_to_task_evidence(self) -> None:
+        document = self._document()
+        document["schema_version"] = 10
+        document["workflow"]["reader_aliases"] = []  # type: ignore[index]
+        runtime_database = self.root / "hermes-state.db"
+        runtime_database.touch(mode=0o600)
+        for runner in document["execution_runners"]:  # type: ignore[index]
+            runner["task_work_root"] = str(self.task_work_root)
+            runner["task_kb_root"] = str(self.root / "task-kb")
+            runner["runtime_session_database"] = str(runtime_database)
+            runner["runtime_log_retention_bytes"] = 31
+        self._write_config(document)
+
+        config = load_deployment_config(self.config_path)
+        argv = config.argv("execution-runner:primary")
+
+        self.assertEqual(
+            argv[argv.index("--runtime-session-database") + 1],
+            str(runtime_database),
+        )
+        self.assertEqual(
+            argv[argv.index("--runtime-log-retention-bytes") + 1], "31"
+        )
+
     def test_an_unknown_granted_kind_is_refused(self) -> None:
         document = self._document()
         document["workflow"]["execute_without_asking"] = [  # type: ignore[index]

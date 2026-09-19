@@ -641,6 +641,7 @@ class ExecutionRunnerTests(unittest.TestCase):
                 worker_command=resolve_worker_command(
                     "foxhound-task-worker"
                 ),
+                source="foxhound-" + "2" * 32,
             ),
         )
         # The instructions belong to this run, not to its arguments: another

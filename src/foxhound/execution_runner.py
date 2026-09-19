@@ -54,9 +54,18 @@ from .task_archive import (
     TaskArchiveError,
     TaskArchivePaths,
     TRANSCRIPT_NAME,
+    clear_missing_runtime_logs,
     prepare_task_archive,
+    record_runtime_log,
     preserve_run_files,
     publish_deliverables,
+)
+from .runtime_session_log import (
+    DEFAULT_RUNTIME_LOG_RETENTION_BYTES,
+    RUNTIME_SESSION_LOG_NAME,
+    RuntimeSessionLogError,
+    rotate_runtime_session_logs,
+    write_runtime_session_log,
 )
 from .task_ledger import TaskLedger, TaskLedgerError
 from .source_policy import action_grants as _action_grants
@@ -108,6 +117,10 @@ class ExecutionRunnerConfig:
     #: or retain evidence without leaving the searchable task note.
     task_work_root: Path | None = field(default=None, repr=False)
     task_kb_root: Path | None = field(default=None, repr=False)
+    #: The private Hermes state database from which this runner copies its
+    #: own tagged structured session record after a run finishes.
+    runtime_session_database: Path | None = field(default=None, repr=False)
+    runtime_log_retention_bytes: int = DEFAULT_RUNTIME_LOG_RETENTION_BYTES
     allowed_phases: tuple[WorkflowPhase, ...] = tuple(WorkflowPhase)
     planning_grants: tuple[str, ...] = ()
     execution_grants: tuple[str, ...] = ()
@@ -196,6 +209,19 @@ class ExecutionRunnerConfig:
                 not isinstance(path, Path) or not path.is_absolute()
             ):
                 raise ValueError("task archive root is invalid")
+        if self.runtime_session_database is not None and (
+            not isinstance(self.runtime_session_database, Path)
+            or not self.runtime_session_database.is_absolute()
+        ):
+            raise ValueError("runtime session database is invalid")
+        if (
+            isinstance(self.runtime_log_retention_bytes, bool)
+            or not isinstance(self.runtime_log_retention_bytes, int)
+            or self.runtime_log_retention_bytes < 1
+        ):
+            raise ValueError("runtime log retention is invalid")
+        if self.runtime_session_database is not None and self.task_work_root is None:
+            raise ValueError("runtime session logs require task archive roots")
 
 
 @dataclass(frozen=True)
@@ -269,6 +295,7 @@ def profile_argv(
     profile: AgentProfile,
     *,
     worker_command: str = "foxhound-task-worker",
+    source: str = "tool",
 ) -> tuple[str, ...]:
     """Build the exact Hermes invocation for one validated profile.
 
@@ -278,7 +305,13 @@ def profile_argv(
     `--ignore-rules` keeps ambient rule, memory, and skill injection from
     changing behavior behind an already recorded revision.
     """
-    if not isinstance(profile, AgentProfile) or profile.runtime != "hermes":
+    if (
+        not isinstance(profile, AgentProfile)
+        or profile.runtime != "hermes"
+        or not isinstance(source, str)
+        or not source
+        or "\0" in source
+    ):
         raise ValueError("execution agent profile is invalid")
     base = _agent_command_argv(command)
     return (
@@ -289,7 +322,7 @@ def profile_argv(
         "--max-turns",
         str(profile.max_turns),
         "--source",
-        "tool",
+        source,
         "--ignore-rules",
         "--toolsets",
         ",".join(profile.toolsets),
@@ -398,6 +431,7 @@ def _run_claim(
             config.agent_command,
             profile,
             worker_command=_worker_command(config),
+            source="foxhound-" + run_id,
         )
     except ValueError:
         _fail_claim(service, claim, "startup_failed")
@@ -626,6 +660,20 @@ def _run_claim(
             instructions_path.unlink(missing_ok=True)
         if archive is not None:
             preserve_run_files(directory, archive.run_directory)
+            if config.runtime_session_database is not None:
+                write_runtime_session_log(
+                    config.runtime_session_database,
+                    source="foxhound-" + run_id,
+                    destination=archive.run_directory,
+                    turn_budget=profile.max_turns,
+                )
+                rotate_runtime_session_logs(
+                    archive.working_directory,
+                    retain_bytes=config.runtime_log_retention_bytes,
+                    current_directory=archive.run_directory,
+                )
+                clear_missing_runtime_logs(archive)
+                record_runtime_log(archive, RUNTIME_SESSION_LOG_NAME)
             # Then again, flattened, at the top of the task folder. The run
             # directory is the record; the folder is what the reader opens.
             with contextlib.suppress(TaskArchiveError):
@@ -1056,6 +1104,20 @@ def _parser() -> argparse.ArgumentParser:
         help="machine-local knowledge-base Tasks root for task Markdown files",
     )
     parser.add_argument(
+        "--runtime-session-database",
+        type=Path,
+        help=(
+            "private Hermes state database used to copy this run's structured "
+            "session record beside its task evidence"
+        ),
+    )
+    parser.add_argument(
+        "--runtime-log-retention-bytes",
+        type=int,
+        default=DEFAULT_RUNTIME_LOG_RETENTION_BYTES,
+        help="total private structured runtime-log history kept per task",
+    )
+    parser.add_argument(
         "--allowed-phase",
         action="append",
         choices=tuple(phase.value for phase in WorkflowPhase),
@@ -1142,6 +1204,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             knowledge_root=args.knowledge_root,
             task_work_root=args.task_work_root,
             task_kb_root=args.task_kb_root,
+            runtime_session_database=args.runtime_session_database,
+            runtime_log_retention_bytes=args.runtime_log_retention_bytes,
             allowed_phases=(
                 tuple(WorkflowPhase(value) for value in args.allowed_phases)
                 if args.allowed_phases
@@ -1171,6 +1235,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ExecutionRunnerError,
         ExecutionWorkerConfigError,
         TaskArchiveError,
+        RuntimeSessionLogError,
     ) as exc:
         print(
             "foxhound execution runner: configuration unavailable: "

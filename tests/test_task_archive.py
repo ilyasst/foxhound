@@ -11,9 +11,11 @@ from pathlib import Path
 from foxhound.task_archive import (
     TaskArchiveError,
     append_result,
+    clear_missing_runtime_logs,
     prepare_task_archive,
     preserve_run_files,
     publish_deliverables,
+    record_runtime_log,
 )
 
 
@@ -102,6 +104,29 @@ class TaskArchiveTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("Recorded anyway.", text)
+
+    def test_ledger_names_the_private_structured_runtime_log(self):
+        paths = self._run("f" * 32)
+
+        record_runtime_log(paths, "runtime-session.json")
+
+        text = (paths.working_directory / "README.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "runs/plan-" + "f" * 32 + "/runtime-session.json", text
+        )
+
+    def test_rotated_runtime_log_is_removed_from_the_ledger(self):
+        paths = self._run("0" * 32)
+        record_runtime_log(paths, "runtime-session.json")
+
+        clear_missing_runtime_logs(paths)
+
+        text = (paths.working_directory / "README.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("runtime-session.json", text)
 
     def test_deliverables_are_published_to_the_task_folder(self):
         """The folder is the deliverable surface, not just an evidence store."""
