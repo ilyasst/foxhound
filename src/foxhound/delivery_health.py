@@ -19,9 +19,9 @@ from .task_ledger import TaskLedgerError
 
 HEALTH_SCHEMA = "foxhound.delivery-health"
 # 2 adds `superseded_profiles`; 3 adds the count of workflows parked because
-# their measured context did not fit. Consumers must not infer either from a
-# missing aggregate field.
-HEALTH_SCHEMA_VERSION = 3
+# their measured context did not fit; 4 adds `admission`. Consumers must not
+# infer any of them from a missing aggregate field.
+HEALTH_SCHEMA_VERSION = 4
 MAX_THRESHOLD_SECONDS = 7 * 24 * 60 * 60
 MAX_RECENT_FAILURES = 10_000
 
@@ -63,17 +63,38 @@ class DeliveryCardHealth:
 
 
 @dataclass(frozen=True)
+class AdmissionHealth:
+    """Open tasks the scheduler has not given a workflow row yet.
+
+    Zero is the healthy steady state: `schedule_new` admits everything
+    eligible on its next pass, so a task is normally unadmitted only for the
+    seconds between intake and that pass. A number that stays above zero
+    means new work has stopped entering execution, and the reason does not
+    matter to a watchdog -- a saturated capacity cap, a stopped timer, a
+    scheduler crashing before it commits, and a database it cannot write all
+    look the same from here and are all worth waking someone for.
+    """
+
+    unadmitted: int
+    oldest_unadmitted_age_seconds: int | None
+
+
+@dataclass(frozen=True)
 class DeliveryHealthPolicy:
     max_pending_age_seconds: int = 900
     max_recent_failures: int = 3
     failure_window_seconds: int = 900
     max_last_delivery_age_seconds: int = 900
+    #: Generous against the scheduler's own five-minute cadence, so an
+    #: ordinary wait between intake and the next pass never alerts.
+    max_unadmitted_age_seconds: int = 1800
 
     def validate(self) -> None:
         for value in (
             self.max_pending_age_seconds,
             self.failure_window_seconds,
             self.max_last_delivery_age_seconds,
+            self.max_unadmitted_age_seconds,
         ):
             if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= MAX_THRESHOLD_SECONDS:
                 raise ValueError("delivery health time threshold is invalid")
@@ -94,6 +115,7 @@ class DeliveryHealth:
     last_successful_delivery_age_seconds: int | None
     workflows: ExecutionReadiness
     superseded_profiles: SupersededProfileHealth
+    admission: AdmissionHealth
     alerts: tuple[str, ...]
 
     @property
@@ -115,6 +137,7 @@ class DeliveryHealth:
             },
             "workflows": asdict(self.workflows),
             "superseded_profiles": asdict(self.superseded_profiles),
+            "admission": asdict(self.admission),
         }
 
 
@@ -140,6 +163,7 @@ def collect_delivery_health(
             recent_failures, last_delivery = _delivery_events(
                 connection, now - timedelta(seconds=policy.failure_window_seconds)
             )
+            admission = _admission_health(connection, now)
         execution = TaskExecutionService(database, clock=lambda: now)
         workflows = execution.readiness()
         superseded = execution.superseded_profile_revisions()
@@ -166,6 +190,12 @@ def collect_delivery_health(
         last_age is None or last_age > policy.max_last_delivery_age_seconds
     ):
         alerts.append("delivery_stale")
+    if (
+        admission.oldest_unadmitted_age_seconds is not None
+        and admission.oldest_unadmitted_age_seconds
+        > policy.max_unadmitted_age_seconds
+    ):
+        alerts.append("admission_stalled")
     return DeliveryHealth(
         task_cards=task_cards,
         execution_cards=execution_cards,
@@ -180,7 +210,38 @@ def collect_delivery_health(
             parked=sum(row.parked for row in superseded),
             running=sum(row.running for row in superseded),
         ),
+        admission=admission,
         alerts=tuple(alerts),
+    )
+
+
+def _admission_health(connection: object, now: datetime) -> AdmissionHealth:
+    """Count open tasks with no workflow row, and age the oldest.
+
+    The predicate mirrors the `eligible` count in
+    `TaskExecutionService.schedule_new`, including its exclusion of a task
+    whose producer candidate was withdrawn but whose task was deliberately
+    preserved open -- that one is not waiting for admission and must not
+    hold the alert on forever.
+    """
+    row = connection.execute(
+        "SELECT COUNT(*) AS unadmitted, MIN(t.created_at) AS oldest "
+        "FROM tasks AS t LEFT JOIN task_execution_workflows AS w "
+        "ON w.task_id=t.id WHERE t.status='open' AND w.task_id IS NULL "
+        "AND NOT EXISTS("
+        " SELECT 1 FROM task_candidate_bindings AS b JOIN "
+        " task_candidate_lifecycle AS l ON l.candidate_id=b.candidate_id "
+        " WHERE b.task_id=t.id AND b.relation='accepted' "
+        " AND l.state='withdrawn' AND l.resolution='preserved_open')"
+    ).fetchone()
+    unadmitted = int(row["unadmitted"] or 0)
+    oldest = row["oldest"]
+    return AdmissionHealth(
+        unadmitted=unadmitted,
+        oldest_unadmitted_age_seconds=(
+            None if not unadmitted or oldest is None
+            else _age(now, _timestamp(oldest))
+        ),
     )
 
 

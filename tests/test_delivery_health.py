@@ -66,6 +66,43 @@ class DeliveryHealthTests(unittest.TestCase):
                 (int(card.lastrowid), kind, self._time(at)),
             )
 
+    def _open_task(self, task_id: int, *, created: datetime,
+                   workflow: bool = False) -> None:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "INSERT INTO tasks(id,status,text,owner,due,version,"
+                "created_at,updated_at,closed_at) "
+                "VALUES(?,'open',?,NULL,NULL,1,?,?,NULL)",
+                (task_id, f"Synthetic task {task_id}", self._time(created),
+                 self._time(created)),
+            )
+            if workflow:
+                connection.execute(
+                    "INSERT INTO task_execution_workflows("
+                    "task_id,task_version,status,phase,version,due_at,"
+                    "failure_count,created_at,updated_at) "
+                    "VALUES(?,1,'queued','plan',1,NULL,0,?,?)",
+                    (task_id, self._time(created), self._time(created)),
+                )
+
+    def _withdraw_preserving_task(self, task_id: int) -> None:
+        """Model a producer candidate withdrawn with its task kept open."""
+        candidate = f"candidate-{task_id}"
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "INSERT INTO task_candidate_bindings("
+                "candidate_id,source_revision,task_id,relation,decided_at) "
+                "VALUES(?,?,?,'accepted',?)",
+                (candidate, "a" * 64, task_id, self._time(NOW)),
+            )
+            connection.execute(
+                "INSERT INTO task_candidate_lifecycle("
+                "candidate_id,source_revision,task_version,state,resolution,"
+                "changed_at,decided_at) "
+                "VALUES(?,?,1,'withdrawn','preserved_open',?,?)",
+                (candidate, "a" * 64, self._time(NOW), self._time(NOW)),
+            )
+
     @staticmethod
     def _time(value: datetime) -> str:
         return value.isoformat(timespec="seconds")
@@ -172,6 +209,56 @@ class DeliveryHealthTests(unittest.TestCase):
 
         self.assertTrue(health.ok)
         self.assertEqual(health.last_successful_delivery_age_seconds, 10)
+
+    def test_a_task_waiting_for_admission_briefly_is_healthy(self) -> None:
+        """The gap between intake and the next scheduling pass is normal."""
+        self._open_task(1, created=NOW - timedelta(minutes=4))
+
+        health = collect_delivery_health(self.database, clock=lambda: NOW)
+
+        self.assertTrue(health.ok)
+        self.assertEqual(health.admission.unadmitted, 1)
+        self.assertEqual(health.admission.oldest_unadmitted_age_seconds, 240)
+
+    def test_a_task_never_admitted_is_unhealthy(self) -> None:
+        """The alert that was missing when admission silently closed.
+
+        A saturated capacity cap stopped every new task from reaching
+        execution for days while the scheduler reported success on every
+        pass. Nothing here asks *why* admission stopped: a stopped timer or
+        a scheduler that cannot commit look identical from the ledger and
+        are equally worth waking someone for.
+        """
+        self._open_task(1, created=NOW - timedelta(hours=6))
+        self._open_task(2, created=NOW - timedelta(minutes=1))
+        self._open_task(3, created=NOW - timedelta(days=2), workflow=True)
+
+        health = collect_delivery_health(self.database, clock=lambda: NOW)
+
+        self.assertFalse(health.ok)
+        self.assertIn("admission_stalled", health.alerts)
+        # The admitted task is not counted, and the oldest unadmitted one
+        # sets the age.
+        self.assertEqual(health.admission.unadmitted, 2)
+        self.assertEqual(
+            health.admission.oldest_unadmitted_age_seconds, 6 * 60 * 60
+        )
+
+    def test_a_task_kept_open_after_withdrawal_never_alerts(self) -> None:
+        """It is not waiting for admission, so it must not hold the alert on.
+
+        `schedule_new` excludes these from its own eligible count. A check
+        that disagreed would alert forever on a deployment that has one,
+        and an alert that is always on is the same as no alert.
+        """
+        self._open_task(1, created=NOW - timedelta(days=30))
+        self._withdraw_preserving_task(1)
+
+        health = collect_delivery_health(self.database, clock=lambda: NOW)
+
+        self.assertTrue(health.ok)
+        self.assertEqual(health.admission.unadmitted, 0)
+        self.assertIsNone(health.admission.oldest_unadmitted_age_seconds)
 
     def test_unavailable_database_has_content_free_cli_output(self) -> None:
         output = io.StringIO()
