@@ -749,6 +749,29 @@ successful runner claim clears the preference atomically, so it cannot steer a
 later phase. Each successful change is an append-only workflow event; workflow
 capacity and runner-slot ceilings remain unchanged.
 
+### Board projections
+
+The console may read two separate, versioned Kanban projections with its
+existing `queue_view` credential: `POST /v1/task-cards/board` and
+`POST /v1/execution-cards/board`.  Both accept only the ordinary request
+envelope plus a bounded `limit` (1–100), never claim a card, and return a
+closed `columns` vocabulary with true totals, a bounded `cards` page, and a
+content-free `held_elsewhere` count.  Cards held by another consumer are not
+serialized.
+
+Task-board columns are `review` and `snoozed`.  Execution-board columns are
+`ready_to_start`, `queued`, `running`, `plan_review`, `external_review`,
+`result_review`, `snoozed`, `parked`, `completed`, and `cancelled`.  These are
+work-state tokens supplied by Foxhound, not delivery states.  A card carries
+its delivery state only as a small attribute.
+
+The projections expose only a bounded board face: stable card handle and
+version, work-state and delivery tokens, short task/summary text, optional
+owner, source kind, agent display name, and a bounded timestamp.  They never
+expose raw provenance, prompts, transcripts, logs, filesystem paths,
+credentials, or agent profile identifiers.  idroid is the intended consumer;
+it keeps all mutations on the existing version-fenced resolve routes.
+
 The packaged service accepts `--agent-profile-directory`; deployments with
 private profiles must give it the same directory as the execution runner. The
 owner-conditioned control is disabled unless all three of `--gw-endpoint`,

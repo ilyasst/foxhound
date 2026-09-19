@@ -146,6 +146,15 @@ class ExecutionCardKind(StrEnum):
     RESULT_REVIEW = "result_review"
 
 
+# Closed work-state vocabulary for the execution board.  It is intentionally
+# separate from the card delivery states below.
+EXECUTION_BOARD_STATUSES = (
+    "ready_to_start", "queued", "running", "plan_review",
+    "external_review", "result_review", "snoozed", "parked",
+    "completed", "cancelled",
+)
+
+
 class ExecutionCardStatus(StrEnum):
     PENDING = "pending"
     DELIVERING = "delivering"
@@ -208,12 +217,21 @@ class ExecutionCardScopedStats:
 
 
 @dataclass(frozen=True)
+class ExecutionBoard:
+    """Current reader-visible execution cards and true per-column totals."""
+
+    cards: tuple["ExecutionReviewCard", ...]
+    totals: Mapping[str, int]
+
+
+@dataclass(frozen=True)
 class ClaimAtCeiling:
     held_count: int
     ceiling: int
 
 
 EXECUTION_CARD_CLAIM_CEILINGS = {"queue_view": 2, "drip": 20}
+BOARD_CARD_LIMIT = 100
 
 
 @dataclass(frozen=True)
@@ -650,6 +668,23 @@ class ExecutionCardService:
         return tuple(
             self._render_card(row) for row in rows if _current_card(row)
         )
+
+    def board(self, *, limit: int = BOARD_CARD_LIMIT) -> ExecutionBoard:
+        """Project current unclaimed execution work without acquiring a lease."""
+        if (isinstance(limit, bool) or not isinstance(limit, int)
+                or not 1 <= limit <= BOARD_CARD_LIMIT):
+            raise TaskLedgerError("execution board limit is invalid")
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                self._card_select() + " WHERE c.status='pending' ORDER BY c.id"
+            ).fetchall()
+        cards = [self._render_card(row) for row in rows if _current_card(row)]
+        totals: dict[str, int] = {
+            status: 0 for status in EXECUTION_BOARD_STATUSES
+        }
+        for card in cards:
+            totals[execution_board_status(card)] += 1
+        return ExecutionBoard(cards=tuple(cards[:limit]), totals=totals)
 
     def resolve_queue_view(
         self, card_id: int, *, expected_version: int, action: str,
@@ -2564,6 +2599,28 @@ class ExecutionCardService:
 
     def _now(self) -> str:
         return self._clock_value().isoformat(timespec="seconds")
+
+
+def execution_board_status(card: ExecutionReviewCard) -> str:
+    """Return the one closed work-state token for a board card."""
+    if not isinstance(card, ExecutionReviewCard):
+        raise TaskLedgerError("execution board card is invalid")
+    status = card.workflow_status
+    if status is WorkflowStatus.AWAITING_REVIEW:
+        return {
+            ExecutionCardKind.PLAN_REVIEW: "plan_review",
+            ExecutionCardKind.EXTERNAL_REVIEW: "external_review",
+            ExecutionCardKind.RESULT_REVIEW: "result_review",
+        }.get(card.kind, "ready_to_start")
+    return {
+        WorkflowStatus.AWAITING_START: "ready_to_start",
+        WorkflowStatus.QUEUED: "queued",
+        WorkflowStatus.RUNNING: "running",
+        WorkflowStatus.SNOOZED: "snoozed",
+        WorkflowStatus.PARKED: "parked",
+        WorkflowStatus.COMPLETED: "completed",
+        WorkflowStatus.CANCELLED: "cancelled",
+    }[status]
 
 
 def render_execution_review_card(

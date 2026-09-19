@@ -36,6 +36,8 @@ from .execution_cards import (
     ExecutionAgentSelectorResult,
     render_execution_agent_selector,
     render_execution_review_card,
+    execution_board_status,
+    EXECUTION_BOARD_STATUSES,
 )
 from .execution_worker import (
     ExecutionWorkerConfigError,
@@ -52,6 +54,7 @@ from .task_cards import (
     TASK_CARD_ACTIONS,
     TASK_CARD_READS,
     TaskCardService,
+    CardStatus,
     render_duplicate_view,
     render_task_review_card,
 )
@@ -73,6 +76,8 @@ STATS_SCHEMA = "foxhound.task-card-service.stats"
 STATS_SCHEMA_VERSION = 2
 QUEUE_SCHEMA = "foxhound.task-card-service.queue"
 QUEUE_SCHEMA_VERSION = 1
+BOARD_SCHEMA = "foxhound.task-card-service.board"
+BOARD_SCHEMA_VERSION = 1
 RESOLVE_SCHEMA = "foxhound.task-card-service.resolve"
 VIEW_SCHEMA = "foxhound.task-card-service.view"
 RESOLVE_SCHEMA_VERSION = 1
@@ -88,6 +93,8 @@ EXECUTION_DETAIL_SCHEMA = "foxhound.execution-card-service.detail"
 EXECUTION_DETAIL_SCHEMA_VERSION = 2
 EXECUTION_QUEUE_SCHEMA = "foxhound.execution-card-service.queue"
 EXECUTION_QUEUE_SCHEMA_VERSION = 1
+EXECUTION_BOARD_SCHEMA = "foxhound.execution-card-service.board"
+EXECUTION_BOARD_SCHEMA_VERSION = 1
 EXECUTION_RESOLVE_SCHEMA = "foxhound.execution-card-service.resolve"
 EXECUTION_RESOLVE_SCHEMA_VERSION = 1
 EXECUTION_AGENT_OPTIONS_SCHEMA = (
@@ -114,6 +121,7 @@ ROUTES = {
     "/v1/task-cards/stats": "stats",
     "/v2/task-cards/stats": "stats_scoped",
     "/v1/task-cards/queue": "queue",
+    "/v1/task-cards/board": "board",
     "/v1/task-cards/resolve": "resolve",
     "/v1/task-cards/schedule": "schedule",
     "/v1/task-cards/claim": "claim",
@@ -139,6 +147,7 @@ ROUTES = {
     "/v1/execution-cards/view": "execution_view",
     "/v1/execution-cards/detail": "execution_detail",
     "/v1/execution-cards/queue": "execution_queue",
+    "/v1/execution-cards/board": "execution_board",
     "/v1/execution-cards/resolve": "execution_resolve",
     "/v1/execution-workflows/priority": "execution_priority",
 }
@@ -415,6 +424,37 @@ class TaskCardApplication:
                 "ok": True,
                 "cards": [_queue_card_document(card) for card in cards],
             }
+        if operation == "board":
+            request = _request(payload, required={"limit"})
+            try:
+                identity = self.resolve_consumer(authorization)
+            except TaskCardConsumerIdentityError as exc:
+                raise TaskCardServerRequestError(
+                    "consumer_unresolved",
+                    "task card consumer role is unresolved",
+                    HTTPStatus.FORBIDDEN,
+                ) from exc
+            if identity is None or identity.role != QUEUE_VIEW_ROLE:
+                raise TaskCardServerRequestError(
+                    "role_forbidden",
+                    "task card board requires the queue_view role",
+                    HTTPStatus.FORBIDDEN,
+                )
+            board = self.cards.board(
+                limit=_integer(request["limit"], minimum=1, maximum=100)
+            )
+            stats = self.cards.stats(consumer_digest=identity.digest)
+            return {
+                "schema": BOARD_SCHEMA,
+                "schema_version": BOARD_SCHEMA_VERSION,
+                "ok": True,
+                "columns": [
+                    {"status": "review", "total": board.review_total},
+                    {"status": "snoozed", "total": board.snoozed_total},
+                ],
+                "held_elsewhere": stats.elsewhere,
+                "cards": [_task_board_card_document(card) for card in board.cards],
+            }
         if operation == "schedule":
             request = _request(payload, required={"limit"})
             limit = _integer(request["limit"], minimum=1, maximum=1_000)
@@ -651,6 +691,41 @@ class TaskCardApplication:
                 "schema_version": EXECUTION_QUEUE_SCHEMA_VERSION,
                 "ok": True,
                 "cards": [_execution_queue_card_document(card) for card in cards],
+            }
+        if operation == "execution_board":
+            request = _request(payload, required={"limit"})
+            try:
+                identity = self.resolve_execution_consumer(authorization)
+            except TaskCardConsumerIdentityError as exc:
+                raise TaskCardServerRequestError(
+                    "consumer_unresolved",
+                    "execution card consumer role is unresolved",
+                    HTTPStatus.FORBIDDEN,
+                ) from exc
+            if identity is None or identity.role != QUEUE_VIEW_ROLE:
+                raise TaskCardServerRequestError(
+                    "role_forbidden",
+                    "execution card board requires the queue_view role",
+                    HTTPStatus.FORBIDDEN,
+                )
+            board = self._execution_cards().board(
+                limit=_integer(request["limit"], minimum=1, maximum=100)
+            )
+            stats = self._execution_cards().stats_scoped(
+                consumer_digest=identity.digest
+            )
+            return {
+                "schema": EXECUTION_BOARD_SCHEMA,
+                "schema_version": EXECUTION_BOARD_SCHEMA_VERSION,
+                "ok": True,
+                "columns": [
+                    {"status": status, "total": board.totals[status]}
+                    for status in EXECUTION_BOARD_STATUSES
+                ],
+                "held_elsewhere": stats.elsewhere,
+                "cards": [
+                    _execution_board_card_document(card) for card in board.cards
+                ],
             }
         if operation == "execution_resolve":
             request = _strict_request(
@@ -1448,6 +1523,24 @@ def _queue_card_document(card: Any) -> dict[str, Any]:
     return document
 
 
+def _task_board_card_document(card: Any) -> dict[str, Any]:
+    """Small, explicit task-board face; never serialize private provenance."""
+    board_status = (
+        "snoozed" if card.status is CardStatus.SNOOZED else "review"
+    )
+    return {
+        "id": card.id,
+        "version": card.version,
+        "handle": f"task-{card.task_id}",
+        "board_status": board_status,
+        "delivery_status": card.status.value,
+        "task": _queue_projection_text(card.text, 500),
+        "owner": _queue_projection_text(card.owner, 200),
+        "source": _queue_projection_text(card.origin_kind, 80),
+        "state_since": _queue_projection_text(card.due_at, 64),
+    }
+
+
 def _queue_projection_text(value: object, maximum: int) -> str:
     if not isinstance(value, str):
         return ""
@@ -1492,6 +1585,25 @@ def _execution_queue_card_document(card: Any) -> dict[str, Any]:
         ],
         "external_actions": _queue_projection_records(card.external_actions),
         "deliverables": _queue_projection_records(card.deliverables),
+    }
+
+
+def _execution_board_card_document(card: Any) -> dict[str, Any]:
+    """Small, explicit execution-board face; no profile ids or raw sources."""
+    return {
+        "id": card.id,
+        "version": card.version,
+        "handle": f"execution-{card.id}",
+        "board_status": execution_board_status(card),
+        "delivery_status": card.status.value,
+        "kind": card.kind.value,
+        "phase": card.phase.value,
+        "task": _queue_projection_text(card.task_text, 500),
+        "owner": _queue_projection_text(card.owner, 200),
+        "agent": _queue_projection_text(card.agent_display_name, 200),
+        "source": _queue_projection_text(card.origin_kind, 80),
+        "summary": _queue_projection_text(card.summary, 1_000),
+        "state_since": _queue_projection_text(card.created_at, 64),
     }
 
 

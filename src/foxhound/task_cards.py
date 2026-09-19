@@ -187,6 +187,11 @@ TASK_CARD_CLAIM_CEILINGS = {
     "drip": 20,
 }
 
+# A board is a glanceable, bounded projection rather than an export.  The
+# ceiling is fixed here so a reader cannot turn a board request into an
+# unbounded read of private card content.
+BOARD_CARD_LIMIT = 100
+
 
 @dataclass(frozen=True)
 class ScheduleResult:
@@ -220,6 +225,15 @@ class CardStats:
     snoozed: int
     elsewhere: int
     active: int
+
+
+@dataclass(frozen=True)
+class TaskBoard:
+    """Current reader-visible intake cards and their true column totals."""
+
+    cards: tuple["TaskReviewCard", ...]
+    review_total: int
+    snoozed_total: int
 
 
 @dataclass(frozen=True)
@@ -535,6 +549,41 @@ class TaskCardService:
                 (now, limit),
             ).fetchall()
         return tuple(_card(row) for row in rows)
+
+    def board(self, *, limit: int = BOARD_CARD_LIMIT) -> TaskBoard:
+        """Return current intake work without claiming or changing a card."""
+        if (isinstance(limit, bool) or not isinstance(limit, int)
+                or not 1 <= limit <= BOARD_CARD_LIMIT):
+            raise TaskLedgerError("task board limit is invalid")
+        where = (
+            " WHERE c.status IN ('pending','snoozed') "
+            "AND t.status='open' AND t.version=c.task_version "
+            "AND NOT EXISTS(SELECT 1 FROM task_relations AS relation "
+            " WHERE relation.subject_id=t.id AND relation.kind='duplicate_of' "
+            " AND relation.withdrawn_at IS NULL) "
+            "AND COALESCE(c.source_revision,'')=COALESCE("
+            + _bound_source_revision("t.id") + ",'') "
+        )
+        with closing(self._connect()) as connection:
+            totals = {
+                str(row["status"]): int(row["total"])
+                for row in connection.execute(
+                    "SELECT c.status,COUNT(*) AS total FROM task_review_cards AS c "
+                    "JOIN tasks AS t ON t.id=c.task_id"
+                    + where + "GROUP BY c.status"
+                ).fetchall()
+            }
+            rows = connection.execute(
+                self._card_select() + where
+                + "ORDER BY CASE c.status WHEN 'pending' THEN 0 ELSE 1 END,"
+                "c.due_at,c.id LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return TaskBoard(
+            cards=tuple(_card(row) for row in rows),
+            review_total=totals.get(CardStatus.PENDING.value, 0),
+            snoozed_total=totals.get(CardStatus.SNOOZED.value, 0),
+        )
 
     def claim_next(
         self, *, lease_seconds: int = 60, consumer_digest: str,
