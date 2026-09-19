@@ -403,6 +403,7 @@ class TaskExecutionService:
         default_profile_id: str = "general",
         planning_grants: object = None,
         execution_grants: object = None,
+        skip_planning_for: object = None,
         action_grants: object = None,
         execution_slot_cap: int | None = None,
         plan_ready_cap: int | None = None,
@@ -456,6 +457,33 @@ class TaskExecutionService:
         # Independent of planning authority above. A machine that has
         # said a kind may be planned has not said its plan may be run.
         self._execution_grants = _execution_grants(execution_grants)
+        # This declaration removes a phase rather than merely its reader
+        # gate, so it needs execution authority.  It is deliberately not
+        # inferred from either grant list: an operator may want unattended
+        # planning while retaining the reviewable plan as the reader input.
+        self._skip_planning_for = _execution_grants(
+            skip_planning_for, label="skip-planning declarations"
+        )
+        missing_execution_grants = (
+            self._skip_planning_for - self._execution_grants
+        )
+        if missing_execution_grants:
+            raise ValueError(
+                "skip-planning declarations lack execution grants: "
+                + ", ".join(sorted(missing_execution_grants))
+            )
+        # And the planning grant, because the plan phase carries the reader's
+        # start gate. Without this, adding a kind here would also delete the
+        # card that asks whether to begin at all, turning an asked source
+        # into an unattended one with no declaration saying so.
+        missing_planning_grants = (
+            self._skip_planning_for - self._planning_grants
+        )
+        if missing_planning_grants:
+            raise ValueError(
+                "skip-planning declarations lack planning grants: "
+                + ", ".join(sorted(missing_planning_grants))
+            )
         # Independent again. Executing a plan and performing an effect
         # other people can see are not the same permission.
         self._action_grants = _action_grants(action_grants)
@@ -630,16 +658,23 @@ class TaskExecutionService:
                         break
                     task_id = int(row["id"])
                     task_version = int(row["version"])
+                    phase = _initial_phase(
+                        row["origin_kind"], self._skip_planning_for
+                    )
                     status = _initial_status(
                         row["origin_kind"], self._planning_grants, row,
-                        self._reader_aliases)
-                    if status.value in WORKING_STATUSES:
+                        self._reader_aliases,
+                    )
+                    if (
+                        phase is WorkflowPhase.PLAN
+                        and status.value in WORKING_STATUSES
+                    ):
                         if plan_room is not None:
                             if plan_room == 0:
                                 capped += 1
                                 continue
                             plan_room -= 1
-                    else:
+                    elif status.value not in WORKING_STATUSES:
                         if waiting_room is not None:
                             if waiting_room == 0:
                                 capped += 1
@@ -651,9 +686,10 @@ class TaskExecutionService:
                         "task_id,task_version,status,phase,version,due_at,"
                         "failure_count,created_at,updated_at,agent_profile_id,"
                         "agent_profile_revision) "
-                        "VALUES(?,?,?,'plan',1,NULL,0,?,?,?,?)",
+                        "VALUES(?,?,?,?,1,NULL,0,?,?,?,?)",
                         (
-                            task_id, task_version, status.value, now, now,
+                            task_id, task_version, status.value, phase.value,
+                            now, now,
                             profile.profile_id,
                             profile.revision,
                         ),
@@ -664,7 +700,7 @@ class TaskExecutionService:
                         "scheduled",
                         1,
                         task_version,
-                        WorkflowPhase.PLAN,
+                        phase,
                         status,
                         now,
                     )
@@ -724,9 +760,12 @@ class TaskExecutionService:
                     return _operation(row, WorkflowDisposition.UNCHANGED)
                 if row is None:
                     version = 1
+                    phase = _initial_phase(
+                        task["origin_kind"], self._skip_planning_for
+                    )
                     status = _initial_status(
                         task["origin_kind"], self._planning_grants, task,
-                        self._reader_aliases
+                        self._reader_aliases,
                     )
                     profile = self._profile_for(task["origin_kind"])
                     connection.execute(
@@ -734,22 +773,26 @@ class TaskExecutionService:
                         "task_id,task_version,status,phase,version,due_at,"
                         "failure_count,created_at,updated_at,agent_profile_id,"
                         "agent_profile_revision) "
-                        "VALUES(?,?,?,'plan',?,NULL,0,?,?,?,?)",
+                        "VALUES(?,?,?,?,?,NULL,0,?,?,?,?)",
                         (
-                            task_id, expected_task_version, status.value, version,
-                            now, now, profile.profile_id, profile.revision,
+                            task_id, expected_task_version, status.value,
+                            phase.value, version, now, now,
+                            profile.profile_id, profile.revision,
                         ),
                     )
                 else:
                     version = int(row["version"]) + 1
+                    phase = _initial_phase(
+                        task["origin_kind"], self._skip_planning_for
+                    )
                     status = _initial_status(
                         task["origin_kind"], self._planning_grants, task,
-                        self._reader_aliases
+                        self._reader_aliases,
                     )
                     profile = self._profile_for(task["origin_kind"])
                     connection.execute(
                         "UPDATE task_execution_workflows SET task_version=?,"
-                        "status=?,phase='plan',version=?,"
+                        "status=?,phase=?,version=?,"
                         "due_at=NULL,claim_token_digest=NULL,claimed_at=NULL,"
                         "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
                         "failure_count=0,last_failure_reason=NULL,"
@@ -759,13 +802,14 @@ class TaskExecutionService:
                         "completed_at=NULL,agent_profile_id=?,"
                         "agent_profile_revision=? WHERE task_id=?",
                         (
-                            expected_task_version, status.value, version, now,
+                            expected_task_version, status.value, phase.value,
+                            version, now,
                             profile.profile_id, profile.revision, task_id,
                         ),
                     )
                 self._event(
                     connection, task_id, "scheduled", version,
-                    expected_task_version, WorkflowPhase.PLAN,
+                    expected_task_version, phase,
                     status, now,
                 )
                 updated_row = connection.execute(
@@ -3103,6 +3147,15 @@ def _initial_status(
     if row is not None and reader_owned(row, reader_aliases):
         return WorkflowStatus.QUEUED
     return WorkflowStatus.AWAITING_START
+
+
+def _initial_phase(
+    origin_kind: object, skip_planning_for: frozenset[str]
+) -> WorkflowPhase:
+    """Choose the first phase for a newly-created workflow only."""
+    if isinstance(origin_kind, str) and origin_kind in skip_planning_for:
+        return WorkflowPhase.EXECUTE
+    return WorkflowPhase.PLAN
 
 
 def _bounded_text(

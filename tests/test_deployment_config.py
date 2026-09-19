@@ -62,7 +62,7 @@ class DeploymentConfigTests(unittest.TestCase):
     def _document(self) -> dict[str, object]:
         return {
             "schema": "foxhound.deployment-config",
-            "schema_version": 8,
+            "schema_version": 10,
             "database": str(self.database),
             "agent_profile_directory": None,
             "card_service": {
@@ -82,7 +82,9 @@ class DeploymentConfigTests(unittest.TestCase):
                 "default_agent_profile": "general",
                 "plan_without_asking": ["issue"],
                 "execute_without_asking": ["issue"],
+                "skip_planning_for": ["issue"],
                 "act_without_asking": ["issue"],
+                "reader_aliases": [],
                 "execution_slot_cap": 2,
                 "plan_ready_cap": 10,
                 "awaiting_reader_cap": 20,
@@ -158,6 +160,9 @@ class DeploymentConfigTests(unittest.TestCase):
         schedule = config.argv("execution-schedule")
         self.assertEqual(schedule[0], "foxhound-execution-schedule")
         self.assertNotIn("--execution-slot-cap", schedule)
+        self.assertEqual(
+            schedule[schedule.index("--skip-planning-for") + 1], "issue"
+        )
         runner = config.argv("execution-runner:primary")
         self.assertEqual(runner[0], "foxhound-execution-runner")
         self.assertIn("--execution-slot-cap", runner)
@@ -207,6 +212,8 @@ class DeploymentConfigTests(unittest.TestCase):
         del document["card_service"]["task_work_root"]  # type: ignore[index]
         del document["workflow"]["act_without_asking"]  # type: ignore[index]
         del document["workflow"]["execute_without_asking"]  # type: ignore[index]
+        del document["workflow"]["skip_planning_for"]  # type: ignore[index]
+        del document["workflow"]["reader_aliases"]  # type: ignore[index]
         document["execution_runner"] = document.pop("execution_runners")[0]
         document.pop("database_consumers")
         for key in ("gw_endpoint", "gw_alias", "gw_token_file"):
@@ -223,6 +230,8 @@ class DeploymentConfigTests(unittest.TestCase):
         del document["card_service"]["task_work_root"]  # type: ignore[index]
         del document["workflow"]["act_without_asking"]  # type: ignore[index]
         del document["workflow"]["execute_without_asking"]  # type: ignore[index]
+        del document["workflow"]["skip_planning_for"]  # type: ignore[index]
+        del document["workflow"]["reader_aliases"]  # type: ignore[index]
         document["execution_runner"] = document.pop("execution_runners")[0]
         document.pop("database_consumers")
         self._write_config(document)
@@ -239,6 +248,8 @@ class DeploymentConfigTests(unittest.TestCase):
         del document["card_service"]["task_work_root"]  # type: ignore[index]
         del document["workflow"]["act_without_asking"]  # type: ignore[index]
         del document["workflow"]["execute_without_asking"]  # type: ignore[index]
+        del document["workflow"]["skip_planning_for"]  # type: ignore[index]
+        del document["workflow"]["reader_aliases"]  # type: ignore[index]
         del document["database_consumers"]["fused_task_titles"]  # type: ignore[index]
         del document["database_consumers"]["duplicate_card_schedule"]  # type: ignore[index]
         del document["database_consumers"]["task_card_requeue"]  # type: ignore[index]
@@ -257,6 +268,8 @@ class DeploymentConfigTests(unittest.TestCase):
         del document["card_service"]["task_work_root"]  # type: ignore[index]
         del document["workflow"]["act_without_asking"]  # type: ignore[index]
         del document["workflow"]["execute_without_asking"]  # type: ignore[index]
+        del document["workflow"]["skip_planning_for"]  # type: ignore[index]
+        del document["workflow"]["reader_aliases"]  # type: ignore[index]
         del document["database_consumers"]["duplicate_card_schedule"]  # type: ignore[index]
         del document["database_consumers"]["task_card_requeue"]  # type: ignore[index]
         self._write_config(document)
@@ -273,6 +286,8 @@ class DeploymentConfigTests(unittest.TestCase):
         del document["card_service"]["task_work_root"]  # type: ignore[index]
         del document["workflow"]["act_without_asking"]  # type: ignore[index]
         del document["workflow"]["execute_without_asking"]  # type: ignore[index]
+        del document["workflow"]["skip_planning_for"]  # type: ignore[index]
+        del document["workflow"]["reader_aliases"]  # type: ignore[index]
         self._write_config(document)
 
         config = load_deployment_config(self.config_path)
@@ -291,6 +306,50 @@ class DeploymentConfigTests(unittest.TestCase):
 
         self.assertEqual(
             argv[argv.index("--execute-without-asking") + 1], "issue"
+        )
+
+    def test_a_skip_declaration_reaches_execution_scheduling(self) -> None:
+        self._write_config(self._document())
+
+        config = load_deployment_config(self.config_path)
+
+        self.assertEqual(config.workflow.skip_planning_for, ("issue",))
+        schedule = config.argv("execution-schedule")
+        self.assertEqual(
+            schedule[schedule.index("--skip-planning-for") + 1], "issue"
+        )
+
+    def test_a_skip_without_execution_authority_names_the_missing_grant(self) -> None:
+        document = self._document()
+        document["workflow"]["execute_without_asking"] = []  # type: ignore[index]
+        self._write_config(document)
+
+        with self.assertRaisesRegex(
+            DeploymentConfigError, "execution grants: issue"
+        ):
+            load_deployment_config(self.config_path)
+
+    def test_a_skip_without_planning_authority_names_the_missing_grant(self) -> None:
+        document = self._document()
+        document["workflow"]["plan_without_asking"] = []  # type: ignore[index]
+        self._write_config(document)
+
+        with self.assertRaisesRegex(
+            DeploymentConfigError, "planning grants: issue"
+        ):
+            load_deployment_config(self.config_path)
+
+    def test_version_nine_configuration_retains_its_plan_phase(self) -> None:
+        document = self._document()
+        document["schema_version"] = 9
+        del document["workflow"]["skip_planning_for"]  # type: ignore[index]
+        self._write_config(document)
+
+        config = load_deployment_config(self.config_path)
+
+        self.assertEqual(config.workflow.skip_planning_for, ())
+        self.assertNotIn(
+            "--skip-planning-for", config.argv("execution-schedule")
         )
 
     def test_an_unknown_granted_kind_is_refused(self) -> None:
@@ -316,6 +375,7 @@ class DeploymentConfigTests(unittest.TestCase):
     def test_the_two_grants_are_independent(self) -> None:
         document = self._document()
         document["workflow"]["plan_without_asking"] = []  # type: ignore[index]
+        document["workflow"]["skip_planning_for"] = []  # type: ignore[index]
         self._write_config(document)
 
         config = load_deployment_config(self.config_path)
@@ -329,6 +389,8 @@ class DeploymentConfigTests(unittest.TestCase):
         document["schema_version"] = 6
         del document["card_service"]["task_work_root"]  # type: ignore[index]
         del document["workflow"]["act_without_asking"]  # type: ignore[index]
+        del document["workflow"]["skip_planning_for"]  # type: ignore[index]
+        del document["workflow"]["reader_aliases"]  # type: ignore[index]
         self._write_config(document)
 
         config = load_deployment_config(self.config_path)
@@ -363,6 +425,7 @@ class DeploymentConfigTests(unittest.TestCase):
         """Either knob alone, in either direction."""
         document = self._document()
         document["workflow"]["execute_without_asking"] = []  # type: ignore[index]
+        document["workflow"]["skip_planning_for"] = []  # type: ignore[index]
         self._write_config(document)
 
         config = load_deployment_config(self.config_path)
