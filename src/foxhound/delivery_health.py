@@ -18,10 +18,10 @@ from .task_ledger import TaskLedgerError
 
 
 HEALTH_SCHEMA = "foxhound.delivery-health"
-# 2 adds `superseded_profiles`. A consumer reading version 1 sees every
-# field it did before; the addition is why the version moved rather than
-# something a reader has to infer from a missing key.
-HEALTH_SCHEMA_VERSION = 2
+# 2 adds `superseded_profiles`; 3 adds the count of workflows parked because
+# their measured context did not fit. Consumers must not infer either from a
+# missing aggregate field.
+HEALTH_SCHEMA_VERSION = 3
 MAX_THRESHOLD_SECONDS = 7 * 24 * 60 * 60
 MAX_RECENT_FAILURES = 10_000
 

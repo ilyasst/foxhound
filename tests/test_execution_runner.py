@@ -880,6 +880,36 @@ class ExecutionRunnerTests(unittest.TestCase):
         self.assertTrue(process.terminated)
         self.assertEqual(self.service.get(1).last_failure_reason, "timeout")
 
+    def test_measured_context_refusal_parks_without_an_automatic_retry(self):
+        self._ready()
+        monotonic = MutableMonotonic()
+
+        def popen(*_args, **kwargs):
+            transcript = kwargs["stdout"]
+            transcript.write(
+                b"context filter: light needs ~200000 tokens, skipping host-a(140032)\n"
+            )
+            transcript.flush()
+            return FakeProcess()
+
+        result = run_once(
+            self._config(),
+            popen=popen,
+            clock=monotonic,
+            sleep=monotonic.sleep,
+            run_id_factory=lambda: "e" * 32,
+            terminate=self._terminator,
+        )
+
+        self.assertEqual(
+            (result.outcome, result.exit_code), ("context_exhausted", 124)
+        )
+        state = self.service.get(1)
+        self.assertEqual(state.status, WorkflowStatus.PARKED)
+        self.assertEqual(state.last_failure_reason, "context_exhausted")
+        self.assertIsNone(state.next_attempt_at)
+        self.assertIsNone(self.service.claim_next())
+
     def test_recorded_result_wins_a_race_with_process_failure(self):
         self._ready()
         original_fail = TaskExecutionService.fail

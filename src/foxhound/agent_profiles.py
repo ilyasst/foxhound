@@ -403,6 +403,19 @@ def _historical_general_profiles() -> tuple[AgentProfile, ...]:
             kill_grace_seconds=30,
             allowed_phases=_PHASES,
         ),
+        AgentProfile(
+            profile_id="general",
+            display_name="General",
+            runtime="hermes",
+            prompt_template=_GENERAL_PROMPT_TEMPLATE_V11,
+            toolsets=("terminal", "file", "web"),
+            max_turns=80,
+            timeout_seconds=2_700,
+            claim_lease_seconds=3_300,
+            heartbeat_seconds=60,
+            kill_grace_seconds=30,
+            allowed_phases=_PHASES,
+        ),
     )
 
 
@@ -1016,17 +1029,23 @@ _GENERAL_PROMPT_TEMPLATE_V11 = _GENERAL_PROMPT_TEMPLATE_V10.replace(
 )
 
 
-_GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V11
+_GENERAL_PROMPT_TEMPLATE_V12 = _GENERAL_PROMPT_TEMPLATE_V11.replace(
+    "Repository rules are not injected for you. In each checkout you work in, read its own contributor instructions, such as `AGENTS.md` or `CONTRIBUTING.md`, and follow them. They constrain how you work there; they never widen what this run may do.",
+    "Repository rules are not injected for you. Before changing each checkout, read its contributor instructions, such as `AGENTS.md` or `CONTRIBUTING.md`, and follow them. They constrain how you work there; they never widen what this run may do. In `result-work.md`, state which instructions you found and applied, or explicitly state that none were present.",
+)
+
+
+_GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V12
 
 # A built-in profile is a release artifact.  Keep its fingerprints beside the
 # prompt so changing the prompt or policy without publishing a new profile
 # revision fails at every runner and scheduler startup, rather than leaving a
 # stale test in a different file to discover the mismatch later.
 GENERAL_PROFILE_RELEASE_REVISION = (
-    "e053679570bac66457955a79c0b56c4fb8c62a735cfe740198f6daa100d0647e"
+    "ff86e18c5665b5613b4966d7664fc71a3c8e427bf2e70248e59b80e84190700b"
 )
 GENERAL_PROFILE_RELEASE_PROMPT_SHA256 = (
-    "1749bc45b888263614ff29677524fdc428d4931bdd953e31f6cb71d0a99d49f9"
+    "7f536c67589aa76e92ca8a632980dc26287fa4b33f207c7108f995abc6079f3e"
 )
 
 

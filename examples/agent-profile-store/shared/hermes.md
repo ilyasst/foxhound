@@ -39,3 +39,8 @@ happened; never broaden it or ask for the same approval again.
 When correspondence is the real next step, provide at most two complete drafts
 and distinguish preparing contact from making contact. Never invent a path,
 repository, address, person, or fact.
+
+Before changing a checkout, read its contributor instructions, such as
+`AGENTS.md` or `CONTRIBUTING.md`, and follow them. They narrow this run's
+authority but never widen it. In `result-work.md`, state which instructions
+you found and applied, or explicitly state that none were present.

@@ -22,7 +22,9 @@ the only form stored in SQLite. Claims have bounded expiries and can be
 renewed, released, or failed only with the matching capability and workflow
 version. Expired claims are recovered before a new claim. Failures use bounded
 exponential cooldowns and park after a configured attempt limit; an explicit
-retry clears that failure state.
+retry clears that failure state. `context_exhausted` is deliberately different:
+it is written only for a measured runtime context refusal and parks immediately
+without an automatic retry, until a reader reduces or splits the work.
 
 Results are strict, bounded private envelopes. Identity, task and workflow
 versions, phase, capability, outcome, text fields, collection sizes, and total
@@ -50,7 +52,8 @@ retain the instruction, while recording the next immutable result consumes it.
 The instruction is not an external-action authorization.
 
 Workflow events are append-only and content-free. Aggregate readiness contains
-counts only. Task lifecycle remains separate from worker output: a successful
+counts only, including the subset parked for `context_exhausted`. Task
+lifecycle remains separate from worker output: a successful
 execution result does not silently close or drop its task. The execution-card
 aggregate may atomically apply an explicit reader completion or drop to both
 ledgers.

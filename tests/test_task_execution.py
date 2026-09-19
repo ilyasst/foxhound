@@ -2237,6 +2237,23 @@ class TaskExecutionTests(unittest.TestCase):
         self.assertEqual(retried.status, WorkflowStatus.QUEUED)
         self.assertEqual(self.service.get(1).failure_count, 0)
 
+    def test_context_exhaustion_parks_immediately_and_is_countable(self):
+        self._schedule_and_start()
+        claim = self._claim()
+
+        parked = self.service.fail(
+            1,
+            expected_version=claim.workflow_version,
+            claim_token=claim.token,
+            reason="context_exhausted",
+        )
+
+        self.assertEqual(parked.status, WorkflowStatus.PARKED)
+        self.assertIsNone(parked.next_attempt_at)
+        health = self.service.readiness()
+        self.assertEqual((health.parked, health.context_exhausted), (1, 1))
+        self.assertIsNone(self.service.claim_next())
+
     def test_task_transition_cancels_stale_work_before_claim(self):
         self._schedule_and_start()
         transitioned = TaskLedger(self.database, clock=self.clock).transition(
@@ -2282,7 +2299,11 @@ class TaskExecutionTests(unittest.TestCase):
         self.service.schedule(1, expected_task_version=1)
         health = self.service.readiness()
         self.assertEqual(health.awaiting_start, 1)
-        self.assertEqual(sum(health.__dict__.values()), 1)
+        self.assertEqual(
+            sum(value for name, value in health.__dict__.items()
+                if name != "context_exhausted"),
+            1,
+        )
         self.assertNotIn("Synthetic", repr(health))
         self.assertNotIn(TOKEN, repr(health))
 
