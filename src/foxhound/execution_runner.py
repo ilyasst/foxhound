@@ -94,6 +94,15 @@ _CONTEXT_FILTER_REFUSAL = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _CONTEXT_EVIDENCE_BYTES = 256 * 1024
+_SESSION_ID_LINE = re.compile(
+    rb"(?m)^session_id:\s*([A-Za-z0-9][A-Za-z0-9._-]{0,127})\s*$"
+)
+_SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_CORRECTIVE_TURN_PROMPT = (
+    "The preceding execution turn ended without recording a result. "
+    "Do not do new work. Use exactly one worker operation now: record the "
+    "result already prepared, or release the claim if no result is ready."
+)
 
 
 class ExecutionRunnerError(RuntimeError):
@@ -364,6 +373,47 @@ def profile_argv(
     )
 
 
+def corrective_argv(
+    command: str,
+    profile: AgentProfile,
+    *,
+    session_id: str,
+    source: str,
+) -> tuple[str, ...]:
+    """Resume one lost turn solely to finish its worker lifecycle action.
+
+    Hermes retains the task context in the named session.  The corrective
+    prompt deliberately does not repeat it, and its one-turn budget permits
+    only the closing ``record`` or ``release`` operation.
+    """
+    if (
+        not isinstance(profile, AgentProfile)
+        or profile.runtime != "hermes"
+        or not isinstance(session_id, str)
+        or _SESSION_ID.fullmatch(session_id) is None
+        or not isinstance(source, str)
+        or not source
+        or "\0" in source
+    ):
+        raise ValueError("execution corrective resume is invalid")
+    return (
+        *_agent_command_argv(command),
+        "chat",
+        "--query",
+        _CORRECTIVE_TURN_PROMPT,
+        "--max-turns",
+        "1",
+        "--source",
+        source,
+        "--ignore-rules",
+        "--toolsets",
+        ",".join(profile.toolsets),
+        "--resume",
+        session_id,
+        "--no-restore-cwd",
+    )
+
+
 def _agent_command_argv(command: object) -> tuple[str, ...]:
     if not isinstance(command, str) or not command.strip():
         raise ValueError("execution agent command is invalid")
@@ -581,6 +631,7 @@ def _run_claim(
 
         started = clock()
         next_heartbeat = started + profile.heartbeat_seconds
+        corrective_attempted = False
         while True:
             current = service.get(claim.task_id)
             terminal = _terminal_result(initial, current, claim.task_id)
@@ -634,6 +685,36 @@ def _run_claim(
                         0 if terminal == "recorded" else NO_PROGRESS_EXIT_CODE,
                         claim.task_id,
                     )
+                if not corrective_attempted:
+                    session_id = _transcript_session_id(
+                        directory / TRANSCRIPT_NAME, transcript
+                    )
+                    if session_id is not None:
+                        try:
+                            corrective = corrective_argv(
+                                config.agent_command,
+                                profile,
+                                session_id=session_id,
+                                source="foxhound-" + run_id,
+                            )
+                            process = popen(
+                                list(corrective),
+                                env=environment,
+                                stdin=subprocess.DEVNULL,
+                                stdout=transcript or subprocess.DEVNULL,
+                                stderr=(
+                                    subprocess.STDOUT
+                                    if transcript else subprocess.DEVNULL
+                                ),
+                                cwd=str(directory),
+                                start_new_session=True,
+                                shell=False,
+                            )
+                        except (OSError, ValueError):
+                            pass
+                        else:
+                            corrective_attempted = True
+                            continue
                 normalized = (
                     128 + abs(child_exit) if child_exit < 0 else child_exit
                 )
@@ -769,6 +850,28 @@ def _terminal_result(
     if current.status is WorkflowStatus.QUEUED:
         return "released"
     return "claim_lost"
+
+
+def _transcript_session_id(path: Path, transcript: object | None) -> str | None:
+    """Return the final Hermes session identity from this private transcript.
+
+    The runner does not query Hermes state or infer an identity from a path.
+    Hermes writes its own final ``session_id:`` line to the transcript, which
+    makes a missing or malformed line a normal no-resume outcome.
+    """
+    try:
+        if transcript is not None:
+            transcript.flush()
+        data = path.read_bytes()
+    except (OSError, AttributeError):
+        return None
+    matches = tuple(_SESSION_ID_LINE.finditer(data))
+    if not matches:
+        return None
+    try:
+        return matches[-1].group(1).decode("ascii")
+    except UnicodeDecodeError:
+        return None
 
 
 def _runner_lock_path(root: Path, slot: str) -> Path:

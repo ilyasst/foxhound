@@ -615,6 +615,108 @@ class ExecutionRunnerTests(unittest.TestCase):
             self.service.get(1).last_failure_reason, "startup_failed"
         )
 
+    def test_unrecorded_session_gets_one_corrective_resume(self):
+        self._ready()
+        launches = []
+
+        def popen(argv, **kwargs):
+            launches.append(tuple(argv))
+            transcript = kwargs["stdout"]
+            if len(launches) == 1:
+                transcript.write(b"session_id: synthetic-session-1\n")
+                transcript.flush()
+                return FakeProcess(exit_code=0)
+
+            state = load_run_state(
+                Path(kwargs["env"]["FOXHOUND_EXECUTION_STATE"])
+            )
+
+            def record():
+                accepted = TaskExecutionService(
+                    state.database_path
+                ).record_result(ExecutionResultEnvelope(
+                    result_id=RESULT_ID,
+                    task_id=state.task_id,
+                    task_version=state.task_version,
+                    workflow_version=state.workflow_version,
+                    phase=state.phase,
+                    claim_token=state.claim_token,
+                    outcome=ExecutionOutcome.AWAITING_PLAN,
+                    summary="Synthetic recovered result",
+                    work_markdown="Synthetic recovered plan",
+                ))
+                self.assertTrue(accepted.accepted)
+
+            return FakeProcess(callback=record)
+
+        result = run_once(
+            self._config(),
+            popen=popen,
+            run_id_factory=lambda: "9" * 32,
+            terminate=self._terminator,
+        )
+
+        self.assertEqual((result.outcome, result.exit_code), ("recorded", 0))
+        self.assertEqual(len(launches), 2)
+        corrective = launches[1]
+        self.assertEqual(
+            corrective[corrective.index("--resume") + 1],
+            "synthetic-session-1",
+        )
+        self.assertIn("--no-restore-cwd", corrective)
+        self.assertEqual(
+            corrective[corrective.index("--max-turns") + 1], "1"
+        )
+        self.assertEqual(
+            corrective[corrective.index("--query") + 1],
+            "The preceding execution turn ended without recording a result. "
+            "Do not do new work. Use exactly one worker operation now: record "
+            "the result already prepared, or release the claim if no result is "
+            "ready.",
+        )
+
+    def test_a_missing_or_malformed_session_id_does_not_retry(self):
+        self._ready()
+        launches = []
+
+        def popen(argv, **kwargs):
+            launches.append(tuple(argv))
+            transcript = kwargs["stdout"]
+            transcript.write(b"session_id: ../not-a-session\n")
+            transcript.flush()
+            return FakeProcess(exit_code=3)
+
+        result = run_once(
+            self._config(),
+            popen=popen,
+            run_id_factory=lambda: "8" * 32,
+            terminate=self._terminator,
+        )
+
+        self.assertEqual((result.outcome, result.exit_code), ("process_exit", 3))
+        self.assertEqual(len(launches), 1)
+
+    def test_a_failed_corrective_resume_is_not_retried(self):
+        self._ready()
+        launches = []
+
+        def popen(argv, **kwargs):
+            launches.append(tuple(argv))
+            transcript = kwargs["stdout"]
+            transcript.write(b"session_id: synthetic-session-2\n")
+            transcript.flush()
+            return FakeProcess(exit_code=3)
+
+        result = run_once(
+            self._config(),
+            popen=popen,
+            run_id_factory=lambda: "7" * 32,
+            terminate=self._terminator,
+        )
+
+        self.assertEqual((result.outcome, result.exit_code), ("process_exit", 3))
+        self.assertEqual(len(launches), 2)
+
     def test_selected_profile_controls_exact_prompt_tools_turns_and_timing(self):
         specialist = parse_profile({
             "schema": "foxhound.agent-profile",
