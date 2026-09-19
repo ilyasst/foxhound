@@ -9,7 +9,9 @@ import json
 import sqlite3
 import stat
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from contextlib import closing, redirect_stderr, redirect_stdout
 from io import StringIO
@@ -264,6 +266,10 @@ class ExecutionRunnerTests(unittest.TestCase):
         self.assertIsNot(launched["kwargs"]["stdout"], subprocess.DEVNULL)
         self.assertIs(launched["kwargs"]["stderr"], subprocess.STDOUT)
         self.assertIs(launched["kwargs"]["stdin"], subprocess.DEVNULL)
+        # Because that stdout is a file, a Python agent buffers it unless
+        # told not to, and a killed run loses the buffer along with the
+        # explanation the transcript exists to hold.
+        self.assertEqual(launched["kwargs"]["env"]["PYTHONUNBUFFERED"], "1")
         turn_index = launched["argv"].index("--max-turns")
         self.assertEqual(
             launched["argv"][turn_index + 1],
@@ -292,6 +298,79 @@ class ExecutionRunnerTests(unittest.TestCase):
         self.assertEqual(
             self.service.get(1).status, WorkflowStatus.AWAITING_REVIEW
         )
+
+    def _launch_environment(self, base_environment):
+        """The environment the runner actually hands the agent."""
+        self._ready()
+        launched = {}
+
+        def popen(argv, **kwargs):
+            launched.update(argv=argv, kwargs=kwargs)
+            return FakeProcess(exit_code=0)
+
+        run_once(
+            self._config(),
+            base_environment=base_environment,
+            popen=popen,
+            run_id_factory=lambda: "a" * 32,
+            terminate=self._terminator,
+        )
+        return launched["kwargs"]["env"]
+
+    def test_an_inherited_buffering_setting_cannot_reinstate_buffering(self):
+        """The runner decides this, not whatever it inherited.
+
+        A supervisor, a shell profile or a wrapper may export the opposite
+        value, and inheriting it would silently restore the buffer loss on
+        exactly the hosts most likely to have one.
+        """
+        environment = self._launch_environment(
+            {"PATH": "/usr/bin", "PYTHONUNBUFFERED": "0"}
+        )
+        self.assertEqual(environment["PYTHONUNBUFFERED"], "1")
+
+    def test_a_killed_agent_still_leaves_the_output_it_produced(self):
+        """The behaviour the setting buys, proven against a real process.
+
+        The transcript exists so a failed run can be explained, and the
+        profile timeout always ends in a kill. A child that writes less
+        than one buffer and is killed used to leave nothing but whatever
+        it had sent to stderr.
+        """
+        environment = self._launch_environment({"PATH": "/usr/bin"})
+        self.assertEqual(environment["PYTHONUNBUFFERED"], "1")
+
+        # Well under one 8 KiB buffer, which is the case that used to
+        # leave an empty transcript.
+        program = (
+            "import sys, time\n"
+            "print('progress the next attempt needs')\n"
+            "sys.stderr.write('startup line\\n')\n"
+            "time.sleep(30)\n"
+        )
+        transcript = self.root / "agent-output.log"
+        with open(transcript, "wb") as handle:
+            process = subprocess.Popen(
+                [sys.executable, "-c", program],
+                env=environment,
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+            )
+            try:
+                # Long enough for the child to write, short enough that the
+                # test does not depend on its sleep elapsing.
+                for _ in range(100):
+                    if transcript.stat().st_size:
+                        break
+                    time.sleep(0.05)
+            finally:
+                process.kill()
+                process.wait(timeout=10)
+
+        captured = transcript.read_text(encoding="utf-8")
+        self.assertIn("progress the next attempt needs", captured)
+        self.assertIn("startup line", captured)
 
     def test_a_granted_advance_is_a_recorded_run_not_a_release(self):
         """A grant queues the next phase instead of raising a card, so the
