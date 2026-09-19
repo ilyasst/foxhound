@@ -1820,7 +1820,9 @@ class ThreadReadTests(unittest.TestCase):
 
         def fake_run(*args, **kw):
             if args[:2] == ("gh", "api"):
-                return (0, json.dumps(issue_data), "")
+                return (0, json.dumps({
+                    "data": {"repository": {"issue": issue_data}}
+                }), "")
             return (1, "", "unexpected")
 
         with (\
@@ -1858,7 +1860,9 @@ class ThreadReadTests(unittest.TestCase):
 
         def fake_run(*args, **kw):
             if args[:2] == ("gh", "api"):
-                return (0, json.dumps(issue_data), "")
+                return (0, json.dumps({
+                    "data": {"repository": {"issue": issue_data}}
+                }), "")
             return (1, "", "unexpected")
 
         with (\
@@ -1905,7 +1909,9 @@ class ThreadReadTests(unittest.TestCase):
 
         def fake_run(*args, **kw):
             if args[:2] == ("gh", "api"):
-                return (0, json.dumps(pr_data), "")
+                return (0, json.dumps({
+                    "data": {"repository": {"pullRequest": pr_data}}
+                }), "")
             return (1, "", "unexpected")
 
         with (\

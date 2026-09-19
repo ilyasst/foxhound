@@ -33,10 +33,9 @@ import subprocess
 from dataclasses import dataclass
 from typing import Any
 
-#: Maximum characters in the raw thread payload before truncation.
-#: A review that runs this long is uncommon; a 200-line thread with
-#: full content fits easily, and a 500-line thread gets trimmed.
-_MAX_THREAD_CHARS = 40_000
+#: The worker prints this result into an agent conversation, so preserve the
+#: useful review evidence but never let one thread consume the run's context.
+_MAX_THREAD_CHARS = 30_000
 
 #: Maximum number of comments returned before truncation.
 _MAX_COMMENTS = 100
@@ -84,6 +83,121 @@ def _detail(stderr: str) -> str:
     return first[:200] or "no detail"
 
 
+def _thread_target(repository: str, number: str, *, label: str) -> tuple[str, str, int]:
+    if not repository or repository.count("/") != 2:
+        raise ForgeThreadError("the task's repository is not a canonical locator")
+    host, _, name_with_owner = repository.partition("/")
+    if host != "github.com":
+        raise ForgeThreadError(f"{host}: reading {label} threads is not supported here")
+    digits = (number or "").strip()
+    if not digits.isdigit() or int(digits) < 1:
+        raise ForgeThreadError(f"the task does not name a {label}")
+    owner, separator, name = name_with_owner.partition("/")
+    if not separator or not owner or not name:
+        raise ForgeThreadError("the task's repository is not a canonical locator")
+    return owner, name, int(digits)
+
+
+def _read_graphql(*, owner: str, name: str, number: int, object_name: str, query: str) -> dict[str, Any]:
+    rc, out, err = _run(
+        "gh", "api", "graphql",
+        "-f", f"query={query}",
+        "-f", f"owner={owner}",
+        "-f", f"name={name}",
+        "-F", f"number={number}",
+    )
+    if rc != 0:
+        raise ForgeThreadError(f"the forge did not return thread data ({_detail(err)})")
+    try:
+        payload = json.loads(out)
+        thread = payload["data"]["repository"][object_name]
+    except (KeyError, TypeError, ValueError):
+        raise ForgeThreadError("the forge returned unparseable thread data") from None
+    if not isinstance(thread, dict):
+        raise ForgeThreadError("the forge did not find the task's thread")
+    return thread
+
+
+def _entries(nodes: object, *, review: bool = False) -> list[dict[str, Any]]:
+    if not isinstance(nodes, list):
+        return []
+    result = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        author = node.get("author") or {}
+        entry = {
+            "author": author.get("login", "") if isinstance(author, dict) else "",
+            "body": node.get("body", "") if isinstance(node.get("body", ""), str) else "",
+            "created_at": node.get("createdAt", "") if isinstance(node.get("createdAt", ""), str) else "",
+        }
+        if review:
+            entry["state"] = node.get("state", "") if isinstance(node.get("state", ""), str) else ""
+        result.append(entry)
+    return result
+
+
+def _connection_entries(thread: dict[str, Any], name: str, *, review: bool = False) -> tuple[list[dict[str, Any]], int]:
+    connection = thread.get(name) or {}
+    if not isinstance(connection, dict):
+        return [], 0
+    entries = _entries(connection.get("nodes"), review=review)
+    total = connection.get("totalCount", len(entries))
+    return entries, total if isinstance(total, int) and total >= len(entries) else len(entries)
+
+
+def _bound_entries(comments: list[dict[str, Any]], reviews: list[dict[str, Any]], *, comment_total: int, review_total: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
+    comments = comments[:_MAX_COMMENTS]
+    reviews = reviews[:_MAX_COMMENTS]
+    truncated = comment_total > len(comments) or review_total > len(reviews)
+
+    def size() -> int:
+        return len(json.dumps({"comments": comments, "reviews": reviews}, ensure_ascii=True))
+
+    while size() > _MAX_THREAD_CHARS:
+        candidates = [
+            entry for entry in (*comments, *reviews)
+            if entry["body"] and entry["body"] != "[truncated]"
+        ]
+        if candidates:
+            entry = max(candidates, key=lambda value: len(value["body"]))
+            excess = size() - _MAX_THREAD_CHARS
+            keep = max(0, len(entry["body"]) - excess - len("[truncated]"))
+            entry["body"] = entry["body"][:keep] + "[truncated]"
+        elif comments:
+            comments.pop()
+        elif reviews:
+            reviews.pop()
+        else:
+            break
+        truncated = True
+    return comments, reviews, truncated
+
+
+_ISSUE_QUERY = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      number url state
+      comments(first: 100) { totalCount nodes { author { login } body createdAt } }
+    }
+  }
+}
+"""
+
+_PULL_REQUEST_QUERY = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      number url state
+      comments(first: 100) { totalCount nodes { author { login } body createdAt } }
+      reviews(first: 100) { totalCount nodes { author { login } state body createdAt } }
+    }
+  }
+}
+"""
+
+
 def read_issue_thread(
     *,
     repository: str,
@@ -94,61 +208,15 @@ def read_issue_thread(
     The repository and number come from the task's binding, not from
     caller arguments. Returns a bounded set of comments and metadata.
     """
-    if not repository or repository.count("/") != 2:
-        raise ForgeThreadError(
-            "the task's repository is not a canonical locator")
-    host, _, name_with_owner = repository.partition("/")
-    if host != "github.com":
-        raise ForgeThreadError(
-            f"{host}: reading issue threads is not supported here")
-    digits = (number or "").strip()
-    if not digits.isdigit() or int(digits) < 1:
-        raise ForgeThreadError("the task does not name an issue")
-
-    # Fetch issue metadata and comments via the GitHub API
-    fields = (
-        "number,url,state,comments{nodes{author{login},body,createdAt},"
-        "pageInfo{hasNextPage,endCursor}}"
+    owner, name, issue_number = _thread_target(repository, number, label="issue")
+    data = _read_graphql(
+        owner=owner, name=name, number=issue_number,
+        object_name="issue", query=_ISSUE_QUERY,
     )
-    rc, out, err = _run(
-        "gh", "api", "--hostname", host,
-        f"repos/{name_with_owner}/issues/{digits}",
-        "-f", f"fields={fields}")
-    if rc != 0:
-        raise ForgeThreadError(
-            f"{repository}#{digits}: the forge did not return thread data "
-            f"({_detail(err)})")
-
-    try:
-        data = json.loads(out)
-    except (ValueError, TypeError):
-        raise ForgeThreadError(
-            f"{repository}#{digits}: the forge returned unparseable data")
-
-    url = data.get("url", "")
-    issue_number = data.get("number", 0)
-
-    # Extract comments
-    comments = []
-    comments_data = data.get("comments", {}) or {}
-    nodes = comments_data.get("nodes", []) or []
-
-    for node in nodes:
-        author_info = node.get("author") or {}
-        author = author_info.get("login", "")
-        body = node.get("body", "") or ""
-        created_at = node.get("createdAt", "")
-        comments.append({
-            "author": author,
-            "body": body,
-            "created_at": created_at,
-        })
-
-    # Truncate if needed
-    truncated = False
-    if len(comments) > _MAX_COMMENTS:
-        comments = comments[:_MAX_COMMENTS]
-        truncated = True
+    comments, comment_total = _connection_entries(data, "comments")
+    comments, _reviews, truncated = _bound_entries(
+        comments, [], comment_total=comment_total, review_total=0,
+    )
 
     return ThreadResult(
         repository=repository,
@@ -157,7 +225,7 @@ def read_issue_thread(
         comments=comments,
         reviews=[],
         truncated=truncated,
-        url=url,
+        url=data.get("url", ""),
     )
 
 
@@ -171,86 +239,17 @@ def read_pull_request_thread(
     The repository and number come from the task's binding. Returns
     a bounded set of comments, reviews, and metadata.
     """
-    if not repository or repository.count("/") != 2:
-        raise ForgeThreadError(
-            "the task's repository is not a canonical locator")
-    host, _, name_with_owner = repository.partition("/")
-    if host != "github.com":
-        raise ForgeThreadError(
-            f"{host}: reading pull request threads is not supported here")
-    digits = (number or "").strip()
-    if not digits.isdigit() or int(digits) < 1:
-        raise ForgeThreadError("the task does not name a pull request")
-
-    # Fetch PR metadata
-    pr_fields = "number,url,state,reviews{nodes{author{login},state,body,createdAt}},comments{nodes{author{login},body,createdAt}}"
-    rc, out, err = _run(
-        "gh", "api", "--hostname", host,
-        f"repos/{name_with_owner}/pulls/{digits}",
-        "-f", f"fields={pr_fields}")
-    if rc != 0:
-        raise ForgeThreadError(
-            f"{repository}#{digits}: the forge did not return thread data "
-            f"({_detail(err)})")
-
-    try:
-        data = json.loads(out)
-    except (ValueError, TypeError):
-        raise ForgeThreadError(
-            f"{repository}#{digits}: the forge returned unparseable data")
-
-    url = data.get("url", "")
-    pr_number = data.get("number", 0)
-
-    # Extract reviews
-    reviews = []
-    reviews_data = data.get("reviews", {}) or {}
-    review_nodes = reviews_data.get("nodes", []) or []
-    for node in review_nodes:
-        author_info = node.get("author") or {}
-        author = author_info.get("login", "")
-        body = node.get("body", "") or ""
-        state = node.get("state", "")
-        created_at = node.get("createdAt", "")
-        reviews.append({
-            "author": author,
-            "state": state,
-            "body": body,
-            "created_at": created_at,
-        })
-
-    # Extract comments (PR-level comments, not review comments)
-    comments = []
-    comments_data = data.get("comments", {}) or {}
-    comment_nodes = comments_data.get("nodes", []) or []
-    for node in comment_nodes:
-        author_info = node.get("author") or {}
-        author = author_info.get("login", "")
-        body = node.get("body", "") or ""
-        created_at = node.get("createdAt", "")
-        comments.append({
-            "author": author,
-            "body": body,
-            "created_at": created_at,
-        })
-
-    # Check total size and truncate if needed
-    truncated = False
-    all_text = json.dumps(comments + reviews)
-    if len(all_text) > _MAX_THREAD_CHARS:
-        # Truncate comments first, then reviews
-        while len(all_text) > _MAX_THREAD_CHARS * 0.6 and comments:
-            comments.pop()
-        while len(all_text) > _MAX_THREAD_CHARS * 0.6 and reviews:
-            reviews.pop()
-        truncated = True
-
-    if len(comments) > _MAX_COMMENTS:
-        comments = comments[:_MAX_COMMENTS]
-        truncated = True
-    if len(reviews) > _MAX_COMMENTS:
-        reviews = reviews[:_MAX_COMMENTS]
-        truncated = True
+    owner, name, pr_number = _thread_target(repository, number, label="pull request")
+    data = _read_graphql(
+        owner=owner, name=name, number=pr_number,
+        object_name="pullRequest", query=_PULL_REQUEST_QUERY,
+    )
+    comments, comment_total = _connection_entries(data, "comments")
+    reviews, review_total = _connection_entries(data, "reviews", review=True)
+    comments, reviews, truncated = _bound_entries(
+        comments, reviews,
+        comment_total=comment_total, review_total=review_total,
+    )
 
     return ThreadResult(
         repository=repository,
@@ -259,5 +258,5 @@ def read_pull_request_thread(
         comments=comments,
         reviews=reviews,
         truncated=truncated,
-        url=url,
+        url=data.get("url", ""),
     )

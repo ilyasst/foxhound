@@ -83,10 +83,14 @@ PR_THREAD_DATA = {
 }
 
 
+def _response(object_name, thread):
+    return {"data": {"repository": {object_name: thread}}}
+
+
 class IssueThreadReads(unittest.TestCase):
     def test_returns_comments_on_the_task_issue(self) -> None:
         runner = _gh([
-            (("gh", "api"), (0, json.dumps(ISSUE_THREAD_DATA), "")),
+            (("gh", "api"), (0, json.dumps(_response("issue", ISSUE_THREAD_DATA)), "")),
         ])
         with mock.patch.object(forge_thread, "_run", runner):
             result = forge_thread.read_issue_thread(
@@ -106,7 +110,7 @@ class IssueThreadReads(unittest.TestCase):
     def test_uses_only_the_task_binding_not_a_caller_argument(self) -> None:
         # The repository comes from the binding, not from a free argument.
         runner = _gh([
-            (("gh", "api"), (0, json.dumps(ISSUE_THREAD_DATA), "")),
+            (("gh", "api"), (0, json.dumps(_response("issue", ISSUE_THREAD_DATA)), "")),
         ])
         with mock.patch.object(forge_thread, "_run", runner):
             forge_thread.read_issue_thread(
@@ -114,16 +118,18 @@ class IssueThreadReads(unittest.TestCase):
                 number="42",
             )
         call = runner.calls[0]
-        # The repository path appears in the API endpoint, not as a separate arg
+        self.assertEqual(call[:3], ("gh", "api", "graphql"))
+        # The repository path appears only as the bound GraphQL variables.
         call_text = " ".join(call)
-        self.assertIn("example-org/example-repo", call_text)
-        self.assertIn("issues/42", call_text)
+        self.assertIn("owner=example-org", call_text)
+        self.assertIn("name=example-repo", call_text)
+        self.assertIn("number=42", call_text)
 
 
 class PullRequestThreadReads(unittest.TestCase):
     def test_returns_reviews_and_comments_on_the_task_pr(self) -> None:
         runner = _gh([
-            (("gh", "api"), (0, json.dumps(PR_THREAD_DATA), "")),
+            (("gh", "api"), (0, json.dumps(_response("pullRequest", PR_THREAD_DATA)), "")),
         ])
         with mock.patch.object(forge_thread, "_run", runner):
             result = forge_thread.read_pull_request_thread(
@@ -148,7 +154,7 @@ class PullRequestThreadReads(unittest.TestCase):
             "comments": {"nodes": []},
         }
         runner = _gh([
-            (("gh", "api"), (0, json.dumps(empty_data), "")),
+            (("gh", "api"), (0, json.dumps(_response("pullRequest", empty_data)), "")),
         ])
         with mock.patch.object(forge_thread, "_run", runner):
             result = forge_thread.read_pull_request_thread(
@@ -209,6 +215,34 @@ class Refusals(unittest.TestCase):
 
 
 class Truncation(unittest.TestCase):
+    def test_one_oversized_comment_is_kept_but_its_body_is_bounded(self) -> None:
+        oversized = {
+            "number": 42,
+            "url": "https://github.com/example-org/example-repo/issues/42",
+            "state": "open",
+            "comments": {
+                "totalCount": 1,
+                "nodes": [{
+                    "author": {"login": "reviewer-a"},
+                    "body": "x" * (forge_thread._MAX_THREAD_CHARS * 2),
+                    "createdAt": "2030-01-02T10:00:00Z",
+                }],
+            },
+        }
+        runner = _gh([(
+            ("gh", "api"), (0, json.dumps(_response("issue", oversized)), ""),
+        )])
+        with mock.patch.object(forge_thread, "_run", runner):
+            result = forge_thread.read_issue_thread(
+                repository="github.com/example-org/example-repo", number="42"
+            )
+        self.assertTrue(result.truncated)
+        self.assertTrue(result.comments[0]["body"].endswith("[truncated]"))
+        self.assertLessEqual(
+            len(json.dumps({"comments": result.comments, "reviews": result.reviews})),
+            forge_thread._MAX_THREAD_CHARS,
+        )
+
     def test_long_comment_list_is_truncated(self) -> None:
         # Create a thread with more comments than the limit
         many_comments = {
@@ -228,7 +262,7 @@ class Truncation(unittest.TestCase):
             },
         }
         runner = _gh([
-            (("gh", "api"), (0, json.dumps(many_comments), "")),
+            (("gh", "api"), (0, json.dumps(_response("issue", many_comments)), "")),
         ])
         with mock.patch.object(forge_thread, "_run", runner):
             result = forge_thread.read_issue_thread(
@@ -268,7 +302,7 @@ class Truncation(unittest.TestCase):
             },
         }
         runner = _gh([
-            (("gh", "api"), (0, json.dumps(many_items), "")),
+            (("gh", "api"), (0, json.dumps(_response("pullRequest", many_items)), "")),
         ])
         with mock.patch.object(forge_thread, "_run", runner):
             result = forge_thread.read_pull_request_thread(
