@@ -759,6 +759,17 @@ class TaskExecutionService:
                     "SELECT * FROM task_execution_workflows WHERE task_id=?",
                     (task_id,),
                 ).fetchone()
+                # A scheduled caller can arrive while the reader's snooze is
+                # still cooling.  Treat that state as a durable refusal to
+                # re-plan, rather than relying on the broader non-terminal
+                # set below: adding another resettable status there must not
+                # make a future snooze eligible for a fresh Start gate.
+                if (row is not None
+                        and int(row["task_version"]) == expected_task_version
+                        and row["status"] == WorkflowStatus.SNOOZED
+                        and row["due_at"] > now):
+                    connection.rollback()
+                    return _operation(row, WorkflowDisposition.UNCHANGED)
                 if (row is not None
                         and int(row["task_version"]) == expected_task_version
                         and row["status"] not in {

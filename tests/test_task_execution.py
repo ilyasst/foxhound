@@ -1598,6 +1598,19 @@ class TaskExecutionTests(unittest.TestCase):
         )
         self.assertEqual(snoozed.status, WorkflowStatus.SNOOZED)
         self.assertIsNotNone(snoozed.wake_at)
+        # A scheduler retry must leave a future snooze completely intact.
+        # This is distinct from refusing an early reader tap: historical
+        # early cards were created when a scheduler rewrote the workflow and
+        # then presented a fresh Start gate.
+        rescheduled = self.service.schedule(1, expected_task_version=1)
+        self.assertEqual(
+            (rescheduled.disposition, rescheduled.status,
+             rescheduled.version, rescheduled.wake_at),
+            (WorkflowDisposition.UNCHANGED, WorkflowStatus.SNOOZED,
+             snoozed.version, snoozed.wake_at),
+        )
+        self.assertEqual(self.service.schedule_new().scheduled, 0)
+        self.assertIsNone(self.service.claim_next())
         early = self.service.start_action(
             1, expected_version=snoozed.version, action="start"
         )
