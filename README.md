@@ -473,6 +473,19 @@ foxhound-agent-profile-store --source /srv/example/private-agent-source   publis
 foxhound-agent-profile-store --source /srv/example/private-agent-source   install --target /srv/example/private-agent-profiles
 ```
 
+A store has no lock and more than one operator can hold it, so a draft can be
+replaced between the edit that was reviewed and the publish meant to ship it.
+`validate` reports, for each pending profile, the revision its draft would
+publish as; passing that value back holds the publish to it:
+
+```sh
+foxhound-agent-profile-store --source /srv/example/private-agent-source   validate
+foxhound-agent-profile-store --source /srv/example/private-agent-source   publish --profile example-scout --expect example-scout=<revision>
+```
+
+Without `--expect`, a publish compiles whatever the draft holds at that moment
+and reports success for it.
+
 Instructions that several agents share, including approved reusable Hermes
 prompt material, belong in the store's shared component rather than in this
 repository or in ambient host configuration: publication composes them into

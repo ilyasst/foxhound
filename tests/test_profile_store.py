@@ -212,6 +212,50 @@ class ProfileStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ProfileStoreError, "absolute path"):
             validate(self.source)
 
+    def test_publish_refuses_a_draft_that_changed_since_it_was_reviewed(self):
+        """The failure this guards: two operators, one store, no lock."""
+        publish(self.source, ["example-scout"])
+        self.write_draft(role=ROLE_TEXT + "First operator's edit.\n")
+        reviewed = validate(self.source)["pending_inputs"]["example-scout"]
+
+        # A second operator replaces the draft before the first publishes.
+        self.write_draft(role=ROLE_TEXT + "Second operator's edit.\n")
+
+        with self.assertRaisesRegex(ProfileStoreError, "example-scout"):
+            publish(
+                self.source, ["example-scout"],
+                expect={"example-scout": reviewed["revision"]},
+            )
+        self.assertEqual(
+            validate(self.source)["pending"], ["example-scout"]
+        )
+
+    def test_publish_proceeds_when_the_draft_is_the_reviewed_one(self):
+        publish(self.source, ["example-scout"])
+        self.write_draft(role=ROLE_TEXT + "Reviewed edit.\n")
+        reviewed = validate(self.source)["pending_inputs"]["example-scout"]
+
+        result = publish(
+            self.source, ["example-scout"],
+            expect={"example-scout": reviewed["revision"]},
+        )
+
+        self.assertEqual(
+            result["published"][0]["revision"], reviewed["revision"]
+        )
+        self.assertEqual(validate(self.source)["pending"], [])
+
+    def test_publish_refuses_an_expectation_it_cannot_check(self):
+        publish(self.source, ["example-scout"])
+        self.write_draft(role=ROLE_TEXT + "Edit.\n")
+        for expect in (
+            {"example-scout": "not-a-revision"},
+            {"example-absent": "0" * 64},
+        ):
+            with self.subTest(expect=expect):
+                with self.assertRaises(ProfileStoreError):
+                    publish(self.source, ["example-scout"], expect=expect)
+
     def test_shared_change_republishes_every_active_profile(self):
         self.write_draft("example-clerk", display_name="Example Clerk")
         publish(self.source, ["example-scout", "example-clerk"])
