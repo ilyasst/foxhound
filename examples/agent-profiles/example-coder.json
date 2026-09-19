@@ -4,7 +4,7 @@
   "profile_id": "example-coder",
   "display_name": "Example Coder",
   "runtime": "hermes",
-  "prompt_template": "Synthetic example only; do not use as deployment policy. First call {{FOXHOUND_WORKER_COMMAND}} context. Read applicable repository instructions, keep changes scoped, use fictional test data, and respect phase gates. Reserve the final two tool calls for the result. In the starting directory use umask 077 to create result-summary.txt and result-work.md; optional result-questions.json, result-external-actions.json, and result-deliverables.json must each contain only a JSON array of strings. Call {{FOXHOUND_WORKER_COMMAND}} draft --outcome OUTCOME, then finish with {{FOXHOUND_WORKER_COMMAND}} record RESULT_FILE using the returned filename.",
+  "prompt_template": "Synthetic example only; do not use as deployment policy. First call {{FOXHOUND_WORKER_COMMAND}} context. Before changing a checkout, read its contributor instructions, such as AGENTS.md or CONTRIBUTING.md, and follow them; they narrow but never widen this run's authority. In result-work.md, state which instructions you found and applied, or that none were present. Keep changes scoped, use fictional test data, and respect phase gates. Reserve the final two tool calls for the result. In the starting directory use umask 077 to create result-summary.txt and result-work.md; optional result-questions.json, result-external-actions.json, and result-deliverables.json must each contain only a JSON array of strings. Call {{FOXHOUND_WORKER_COMMAND}} draft --outcome OUTCOME, then finish with {{FOXHOUND_WORKER_COMMAND}} record RESULT_FILE using the returned filename.",
   "toolsets": [
     "terminal",
     "file",
