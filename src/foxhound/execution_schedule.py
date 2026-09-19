@@ -6,7 +6,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from .agent_profiles import AgentProfileError, load_registry
 from .task_bootstrap import TaskBootstrapConfigError, _private_database
@@ -23,7 +23,8 @@ def run_schedule(
     database_path: Path,
     limit: int = 100,
     agent_profile_directory: Path | None = None,
-    default_agent_profile: str = "sigint",
+    default_agent_profile: str = "general",
+    profile_routes: Mapping[str, str] | None = None,
     plan_without_asking: Sequence[str] | None = None,
     plan_ready_cap: int | None = None,
     awaiting_reader_cap: int | None = None,
@@ -31,26 +32,11 @@ def run_schedule(
 ) -> ExecutionScheduleResult:
     database = _private_database(database_path)
     registry = load_registry(agent_profile_directory)
-    # The production scheduler must never silently run repository work on the
-    # compatibility profile when SigInt is missing or disabled.
-    if agent_profile_directory is not None and default_agent_profile == "sigint":
-        sigint = registry.get("sigint")
-        if sigint is None or any(
-            phase.value not in sigint.allowed_phases for phase in WorkflowPhase
-        ):
-            raise AgentProfileError(
-                "the installed SigInt profile is unavailable"
-            )
-    # A library/test invocation without the private catalog can only use the
-    # built-in compatibility profile. Production invocations pass the
-    # catalog directory and are rejected above when SigInt is unavailable.
-    selected_profile = default_agent_profile
-    if agent_profile_directory is None and selected_profile == "sigint":
-        selected_profile = "general"
     return TaskExecutionService(
         database,
         profile_registry=registry,
-        default_profile_id=selected_profile,
+        default_profile_id=default_agent_profile,
+        profile_routes=profile_routes,
         planning_grants=plan_without_asking,
         plan_ready_cap=plan_ready_cap,
         awaiting_reader_cap=awaiting_reader_cap,
@@ -66,7 +52,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--database", required=True, type=Path)
     parser.add_argument("--limit", default=100, type=int)
     parser.add_argument("--agent-profile-directory", type=Path)
-    parser.add_argument("--default-agent-profile", default="sigint")
+    parser.add_argument("--default-agent-profile", default="general")
+    parser.add_argument(
+        "--profile-route", action="append", metavar="SOURCE_KIND=PROFILE",
+        help="route one source kind to an installed profile; repeat as needed",
+    )
     parser.add_argument(
         "--plan-without-asking",
         action="append",
@@ -118,6 +108,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             limit=args.limit,
             agent_profile_directory=args.agent_profile_directory,
             default_agent_profile=args.default_agent_profile,
+            profile_routes=_profile_routes(args.profile_route),
             plan_without_asking=args.plan_without_asking,
             plan_ready_cap=args.plan_ready_cap,
             awaiting_reader_cap=args.awaiting_reader_cap,
@@ -153,6 +144,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         "scheduled": result.scheduled,
     }, sort_keys=True))
     return 0
+
+
+def _profile_routes(values: Sequence[str] | None) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for value in values or ():
+        kind, separator, profile_id = value.partition("=")
+        if not separator or not kind or not profile_id or kind in result:
+            raise ValueError("agent profile routes are invalid")
+        result[kind] = profile_id
+    return result
 
 
 if __name__ == "__main__":

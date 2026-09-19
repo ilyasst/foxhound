@@ -12,8 +12,15 @@ make it owner-only (`0600`), and do not commit it, paste it into issues, or
 send its rendered command lines to logs. It contains paths but never token
 values.
 
-Version 8 is current. Two things about it are worth knowing before an
+Version 10 is current. Three things about it are worth knowing before an
 upgrade, because neither announces itself:
+
+- Version 10 makes profile routing a deployment choice. `default_agent_profile`
+  remains the required fallback, while each `agent_profile_routes` entry names
+  a selector and an installed profile. The initial selector is `source_kind`;
+  the entry shape leaves room for additional selectors without replacing the
+  routing list. Older documents migrate to an empty route list, so every task
+  uses their already-declared default until routes are added deliberately.
 
 - `card_service.task_work_root` is **required** once delivery is enabled, and
   it is what switches result artifacts on. Without it the artifact routes are
@@ -37,7 +44,7 @@ and all paths are absolute.
 ```json
 {
   "schema": "foxhound.deployment-config",
-  "schema_version": 8,
+  "schema_version": 10,
   "database": "/srv/example/private-foxhound-state/foxhound.sqlite3",
   "agent_profile_directory": null,
   "card_service": {
@@ -59,6 +66,11 @@ and all paths are absolute.
   },
   "workflow": {
     "default_agent_profile": "general",
+    "agent_profile_routes": [{
+      "selector": {"source_kind": "issue"},
+      "profile_id": "example-repository-agent"
+    }],
+    "reader_aliases": [],
     "plan_without_asking": ["issue"],
     "execute_without_asking": ["issue"],
     "act_without_asking": ["issue"],

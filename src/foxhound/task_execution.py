@@ -51,13 +51,6 @@ REVIEW_SNOOZE_ACTIONS = frozenset({
 #: button, and one dead button teaches a reader that none of them are
 #: trustworthy. So it is answered here too, as the nearest choice.
 _SNOOZE_ACTIONS = frozenset({"snooze", *REVIEW_SNOOZE_ACTIONS})
-#: The agent a kind of work starts on, when that machine has it installed.
-#: Repository work is routed to SigInt by the runtime profile catalog.
-SOURCE_KIND_PROFILES = {
-    "issue": "sigint",
-    "review_request": "sigint",
-}
-
 #: Source ordering is stronger than a reader's bounded queue preference.
 #: Pull-request reviews lead the queue, repository issues trail it, and
 #: communication plus every other non-issue source remain in the middle tier.
@@ -401,6 +394,7 @@ class TaskExecutionService:
         plan_ready_cap: int | None = None,
         awaiting_reader_cap: int | None = None,
         reader_aliases: object = None,
+        profile_routes: Mapping[str, str] | None = None,
     ) -> None:
         if (isinstance(max_attempts, bool)
                 or not isinstance(max_attempts, int)
@@ -438,6 +432,18 @@ class TaskExecutionService:
         ):
             raise ValueError("default agent profile is unavailable")
         self._profile_registry = registry
+        if profile_routes is None:
+            profile_routes = {}
+        if (
+            not isinstance(profile_routes, Mapping)
+            or any(
+                not isinstance(kind, str) or not kind
+                or not isinstance(profile_id, str) or not profile_id
+                for kind, profile_id in profile_routes.items()
+            )
+        ):
+            raise ValueError("agent profile routes are invalid")
+        self._profile_routes = dict(profile_routes)
         # Task IDs the last claim deferred because their pinned profile could
         # not be resolved.  Read by the runner so a queue that is quietly
         # shedding work says so instead of just looking idle.
@@ -457,24 +463,16 @@ class TaskExecutionService:
     def _profile_for(self, origin_kind: object) -> AgentProfile:
         """Which agent a task of this kind starts on.
 
-        A default that ignores what the task is sends repository work to a
-        compatibility profile. One review of a pull request went to
-        `general`, produced nothing recordable three times, and parked —
-        with the review already written.
-
-        Falls back to the configured default when a preferred profile is not
-        installed. The production scheduler validates that SigInt is installed
-        before accepting repository work; this keeps the library usable on
-        compatibility-only test and migration hosts.
+        An unmapped kind uses the declared default. A mapped profile is
+        validated when deployment configuration loads, so this selection is
+        deterministic and never falls back to another profile.
         """
-        preferred = SOURCE_KIND_PROFILES.get(origin_kind)
-        if preferred:
+        preferred = self._profile_routes.get(origin_kind)
+        if preferred is not None:
             profile = self._profile_registry.get(preferred)
-            if profile is not None and all(
-                phase.value in profile.allowed_phases
-                for phase in WorkflowPhase
-            ):
-                return profile
+            if profile is None:
+                raise TaskLedgerError("routed agent profile is unavailable")
+            return profile
         return self._default_profile
 
     def schedule_new(self, *, limit: int = 100) -> ExecutionScheduleResult:
