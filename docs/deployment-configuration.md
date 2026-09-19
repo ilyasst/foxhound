@@ -205,6 +205,40 @@ way the runner asks the worker what run-state schema it speaks before claiming
 any work, and refuses to claim when the answer does not match what it writes.
 See [ADR 0046](architecture/0046-worker-resolved-from-the-running-release.md).
 
+## A unit must not reach into a development checkout
+
+Not every step of a unit is foxhound. The candidate sync and the lifecycle
+bridge each shell out to the sibling `gw` package, and those `ExecStart` lines
+name an interpreter explicitly rather than going through `exec` above. Two
+separate decisions hide in one line there, and only one of them is obvious:
+
+- **Which code runs.** For `gw` steps this is a pinned root on `PYTHONPATH`.
+- **Which interpreter runs it.** This is the path at the front of the command.
+
+Both must come from somewhere a deployment controls. **Neither may be a path
+inside a development checkout** — not the interpreter, not a script, not a
+module root. A clone's virtual environment is rebuilt by whoever is working in
+it and removed outright by unrelated tool updates, so a unit pointed at one
+fails for reasons that have nothing to do with the host, the release, or the
+code it runs, and the failure arrives at whatever hour someone else happened
+to run `pip`.
+
+This is easy to get wrong because the visible half looks right. One deployment
+ran its issue-intake step — the front of the whole intake path — on a shared
+clone's interpreter for weeks while taking its `gw` code correctly from the
+pinned root. Nothing in the unit looked unusual.
+
+Audit a host in one line:
+
+```sh
+grep -h '^ExecStart=' ~/.config/systemd/user/foxhound-*.service{,.d/*.conf} \
+  | grep -- '-checkout\|/src/\|/Repositories/'
+```
+
+Any output is a unit to repoint. Prefer an interpreter owned by a deployed
+component or by a service that is itself deployed; if a host genuinely has no
+such interpreter, that is the thing to fix, not the unit.
+
 ## Gates a machine may stand down
 
 A task passes reader gates on its way through a workflow. Three of them are
