@@ -3471,6 +3471,13 @@ def _start_card_lines(
                 f"🔍 <b>Why it stopped:</b> {_escape(card.failure_digest)}"
                 if html else f"🔍 Why it stopped: {card.failure_digest}"
             )
+        if card.failure_reason == "context_exhausted":
+            return lines + [
+                "",
+                "This work did not fit the runtime context window. Automatic "
+                "retries are stopped; reduce its scope or split it before "
+                "starting another run.",
+            ]
         explanation = (
             "Continue tries again. The runs so far left nothing recorded."
         )
@@ -4302,6 +4309,24 @@ def _button_rows(
 ) -> tuple[tuple[tuple[str, str], ...], ...]:
     kind = card.kind
     if kind is ExecutionCardKind.START:
+        if (
+            card.workflow_status is WorkflowStatus.PARKED
+            and card.failure_reason == "context_exhausted"
+        ):
+            # A measured context refusal cannot be repaired by repeating the
+            # same run, so this set carries no retry. Everything that is not
+            # a retry stays: a reader who has already done the work by hand
+            # still needs Done, and one who cannot act yet still needs
+            # Snooze. Drop abandons a task rather than settling it, and must
+            # not be the only way to close work that merely did not fit.
+            rows = (
+                (("✏️ Reduce scope", "discuss"),),
+                SNOOZE_BUTTON_ROW,
+                (("🗑 Drop", "drop"), ("👥 Reassign", "reassign")),
+            )
+            if approvable:
+                rows = ((("✅ Done", "done"),),) + rows
+            return rows + ((("📋 Task brief", "brief"),),)
         rows: tuple[tuple[tuple[str, str], ...], ...] = (
             (("✅ Done", "done"), ("▶️ Continue", "start")),
             (("🗑 Drop", "drop"), ("✏️ Update", "discuss")),

@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 47
+SCHEMA_VERSION = 48
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -2849,6 +2849,14 @@ _SCHEMA_V47 = (
 );""",
 )
 
+
+# Context exhaustion is a separate terminal condition for one attempt. The
+# workflow table has a closed reason vocabulary, so admitting it requires a
+# table rebuild rather than silently recording it as an ordinary timeout.
+# The migration below takes the current definition from SQLite, preserving
+# every later-added column and constraint while widening only this vocabulary.
+_CONTEXT_EXHAUSTED_REASON = "'result_invalid','context_exhausted'"
+
 _SCHEMA_V46 = (
     """CREATE TABLE IF NOT EXISTS execution_result_artifacts (
     result_id       TEXT NOT NULL REFERENCES task_execution_results(result_id),
@@ -4134,6 +4142,53 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 47
+            if version == 47:
+                connection.execute("PRAGMA foreign_keys = OFF")
+                connection.execute("PRAGMA legacy_alter_table = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    definition = connection.execute(
+                        "SELECT sql FROM sqlite_master WHERE type='table' "
+                        "AND name='task_execution_workflows'"
+                    ).fetchone()
+                    if definition is None:
+                        raise InboxError("candidate inbox schema is incomplete")
+                    workflow_sql = str(definition["sql"])
+                    if "'context_exhausted'" not in workflow_sql:
+                        widened = workflow_sql.replace(
+                            "'result_invalid'", _CONTEXT_EXHAUSTED_REASON,
+                        )
+                        if widened == workflow_sql:
+                            raise InboxError(
+                                "candidate inbox schema is incomplete"
+                            )
+                        connection.execute(
+                            "DROP INDEX task_execution_workflows_ready"
+                        )
+                        connection.execute(
+                            "DROP INDEX task_execution_workflows_priority_ready"
+                        )
+                        connection.execute(
+                            "ALTER TABLE task_execution_workflows RENAME TO "
+                            "task_execution_workflows_v47"
+                        )
+                        connection.execute(widened)
+                        connection.execute(
+                            "INSERT INTO task_execution_workflows "
+                            "SELECT * FROM task_execution_workflows_v47"
+                        )
+                        connection.execute("DROP TABLE task_execution_workflows_v47")
+                        connection.execute(_SCHEMA_V8[1])
+                        connection.execute(_SCHEMA_V32[1])
+                    connection.execute("PRAGMA user_version = 48")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                finally:
+                    connection.execute("PRAGMA legacy_alter_table = OFF")
+                    connection.execute("PRAGMA foreign_keys = ON")
+                version = 48
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:
