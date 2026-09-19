@@ -174,7 +174,15 @@ fragment the new release refuses takes down every store operation at once:
 first step and aborts before installing anything, and the host mirror validates
 both stores and stops.  The effect is not that one profile cannot be edited; it
 is that no profile can be published or installed on any host running the new
-release, while the previously installed profiles keep serving.
+release.
+
+It is also worse than a stalled install. The card service `Requires` the
+install unit, so an install that exits non-zero takes the card service down
+with it: the service does not start, and `systemctl start` reports only
+`A dependency job for foxhound-task-cards.service failed`, naming neither the
+store nor the fragment. Observed on the first promotion of the absolute-path
+guard. Read the install unit's own status before reading anything into the
+card service's.
 
 So the store is brought into compliance first, and the release is promoted
 after.  Rolling the release back restores the old rule, but a store edited in
