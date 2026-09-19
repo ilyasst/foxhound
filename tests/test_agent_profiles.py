@@ -180,6 +180,8 @@ class AgentProfileTests(unittest.TestCase):
             "act review --body-file FILE",
             "record the precise blocker and the bounded continuation needed",
             "stop lower-priority exploration",
+            "Before changing each checkout, read its contributor instructions",
+            "In `result-work.md`, state which instructions you found and applied",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, prompt)
