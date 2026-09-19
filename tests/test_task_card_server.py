@@ -394,6 +394,44 @@ class TaskCardServerTests(unittest.TestCase):
         card = self.execution_cards.due(limit=1)[0]
         return card
 
+    def test_execution_retraction_routes_acknowledge_a_stale_delivery(self):
+        self.execution.schedule(1, expected_task_version=1)
+        self.execution_cards.schedule()
+        delivery = self.execution_cards.claim_next()
+        self.execution_cards.complete_delivery(
+            delivery.card.id,
+            expected_version=delivery.card.version,
+            claim_token=delivery.token,
+            transport="synthetic",
+            delivery_ref="synthetic-stale-message",
+        )
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "UPDATE task_execution_workflows SET status='queued',"
+                "version=version+1,claim_token_digest=NULL,claimed_at=NULL,"
+                "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
+                "current_run_id=NULL WHERE task_id=1"
+            )
+        self.execution_cards.schedule()
+
+        claimed = self.app.dispatch(
+            "execution_retraction_claim",
+            request_document(lease_seconds=60),
+            authorization=f"Bearer {TOKEN}",
+        )
+        self.assertEqual(claimed["status"], "claimed")
+        self.assertEqual(claimed["claim"]["delivery_ref"],
+                         "synthetic-stale-message")
+        completed = self.app.dispatch(
+            "execution_retracted",
+            request_document(
+                card_id=claimed["claim"]["card_id"],
+                claim_token=claimed["claim"]["claim_token"],
+            ),
+            authorization=f"Bearer {TOKEN}",
+        )
+        self.assertEqual(completed["status"], "applied")
+
     def test_execution_queue_resolve_claims_and_resolves_atomically(self):
         card = self._queue_card()
         queue = "q" * 43

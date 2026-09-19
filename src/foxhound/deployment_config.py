@@ -41,7 +41,7 @@ from .task_execution import TaskExecutionService, WorkflowPhase
 
 
 DEPLOYMENT_SCHEMA = "foxhound.deployment-config"
-DEPLOYMENT_SCHEMA_VERSION = 12
+DEPLOYMENT_SCHEMA_VERSION = 13
 MAX_CONFIG_BYTES = 64 * 1024
 
 
@@ -106,6 +106,7 @@ class WorkflowConfig:
     execution_slot_cap: int
     plan_ready_cap: int
     awaiting_reader_cap: int
+    steer_while_running: tuple[str, ...] = ()
     #: Kinds whose recorded plan runs without a card. Defaults to empty so a
     #: configuration written before this key existed keeps asking.
     execute_without_asking: tuple[str, ...] = ()
@@ -138,6 +139,8 @@ class WorkflowConfig:
             result.extend(("--profile-route", f"{source_kind}={profile_id}"))
         for kind in self.plan_without_asking:
             result.extend(("--plan-without-asking", kind))
+        for kind in self.steer_while_running:
+            result.extend(("--steer-while-running", kind))
         for kind in self.skip_planning_for:
             result.extend(("--skip-planning-for", kind))
         for alias in self.reader_aliases:
@@ -424,7 +427,8 @@ def _parse_document(document: object) -> DeploymentConfig:
     if (
         document.get("schema") != DEPLOYMENT_SCHEMA
         or version not in {
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, DEPLOYMENT_SCHEMA_VERSION
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+            DEPLOYMENT_SCHEMA_VERSION
         }
         or isinstance(version, bool)
     ):
@@ -544,7 +548,11 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
         fields = fields | {"skip_planning_for"}
     if version >= 11:
         fields = fields | {"agent_profile_routes"}
-    document = _object(value, fields)
+    # Announcements are opt-in. Keep a current configuration that predates
+    # this declaration valid and byte-for-byte equivalent to an empty list.
+    # This also makes a controlled schema-version upgrade non-disruptive.
+    optional = {"steer_while_running"} if version >= 13 else set()
+    document = _object(value, fields, optional)
     profile = document["default_agent_profile"]
     grants = document["plan_without_asking"]
     execute_grants = (
@@ -556,6 +564,7 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
     routes = _profile_routes(
         document["agent_profile_routes"] if version >= 11 else []
     )
+    steer = document.get("steer_while_running", []) if version >= 13 else []
     caps = tuple(document[key] for key in (
         "execution_slot_cap", "plan_ready_cap", "awaiting_reader_cap"
     ))
@@ -566,6 +575,7 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
         or not _grant_list(act_grants)
         or not _grant_list(aliases)
         or not _grant_list(skipped)
+        or not _grant_list(steer)
         or any(isinstance(cap, bool) or not isinstance(cap, int) for cap in caps)
     ):
         raise DeploymentConfigError("workflow configuration is invalid")
@@ -574,6 +584,7 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
         routes,
         tuple(grants),
         *caps,
+        steer_while_running=tuple(steer),
         execute_without_asking=tuple(execute_grants),
         act_without_asking=tuple(act_grants),
         reader_aliases=tuple(aliases),
@@ -919,6 +930,10 @@ def _validate_runtime(config: DeploymentConfig) -> None:
         )
     action_grants(config.workflow.act_without_asking)
     source_kind_grants(
+        config.workflow.steer_while_running,
+        label="steer-while-running declarations",
+    )
+    source_kind_grants(
         (source_kind for source_kind, _profile in config.workflow.agent_profile_routes),
         label="workflow agent profile routes",
     )
@@ -928,6 +943,7 @@ def _validate_runtime(config: DeploymentConfig) -> None:
         profile_registry=registry,
         default_profile_id=config.workflow.default_agent_profile,
         planning_grants=config.workflow.plan_without_asking,
+        steer_while_running=config.workflow.steer_while_running,
         execution_grants=config.workflow.execute_without_asking,
         skip_planning_for=config.workflow.skip_planning_for,
         action_grants=config.workflow.act_without_asking,

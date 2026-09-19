@@ -12,7 +12,7 @@ make it owner-only (`0600`), and do not commit it, paste it into issues, or
 send its rendered command lines to logs. It contains paths but never token
 values.
 
-Version 12 is current. Five things about it are worth knowing before an
+Version 13 is current. Six things about it are worth knowing before an
 upgrade, because none of them announces itself:
 
 - `card_service.task_work_root` is **required** once delivery is enabled, and
@@ -42,6 +42,12 @@ upgrade, because none of them announces itself:
   evidence. `runtime_log_retention_bytes` is the per-task history limit and
   defaults to 30 MiB. These logs can contain private tool arguments and
   results: they are not artifacts and must never be committed or delivered.
+- Version 13 adds `workflow.steer_while_running`. It is a list of source
+  kinds whose newly admitted runs may raise a Steer card after they have been
+  running for the configured threshold. It is independent of
+  `plan_without_asking`: without planning authority, the Start gate remains
+  and the declaration is inert. Changing the list never retroactively changes
+  a workflow that is already admitted.
 
 Version 5 covers every enabled component that reads or writes the shared
 database: the task-card service, scheduler, one or more runners, feed import,
@@ -55,7 +61,7 @@ before it existed is brought forward.
 ```json
 {
   "schema": "foxhound.deployment-config",
-  "schema_version": 12,
+  "schema_version": 13,
   "database": "/srv/example/private-foxhound-state/foxhound.sqlite3",
   "agent_profile_directory": null,
   "card_service": {
@@ -83,6 +89,7 @@ before it existed is brought forward.
     }],
     "reader_aliases": [],
     "plan_without_asking": ["issue"],
+    "steer_while_running": ["email", "teams", "meeting", "calendar", "alert", "mention", "legacy"],
     "execute_without_asking": ["issue"],
     "skip_planning_for": ["issue"],
     "act_without_asking": ["issue"],
@@ -152,7 +159,7 @@ Set a disabled `card_service`, runner, or database consumer to exactly
 to be declared separately; enabled slots must have distinct names. The
 workflow section remains required because it owns the shared policy and
 limits. Earlier versions remain readable for a controlled transition, but
-only version 11 can declare the complete deployment boundary.
+only version 13 can declare the complete deployment boundary.
 
 `task_card_requeue` may be omitted from an existing version 5 document during
 the transition. Rendering `task-card-requeue` then refuses safely; add it with
@@ -273,6 +280,15 @@ reader's start gate as well as the plan itself: a kind that is still asked
 about before planning would otherwise lose that question too, with no
 declaration saying so. Existing workflow rows are never rewritten when the
 declaration changes.
+
+`steer_while_running` does not grant an advance or add a gate. It permits a
+newly admitted run of that source kind to raise a status card if it remains
+running. The task-card service defaults to a 20-minute threshold for both
+plan and execute passes; deployments may set separate values with
+`--steer-plan-threshold-seconds` and `--steer-execute-threshold-seconds`.
+An `external_action` pass uses the execute threshold.
+The card lets a reader stop the pass and queue a new one with a note; it never
+injects text into an agent that is already running.
 
 `act_without_asking` skips the external-action gate. A reviewed external
 action runs instead of waiting for a second card. This is the strongest of

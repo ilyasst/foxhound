@@ -170,6 +170,7 @@ class ExecutionRunnerTests(unittest.TestCase):
 
         def popen(argv, **kwargs):
             launched["kwargs"] = kwargs
+            self.assertEqual(self.service.get(1).current_run_id, "b" * 32)
             handle = kwargs["stdout"]
             handle.write(b"synthetic agent output\n")
             handle.flush()
@@ -579,9 +580,9 @@ class ExecutionRunnerTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            (result.outcome, result.exit_code), ("released", 70)
+            (result.outcome, result.exit_code), ("released", 0)
         )
-        self.assertFalse(result.ok)
+        self.assertTrue(result.ok)
 
     def test_process_exit_and_start_failure_enter_durable_backoff(self):
         self._ready()

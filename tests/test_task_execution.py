@@ -1667,6 +1667,46 @@ class TaskExecutionTests(unittest.TestCase):
         )
         self.assertEqual(repeated.refusal, WorkflowRefusal.STALE_WORKFLOW)
 
+    def test_current_run_identity_is_fenced_and_cleared_with_the_claim(self):
+        self._schedule_and_start()
+        claim = self._claim()
+        wrong = self.service.attach_run_id(
+            1,
+            expected_version=claim.workflow_version,
+            claim_token=OTHER_TOKEN,
+            run_id="a" * 32,
+        )
+        self.assertEqual(wrong.refusal, WorkflowRefusal.CLAIM_MISMATCH)
+        self.assertIsNone(self.service.get(1).current_run_id)
+        attached = self.service.attach_run_id(
+            1,
+            expected_version=claim.workflow_version,
+            claim_token=claim.token,
+            run_id="a" * 32,
+        )
+        self.assertEqual(attached.disposition, WorkflowDisposition.APPLIED)
+        self.assertEqual(self.service.get(1).current_run_id, "a" * 32)
+        released = self.service.release(
+            1,
+            expected_version=claim.workflow_version,
+            claim_token=claim.token,
+        )
+        self.assertEqual(released.status, WorkflowStatus.QUEUED)
+        self.assertIsNone(self.service.get(1).current_run_id)
+
+    def test_recording_a_result_clears_the_current_run_identity(self):
+        self._schedule_and_start()
+        claim = self._claim()
+        self.assertTrue(self.service.attach_run_id(
+            1,
+            expected_version=claim.workflow_version,
+            claim_token=claim.token,
+            run_id="b" * 32,
+        ).accepted)
+        recorded = self.service.record_result(self._result(claim))
+        self.assertTrue(recorded.accepted)
+        self.assertIsNone(self.service.get(1).current_run_id)
+
     def test_claim_phase_allowlist_is_atomic_and_leaves_other_work_queued(self):
         self._schedule_and_start()
         plan_claim = self._claim()
