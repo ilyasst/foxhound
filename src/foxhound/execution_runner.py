@@ -122,6 +122,9 @@ class ExecutionRunnerConfig:
     #: Where this machine keeps the knowledge base. Per host, never derived:
     #: the sync roots differ across the fleet.
     knowledge_root: Path | None = field(default=None, repr=False)
+    #: Named, deployment-configured roots an agent may refer to in portable
+    #: profile guidance. Missing optional roots are deliberately omitted.
+    deployment_roots: Mapping[str, Path] = field(default_factory=dict, repr=False)
     #: Explicit per-machine Syncthing destinations. They are a pair because a
     #: task must never become searchable without retaining its working evidence,
     #: or retain evidence without leaving the searchable task note.
@@ -224,6 +227,18 @@ class ExecutionRunnerConfig:
             raise ValueError("execution poll interval is invalid")
         if (self.task_work_root is None) != (self.task_kb_root is None):
             raise ValueError("task archive roots must be configured together")
+        if (
+            not isinstance(self.deployment_roots, Mapping)
+            or any(
+                not isinstance(name, str)
+                or re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", name) is None
+                or not isinstance(path, Path)
+                or not path.is_absolute()
+                or not path.is_dir()
+                for name, path in self.deployment_roots.items()
+            )
+        ):
+            raise ValueError("execution deployment roots are invalid")
         for path in (self.task_work_root, self.task_kb_root):
             if path is not None and (
                 not isinstance(path, Path) or not path.is_absolute()
@@ -959,6 +974,9 @@ def _write_state(
             None if config.knowledge_root is None
             else str(config.knowledge_root)
         ),
+        "deployment_roots": {
+            name: str(root) for name, root in sorted(config.deployment_roots.items())
+        },
         "task_work_directory": (
             None if archive is None else str(archive.working_directory)
         ),
@@ -1132,6 +1150,10 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--worker-command", default="foxhound-task-worker")
     parser.add_argument(
+        "--deployment-root", action="append", metavar="NAME=PATH",
+        help="named deployment root available to the worker (repeatable)",
+    )
+    parser.add_argument(
         "--runner-slot", default="default",
         help="stable local execution-slot name; distinct slots may run together",
     )
@@ -1262,6 +1284,16 @@ def _profile_routes(values: Sequence[str] | None) -> dict[str, str]:
     return result
 
 
+def _deployment_roots(values: Sequence[str] | None) -> dict[str, Path]:
+    result: dict[str, Path] = {}
+    for value in values or ():
+        name, separator, raw_path = value.partition("=")
+        if not separator or not name or not raw_path or name in result:
+            raise ValueError("execution deployment roots are invalid")
+        result[name] = Path(raw_path)
+    return result
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -1282,6 +1314,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             action_grants=tuple(args.act_without_asking or ()),
             workflow_policy=_read_workflow_policy(args.workflow_policy),
             knowledge_root=args.knowledge_root,
+            deployment_roots=_deployment_roots(args.deployment_root),
             task_work_root=args.task_work_root,
             task_kb_root=args.task_kb_root,
             runtime_session_database=args.runtime_session_database,

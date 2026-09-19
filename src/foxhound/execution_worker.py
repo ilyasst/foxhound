@@ -69,10 +69,10 @@ from .task_archive import (
 
 
 RUN_STATE_SCHEMA = "foxhound.execution-run-state"
-RUN_STATE_SCHEMA_VERSION = 5
+RUN_STATE_SCHEMA_VERSION = 6
 INSTRUCTIONS_NAME = "agent-instructions.json"
 WORK_CONTEXT_SCHEMA = "foxhound.execution-work-context"
-WORK_CONTEXT_SCHEMA_VERSION = 6
+WORK_CONTEXT_SCHEMA_VERSION = 7
 WORKER_SEARCH_SCHEMA = "foxhound.execution-worker-search"
 RESULT_DRAFT_SCHEMA = "foxhound.execution-result-draft"
 RESULT_DRAFT_READY_SCHEMA = "foxhound.execution-result-draft-ready"
@@ -220,6 +220,7 @@ class ExecutionRunState:
     execution_grants: frozenset[str] = field(default_factory=frozenset)
     action_grants: frozenset[str] = field(default_factory=frozenset)
     knowledge_root: str | None = None
+    deployment_roots: Mapping[str, str] = field(default_factory=dict)
     task_work_directory: str | None = None
     task_kb_file: str | None = None
     task_run_directory: str | None = None
@@ -292,6 +293,11 @@ class ExecutionWorker:
                 # profile-versioned; this contract names only the approved
                 # read/research surface.
                 "local_research_clients": _local_research_clients(),
+                # Stable symbolic roots supplied by deployment configuration.
+                # They are runtime facts, rather than profile policy, so an
+                # identical reviewed profile works on hosts with different
+                # mounts or with no optional root at all.
+                "deployment_roots": dict(state.deployment_roots),
                 "worker_operations": _worker_operations(state.phase),
                 "external_effects_allowed": (
                     state.phase is WorkflowPhase.EXTERNAL_ACTION
@@ -983,16 +989,18 @@ def load_run_state(path: str | os.PathLike[str]) -> ExecutionRunState:
         "task_work_directory", "task_kb_file", "task_run_directory",
     }
     grant_fields = {"execution_grants", "action_grants"}
+    root_fields = {"deployment_roots"}
     _exact_fields(
         document,
         base_fields | (
-            archive_fields if version in {4, RUN_STATE_SCHEMA_VERSION} else set()
-        ) | (grant_fields if version == RUN_STATE_SCHEMA_VERSION else set()),
+            archive_fields if version in {4, 5, RUN_STATE_SCHEMA_VERSION} else set()
+        ) | (grant_fields if version in {5, RUN_STATE_SCHEMA_VERSION} else set())
+        | (root_fields if version == RUN_STATE_SCHEMA_VERSION else set()),
         "execution run state",
     )
     if (
         document["schema"] != RUN_STATE_SCHEMA
-        or document["schema_version"] not in {3, 4, RUN_STATE_SCHEMA_VERSION}
+        or document["schema_version"] not in {3, 4, 5, RUN_STATE_SCHEMA_VERSION}
         or isinstance(document["schema_version"], bool)
         or not isinstance(document["run_id"], str)
         or not _RUN_ID_RE.fullmatch(document["run_id"])
@@ -1068,6 +1076,9 @@ def load_run_state(path: str | os.PathLike[str]) -> ExecutionRunState:
         execution_grants=execution_grants,
         action_grants=action_grants,
         knowledge_root=_knowledge_root(document["knowledge_root"]),
+        deployment_roots=_deployment_roots(
+            document.get("deployment_roots") if version == RUN_STATE_SCHEMA_VERSION else {}
+        ),
         task_work_directory=task_work_directory,
         task_kb_file=task_kb_file,
         task_run_directory=task_run_directory,
@@ -1101,6 +1112,28 @@ def _knowledge_root(value: object) -> str | None:
     if not path.is_absolute() or not path.is_dir():
         raise ExecutionWorkerConfigError("execution run state is invalid")
     return str(path)
+
+
+def _deployment_roots(value: object) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise ExecutionWorkerConfigError("execution run state is invalid")
+    roots: dict[str, str] = {}
+    for name, raw_path in value.items():
+        if (
+            not isinstance(name, str)
+            or not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", name)
+            or not isinstance(raw_path, str)
+        ):
+            raise ExecutionWorkerConfigError("execution run state is invalid")
+        path = Path(raw_path)
+        # Absoluteness is a property of the recorded value; existence is not.
+        # The runner already refuses to start with a root that is not a
+        # directory, and a mount that drops mid-run must not make the run's
+        # own state unreadable.
+        if not path.is_absolute():
+            raise ExecutionWorkerConfigError("execution run state is invalid")
+        roots[name] = str(path)
+    return dict(sorted(roots.items()))
 
 
 def load_result_draft(
