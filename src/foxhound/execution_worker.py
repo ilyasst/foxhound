@@ -1696,7 +1696,8 @@ def _repository_result(
     if state.phase is WorkflowPhase.EXECUTE and repository_impact:
         if outcome == "completed":
             raise ExecutionWorkerDraftError(
-                "repository execution must await an approved follow-through"
+                "repository execution must await an approved follow-through "
+                "or explicitly declare false in result-repository-impact.json"
             )
         if (outcome == "awaiting_external"
                 and not _has_origin_follow_through_action(actions, origin)):

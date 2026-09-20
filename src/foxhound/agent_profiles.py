@@ -968,7 +968,7 @@ _GENERAL_PROMPT_TEMPLATE_V7 = _GENERAL_PROMPT_TEMPLATE_V6.replace(
     "\n".join((
         "Prepare the reviewable result early enough that useful work cannot be lost to the turn limit. Write owner-only `result-summary.txt` and `result-work.md` in the starting directory, plus `result-questions.json`, `result-external-actions.json`, and `result-deliverables.json` only when those arrays are non-empty.",
         "When you create working files that a reader needs to verify the result, list their relative paths as strings in owner-only `result-artifacts.json`. Foxhound preserves only that explicit list plus the transcript and standard result files; never list run state, instructions, repository checkouts, dependencies, caches, or copied private source material.",
-        "Questions are strings. External actions may be strings or objects with `action` plus optional `requires` and `channel`; deliverables may be strings or objects with `body` plus optional `label`, `recipient`, and `subject`. Use objects when the extra fields make the review card complete.",
+        "Questions are strings. External actions may be strings or objects with `action` plus optional `requires`, `channel`, and `target`; deliverables may be strings or objects with `body` plus optional `label`, `recipient`, and `subject`. Use objects when the extra fields make the review card complete.",
         "Put every verified source issue, related issue, pull request, commit, and check needed for review in `result-work.md` as a descriptive Markdown link. Do not make the reader reconstruct or search for those references.",
     )),
 )
@@ -1042,10 +1042,10 @@ _GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V12
 # revision fails at every runner and scheduler startup, rather than leaving a
 # stale test in a different file to discover the mismatch later.
 GENERAL_PROFILE_RELEASE_REVISION = (
-    "ff86e18c5665b5613b4966d7664fc71a3c8e427bf2e70248e59b80e84190700b"
+    "737d26e5f592111fe8b503ddb00b3c2cfa903bc5ab686e85a3025d840f4b8e24"
 )
 GENERAL_PROFILE_RELEASE_PROMPT_SHA256 = (
-    "7f536c67589aa76e92ca8a632980dc26287fa4b33f207c7108f995abc6079f3e"
+    "633222b4b04edd4438660c5625f35e3cb5dbc4e2a82119640a55a4994f24fc51"
 )
 
 

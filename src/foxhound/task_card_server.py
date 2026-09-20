@@ -1506,6 +1506,7 @@ def _queue_projection_records(records: object) -> list[dict[str, str]]:
             "text": _queue_projection_text(record.text, 3_000),
             "requires": _queue_projection_text(record.requires, 200),
             "channel": _queue_projection_text(record.channel, 200),
+            "target": _queue_projection_text(record.target, 200),
             "label": _queue_projection_text(record.label, 200),
             "recipient": _queue_projection_text(record.recipient, 200),
             "subject": _queue_projection_text(record.subject, 500),

@@ -1339,6 +1339,28 @@ class ExecutionWorkerTests(unittest.TestCase):
             }, self.run_directory)
         self.assertEqual(result["repository_references"], [])
 
+    def test_missing_repository_impact_produces_corrective_error(self):
+        state = SimpleNamespace(
+            database_path=self.database,
+            task_id=1,
+            phase=WorkflowPhase.EXECUTE,
+        )
+        origin = SimpleNamespace(
+            kind="issue",
+            record_id="github.com/example-org/example-repo",
+            item_id="42",
+        )
+        with mock.patch(
+            "foxhound.execution_worker._repository_origin", return_value=origin,
+        ):
+            with self.assertRaisesRegex(
+                ExecutionWorkerDraftError, "explicitly declare false in result-repository-impact.json",
+            ):
+                _repository_result(state, {
+                    "outcome": "completed",
+                    "deliverables": ["Analysis with a bounded recommendation"],
+                }, self.run_directory)
+
     def test_github_external_completion_needs_worker_receipt(self):
         state = SimpleNamespace(
             database_path=self.database,
