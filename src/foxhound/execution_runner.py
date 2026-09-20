@@ -668,6 +668,16 @@ def _run_claim(
             transcript = _open_transcript(directory)
         except OSError:
             transcript = None
+        if transcript is not None:
+            # The run directory and its transcript now exist together. The
+            # pointer is optional (a database race must not cost the run),
+            # but never record one before there is something safe to read.
+            service.attach_run_id(
+                claim.task_id,
+                expected_version=claim.workflow_version,
+                claim_token=claim.token,
+                run_id=run_id,
+            )
         try:
             process = popen(
                 list(command),
@@ -703,7 +713,9 @@ def _run_claim(
                     sleep=sleep, clock=clock
                 )
                 return ExecutionRunResult(
-                    terminal, 0 if terminal == "recorded" else NO_PROGRESS_EXIT_CODE,
+                    terminal,
+                    0 if terminal in {"recorded", "released"}
+                    else NO_PROGRESS_EXIT_CODE,
                     claim.task_id, forced,
                 )
 
@@ -744,7 +756,8 @@ def _run_claim(
                 if terminal is not None:
                     return ExecutionRunResult(
                         terminal,
-                        0 if terminal == "recorded" else NO_PROGRESS_EXIT_CODE,
+                        0 if terminal in {"recorded", "released"}
+                        else NO_PROGRESS_EXIT_CODE,
                         claim.task_id,
                     )
                 if not corrective_attempted:
@@ -1047,7 +1060,8 @@ def _failure_result(
     if terminal in {"recorded", "released"}:
         return ExecutionRunResult(
             terminal,
-            0 if terminal == "recorded" else NO_PROGRESS_EXIT_CODE,
+            0 if terminal in {"recorded", "released"}
+            else NO_PROGRESS_EXIT_CODE,
             claim.task_id,
             forced,
         )
