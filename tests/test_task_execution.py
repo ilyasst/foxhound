@@ -1949,6 +1949,41 @@ class TaskExecutionTests(unittest.TestCase):
         self.assertEqual(stale.scheduled, 0)
         self.assertEqual(self.service.get(1).status, WorkflowStatus.CANCELLED)
 
+    def test_a_resurfaced_issue_task_gets_a_fresh_workflow(self):
+        """End to end: the reopen is worthless if no work is ever scheduled.
+
+        Reopening the task and re-scheduling it live in different modules, and
+        each looked correct alone. Before the scheduler gate was relaxed a
+        re-surfaced `issue` task reopened and then sat open forever, because
+        its completed workflow still satisfied the join.
+        """
+        self._bind_origin(1, "issue")
+        self._schedule_and_start()
+        self.service.record_result(self._result(
+            self._claim(), outcome=ExecutionOutcome.COMPLETED
+        ))
+        self.assertEqual(self._grant_service("issue").schedule_new().scheduled, 0)
+
+        # The reader closes it, then the source moves and the ledger reopens
+        # the task -- the state ADR 0039 now produces.
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "UPDATE task_execution_workflows SET status='completed',"
+                "completed_at=? WHERE task_id=1",
+                (self._now(),),
+            )
+            connection.execute(
+                "UPDATE tasks SET status='open',version=version+1 WHERE id=1"
+            )
+            connection.commit()
+
+        resurfaced = self._grant_service("issue").schedule_new()
+
+        self.assertEqual(resurfaced.scheduled, 1)
+        self.assertEqual(
+            self.service.get(1).status, WorkflowStatus.AWAITING_START
+        )
+
     def test_granting_execution_does_not_grant_a_completed_result(self):
         """Only the plan-approval gate is granted; an ending still lands."""
         self._bind_origin(1, "issue")

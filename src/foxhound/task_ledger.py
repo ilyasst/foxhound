@@ -672,6 +672,25 @@ class TaskLedger:
                         # A binding pointing at a task that does not exist is
                         # corruption, not a race, and must still stop the pass.
                         raise _NativeIntakeConflict
+                    if task["status"] == TaskStatus.DONE:
+                        # ADR 0039: a task in `done` re-surfaces when its
+                        # source moves. The work it recorded may never have
+                        # reached the outside world, and refusing to reopen
+                        # made that unreachable forever -- the only remedy was
+                        # to recreate the task outside the ledger.
+                        #
+                        # `dropped` deliberately does not reopen below: a
+                        # reader who dropped a task rejected the work itself,
+                        # and a source edit is not grounds to overrule that.
+                        connection.execute(
+                            "UPDATE tasks SET status=?,closed_at=NULL "
+                            "WHERE id=?",
+                            (TaskStatus.OPEN, int(binding["task_id"])),
+                        )
+                        task = connection.execute(
+                            "SELECT * FROM tasks WHERE id=?",
+                            (int(binding["task_id"]),),
+                        ).fetchone()
                     if task["status"] != TaskStatus.OPEN:
                         # The reader got there first. That is the ordinary end
                         # of a task's life, and a producer that still holds it
@@ -1685,9 +1704,15 @@ class TaskLedger:
             "AND status NOT IN ('awaiting_start','completed','cancelled')",
             (int(binding["task_id"]),),
         ).fetchone()
+        # A task in `done` re-surfaces: the work it recorded may never have
+        # reached the outside world, and refusing to reopen made that
+        # unreachable forever. `dropped` stays terminal -- a reader who dropped
+        # a task rejected the work itself, and a source edit does not overrule
+        # that. See ADR 0039, which this replaced the refusal in.
+        reopening = task["status"] == TaskStatus.DONE
         reader_conflict = (
             binding["lifecycle_resolution"] == "reader_conflict"
-            or task["status"] != TaskStatus.OPEN
+            or (task["status"] != TaskStatus.OPEN and not reopening)
             or int(task["version"]) != int(binding["task_version"])
             or active_workflow is not None
         )
@@ -1696,6 +1721,11 @@ class TaskLedger:
         resolution = "reader_conflict"
         if not reader_conflict:
             version += 1
+            if reopening:
+                connection.execute(
+                    "UPDATE tasks SET status=?,closed_at=NULL WHERE id=?",
+                    (TaskStatus.OPEN, int(binding["task_id"])),
+                )
             desired_owner = (
                 _row_owner_values(task)
                 if bool(task["owner_pinned"])

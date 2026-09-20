@@ -599,11 +599,22 @@ class TaskExecutionService:
                     "LEFT JOIN task_execution_workflows AS w "
                     "ON w.task_id=t.id WHERE t.status='open' "
                     "AND (w.task_id IS NULL OR (w.task_version!=t.version "
-                    "AND EXISTS(SELECT 1 FROM task_candidate_bindings AS review "
+                    # A re-surfaced task needs a fresh workflow whatever its
+                    # source kind. Without this, ADR 0039 reopens a task whose
+                    # completed workflow still satisfies this join, and it
+                    # never runs again.
+                    #
+                    # `completed` only, deliberately. `cancelled` is what
+                    # `_cancel_stale` writes moments earlier in this same pass
+                    # for a workflow whose task moved underneath it, and that
+                    # reconciliation must keep ending in a cancellation rather
+                    # than turning into an immediate re-schedule.
+                    "AND (w.status='completed' "
+                    "OR EXISTS(SELECT 1 FROM task_candidate_bindings AS review "
                     "JOIN candidate_inbox AS source "
                     "ON source.candidate_id=review.candidate_id "
                     "WHERE review.task_id=t.id AND review.relation='accepted' "
-                    "AND source.source_kind='review_request'))) "
+                    "AND source.source_kind='review_request')))) "
                     "AND NOT EXISTS("
                     " SELECT 1 FROM task_candidate_bindings AS b JOIN "
                     " task_candidate_lifecycle AS l ON l.candidate_id=b.candidate_id "
@@ -712,11 +723,22 @@ class TaskExecutionService:
                     "LEFT JOIN task_execution_workflows AS w "
                     "ON w.task_id=t.id WHERE t.status='open' "
                     "AND (w.task_id IS NULL OR (w.task_version!=t.version "
-                    "AND EXISTS(SELECT 1 FROM task_candidate_bindings AS review "
+                    # A re-surfaced task needs a fresh workflow whatever its
+                    # source kind. Without this, ADR 0039 reopens a task whose
+                    # completed workflow still satisfies this join, and it
+                    # never runs again.
+                    #
+                    # `completed` only, deliberately. `cancelled` is what
+                    # `_cancel_stale` writes moments earlier in this same pass
+                    # for a workflow whose task moved underneath it, and that
+                    # reconciliation must keep ending in a cancellation rather
+                    # than turning into an immediate re-schedule.
+                    "AND (w.status='completed' "
+                    "OR EXISTS(SELECT 1 FROM task_candidate_bindings AS review "
                     "JOIN candidate_inbox AS source "
                     "ON source.candidate_id=review.candidate_id "
                     "WHERE review.task_id=t.id AND review.relation='accepted' "
-                    "AND source.source_kind='review_request'))) "
+                    "AND source.source_kind='review_request')))) "
                     "AND NOT EXISTS("
                     " SELECT 1 FROM task_candidate_bindings AS blocked JOIN "
                     " task_candidate_lifecycle AS l "
