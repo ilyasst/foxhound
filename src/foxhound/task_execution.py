@@ -323,6 +323,14 @@ class ExecutionReadiness:
     #: This is a subset of ``parked``, kept separate so operators can count
     #: unsatisfiable work rather than infer it from busy runner slots.
     context_exhausted: int
+    #: Workflows that have stopped and been restarted more than once in the
+    #: phase they are in now without ever recording a result for it.  Not a
+    #: subset of ``parked``: the loop this counts spends most of its time
+    #: queued or running, because a reader answering the Start card requeues
+    #: it immediately.  Two such workflows once took about a fifth of all
+    #: slot time over two days while recording nothing, and no number
+    #: anywhere made that visible.
+    unproductive: int
     completed: int
     cancelled: int
 
@@ -1945,6 +1953,25 @@ class TaskExecutionService:
                 "SUM(status='parked') AS parked,"
                 "SUM(status='parked' AND "
                 "last_failure_reason='context_exhausted') AS context_exhausted,"
+                # Derived from the event log for the same reason the card is:
+                # `failure_count` resets on park, so nothing live carries the
+                # history across one.
+                # Every outer column is spelled out. `e.phase=phase` reads
+                # as the obvious correlation and is not one: the inner table
+                # has a `phase` column too, SQLite resolves the bare name to
+                # it, and the predicate quietly becomes a tautology.
+                "SUM((SELECT count(*) FROM task_execution_events AS e "
+                "     WHERE e.task_id=task_execution_workflows.task_id "
+                "     AND e.kind='parked' "
+                "     AND e.phase=task_execution_workflows.phase "
+                "     AND e.task_version=task_execution_workflows.task_version"
+                "    )>1 "
+                "    AND NOT EXISTS(SELECT 1 FROM task_execution_results AS r "
+                "     WHERE r.task_id=task_execution_workflows.task_id "
+                "     AND r.phase=task_execution_workflows.phase "
+                "     AND r.task_version="
+                "         task_execution_workflows.task_version)"
+                ") AS unproductive,"
                 "SUM(status='completed') AS completed,"
                 "SUM(status='cancelled') AS cancelled "
                 "FROM task_execution_workflows",
@@ -1955,7 +1982,7 @@ class TaskExecutionService:
             for name in (
                 "awaiting_start", "snoozed", "ready", "cooling",
                 "running", "expired", "awaiting_review", "parked",
-                "context_exhausted", "completed", "cancelled",
+                "context_exhausted", "unproductive", "completed", "cancelled",
             )
         ))
 
