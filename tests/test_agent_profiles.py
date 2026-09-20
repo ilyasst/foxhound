@@ -18,6 +18,8 @@ from foxhound.agent_profiles import (
     GENERAL_PROFILE_RELEASE_PROMPT_SHA256,
     GENERAL_PROFILE_RELEASE_REVISION,
     MAX_MANIFEST_BYTES,
+    PHASE_CONTRACT_PRECEDENCE,
+    AgentProfile,
     AgentProfileError,
     AgentProfileRegistry,
     WORKER_COMMAND_TOKEN,
@@ -129,6 +131,55 @@ class AgentProfileTests(unittest.TestCase):
                 "profiles": profiles,
             },
             "catalog.json",
+        )
+
+    def test_every_rendered_prompt_leads_with_phase_contract_precedence(self):
+        """Profile content is deployment-owned; this cannot be left to it.
+
+        The runtime puts its own guidance ahead of the profile prompt, and
+        that guidance tells the model never to end a turn with a plan. The
+        phase contract needs the opposite, so the resolution is prepended by
+        the code that renders any profile rather than authored into one.
+        """
+        profile = AgentProfile(
+            profile_id="synthetic",
+            display_name="Synthetic",
+            runtime="hermes",
+            prompt_template=f"Run {WORKER_COMMAND_TOKEN} context.",
+            toolsets=("terminal",),
+            max_turns=4,
+            timeout_seconds=60,
+            claim_lease_seconds=600,
+            heartbeat_seconds=30,
+            kill_grace_seconds=10,
+            allowed_phases=("plan", "execute", "external_action"),
+        )
+        prompt = profile.render_prompt("synthetic-worker")
+
+        self.assertTrue(prompt.startswith(PHASE_CONTRACT_PRECEDENCE))
+        self.assertLess(
+            prompt.index("# Precedence"),
+            prompt.index("Run synthetic-worker context."),
+        )
+        for required in (
+            "awaiting_plan",
+            "awaiting_external",
+            "what follows wins",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, prompt)
+
+    def test_phase_contract_precedence_does_not_move_a_profile_revision(self):
+        """A published profile stays pinned when this text changes.
+
+        The revision digests the stored document, not the rendered prompt, so
+        the resolution reaches profiles that were published before it existed
+        and no deployment has to republish to receive it.
+        """
+        profile = general_profile()
+        self.assertEqual(profile.revision, GENERAL_PROFILE_RELEASE_REVISION)
+        self.assertNotIn(
+            PHASE_CONTRACT_PRECEDENCE, profile.document()["prompt_template"],
         )
 
     def test_general_profile_is_exact_runner_compatibility_profile(self):

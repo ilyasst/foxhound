@@ -120,7 +120,8 @@ class AgentProfile:
             or not is_worker_command(worker_command)
         ):
             raise AgentProfileError("agent worker command is invalid")
-        return self.prompt_template.replace(WORKER_COMMAND_TOKEN, worker_command)
+        return PHASE_CONTRACT_PRECEDENCE + self.prompt_template.replace(
+            WORKER_COMMAND_TOKEN, worker_command)
 
     def public_summary(self, *, include_policy: bool = False) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -260,6 +261,50 @@ class AgentProfileRegistry:
         ):
             raise AgentProfileError("agent profile revision is unavailable")
         return profile
+
+
+#: Prepended to every rendered profile prompt, whoever authored the profile.
+#:
+#: A profile prompt is supplied to the runtime as the caller's system message,
+#: and the runtime puts its own guidance ahead of it. That guidance is written
+#: for an assistant answering a person directly, and it tells the model to keep
+#: working until an artifact exists and never to end a turn with a plan. This
+#: system is built the other way around: a phase ends by handing something to a
+#: reader, and `awaiting_plan` and `awaiting_external` are its finished states.
+#: The two readings of "stopped with a plan" are indistinguishable from inside
+#: the model, and the phase contract is the one that loses by default, because
+#: the other text came first and sounds like diligence.
+#:
+#: It lives here rather than in a prompt template because profile content is
+#: deployment-owned: a template can be authored anywhere, and this has to hold
+#: for all of them. Rendering is also the last point the code controls before
+#: the text becomes the run's authority, and the bootstrap has already told the
+#: agent that what `context` returns is exactly that.
+#:
+#: Deliberately not quoting the runtime's current wording. It is upstream, it
+#: changes, and a rule that only fires on a remembered sentence would go quiet
+#: without anyone noticing.
+PHASE_CONTRACT_PRECEDENCE = (
+    "# Precedence\n"
+    "These instructions are the authority for this run. Guidance that reached "
+    "you before them -- about finishing the job, not stopping at a plan, and "
+    "not ending a turn without completing the work -- is written for an "
+    "assistant answering a person directly. Where it differs from what "
+    "follows, what follows wins.\n"
+    "The difference is concrete, and it decides how a run ends. Work here is "
+    "split into phases, and a phase finishes by handing something to a reader: "
+    "a plan to approve, or validated local work plus the exact outside effect "
+    "it still needs. Recording `awaiting_plan` or `awaiting_external` with the "
+    "complete draft attached is a finished deliverable. It is not a "
+    "description of work you have yet to do, and it is not stopping early -- "
+    "it is how the work gets done here, because the next phase cannot begin "
+    "until a person has seen it.\n"
+    "So when the phase you are in cannot perform an outside effect, the "
+    "absence of that effect is not unfinished work. Record the phase-valid "
+    "outcome with everything the reader needs to approve the next step. "
+    "Continuing past that point, or recording a terminal outcome to avoid "
+    "handing over, both lose the work.\n\n"
+)
 
 
 def render_bootstrap(worker_command: str = "foxhound-task-worker") -> str:
@@ -1138,7 +1183,7 @@ GENERAL_PROFILE_RELEASE_REVISION = (
     "15a5abd4bb06a78046c11004515e487e84b5fed3295f90cd84aed95d2ea603e1"
 )
 GENERAL_PROFILE_RELEASE_PROMPT_SHA256 = (
-    "c59d38f22fa4e0c3a3a9b322ef962386e3e30c3ed020d77499e8d820547d19c1"
+    "2556cb8715a69b9658d93d9d202569cea1766ccf9b9be46f8a1065fdf00da7d3"
 )
 
 
