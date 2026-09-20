@@ -47,3 +47,30 @@ def test_cleanup_ignores_non_repos(tmp_path: Path):
     
     cleanup_run_clones(run_dir)
     assert non_repo.exists()
+
+
+def test_cleanup_preserves_a_clone_when_the_check_itself_fails(tmp_path: Path):
+    """A check that could not run must not be read as permission to delete.
+
+    These clones are live while the runner works in them, so `git log` exits
+    non-zero for ordinary reasons -- an `index.lock`, a repository caught
+    mid-operation, a permissions hiccup. The first version of this cleanup
+    treated every non-zero exit as "no unpushed commits" and removed the
+    directory, which deleted precisely when it was least sure.
+    """
+    clone = tmp_path / "repo-unreadable"
+    (clone / ".git").mkdir(parents=True)
+    keep = clone / "work.txt"
+    keep.write_text("work that only exists here")
+
+    # `.git` is a directory but not a repository, so git exits 128.
+    probe = subprocess.run(
+        ["git", "-C", str(clone), "log", "--oneline", "--all", "--not", "--remotes"],
+        capture_output=True, text=True, check=False,
+    )
+    assert probe.returncode != 0, "precondition: the check must fail here"
+
+    cleanup_run_clones(tmp_path)
+
+    assert clone.is_dir(), "an unreadable clone must be preserved, not removed"
+    assert keep.read_text() == "work that only exists here"

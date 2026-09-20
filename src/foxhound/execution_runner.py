@@ -906,7 +906,13 @@ def cleanup_run_clones(run_directory: Path) -> None:
                 )
             except OSError:
                 continue
-            if result.returncode == 0 and result.stdout.strip():
+            # A check that could not run has not established anything. Only a
+            # successful, empty answer means "no unpushed work"; a non-zero
+            # exit means git could not tell us, and the clone stays. These
+            # directories are live -- an index.lock, a repo mid-operation or a
+            # permissions hiccup all exit non-zero, and deleting on those
+            # would be deleting precisely when we are least sure.
+            if result.returncode != 0 or result.stdout.strip():
                 continue
             try:
                 shutil.rmtree(entry)
