@@ -4099,5 +4099,15 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertEqual(after_events, event_count)
 
 
+    def test_execution_board_status_handles_unrecognized_workflow_status(self):
+        from foxhound.execution_cards import execution_board_status
+        self.execution.schedule(1, expected_task_version=1)
+        self.cards.schedule()
+        card = self.cards.due(limit=1)[0]
+        object.__setattr__(card, "workflow_status", "unknown_future_status")
+        status = execution_board_status(card)
+        self.assertEqual(status, "unrecognized")
+
+
 if __name__ == "__main__":
     unittest.main()

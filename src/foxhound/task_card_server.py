@@ -54,6 +54,7 @@ from .task_cards import (
     TASK_CARD_ACTIONS,
     TASK_CARD_READS,
     TaskCardService,
+    TaskCardDetail,
     CardStatus,
     render_duplicate_view,
     render_task_review_card,
@@ -76,6 +77,9 @@ STATS_SCHEMA = "foxhound.task-card-service.stats"
 STATS_SCHEMA_VERSION = 2
 QUEUE_SCHEMA = "foxhound.task-card-service.queue"
 QUEUE_SCHEMA_VERSION = 1
+TASK_DETAIL_SCHEMA = "foxhound.task-card-service.detail"
+TASK_DETAIL_SCHEMA_VERSION = 1
+
 BOARD_SCHEMA = "foxhound.task-card-service.board"
 BOARD_SCHEMA_VERSION = 1
 RESOLVE_SCHEMA = "foxhound.task-card-service.resolve"
@@ -93,6 +97,9 @@ EXECUTION_DETAIL_SCHEMA = "foxhound.execution-card-service.detail"
 EXECUTION_DETAIL_SCHEMA_VERSION = 2
 EXECUTION_QUEUE_SCHEMA = "foxhound.execution-card-service.queue"
 EXECUTION_QUEUE_SCHEMA_VERSION = 1
+TASK_DETAIL_SCHEMA = "foxhound.task-card-service.detail"
+TASK_DETAIL_SCHEMA_VERSION = 1
+
 EXECUTION_BOARD_SCHEMA = "foxhound.execution-card-service.board"
 EXECUTION_BOARD_SCHEMA_VERSION = 1
 EXECUTION_RESOLVE_SCHEMA = "foxhound.execution-card-service.resolve"
@@ -122,6 +129,7 @@ ROUTES = {
     "/v2/task-cards/stats": "stats_scoped",
     "/v1/task-cards/queue": "queue",
     "/v1/task-cards/board": "board",
+    "/v1/task-cards/detail": "detail",
     "/v1/task-cards/resolve": "resolve",
     "/v1/task-cards/schedule": "schedule",
     "/v1/task-cards/claim": "claim",
@@ -238,6 +246,7 @@ class TaskCardApplication:
     def __init__(
         self,
         cards: TaskCardService,
+    TaskCardDetail,
         token: str | Mapping[str, str],
         *,
         execution_cards: ExecutionCardService | None = None,
@@ -424,6 +433,31 @@ class TaskCardApplication:
                 "ok": True,
                 "cards": [_queue_card_document(card) for card in cards],
             }
+        if operation == "detail":
+            request = _strict_request(
+                payload, required={"card_id", "card_version"}, optional=set()
+            )
+            try:
+                identity = self.resolve_consumer(authorization)
+            except TaskCardConsumerIdentityError as exc:
+                raise TaskCardServerRequestError(
+                    "consumer_unresolved",
+                    "task card consumer role is unresolved",
+                    HTTPStatus.FORBIDDEN,
+                ) from exc
+            if identity is None or identity.role != QUEUE_VIEW_ROLE:
+                raise TaskCardServerRequestError(
+                    "role_forbidden",
+                    "task card detail requires the queue_view role",
+                    HTTPStatus.FORBIDDEN,
+                )
+            return _task_detail_document(
+                self.cards.detail(
+                    _integer(request["card_id"], minimum=1),
+                    expected_version=_integer(request["card_version"], minimum=1),
+                )
+            )
+
         if operation == "board":
             request = _request(payload, required={"limit"})
             try:

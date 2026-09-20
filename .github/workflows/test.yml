@@ -18,7 +18,7 @@ jobs:
         # this is Linux, and the worker-resolution tests are sensitive to
         # where a console script lands.
         python-version: ["3.11", "3.13"]
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
         with:

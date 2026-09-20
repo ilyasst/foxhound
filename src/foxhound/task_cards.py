@@ -337,6 +337,29 @@ class ClaimAtCeiling:
 
 
 @dataclass(frozen=True)
+
+@dataclass(frozen=True)
+class TaskCardDetail:
+    """Bounded, non-mutating current-run projection for a queue reader."""
+
+    disposition: CardDisposition
+    card_id: int
+    version: int | None = None
+    status: CardStatus | None = None
+    task_id: int | None = None
+    task_version: int | None = None
+    due_at: str | None = None
+    text: str | None = None
+    owner: str | None = None
+    origin_kind: str | None = None
+    origin_record_id: str | None = None
+    origin_item_id: str | None = None
+    refusal: CardRefusal | None = None
+
+    @property
+    def accepted(self) -> bool:
+        return self.disposition is not CardDisposition.REFUSED
+
 class CardOperationResult:
     """Content-free result for delivery and reader operations."""
 
@@ -549,6 +572,50 @@ class TaskCardService:
                 (now, limit),
             ).fetchall()
         return tuple(_card(row) for row in rows)
+
+    def detail(self, card_id: int, *, expected_version: int) -> TaskCardDetail:
+        """Return a bounded current-run view without claiming the card."""
+        def refused(reason: CardRefusal) -> TaskCardDetail:
+            return TaskCardDetail(
+                CardDisposition.REFUSED, card_id, refusal=reason
+            )
+
+        if not _valid_identity(card_id, expected_version):
+            return refused(CardRefusal.INVALID_ARGUMENT)
+        
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    c.id, c.version, c.status, c.due_at,
+                    t.id, t.version, t.text, t.owner,
+                    t.origin_kind, t.origin_record_id, t.origin_item_id
+                FROM foxhound_task_cards AS c
+                JOIN foxhound_tasks AS t ON c.task_id = t.id
+                WHERE c.id = ?
+                """,
+                (card_id,),
+            ).fetchone()
+            if row is None:
+                return refused(CardRefusal.NOT_FOUND)
+            refusal = _card_guard(row, expected_version)
+            if refusal is not None:
+                return refused(refusal)
+            
+            return TaskCardDetail(
+                CardDisposition.UNCHANGED,
+                card_id,
+                version=row[1],
+                status=CardStatus(row[2]),
+                due_at=row[3],
+                task_id=row[4],
+                task_version=row[5],
+                text=row[6],
+                owner=row[7],
+                origin_kind=row[8],
+                origin_record_id=row[9],
+                origin_item_id=row[10],
+            )
 
     def board(self, *, limit: int = BOARD_CARD_LIMIT) -> TaskBoard:
         """Return current intake work without claiming or changing a card."""

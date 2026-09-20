@@ -253,6 +253,8 @@ class TaskCardServerTests(unittest.TestCase):
                          (EXECUTION_BOARD_SCHEMA, True))
         self.assertEqual(board["columns"][0],
                          {"status": "ready_to_start", "total": 1})
+        self.assertEqual(board["columns"][-1],
+                         {"status": "unrecognized", "total": 0})
         self.assertEqual(len(board["cards"]), 1)
         card = board["cards"][0]
         self.assertEqual(card["board_status"], "ready_to_start")

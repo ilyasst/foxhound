@@ -151,7 +151,7 @@ class ExecutionCardKind(StrEnum):
 EXECUTION_BOARD_STATUSES = (
     "ready_to_start", "queued", "running", "plan_review",
     "external_review", "result_review", "snoozed", "parked",
-    "completed", "cancelled",
+    "completed", "cancelled", "unrecognized",
 )
 
 
@@ -2611,7 +2611,7 @@ def execution_board_status(card: ExecutionReviewCard) -> str:
             ExecutionCardKind.PLAN_REVIEW: "plan_review",
             ExecutionCardKind.EXTERNAL_REVIEW: "external_review",
             ExecutionCardKind.RESULT_REVIEW: "result_review",
-        }.get(card.kind, "ready_to_start")
+        }.get(card.kind, "unrecognized")
     return {
         WorkflowStatus.AWAITING_START: "ready_to_start",
         WorkflowStatus.QUEUED: "queued",
@@ -2620,7 +2620,7 @@ def execution_board_status(card: ExecutionReviewCard) -> str:
         WorkflowStatus.PARKED: "parked",
         WorkflowStatus.COMPLETED: "completed",
         WorkflowStatus.CANCELLED: "cancelled",
-    }[status]
+    }.get(status, "unrecognized")
 
 
 def render_execution_review_card(
