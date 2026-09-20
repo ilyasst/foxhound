@@ -12,7 +12,7 @@ make it owner-only (`0600`), and do not commit it, paste it into issues, or
 send its rendered command lines to logs. It contains paths but never token
 values.
 
-Version 12 is current. Five things about it are worth knowing before an
+Version 14 is current. Seven things about it are worth knowing before an
 upgrade, because none of them announces itself:
 
 - `card_service.task_work_root` is **required** once delivery is enabled, and
@@ -43,6 +43,20 @@ upgrade, because none of them announces itself:
   defaults to 30 MiB. These logs can contain private tool arguments and
   results: they are not artifacts and must never be committed or delivered.
 
+- Version 13 adds `execution_runners[].deployment_roots`: named roots a
+  portable profile can refer to while each host resolves them. An empty object
+  is what its absence meant.
+- Version 14 adds `execution_runners[].agent_model` and
+  `agent_provider`, which choose the inference backend for **that runner's**
+  agents. Both `null` is the default and means the agent runtime's own
+  configured backend: nothing is added to the command, and the runtime's
+  configuration is neither read nor written. This distinction is the point of
+  the fields — a deployment that wants one slot on a different backend states
+  it here, next to the slot, instead of changing a runtime default that every
+  other user of that runtime on the machine also gets. A provider without a
+  model is rejected at load; see
+  [ADR 0048](architecture/0048-per-runner-inference-backend.md).
+
 Version 5 covers every enabled component that reads or writes the shared
 database: the task-card service, scheduler, one or more runners, feed import,
 native intake, execution-card requeue, lifecycle-outcome export, fused task
@@ -55,7 +69,7 @@ before it existed is brought forward.
 ```json
 {
   "schema": "foxhound.deployment-config",
-  "schema_version": 12,
+  "schema_version": 14,
   "database": "/srv/example/private-foxhound-state/foxhound.sqlite3",
   "agent_profile_directory": null,
   "card_service": {
@@ -98,6 +112,8 @@ before it existed is brought forward.
     "gw_alias": "example-operator",
     "gw_token_file": "/srv/example/private-foxhound-state/gw.token",
     "agent_command": "hermes",
+    "agent_model": null,
+    "agent_provider": null,
     "worker_command": "foxhound-task-worker",
     "runner_slot": "primary",
     "knowledge_root": null,

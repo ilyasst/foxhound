@@ -33,6 +33,7 @@ from foxhound.execution_runner import (
     _exclusive_lock,
     _runner_lock_path,
     agent_prompt,
+    agent_selection_argv,
     hermes_argv,
     main,
     profile_argv,
@@ -1347,6 +1348,108 @@ class ExecutionRunnerTests(unittest.TestCase):
         self.assertIsNotNone(
             run.call_args.args[0].profile_registry.get("specialist")
         )
+
+    def test_declared_backend_is_selected_before_the_subcommand(self):
+        profile = load_registry().get("general")
+        argv = profile_argv(
+            "synthetic-agent --local",
+            profile,
+            worker_command="synthetic-worker",
+            model="synthetic-model-a",
+            provider="synthetic-provider",
+        )
+
+        self.assertEqual(
+            argv[:6],
+            (
+                "synthetic-agent",
+                "--local",
+                "--model",
+                "synthetic-model-a",
+                "--provider",
+                "synthetic-provider",
+            ),
+        )
+        self.assertEqual(argv[6], "chat")
+
+    def test_an_undeclared_backend_adds_nothing_to_the_invocation(self):
+        profile = load_registry().get("general")
+        selected = profile_argv("synthetic-agent", profile)
+
+        self.assertEqual(selected[0], "synthetic-agent")
+        self.assertEqual(selected[1], "chat")
+        for flag in ("--model", "--provider"):
+            self.assertNotIn(flag, selected)
+            self.assertNotIn(flag, hermes_argv("synthetic-agent", max_turns=2))
+        self.assertEqual(agent_selection_argv(None, None), ())
+
+    def test_an_unusable_backend_selection_is_refused_before_any_claim(self):
+        unusable = (
+            (None, "synthetic-provider"),
+            ("--not-a-model", None),
+            ("synthetic model", None),
+            ("synthetic-model-a", "synthetic provider"),
+            ("synthetic-model-a", "--not-a-provider"),
+            ("", None),
+            ("synthetic-model-a\x00", None),
+        )
+        for model, provider in unusable:
+            with self.subTest(model=model, provider=provider):
+                with self.assertRaises(ValueError):
+                    agent_selection_argv(model, provider)
+                with self.assertRaises(ValueError):
+                    self._config(agent_model=model, agent_provider=provider)
+
+    def test_a_corrective_resume_runs_on_the_backend_the_turn_started_on(self):
+        self._ready()
+        launches = []
+
+        def popen(argv, **kwargs):
+            launches.append(tuple(argv))
+            transcript = kwargs["stdout"]
+            if len(launches) == 1:
+                transcript.write(b"session_id: synthetic-session-1\n")
+                transcript.flush()
+                return FakeProcess(exit_code=0)
+            state = load_run_state(
+                Path(kwargs["env"]["FOXHOUND_EXECUTION_STATE"])
+            )
+
+            def record():
+                TaskExecutionService(state.database_path).record_result(
+                    ExecutionResultEnvelope(
+                        result_id=RESULT_ID,
+                        task_id=state.task_id,
+                        task_version=state.task_version,
+                        workflow_version=state.workflow_version,
+                        phase=state.phase,
+                        claim_token=state.claim_token,
+                        outcome=ExecutionOutcome.AWAITING_PLAN,
+                        summary="Synthetic recovered result",
+                        work_markdown="Synthetic recovered plan",
+                    )
+                )
+
+            return FakeProcess(callback=record)
+
+        run_once(
+            self._config(
+                agent_model="synthetic-model-a",
+                agent_provider="synthetic-provider",
+            ),
+            popen=popen,
+            run_id_factory=lambda: "9" * 32,
+            terminate=self._terminator,
+        )
+
+        self.assertEqual(len(launches), 2)
+        selection = ("--model", "synthetic-model-a",
+                     "--provider", "synthetic-provider")
+        for launch in launches:
+            with self.subTest(launch=launch[0]):
+                index = launch.index("chat")
+                self.assertEqual(launch[index - 4:index], selection)
+        self.assertIn("--resume", launches[1])
 
 
 if __name__ == "__main__":

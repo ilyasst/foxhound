@@ -98,6 +98,12 @@ _SESSION_ID_LINE = re.compile(
     rb"(?m)^session_id:\s*([A-Za-z0-9][A-Za-z0-9._-]{0,127})\s*$"
 )
 _SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+#: One inference model or provider name, as the agent runtime names it.  A
+#: single argument: no whitespace to split on, no leading dash to be read as
+#: another flag, and nothing that needs quoting to survive the process
+#: boundary.  Deliberately narrower than what some catalog might accept --
+#: this value is chosen by the deployment, not discovered.
+_AGENT_SELECTION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,127}$")
 _CORRECTIVE_TURN_PROMPT = (
     "The preceding execution turn ended without recording a result. "
     "Do not do new work. Use exactly one worker operation now: record the "
@@ -123,6 +129,14 @@ class ExecutionRunnerConfig:
     gw_alias: str = field(repr=False)
     gw_token_file: Path = field(repr=False)
     agent_command: str = field(default="hermes", repr=False)
+    #: Which inference backend this runner's agents run on.  Unset -- the
+    #: default -- means the agent runtime's own configured backend: no
+    #: argument is added and no runtime configuration is read.  Set, they are
+    #: passed to the agent command for this runner's processes alone, so a
+    #: single slot can be moved without changing a default that every other
+    #: user of that runtime on the machine shares.
+    agent_model: str | None = None
+    agent_provider: str | None = None
     profile_registry: AgentProfileRegistry = field(
         default_factory=load_registry, repr=False
     )
@@ -167,6 +181,7 @@ class ExecutionRunnerConfig:
         ):
             raise ValueError("execution runner configuration is invalid")
         _agent_command_argv(self.agent_command)
+        agent_selection_argv(self.agent_model, self.agent_provider)
         if not isinstance(self.profile_registry, AgentProfileRegistry):
             raise ValueError("agent profile registry is invalid")
         if (
@@ -302,12 +317,42 @@ def agent_prompt(worker_command: str = "foxhound-task-worker") -> str:
         raise ValueError("execution worker command is invalid") from exc
 
 
+def agent_selection_argv(
+    model: str | None, provider: str | None
+) -> tuple[str, ...]:
+    """Return the arguments that put one agent on a chosen inference backend.
+
+    Empty when neither is declared, which is both the default and exactly the
+    invocation this runner made before a selection could be expressed at all.
+
+    A provider without a model is refused here rather than at agent start.
+    Carrying whatever model the runtime happens to be configured with across
+    to a different provider is a mismatch, and one discovered by the agent
+    runtime costs a claimed workflow to learn.
+    """
+    if provider is not None and model is None:
+        raise ValueError("execution agent inference selection is invalid")
+    argv: list[str] = []
+    for option, value in (("--model", model), ("--provider", provider)):
+        if value is None:
+            continue
+        if (
+            not isinstance(value, str)
+            or _AGENT_SELECTION.fullmatch(value) is None
+        ):
+            raise ValueError("execution agent inference selection is invalid")
+        argv.extend((option, value))
+    return tuple(argv)
+
+
 def hermes_argv(
     command: str,
     *,
     max_turns: int,
     worker_command: str = "foxhound-task-worker",
     toolsets: str | None = None,
+    model: str | None = None,
+    provider: str | None = None,
 ) -> tuple[str, ...]:
     if (
         not isinstance(max_turns, int)
@@ -318,6 +363,11 @@ def hermes_argv(
     base = _agent_command_argv(command)
     argv = [
         *base,
+        # Before the subcommand: these select the runtime itself, and the
+        # runtime accepts them there for exactly that reason.  Keeping them
+        # out of the subcommand's arguments also keeps this runner's own
+        # per-run arguments a fixed, readable shape.
+        *agent_selection_argv(model, provider),
         "chat",
         "--query",
         agent_prompt(worker_command),
@@ -340,6 +390,8 @@ def profile_argv(
     *,
     worker_command: str = "foxhound-task-worker",
     source: str = "tool",
+    model: str | None = None,
+    provider: str | None = None,
 ) -> tuple[str, ...]:
     """Build the exact Hermes invocation for one validated profile.
 
@@ -360,6 +412,7 @@ def profile_argv(
     base = _agent_command_argv(command)
     return (
         *base,
+        *agent_selection_argv(model, provider),
         "chat",
         "--query",
         agent_prompt(worker_command),
@@ -379,6 +432,8 @@ def corrective_argv(
     *,
     session_id: str,
     source: str,
+    model: str | None = None,
+    provider: str | None = None,
 ) -> tuple[str, ...]:
     """Resume one lost turn solely to finish its worker lifecycle action.
 
@@ -398,6 +453,11 @@ def corrective_argv(
         raise ValueError("execution corrective resume is invalid")
     return (
         *_agent_command_argv(command),
+        # The same backend the lost turn ran on.  This turn resumes that
+        # session to close it out; finishing it somewhere else would hand the
+        # accumulated context to a different model for the one call that
+        # decides what is recorded.
+        *agent_selection_argv(model, provider),
         "chat",
         "--query",
         _CORRECTIVE_TURN_PROMPT,
@@ -518,6 +578,8 @@ def _run_claim(
             profile,
             worker_command=_worker_command(config),
             source="foxhound-" + run_id,
+            model=config.agent_model,
+            provider=config.agent_provider,
         )
     except ValueError:
         _fail_claim(service, claim, "startup_failed")
@@ -696,6 +758,8 @@ def _run_claim(
                                 profile,
                                 session_id=session_id,
                                 source="foxhound-" + run_id,
+                                model=config.agent_model,
+                                provider=config.agent_provider,
                             )
                             process = popen(
                                 list(corrective),
@@ -1246,6 +1310,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--gw-alias", required=True)
     parser.add_argument("--gw-token-file", required=True, type=Path)
     parser.add_argument("--agent-command", default="hermes")
+    parser.add_argument(
+        "--agent-model",
+        help="inference model for this runner's agents; omitted means the "
+             "agent runtime's own default",
+    )
+    parser.add_argument(
+        "--agent-provider",
+        help="inference provider serving --agent-model; requires it",
+    )
     parser.add_argument("--agent-profile-directory", type=Path)
     parser.add_argument("--default-agent-profile", default="general")
     parser.add_argument(
@@ -1407,6 +1480,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             gw_alias=args.gw_alias,
             gw_token_file=args.gw_token_file,
             agent_command=args.agent_command,
+            agent_model=args.agent_model,
+            agent_provider=args.agent_provider,
             profile_registry=load_registry(args.agent_profile_directory),
             default_agent_profile=args.default_agent_profile,
             profile_routes=_profile_routes(args.profile_route),
