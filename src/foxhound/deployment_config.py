@@ -21,7 +21,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .agent_profiles import AgentProfileError, load_registry
-from .execution_runner import ExecutionRunnerConfig
+from .execution_runner import ExecutionRunnerConfig, agent_selection_argv
 from .execution_worker import ExecutionWorkerConfigError, load_knowledge_config
 from .source_policy import (
     action_grants,
@@ -42,7 +42,7 @@ from .task_execution import TaskExecutionService, WorkflowPhase
 
 
 DEPLOYMENT_SCHEMA = "foxhound.deployment-config"
-DEPLOYMENT_SCHEMA_VERSION = 13
+DEPLOYMENT_SCHEMA_VERSION = 15
 _DEPLOYMENT_ROOT_NAME = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 MAX_CONFIG_BYTES = 64 * 1024
 
@@ -108,6 +108,7 @@ class WorkflowConfig:
     execution_slot_cap: int
     plan_ready_cap: int
     awaiting_reader_cap: int
+    steer_while_running: tuple[str, ...] = ()
     #: Kinds whose recorded plan runs without a card. Defaults to empty so a
     #: configuration written before this key existed keeps asking.
     execute_without_asking: tuple[str, ...] = ()
@@ -140,6 +141,8 @@ class WorkflowConfig:
             result.extend(("--profile-route", f"{source_kind}={profile_id}"))
         for kind in self.plan_without_asking:
             result.extend(("--plan-without-asking", kind))
+        for kind in self.steer_while_running:
+            result.extend(("--steer-while-running", kind))
         for kind in self.skip_planning_for:
             result.extend(("--skip-planning-for", kind))
         for alias in self.reader_aliases:
@@ -155,6 +158,14 @@ class ExecutionRunnerDeploymentConfig:
     gw_alias: str | None = None
     gw_token_file: Path | None = None
     agent_command: str | None = None
+    #: The inference backend this runner's agents use.  Both unset is the
+    #: default and means the agent runtime's own configured backend: nothing
+    #: is added to the command and that runtime's configuration is neither
+    #: read nor written.  Declaring them moves this slot alone, which is what
+    #: makes a mixed deployment -- some slots on one backend, some on another
+    #: -- a configuration edit rather than a machine-wide change.
+    agent_model: str | None = None
+    agent_provider: str | None = None
     worker_command: str | None = None
     runner_slot: str | None = None
     knowledge_root: Path | None = None
@@ -199,6 +210,14 @@ class ExecutionRunnerDeploymentConfig:
         ]
         if profile_directory is not None:
             result.extend(("--agent-profile-directory", str(profile_directory)))
+        # Omitted when unset, so a deployment that declares no selection
+        # renders the command it rendered before these fields existed.
+        for option, selection in (
+            ("--agent-model", self.agent_model),
+            ("--agent-provider", self.agent_provider),
+        ):
+            if selection is not None:
+                result.extend((option, selection))
         for source_kind, profile_id in workflow.agent_profile_routes:
             result.extend(("--profile-route", f"{source_kind}={profile_id}"))
         for name, root in sorted(self.deployment_roots.items()):
@@ -432,7 +451,8 @@ def _parse_document(document: object) -> DeploymentConfig:
     if (
         document.get("schema") != DEPLOYMENT_SCHEMA
         or version not in {
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, DEPLOYMENT_SCHEMA_VERSION
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+            DEPLOYMENT_SCHEMA_VERSION
         }
         or isinstance(version, bool)
     ):
@@ -552,7 +572,11 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
         fields = fields | {"skip_planning_for"}
     if version >= 11:
         fields = fields | {"agent_profile_routes"}
-    document = _object(value, fields)
+    # Announcements are opt-in. Keep a current configuration that predates
+    # this declaration valid and byte-for-byte equivalent to an empty list.
+    # This also makes a controlled schema-version upgrade non-disruptive.
+    optional = {"steer_while_running"} if version >= 15 else set()
+    document = _object(value, fields, optional)
     profile = document["default_agent_profile"]
     grants = document["plan_without_asking"]
     execute_grants = (
@@ -564,6 +588,7 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
     routes = _profile_routes(
         document["agent_profile_routes"] if version >= 11 else []
     )
+    steer = document.get("steer_while_running", []) if version >= 15 else []
     caps = tuple(document[key] for key in (
         "execution_slot_cap", "plan_ready_cap", "awaiting_reader_cap"
     ))
@@ -574,6 +599,7 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
         or not _grant_list(act_grants)
         or not _grant_list(aliases)
         or not _grant_list(skipped)
+        or not _grant_list(steer)
         or any(isinstance(cap, bool) or not isinstance(cap, int) for cap in caps)
     ):
         raise DeploymentConfigError("workflow configuration is invalid")
@@ -582,6 +608,7 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
         routes,
         tuple(grants),
         *caps,
+        steer_while_running=tuple(steer),
         execute_without_asking=tuple(execute_grants),
         act_without_asking=tuple(act_grants),
         reader_aliases=tuple(aliases),
@@ -624,6 +651,29 @@ def _grant_list(value: object) -> bool:
     )
 
 
+def _agent_selection(
+    model: object, provider: object
+) -> tuple[str | None, str | None]:
+    """Validate one runner's declared inference backend.
+
+    Refused here rather than at agent start: a deployment error that only
+    appears when an agent runs costs a claimed workflow to discover, and the
+    claim is what a reader is waiting on.  ``None`` for both is the supported
+    way to say "whatever the agent runtime is configured to use".
+    """
+    if model is not None and not isinstance(model, str):
+        raise DeploymentConfigError("execution runner configuration is invalid")
+    if provider is not None and not isinstance(provider, str):
+        raise DeploymentConfigError("execution runner configuration is invalid")
+    try:
+        agent_selection_argv(model, provider)
+    except ValueError as exc:
+        raise DeploymentConfigError(
+            "execution runner configuration is invalid"
+        ) from exc
+    return model, provider
+
+
 def _parse_execution_runner(
     value: object, *, version: int
 ) -> ExecutionRunnerDeploymentConfig:
@@ -644,12 +694,18 @@ def _parse_execution_runner(
         fields.update({"runtime_session_database", "runtime_log_retention_bytes"})
     if version >= 13:
         fields.add("deployment_roots")
+    if version >= 14:
+        fields.update({"agent_model", "agent_provider"})
     document = _object(value, fields)
     strings = tuple(document[key] for key in (
         "gw_endpoint", "gw_alias", "agent_command", "worker_command", "runner_slot"
     ))
     if any(not isinstance(item, str) for item in strings):
         raise DeploymentConfigError("execution runner configuration is invalid")
+    agent_model, agent_provider = (
+        _agent_selection(document["agent_model"], document["agent_provider"])
+        if version >= 14 else (None, None)
+    )
     runtime_database = (
         _optional_absolute_path(document["runtime_session_database"])
         if version >= 12 else None
@@ -676,6 +732,8 @@ def _parse_execution_runner(
         gw_alias=strings[1],
         gw_token_file=_absolute_path(document["gw_token_file"]),
         agent_command=strings[2],
+        agent_model=agent_model,
+        agent_provider=agent_provider,
         worker_command=strings[3],
         runner_slot=strings[4],
         knowledge_root=_optional_absolute_path(document["knowledge_root"]),
@@ -950,6 +1008,10 @@ def _validate_runtime(config: DeploymentConfig) -> None:
         )
     action_grants(config.workflow.act_without_asking)
     source_kind_grants(
+        config.workflow.steer_while_running,
+        label="steer-while-running declarations",
+    )
+    source_kind_grants(
         (source_kind for source_kind, _profile in config.workflow.agent_profile_routes),
         label="workflow agent profile routes",
     )
@@ -959,6 +1021,7 @@ def _validate_runtime(config: DeploymentConfig) -> None:
         profile_registry=registry,
         default_profile_id=config.workflow.default_agent_profile,
         planning_grants=config.workflow.plan_without_asking,
+        steer_while_running=config.workflow.steer_while_running,
         execution_grants=config.workflow.execute_without_asking,
         skip_planning_for=config.workflow.skip_planning_for,
         action_grants=config.workflow.act_without_asking,
@@ -987,6 +1050,8 @@ def _validate_runtime(config: DeploymentConfig) -> None:
                 gw_alias=runner.gw_alias,
                 gw_token_file=runner.gw_token_file,
                 agent_command=runner.agent_command,
+                agent_model=runner.agent_model,
+                agent_provider=runner.agent_provider,
                 profile_registry=registry,
                 default_agent_profile=config.workflow.default_agent_profile,
                 worker_command=runner.worker_command,

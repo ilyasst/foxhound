@@ -1,4 +1,4 @@
-# ADR 0023: Producer candidate lifecycle
+# ADR 0049: Producer candidate lifecycle
 
 Status: accepted.
 

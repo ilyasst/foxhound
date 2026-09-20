@@ -12,7 +12,7 @@ make it owner-only (`0600`), and do not commit it, paste it into issues, or
 send its rendered command lines to logs. It contains paths but never token
 values.
 
-Version 12 is current. Five things about it are worth knowing before an
+Version 15 is current. Eight things about it are worth knowing before an
 upgrade, because none of them announces itself:
 
 - `card_service.task_work_root` is **required** once delivery is enabled, and
@@ -42,6 +42,19 @@ upgrade, because none of them announces itself:
   evidence. `runtime_log_retention_bytes` is the per-task history limit and
   defaults to 30 MiB. These logs can contain private tool arguments and
   results: they are not artifacts and must never be committed or delivered.
+- Version 13 adds `execution_runners[].deployment_roots`: named roots a
+  portable profile can refer to while each host resolves them. An empty object
+  is what its absence meant.
+- Version 14 adds `execution_runners[].agent_model` and
+  `agent_provider`, which choose the inference backend for **that runner's**
+  agents. Both `null` is the default and means the agent runtime's own
+  configured backend: nothing is added to the command, and the runtime's
+  configuration is neither read nor written. This distinction is the point of
+  the fields — a deployment that wants one slot on a different backend states
+  it here, next to the slot, instead of changing a runtime default that every
+  other user of that runtime on the machine also gets. A provider without a
+  model is rejected at load; see
+  [ADR 0048](architecture/0048-per-runner-inference-backend.md).
 
 Version 5 covers every enabled component that reads or writes the shared
 database: the task-card service, scheduler, one or more runners, feed import,
@@ -52,10 +65,16 @@ and all paths are absolute. The one exception is noted with the component it
 applies to: `task_card_requeue` may be omitted while a deployment written
 before it existed is brought forward.
 
+- Version 15 adds `workflow.steer_while_running`. It is a list of source
+  kinds whose newly admitted runs may raise a Steer card after they have been
+  running for the configured threshold. It is independent of
+  `plan_without_asking`: without planning authority, the Start gate remains
+  and the declaration is inert. Changing the list never retroactively changes
+  a workflow that is already admitted.
 ```json
 {
   "schema": "foxhound.deployment-config",
-  "schema_version": 12,
+  "schema_version": 15,
   "database": "/srv/example/private-foxhound-state/foxhound.sqlite3",
   "agent_profile_directory": null,
   "card_service": {
@@ -83,6 +102,7 @@ before it existed is brought forward.
     }],
     "reader_aliases": [],
     "plan_without_asking": ["issue"],
+    "steer_while_running": ["email", "teams", "meeting", "calendar", "alert", "mention", "legacy"],
     "execute_without_asking": ["issue"],
     "skip_planning_for": ["issue"],
     "act_without_asking": ["issue"],
@@ -98,6 +118,8 @@ before it existed is brought forward.
     "gw_alias": "example-operator",
     "gw_token_file": "/srv/example/private-foxhound-state/gw.token",
     "agent_command": "hermes",
+    "agent_model": null,
+    "agent_provider": null,
     "worker_command": "foxhound-task-worker",
     "runner_slot": "primary",
     "knowledge_root": null,
@@ -153,7 +175,7 @@ Set a disabled `card_service`, runner, or database consumer to exactly
 to be declared separately; enabled slots must have distinct names. The
 workflow section remains required because it owns the shared policy and
 limits. Earlier versions remain readable for a controlled transition, but
-only version 11 can declare the complete deployment boundary.
+only version 13 can declare the complete deployment boundary.
 
 `task_card_requeue` may be omitted from an existing version 5 document during
 the transition. Rendering `task-card-requeue` then refuses safely; add it with
@@ -293,6 +315,15 @@ about before planning would otherwise lose that question too, with no
 declaration saying so. Existing workflow rows are never rewritten when the
 declaration changes.
 
+`steer_while_running` does not grant an advance or add a gate. It permits a
+newly admitted run of that source kind to raise a status card if it remains
+running. The task-card service defaults to a 20-minute threshold for both
+plan and execute passes; deployments may set separate values with
+`--steer-plan-threshold-seconds` and `--steer-execute-threshold-seconds`.
+An `external_action` pass uses the execute threshold.
+The card lets a reader stop the pass and queue a new one with a note; it never
+injects text into an agent that is already running.
+
 `act_without_asking` skips the external-action gate. A reviewed external
 action runs instead of waiting for a second card. This is the strongest of
 the three and the only one whose subject is an effect other people can see,
@@ -356,3 +387,46 @@ attempt does nothing.
 a private timer after native intake. It binds only proposed duplicate pairs to
 reader cards; it does not create ordinary task-review cards. The existing
 delivery consumer then claims and sends those cards to Telegram.
+
+## Multi-runner deployment
+
+The execution runner has two separate concurrency concepts. First, `--execution-slot-cap` limits the number of tasks in the active `execute` phase system-wide to prevent out-of-memory cascades across concurrent worker processes. Second, each execution runner process handles only one task workflow at a time because it blocks on bounded agent work. Thus, raising the slot cap alone does not enable concurrent agent execution.
+
+To actually run multiple tasks at once, you must deploy multiple independent runner processes. This is safely supported through a generic systemd template unit for the runners, combined with explicitly configured, distinct `runner_slot` identifiers in the shared configuration file.
+
+### Adding runners safely
+
+Because the single-runner behavior is explicit and backward compatible, scaling out involves configuring slots and transitioning to instantiated services:
+
+1. **Assign distinct slot identities:** In your private deployment JSON file, declare each runner under the `execution_runners` list. Set each runner's `enabled` to `true`, and ensure each gets a unique string as its `runner_slot`.
+2. **Apply the shared slot cap:** Pass the same `--execution-slot-cap=N` (for example, 2 or 3) to the command-line arguments of every worker instance. The database enforces this ceiling globally across all stable slot names.
+3. **Use a systemd template:** Instead of a single static `foxhound-execution-runner.service`, define a generic template `foxhound-execution-runner@.service`. The instance name `%i` becomes the runner slot.
+
+```ini
+[Unit]
+Description=Foxhound Execution Runner (%i)
+After=network.target
+
+[Service]
+Type=simple
+User=foxhound
+# The runner reads its configured agent environment and paths from the shared JSON.
+# Pass the instance name (%i) and the global slot cap.
+ExecStart=/opt/foxhound/venv/bin/foxhound-deployment-config exec \
+    --component execution-runner \
+    --runner-slot %i \
+    -- /opt/foxhound/venv/bin/foxhound-execution-runner \
+       --execution-slot-cap 3
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+4. **Start instances without interrupting:** A fenced run on an existing runner is shielded. When adding runners, do not restart an active instance. Simply instantiate the additional workers:
+   ```bash
+   systemctl enable --now foxhound-execution-runner@slot-2.service
+   systemctl enable --now foxhound-execution-runner@slot-3.service
+   ```
+   The original single runner can eventually be migrated to `foxhound-execution-runner@slot-1.service` during a natural idle window, or safely disabled while the others pick up the load. To scale down, `systemctl stop` a worker; active execution state remains durable and the scheduled task will either finish its phase and exit or time out gracefully.
