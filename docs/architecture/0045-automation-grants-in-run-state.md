@@ -44,8 +44,25 @@ not change `last_result_id`. A run that recorded one is reported as
 
 ## Consequences
 
-The grant applies at the moment of recording, so no card is created and
-none has to be retired. Reconciling workflows that were already waiting when
+The grant applies at the moment of recording, so no *gate* card is created and
+none has to be retired. It does leave a bounded run summary: work that needs no
+approval was otherwise entirely silent, and a reader who is told nothing cannot
+tell an automated phase that advanced from one that never ran.
+
+A summary is a delivery record, not a gate, and the separation is enforced
+rather than described. It carries no controls, settles when it is delivered,
+and is bounded by its own capacity band, so it can neither displace a card that
+wants an answer nor relax the ceiling that limits how many such cards a reader
+sees at once. At most one summary is active per task: a workflow that advances
+three times leaves one summary saying where it got to, not three saying where
+it passed through.
+
+It travels as an ordinary execution card row rather than a new kind. The
+transport validates `kind` against a closed set and refuses anything else —
+after the claim has been handed out, which holds the delivery slot and stops
+every card, not just the unrecognised one. The distinction is carried by a
+column and by an `informational` flag on the claim, which that transport
+already accepts. Reconciling workflows that were already waiting when
 policy changed is a separate concern, and stays in scheduling.
 
 The runner and the worker must be the same build. This paragraph once noted

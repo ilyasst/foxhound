@@ -235,6 +235,11 @@ class ClaimAtCeiling:
 # not prevent an approval or result from being shown.
 EXECUTION_CARD_CLAIM_CEILINGS = {
     "queue_view": 2, "drip": 20, "queue_view_steer": 3, "drip_steer": 5,
+    # A run summary asks nothing of the reader, so its band bounds how much
+    # of the transport it may occupy at once, not how much of the reader's
+    # attention.  It is deliberately small: a summary that cannot be sent
+    # now is superseded by the next one for that task rather than queued.
+    "queue_view_summary": 2, "drip_summary": 5,
 }
 STEER_DIGEST_REFRESH_INTERVAL = timedelta(minutes=30)
 STEER_DIGEST_MAX_ATTEMPTS = 3
@@ -294,6 +299,9 @@ class ExecutionReviewCard:
     failure_reason: str = field(default="", repr=False)
     failure_exit_code: int | None = field(default=None, repr=False)
     failure_run_id: str | None = field(default=None, repr=False)
+    #: Informational: this card reports what a run did and asks
+    #: nothing.  It carries no controls and settles when it is delivered.
+    summary_only: bool = False
     #: Why the last attempt stopped, in the summariser's words. A reason
     #: and an exit code say how the process ended, which cannot tell an
     #: exhausted turn budget from a saturated backend from a refused
@@ -709,8 +717,8 @@ class ExecutionCardService:
         now = self._now()
         with closing(self._connect()) as connection:
             rows = connection.execute(
-                self._card_select()
-                + " WHERE c.status='pending' AND ("
+                self._card_select(summaries=False)
+                + " AND c.status='pending' AND ("
                 + "w.status<>'snoozed' OR w.due_at<=?) "
                 + "ORDER BY c.id LIMIT ?",
                 (now, limit),
@@ -748,7 +756,7 @@ class ExecutionCardService:
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("BEGIN IMMEDIATE")
             try:
-                row = connection.execute(self._card_select() + " WHERE c.id=?", (card_id,)).fetchone()
+                row = connection.execute(self._card_select(summaries=False) + " AND c.id=?", (card_id,)).fetchone()
                 refusal = _card_guard(row, expected_version)
                 if refusal is None and row["status"] != ExecutionCardStatus.PENDING:
                     refusal = ExecutionCardRefusal.INVALID_STATE
@@ -760,10 +768,15 @@ class ExecutionCardService:
                 kind = ExecutionCardKind(row["kind"]) if row is not None else None
                 steer = kind is ExecutionCardKind.STEER
                 ceiling_key = "queue_view_steer" if steer else "queue_view"
+                # Summaries are excluded here as they are from the row lookup
+                # above: the console is never offered one, so one in flight
+                # must not consume the capacity it holds for cards that do
+                # need an answer.
                 held = connection.execute(
                     "SELECT count(*) FROM execution_review_cards WHERE "
                     "status IN ('delivering','delivered') AND consumer_digest=? "
-                    "AND kind " + ("='steer'" if steer else "<>'steer'"),
+                    "AND summary_only=0 AND kind "
+                    + ("='steer'" if steer else "<>'steer'"),
                     (consumer_digest,),
                 ).fetchone()[0]
                 if refusal is None and held >= EXECUTION_CARD_CLAIM_CEILINGS[ceiling_key]:
@@ -902,8 +915,8 @@ class ExecutionCardService:
                         now=now,
                     )
                 row = connection.execute(
-                    self._card_select()
-                    + " WHERE c.status='pending' "
+                    self._card_select(summaries=False)
+                    + " AND c.status='pending' "
                     "ORDER BY CASE c.kind "
                     "WHEN 'result_review' THEN 0 "
                     "WHEN 'plan_review' THEN 1 "
@@ -911,23 +924,41 @@ class ExecutionCardService:
                     "WHEN 'start' THEN 2 "
                     "ELSE 3 END,c.created_at,c.id LIMIT 1"
                 ).fetchone()
+                at_ceiling: ClaimAtCeiling | None = None
+                if row is not None:
+                    if not _current_card(row):
+                        raise TaskLedgerError(
+                            "execution card state is invalid")
+                    band, held = self._band(connection, row, consumer_role,
+                                            consumer_digest)
+                    band_ceiling = EXECUTION_CARD_CLAIM_CEILINGS[band]
+                    if held >= band_ceiling:
+                        # The reader's surface is full.  Rather than spending
+                        # this claim on nothing, offer a summary: it settles
+                        # on delivery and occupies no part of that surface.
+                        # The ceiling itself is never relaxed -- the card that
+                        # did not fit stays pending and is offered again.
+                        at_ceiling = ClaimAtCeiling(int(held), band_ceiling)
+                        row = None
+                if row is None:
+                    row = connection.execute(
+                        self._card_select(summaries=True)
+                        + " AND c.status='pending' "
+                        "ORDER BY c.created_at,c.id LIMIT 1"
+                    ).fetchone()
+                    if row is not None and not _current_card(row):
+                        raise TaskLedgerError(
+                            "execution card state is invalid")
                 if row is None:
                     connection.commit()
-                    return None
-                if not _current_card(row):
-                    raise TaskLedgerError("execution card state is invalid")
-                steer = row["kind"] == ExecutionCardKind.STEER
-                band = consumer_role + ("_steer" if steer else "")
+                    return at_ceiling
+                band, held = self._band(connection, row, consumer_role,
+                                        consumer_digest)
                 band_ceiling = EXECUTION_CARD_CLAIM_CEILINGS[band]
-                held = connection.execute(
-                    "SELECT count(*) FROM execution_review_cards WHERE "
-                    "status IN ('delivering','delivered') AND "
-                    "consumer_digest=? AND kind " + ("='steer'" if steer else "<>'steer'"),
-                    (consumer_digest,),
-                ).fetchone()[0]
                 if held >= band_ceiling:
                     connection.commit()
-                    return ClaimAtCeiling(int(held), band_ceiling)
+                    return at_ceiling or ClaimAtCeiling(
+                        int(held), band_ceiling)
                 self._render_card(row)
                 version = int(row["version"]) + 1
                 updated = connection.execute(
@@ -1143,7 +1174,7 @@ class ExecutionCardService:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 row = connection.execute(
-                    self._card_select() + " WHERE c.id=?", (card_id,)
+                    self._card_select(summaries=False) + " AND c.id=?", (card_id,)
                 ).fetchone()
                 refusal = _card_guard(row, expected_version)
                 if (
@@ -1217,8 +1248,8 @@ class ExecutionCardService:
             try:
                 self._cancel_stale(connection, now)
                 rows = connection.execute(
-                    self._card_select()
-                    + " WHERE c.status='delivered' AND c.kind<>'steer' "
+                    self._card_select(summaries=False)
+                    + " AND c.status='delivered' AND c.kind<>'steer' "
                     "AND c.delivered_at<=? "
                     "ORDER BY c.delivered_at,c.id LIMIT ?",
                     (due, limit),
@@ -1468,7 +1499,7 @@ class ExecutionCardService:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 row = connection.execute(
-                    self._card_select() + " WHERE c.id=?", (card_id,)
+                    self._card_select(summaries=False) + " AND c.id=?", (card_id,)
                 ).fetchone()
                 refusal = _card_guard(row, expected_version)
                 if refusal is None and row["status"] != ExecutionCardStatus.DELIVERED:
@@ -1595,7 +1626,7 @@ class ExecutionCardService:
             )
         with closing(self._connect()) as connection:
             row = connection.execute(
-                self._card_select() + " WHERE c.id=?", (card_id,)
+                self._card_select(summaries=False) + " AND c.id=?", (card_id,)
             ).fetchone()
             refusal = _agent_card_refusal(row, expected_version)
             if refusal is not None:
@@ -1640,7 +1671,7 @@ class ExecutionCardService:
             return refused(ExecutionCardRefusal.INVALID_ARGUMENT)
         with closing(self._connect()) as connection:
             row = connection.execute(
-                self._card_select() + " WHERE c.id=?", (card_id,)
+                self._card_select(summaries=False) + " AND c.id=?", (card_id,)
             ).fetchone()
             refusal = _card_guard(row, expected_version)
             if refusal is None and row["status"] != ExecutionCardStatus.DELIVERED:
@@ -1673,7 +1704,7 @@ class ExecutionCardService:
             return refused(ExecutionCardRefusal.INVALID_ARGUMENT)
         with closing(self._connect()) as connection:
             row = connection.execute(
-                self._card_select() + " WHERE c.id=?", (card_id,)
+                self._card_select(summaries=False) + " AND c.id=?", (card_id,)
             ).fetchone()
             if row is None:
                 return refused(ExecutionCardRefusal.NOT_FOUND)
@@ -1711,7 +1742,7 @@ class ExecutionCardService:
             return refused(ExecutionCardRefusal.INVALID_ARGUMENT)
         with closing(self._connect()) as connection:
             row = connection.execute(
-                self._card_select() + " WHERE c.id=?", (card_id,)
+                self._card_select(summaries=False) + " AND c.id=?", (card_id,)
             ).fetchone()
             refusal = _card_guard(row, expected_version)
             if (
@@ -1765,7 +1796,7 @@ class ExecutionCardService:
             )
         with closing(self._connect()) as connection:
             row = connection.execute(
-                self._card_select() + " WHERE c.id=?", (card_id,)
+                self._card_select(summaries=False) + " AND c.id=?", (card_id,)
             ).fetchone()
             refusal = _artifact_card_refusal(row, expected_version)
             if refusal is not None:
@@ -1803,7 +1834,7 @@ class ExecutionCardService:
             )
         with closing(self._connect()) as connection:
             row = connection.execute(
-                self._card_select() + " WHERE c.id=?", (card_id,)
+                self._card_select(summaries=False) + " AND c.id=?", (card_id,)
             ).fetchone()
             refusal = _artifact_card_refusal(row, expected_version)
             if refusal is not None:
@@ -1897,7 +1928,7 @@ class ExecutionCardService:
         now = self._clock_value().isoformat(timespec="seconds")
         with closing(self._connect()) as connection:
             row = connection.execute(
-                self._card_select() + " WHERE c.id=?", (card_id,)
+                self._card_select(summaries=False) + " AND c.id=?", (card_id,)
             ).fetchone()
             refusal = _card_guard(row, expected_version)
             if refusal is None and row["status"] != ExecutionCardStatus.PENDING:
@@ -1952,7 +1983,7 @@ class ExecutionCardService:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 row = connection.execute(
-                    self._card_select() + " WHERE c.id=?", (card_id,)
+                    self._card_select(summaries=False) + " AND c.id=?", (card_id,)
                 ).fetchone()
                 refusal = _agent_card_refusal(row, expected_version)
                 if refusal is not None:
@@ -2067,7 +2098,7 @@ class ExecutionCardService:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 row = connection.execute(
-                    self._card_select() + " WHERE c.id=?", (card_id,)
+                    self._card_select(summaries=False) + " AND c.id=?", (card_id,)
                 ).fetchone()
                 refusal = _card_guard(row, expected_version)
                 if (
@@ -2283,7 +2314,7 @@ class ExecutionCardService:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 row = connection.execute(
-                    self._card_select() + " WHERE c.id=?", (card_id,)
+                    self._card_select(summaries=False) + " AND c.id=?", (card_id,)
                 ).fetchone()
                 refusal = _card_guard(row, expected_version)
                 if (
@@ -2420,8 +2451,8 @@ class ExecutionCardService:
             rows = [
                 row
                 for row in connection.execute(
-                    self._card_select()
-                    + " WHERE c.status IN ('pending','delivering','delivered')"
+                    self._card_select(summaries=False)
+                    + " AND c.status IN ('pending','delivering','delivered')"
                 ).fetchall()
                 if _current_card(row)
             ]
@@ -2455,7 +2486,11 @@ class ExecutionCardService:
                 "SUM(CASE WHEN status='pending' AND kind='steer' THEN 1 ELSE 0 END) AS steer_pending,"
                 "SUM(CASE WHEN status='delivering' AND kind='steer' AND consumer_digest=? THEN 1 ELSE 0 END) AS steer_delivering,"
                 "SUM(CASE WHEN status='delivered' AND kind='steer' AND consumer_digest=? THEN 1 ELSE 0 END) AS steer_delivered "
-                "FROM execution_review_cards",
+                # These numbers describe the surface a reader is looking at,
+                # and a run summary is not on it: it asks nothing, settles on
+                # delivery, and is bounded by its own band.  Counting one here
+                # would report it as backlog waiting for an answer.
+                "FROM execution_review_cards WHERE summary_only=0",
                 (consumer_digest, consumer_digest, consumer_digest,
                  consumer_digest, consumer_digest),
             ).fetchone()
@@ -2658,8 +2693,8 @@ class ExecutionCardService:
         self, connection: sqlite3.Connection, now: str
     ) -> int:
         rows = connection.execute(
-            self._card_select()
-            + " WHERE c.status IN ('pending','delivering','delivered') "
+            self._card_select(summaries=None)
+            + " AND c.status IN ('pending','delivering','delivered') "
             "ORDER BY c.id"
         ).fetchall()
         cancelled = 0
@@ -2697,8 +2732,53 @@ class ExecutionCardService:
         return cancelled
 
     @staticmethod
-    def _card_select() -> str:
-        return (
+    def _band(
+        connection: sqlite3.Connection,
+        row: Mapping[str, object],
+        consumer_role: str,
+        consumer_digest: str,
+    ) -> tuple[str, int]:
+        """Name this card's capacity band and how much of it is already held.
+
+        The three bands are disjoint by construction, which is the property
+        that matters: a card can only ever be counted against the ceiling it
+        is itself bounded by, so no band can be made to appear emptier -- or
+        fuller -- by what is happening in another.
+        """
+        if bool(row["summary_only"]):
+            suffix, predicate = "_summary", "summary_only=1"
+        elif row["kind"] == ExecutionCardKind.STEER:
+            suffix, predicate = "_steer", "summary_only=0 AND kind='steer'"
+        else:
+            suffix, predicate = "", "summary_only=0 AND kind<>'steer'"
+        held = connection.execute(
+            "SELECT count(*) FROM execution_review_cards WHERE "
+            "status IN ('delivering','delivered') AND consumer_digest=? "
+            "AND " + predicate,
+            (consumer_digest,),
+        ).fetchone()[0]
+        return consumer_role + suffix, int(held)
+
+    @staticmethod
+    def _card_select(*, summaries: bool | None) -> str:
+        """Every read of this table must say which population it means.
+
+        A run summary is an ordinary row carrying ``summary_only=1``.  It is
+        not a reader-action card: it cannot be approved, requeued, counted
+        against the surface a reader sees, or offered to the console.  Making
+        the population a required argument is what keeps that true -- the
+        alternative is one predicate repeated at eighteen call sites, where
+        the three that are forgotten are found in production.
+
+        ``None`` means both, and exactly one caller wants it: the sweep that
+        retires cards whose task has moved on, which applies to summaries for
+        the same reason it applies to gates.
+        """
+        scope = (
+            "1=1" if summaries is None
+            else f"c.summary_only={1 if summaries else 0}"
+        )
+        return ((
             "SELECT c.*,t.text AS task_text,t.owner,t.owner_ref_version,"
             "t.owner_kind,t.owner_speaker_id,t.owner_canonical_speaker_id,"
             "t.owner_speaker_registry_id,t.owner_pinned,t.owner_provisional,"
@@ -2825,7 +2905,7 @@ class ExecutionCardService:
             "JOIN tasks AS t ON t.id=c.task_id "
             "JOIN task_execution_workflows AS w ON w.task_id=c.task_id "
             "LEFT JOIN task_execution_results AS r ON r.result_id=c.result_id"
-        )
+        ) + " WHERE " + scope)
 
     @staticmethod
     def _event(
@@ -3078,6 +3158,18 @@ def _kind_for_workflow(row: Mapping[str, object]) -> ExecutionCardKind:
 def _current_card(row: Mapping[str, object]) -> bool:
     try:
         kind = ExecutionCardKind(row["kind"])
+        if bool(row["summary_only"]):
+            # A summary describes one recorded result, so it stays truthful
+            # for as long as that result belongs to the task as it now is.
+            # It is deliberately not pinned to the workflow version or phase:
+            # the run it reports on has finished, and the workflow moving on
+            # afterwards is the normal case, not staleness.
+            return (
+                row["task_status_current"] == TaskStatus.OPEN
+                and row["result_id"] is not None
+                and int(row["task_version_current"])
+                == int(row["task_version"])
+            )
         if (
             row["task_status_current"] != TaskStatus.OPEN
             or int(row["task_version_current"]) != int(row["task_version"])
@@ -3248,6 +3340,7 @@ def _card(
                 if row["result_outcome"] is None
                 else ExecutionOutcome(row["result_outcome"])
             ),
+            summary_only=bool(row["summary_only"]),
             revisions=max(0, int(row["revision_count"] or 0)),
             revision_note=str(row["revision_note"] or ""),
             unchanged_from_previous=bool(row["unchanged_from_previous"]),
@@ -4086,7 +4179,31 @@ def _repository_review_line(card: ExecutionReviewCard, *, html: bool) -> str:
     return f"Repository: [{name}]({target})"
 
 
+def _summary_card_lines(
+    card: ExecutionReviewCard, *, html: bool
+) -> list[str]:
+    """What a run did, for a reader who is not being asked to decide.
+
+    Bounded and deliberately short: this arrives unprompted after work that
+    needed no approval, so it has to be readable at a glance and must not
+    resemble a card that wants an answer.
+    """
+    lines = [*_heading_lines(card, html=html), ""]
+    outcome = str(card.outcome) if card.outcome is not None else "recorded"
+    if html:
+        lines.append("\U0001f4dd <b>Run summary</b> \u2014 no reply needed")
+        lines.extend(_labelled_html_lines("Outcome", outcome))
+        lines.extend(_labelled_html_lines("Summary", card.summary))
+    else:
+        lines.append("\U0001f4dd Run summary \u2014 no reply needed")
+        lines.append(f"Outcome: {outcome}")
+        lines.append(f"Summary: {card.summary}")
+    return lines
+
+
 def _card_lines(card: ExecutionReviewCard) -> list[str]:
+    if card.summary_only:
+        return _summary_card_lines(card, html=False)
     if card.kind is ExecutionCardKind.START:
         return _start_card_lines(card, html=False)
     if card.kind is ExecutionCardKind.STEER:
@@ -4315,6 +4432,8 @@ def _drafted(values: Sequence[CardRecord]) -> list[str]:
 
 
 def _html_card_lines(card: ExecutionReviewCard) -> list[str]:
+    if card.summary_only:
+        return _summary_card_lines(card, html=True)
     if card.kind is ExecutionCardKind.START:
         return _start_card_lines(card, html=True)
     if card.kind is ExecutionCardKind.STEER:
@@ -4726,6 +4845,11 @@ def _escape(value: str) -> str:
 def _button_rows(
     card: ExecutionReviewCard, *, approvable: bool
 ) -> tuple[tuple[tuple[str, str], ...], ...]:
+    if card.summary_only:
+        # Nothing to press. A control here would be a decision the workflow
+        # has already taken without the reader, offered back to them as
+        # though it were still open.
+        return ()
     kind = card.kind
     if kind is ExecutionCardKind.START:
         if (

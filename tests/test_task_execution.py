@@ -408,6 +408,21 @@ class TaskExecutionTests(unittest.TestCase):
                 "ALTER TABLE execution_review_cards DROP COLUMN "
                 "work_revision_id"
             )
+            # v54 added the informational-delivery marker and split the one
+            # active-card index in two; an older database has one index and
+            # no such column.
+            connection.execute(
+                "DROP INDEX execution_review_cards_one_active_summary")
+            connection.execute(
+                "DROP INDEX execution_review_cards_one_active")
+            connection.execute(
+                "ALTER TABLE execution_review_cards DROP COLUMN summary_only"
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX execution_review_cards_one_active "
+                "ON execution_review_cards(task_id) "
+                "WHERE status IN ('pending','delivering','delivered')"
+            )
             connection.execute("PRAGMA user_version = 11")
             connection.commit()
 

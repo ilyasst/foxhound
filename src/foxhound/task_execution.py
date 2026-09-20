@@ -1674,6 +1674,54 @@ class TaskExecutionService:
                       artifact["content_digest"], artifact["run_directory"])
                      for index, artifact in enumerate(result["artifacts"])],
                 )
+                if advance is not None:
+                    # An automatically advanced phase asks the reader nothing,
+                    # so without this the work is silent. The row rides the
+                    # established card transport -- inventing a kind would be
+                    # refused by it, and a refused claim blocks the delivery
+                    # slot for every card, not just this one -- and is marked
+                    # summary-only, which is what keeps it out of every
+                    # ceiling, every reader-action path and every count of
+                    # what is waiting for an answer.
+                    #
+                    # Superseding rather than appending is what bounds the
+                    # queue: a task that advances three times leaves one
+                    # summary describing where it got to, not three describing
+                    # where it passed through. It is also what makes a repeat
+                    # of this call idempotent.
+                    superseded = connection.execute(
+                        "SELECT id,version,workflow_version FROM "
+                        "execution_review_cards WHERE task_id=? "
+                        "AND summary_only=1 AND status IN "
+                        "('pending','delivering','delivered')",
+                        (result["task_id"],),
+                    ).fetchall()
+                    for stale in superseded:
+                        connection.execute(
+                            "UPDATE execution_review_cards SET "
+                            "status='cancelled',version=?,"
+                            "claim_token_digest=NULL,claim_expires_at=NULL,"
+                            "consumer_digest=NULL,resolved_at=?,updated_at=? "
+                            "WHERE id=? AND version=?",
+                            (int(stale["version"]) + 1, now, now,
+                             int(stale["id"]), int(stale["version"])),
+                        )
+                    connection.execute(
+                        "INSERT INTO execution_review_cards("
+                        "task_id,task_version,workflow_version,kind,phase,"
+                        "result_id,status,version,created_at,updated_at,"
+                        "work_revision_id,summary_only) "
+                        "VALUES(?,?,?,?,?,?,'pending',1,?,?,"
+                        "(SELECT r.id FROM work_revisions AS r "
+                        " JOIN work_items AS w ON w.id=r.work_item_id "
+                        " WHERE w.task_id=? ORDER BY r.id DESC LIMIT 1),1)",
+                        (
+                            result["task_id"], result["task_version"],
+                            result["workflow_version"] + 1,
+                            "result_review", recorded_phase,
+                            result["result_id"], now, now, result["task_id"],
+                        ),
+                    )
                 version = result["workflow_version"] + 1
                 completed = (
                     now if target is WorkflowStatus.COMPLETED else None

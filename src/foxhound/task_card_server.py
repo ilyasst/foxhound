@@ -772,6 +772,12 @@ class TaskCardApplication:
                     "card_id": claim.card.id,
                     "card_version": claim.card.version,
                     "kind": claim.card.kind.value,
+                    # The transport validates `kind` against a closed set, so
+                    # a summary arrives as an ordinary kind and says what it
+                    # really is here instead. The transport already treats
+                    # this field as optional, so senders on either side of the
+                    # change stay deployable.
+                    "informational": claim.card.summary_only,
                     "phase": claim.card.phase.value,
                     "claim_token": claim.token,
                     "expires_at": claim.expires_at,
