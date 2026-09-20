@@ -17,6 +17,18 @@ import sys
 
 
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})")
+
+#: A systemd template instance puts an "at" sign between a unit name and an
+#: instance, then a dotted suffix -- the same shape an address has, so
+#: `EMAIL_RE` matches it. The unit suffixes are a closed, narrow set and no
+#: mail domain ends in `.service`, so excluding them costs the real check
+#: nothing. Without this, ordinary `systemctl` documentation is reported as a
+#: leaked address, and a guard that fires on documentation teaches people to
+#: pass --no-verify, which is when it stops protecting anything.
+SYSTEMD_UNIT_SUFFIXES = (
+    ".service", ".socket", ".timer", ".target", ".path", ".mount",
+    ".automount", ".swap", ".slice", ".scope", ".device",
+)
 URL_HOST_RE = re.compile(r"https?://([A-Za-z0-9.-]+)(?::\d+)?(?:[/?#]|$)", re.I)
 HOME_PATH_RE = re.compile(
     r"(?:/home/|/Users/)[A-Za-z0-9._-]+(?:/|\b)|"
@@ -106,6 +118,8 @@ def findings(diff_text: str, *, private_terms: tuple[str, ...] | None = None) ->
 
         for match in EMAIL_RE.finditer(line):
             domain = match.group(1).lower()
+            if domain.endswith(SYSTEMD_UNIT_SUFFIXES):
+                continue  # `foxhound-execution-runner@slot-2.service`
             if domain not in ALLOWED_EMAIL_DOMAINS and not domain.endswith(RESERVED_DOMAIN_SUFFIXES):
                 found.append(f"added line {added_line}: non-example email address")
                 break

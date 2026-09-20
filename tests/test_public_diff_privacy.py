@@ -88,3 +88,28 @@ class PublicDiffGuardTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_systemd_template_units_are_not_email_addresses():
+    """`unit@instance.service` is a systemd instance, not a leaked address.
+
+    The multi-runner documentation on `main` contains `systemctl enable`
+    examples, so this pattern is in the tree: without the exclusion the guard
+    blocks any commit that touches that file. A guard that fires on
+    documentation is one people learn to pass `--no-verify` to.
+    """
+    documentation = "\n".join((
+        "+   systemctl enable --now foxhound-execution-runner@slot-2.service",
+        "+   systemctl enable --now foxhound-execution-runner@slot-3.service",
+        "+   systemctl start backup@daily.timer",
+        "+   systemctl status sshd@0.socket",
+    ))
+    assert findings(documentation) == []
+
+
+def test_a_real_address_is_still_caught_beside_a_unit_name():
+    """The exclusion must be narrow: one line carrying both still reports."""
+    mixed = ("+ systemctl restart worker@slot-1.service  # owner: "
+             + "person" + "@" + "company" + ".com")
+    labels = findings(mixed)
+    assert any("email" in label for label in labels), labels
