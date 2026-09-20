@@ -8,6 +8,7 @@ from foxhound import execution_cards
 
 import json
 import os
+import re
 import sqlite3
 import tempfile
 import time
@@ -2060,7 +2061,11 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertEqual(self.cards.schedule().created, 1)
         body, _keyboard = render_execution_review_card(
             self.cards.claim_next().card)
-        self.assertIn("Stopped after 3 failed attempt", body)
+        # Four claims happened in this phase; the live counter reset to
+        # three when it parked. The card must report what happened.
+        self.assertIn("Stopped after 4 failed attempts in plan", body)
+        self.assertIn("1 result recorded for this phase", body)
+        self.assertIn("from where this phase already got to", body)
 
     def _park_in_execute(self, task_id: int):
         """Plan, get approved, then fail the execute phase until it parks."""
@@ -4327,6 +4332,172 @@ class ExecutionCardTests(unittest.TestCase):
 
 
 CONSUMER = "d" * 64
+
+
+class ParkedAttemptHistoryTests(ExecutionCardTests):
+    """What a parked Start card says about how much has already been spent.
+
+    `claim_next` resets `failure_count` on park, deliberately: a retry that
+    began one slip from parking again would be a retry in name only.  The
+    cost was that nothing carried history across a park, so the card asked
+    the reader to authorise a twentieth attempt while reporting the first.
+    """
+
+    def _burn(self, task_id: int, attempts: int = 3) -> None:
+        """Claim, spend real agent time, fail -- until it parks."""
+        for _ in range(attempts):
+            self.clock.advance(timedelta(minutes=5))
+            claim = self.execution.claim_next()
+            self.assertIsNotNone(claim)
+            # Time passes inside the claim, which is where agent time goes.
+            self.clock.advance(timedelta(minutes=40))
+            self.execution.fail(
+                task_id,
+                expected_version=claim.workflow_version,
+                claim_token=claim.token,
+                reason="process_exit",
+            )
+
+    def _park_in_execute_slowly(self, task_id: int):
+        """As ``_park_in_execute``, but the attempts consume agent time."""
+        self._plan_review(task_id, f"plan-{task_id}")
+        approved = self.execution.review_action(
+            task_id,
+            expected_version=self.execution.get(task_id).version,
+            action="approve",
+        )
+        self.assertEqual(approved.phase, WorkflowPhase.EXECUTE)
+        self._burn(task_id)
+        return self.execution.get(task_id)
+
+    def _park_again(self, task_id: int, *, attempts: int = 3) -> None:
+        """One full turn of the loop: answer Start, reclaim, fail, park."""
+        self.execution.start_action(
+            task_id,
+            expected_version=self.execution.get(task_id).version,
+            action="start",
+        )
+        self._burn(task_id, attempts)
+
+    def _parked_body(self, task_id: int) -> str:
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "UPDATE execution_review_cards SET status='cancelled',"
+                "claim_token_digest=NULL,claim_expires_at=NULL,"
+                "resolved_at='2030-01-01T00:00:00+00:00' "
+                "WHERE task_id=? AND status IN "
+                "('pending','delivering','delivered')", (task_id,))
+            connection.commit()
+        self.cards.schedule()
+        body, _keyboard = render_execution_review_card(
+            self.cards.claim_next().card)
+        return body
+
+    def test_the_reported_count_keeps_rising_across_parks(self):
+        """The loop itself, constructed turn by turn.
+
+        Park, reader answers Start, reclaim, park again.  The live counter
+        returns to three every time; what the card says must not.
+        """
+        task_id = 1
+        self._park_in_execute_slowly(task_id)
+        self.assertEqual(
+            self.execution.get(task_id).status, WorkflowStatus.PARKED)
+
+        seen = []
+        for turn in range(3):
+            body = self._parked_body(task_id)
+            self.assertIn("no result recorded for this phase", body.lower())
+            match = re.search(r"Stopped after (\d+) failed attempt", body)
+            self.assertIsNotNone(match, body)
+            seen.append(int(match.group(1)))
+            with self.subTest(turn=turn):
+                # The live counter is back to three on every turn but the
+                # first; the card must not be.
+                self.assertEqual(
+                    self.execution.get(task_id).failure_count, 3)
+            self._park_again(task_id)
+
+        self.assertEqual(seen, [3, 6, 9])
+
+    def test_a_repeated_park_says_another_identical_attempt_is_unlikely(self):
+        task_id = 1
+        self._park_in_execute_slowly(task_id)
+        first = self._parked_body(task_id)
+        self.assertNotIn("stopped and been restarted", first)
+
+        self._park_again(task_id)
+        second = self._parked_body(task_id)
+        self.assertIn("across 2 parks", second)
+        self.assertIn("stopped and been restarted 2 times", second)
+
+    def test_history_is_scoped_to_the_phase_the_workflow_is_in(self):
+        """A plan that succeeded is not an execute that is stuck.
+
+        Aggregating across phases would report a task as failing many times
+        when only its current phase is, which is a different problem with a
+        different answer.
+        """
+        task_id = 1
+        self._park_in_execute_slowly(task_id)
+        body = self._parked_body(task_id)
+
+        # The planning pass claimed once and recorded a result; the execute
+        # phase has claimed three times and recorded nothing.
+        self.assertIn("Stopped after 3 failed attempts in execute", body)
+        self.assertIn("no result recorded for this phase", body.lower())
+
+    def test_the_card_reports_agent_time_once_it_is_worth_reporting(self):
+        task_id = 1
+        self._park_in_execute_slowly(task_id)
+        body = self._parked_body(task_id)
+        self.assertRegex(body, "\u23f1 \\d+h( \\d+m)? of agent time")
+
+    def test_the_existing_reset_is_unchanged(self):
+        """The reset protects a real behaviour and must stay.
+
+        A retry that began with one attempt left would park again on the
+        first slip. This issue is about not relying on the live counter to
+        carry history, not about removing the reset.
+        """
+        task_id = 1
+        self._park_in_execute_slowly(task_id)
+        self.assertEqual(self.execution.get(task_id).failure_count, 3)
+        self.execution.start_action(
+            task_id,
+            expected_version=self.execution.get(task_id).version,
+            action="start",
+        )
+        self.clock.advance(timedelta(hours=1))
+        claim = self.execution.claim_next()
+        self.assertIsNotNone(claim)
+        self.assertEqual(self.execution.get(task_id).failure_count, 0)
+
+    def test_a_looping_workflow_is_visible_in_readiness(self):
+        """Capacity going into work that never completes, as a number.
+
+        Two such workflows once accounted for about a fifth of all slot
+        time over two days, and nothing anywhere said so.
+        """
+        self.assertEqual(self.execution.readiness().unproductive, 0)
+        self._park_in_execute_slowly(1)
+        # One park is a failure, not yet a loop.
+        self.assertEqual(self.execution.readiness().unproductive, 0)
+        self._park_again(1)
+        self.assertEqual(self.execution.readiness().unproductive, 1)
+
+    def test_a_phase_that_recorded_something_is_not_counted_as_looping(self):
+        task_id = 1
+        self._plan_review(task_id, "recorded-plan")
+        self.execution.review_action(
+            task_id,
+            expected_version=self.execution.get(task_id).version,
+            action="revise")
+        for _ in range(2):
+            self._park_again(task_id)
+        self.assertEqual(
+            self.execution.get(task_id).status, WorkflowStatus.PARKED)
+        self.assertEqual(self.execution.readiness().unproductive, 0)
 
 
 class RunSummaryCardTests(ExecutionCardTests):

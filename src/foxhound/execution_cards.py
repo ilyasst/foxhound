@@ -296,6 +296,13 @@ class ExecutionReviewCard:
     #: happened cannot tell a task nobody reached from one that was
     #: abandoned.
     failure_count: int = 0
+    #: Attempts, parks, recorded results and agent seconds for the phase
+    #: this workflow is in now, across every park.  `failure_count` above
+    #: is the live counter, which resets on park; these do not.
+    phase_attempts: int = 0
+    phase_parks: int = 0
+    phase_results: int = 0
+    phase_seconds: int = 0
     failure_reason: str = field(default="", repr=False)
     failure_exit_code: int | None = field(default=None, repr=False)
     failure_run_id: str | None = field(default=None, repr=False)
@@ -2796,6 +2803,47 @@ class ExecutionCardService:
             " WHERE d.task_id=w.task_id AND d.phase=w.phase "
             " ORDER BY d.workflow_version DESC LIMIT 1"
             ") AS workflow_failure_digest,"
+            # Cumulative history for the phase the workflow is in now,
+            # derived rather than counted live.  `claim_next` resets
+            # `failure_count` on park -- deliberately, so a retry does not
+            # begin one slip from parking again -- which means the live
+            # counter says how many attempts happened since the last park,
+            # not how many have happened.  A workflow looping through
+            # park, reader-answers-start, reclaim therefore reported "1
+            # failed attempt" on its twentieth.  The event log cannot
+            # drift from what happened, and scoping to the phase keeps a
+            # plan that succeeded from being reported against an execute
+            # that is stuck.
+            "("
+            " SELECT count(*) FROM task_execution_events AS e "
+            " WHERE e.task_id=w.task_id AND e.kind='claimed' "
+            " AND e.phase=w.phase AND e.task_version=w.task_version"
+            ") AS workflow_phase_attempts,"
+            "("
+            " SELECT count(*) FROM task_execution_events AS e "
+            " WHERE e.task_id=w.task_id AND e.kind='parked' "
+            " AND e.phase=w.phase AND e.task_version=w.task_version"
+            ") AS workflow_phase_parks,"
+            "("
+            " SELECT count(*) FROM task_execution_results AS r "
+            " WHERE r.task_id=w.task_id AND r.phase=w.phase "
+            " AND r.task_version=w.task_version"
+            ") AS workflow_phase_results,"
+            # How much agent time those attempts consumed: each claim until
+            # whatever ended it.  A reader deciding whether to authorise
+            # another run is deciding how to spend the next one of these.
+            "("
+            " SELECT CAST(ROUND(COALESCE(SUM(("
+            "  julianday(COALESCE(("
+            "   SELECT MIN(f.occurred_at) FROM task_execution_events AS f "
+            "   WHERE f.task_id=e.task_id AND f.sequence>e.sequence "
+            "   AND f.kind IN ('released','claim_expired',"
+            "                  'retry_scheduled','parked','result_recorded')"
+            "  ),e.occurred_at))-julianday(e.occurred_at))*86400),0)) "
+            " AS INTEGER) FROM task_execution_events AS e "
+            " WHERE e.task_id=w.task_id AND e.kind='claimed' "
+            " AND e.phase=w.phase AND e.task_version=w.task_version"
+            ") AS workflow_phase_seconds,"
             "w.last_failure_reason AS workflow_failure_reason,"
             "w.last_failure_exit_code AS workflow_failure_exit_code,"
             "w.last_failure_run_id AS workflow_failure_run_id,"
@@ -3294,6 +3342,10 @@ def _card(
             created_at=str(row["created_at"]),
             workflow_status=WorkflowStatus(row["workflow_status_current"]),
             failure_count=int(row["workflow_failure_count"] or 0),
+            phase_attempts=int(row["workflow_phase_attempts"] or 0),
+            phase_parks=int(row["workflow_phase_parks"] or 0),
+            phase_results=int(row["workflow_phase_results"] or 0),
+            phase_seconds=int(row["workflow_phase_seconds"] or 0),
             failure_reason=str(row["workflow_failure_reason"] or ""),
             failure_exit_code=row["workflow_failure_exit_code"],
             failure_run_id=row["workflow_failure_run_id"],
@@ -3841,6 +3893,24 @@ def _card_date(value: str | None) -> str:
     return "" if not value else str(value)[:10]
 
 
+def _approximate_duration(seconds: int) -> str:
+    """Agent time as a reader thinks about it, or nothing at all.
+
+    Deliberately coarse.  This number exists to answer "is this worth
+    another run?", and a figure to the second would invite it to be read as
+    accounting rather than as the order of magnitude it is.
+    """
+    if seconds < 60:
+        return ""
+    hours, remainder = divmod(int(seconds), 3600)
+    minutes = remainder // 60
+    if hours and minutes:
+        return f"{hours}h {minutes}m"
+    if hours:
+        return f"{hours}h"
+    return f"{minutes}m"
+
+
 def _start_card_lines(
     card: ExecutionReviewCard, *, html: bool
 ) -> list[str]:
@@ -3886,12 +3956,34 @@ def _start_card_lines(
     if card.workflow_status is WorkflowStatus.PARKED:
         # A reader who is never told has no way to distinguish a task
         # nobody has reached from one the agent abandoned.
+        # The count across every park, not the count since the last one.
+        # A reader told "1 failed attempt" answers Start, because that is
+        # what a first hiccup deserves; the same card on the twentieth
+        # attempt deserves a different answer, and used to look identical.
+        attempts = max(card.phase_attempts, card.failure_count)
         stopped = (
-            f"⚠️ Stopped after {card.failure_count} failed attempt"
-            f"{'s' if card.failure_count != 1 else ''}"
+            f"⚠️ Stopped after {attempts} failed attempt"
+            f"{'s' if attempts != 1 else ''}"
+            + (f" in {card.phase.value}" if card.phase_attempts else "")
+            + (f", across {card.phase_parks} parks"
+               if card.phase_parks > 1 else "")
             + (f" ({card.failure_reason})" if card.failure_reason else "")
         )
         lines.append(f"<b>{_escape(stopped)}</b>" if html else stopped)
+        # Whether anything was ever recorded for this phase is the fact
+        # that most changes the answer, and it was not on the card at all.
+        recorded = (
+            "no result recorded for this phase" if not card.phase_results
+            else f"{card.phase_results} result"
+                 f"{'s' if card.phase_results != 1 else ''} recorded"
+                 " for this phase"
+        )
+        spent = _approximate_duration(card.phase_seconds)
+        history = (
+            f"⏱ {spent} of agent time, {recorded}" if spent
+            else f"⏱ {recorded[0].upper()}{recorded[1:]}"
+        )
+        lines.append(f"<b>{_escape(history)}</b>" if html else history)
         if card.failure_exit_code is not None:
             diagnostic = f"Last agent exit code: {card.failure_exit_code}"
             lines.append(
@@ -3918,9 +4010,20 @@ def _start_card_lines(
                 "retries are stopped; reduce its scope or split it before "
                 "starting another run.",
             ]
+        # The blanket claim that nothing was recorded is now checked rather
+        # than asserted: a workflow can park in a phase that did record, and
+        # telling the reader otherwise contradicts the line above it.
         explanation = (
             "Continue tries again. The runs so far left nothing recorded."
+            if not card.phase_results
+            else "Continue tries again from where this phase already got to."
         )
+        if card.phase_parks > 1 and not card.phase_results:
+            explanation += (
+                " This has already stopped and been restarted "
+                f"{card.phase_parks} times without recording anything, so a "
+                "further identical attempt is unlikely to end differently."
+            )
         return lines + ["", explanation]
     explanation = "No agent has looked at this yet. "
     explanation += (
