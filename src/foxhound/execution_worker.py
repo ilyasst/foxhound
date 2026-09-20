@@ -1732,6 +1732,11 @@ def _repository_result(
         raise ExecutionWorkerDraftError(
             "repository work that changed the repository cannot be ineligible"
         )
+    origin_kind = getattr(origin, "kind", "")
+    publication_is_the_work = (
+        isinstance(origin_kind, str)
+        and _publication_is_the_deliverable(origin_kind)
+    )
     if state.phase is WorkflowPhase.EXECUTE and repository_impact:
         if outcome == "completed":
             raise ExecutionWorkerDraftError(
@@ -1739,11 +1744,48 @@ def _repository_result(
                 "for analysis-only work write JSON false to "
                 "result-repository-impact.json"
             )
-        if (outcome == "awaiting_external"
-                and not _has_origin_follow_through_action(actions, origin)):
-            raise ExecutionWorkerDraftError(
-                "repository execution must request an action targeting its origin"
-            )
+    if (
+        state.phase in (WorkflowPhase.PLAN, WorkflowPhase.EXECUTE)
+        and publication_is_the_work
+        and not repository_impact
+        and outcome == "completed"
+        and not references
+    ):
+        # The guard above asks a run that changed the repository to publish
+        # what it changed, and offers `repository_impact: false` to work that
+        # changed nothing. For most origins that exemption is right: an issue
+        # can ask a question, and the answer belongs on the card.
+        #
+        # A review is the exception. It reads a pull request and changes no
+        # files, so the flag is truthfully false and the run took the
+        # exemption -- but its entire deliverable was the remote write the
+        # exemption excused. `completed` was accepted with no action and no
+        # receipt, the workflow went to review, and an ordinary `done` closed
+        # it while the findings existed only in the run directory, which is
+        # reclaimed afterwards. Analysis-only and review are the same shape to
+        # every check here and opposite in what they owe.
+        #
+        # `_required_repository_receipt_kinds` already knows what each origin
+        # owes; it was consulted only in `external_action`, which a completed
+        # execute phase never reaches.
+        #
+        # Naming follow-through that already exists still completes the task.
+        # That is how a re-surfaced task stops instead of repeating published
+        # work, so it stays open to a run that writes nothing itself.
+        raise ExecutionWorkerDraftError(
+            f"repository {origin_kind} completion requires published "
+            "follow-through: request the action on its origin, or name the "
+            "existing follow-through in repository references"
+        )
+    if (
+        state.phase is WorkflowPhase.EXECUTE
+        and (repository_impact or publication_is_the_work)
+        and outcome == "awaiting_external"
+        and not _has_origin_follow_through_action(actions, origin)
+    ):
+        raise ExecutionWorkerDraftError(
+            "repository execution must request an action targeting its origin"
+        )
     if (
         state.phase is WorkflowPhase.EXTERNAL_ACTION
         and outcome == "completed"
@@ -1828,6 +1870,25 @@ def _required_repository_receipt_kinds(origin_kind: str) -> frozenset[str]:
     if origin_kind == "review_request":
         return frozenset({"review"})
     return frozenset()
+
+
+#: Receipt kinds that can only exist because the run changed the repository.
+#: A pull request needs a branch; a comment or a review needs neither.
+_CHANGE_BACKED_RECEIPT_KINDS = frozenset({"pull-request"})
+
+
+def _publication_is_the_deliverable(origin_kind: str) -> bool:
+    """True when this origin owes a write that no repository change produces.
+
+    Derived rather than listed, so a new origin kind is classified by what it
+    owes instead of by being remembered here. An origin whose follow-through
+    includes a pull request has a deliverable that can exist locally first,
+    and analysis about it is a coherent result on its own. An origin whose
+    follow-through is only a comment or a review has nothing to show for the
+    run except the write itself.
+    """
+    required = _required_repository_receipt_kinds(origin_kind)
+    return bool(required) and not (required & _CHANGE_BACKED_RECEIPT_KINDS)
 
 
 def _repository_receipts(run_directory: Path) -> tuple[dict[str, str], ...]:
