@@ -185,6 +185,13 @@ class AgentProfileTests(unittest.TestCase):
             "stop lower-priority exploration",
             "Before changing each checkout, read its contributor instructions",
             "In `result-work.md`, state which instructions you found and applied",
+            # The working tree is available in every phase now, so the prompt
+            # has to say where writing belongs. Withholding it from planning
+            # did not stop the writing; it sent it to a shared checkout.
+            "available in every phase, planning included",
+            "Every other checkout on this host is read only for you",
+            "Do not `cd` into one to commit, switch its branch, reset it",
+            "The reviewable output of planning is still the plan",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, prompt)
@@ -413,9 +420,9 @@ class AgentProfileTests(unittest.TestCase):
             ("max_turns", 201),
             ("max_turns", True),
             ("timeout_seconds", 29),
-            ("timeout_seconds", 3_301),
+            ("timeout_seconds", 7_201),
             ("claim_lease_seconds", 299),
-            ("claim_lease_seconds", 3_601),
+            ("claim_lease_seconds", 10_801),
             ("heartbeat_seconds", 4),
             ("heartbeat_seconds", 601),
             ("kill_grace_seconds", 0),

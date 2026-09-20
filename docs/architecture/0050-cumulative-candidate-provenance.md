@@ -1,4 +1,4 @@
-# ADR 0036: Cumulative candidate provenance
+# ADR 0050: Cumulative candidate provenance
 
 ## Status
 

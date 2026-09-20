@@ -57,6 +57,11 @@ _FIELDS = frozenset({
 })
 _CATALOG_FIELDS = frozenset({"schema", "schema_version", "profiles"})
 _CATALOG_ENTRY_FIELDS = frozenset({"state", "revision", "history"})
+#: A profile that renders differently per host also publishes one revision per
+#: named variant. The key is absent for a profile that has none, so a catalog
+#: that uses no variants is byte-identical to one written before they existed.
+_CATALOG_ENTRY_VARIANT_FIELDS = _CATALOG_ENTRY_FIELDS | {"variants"}
+_VARIANT_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 _CATALOG_STATES = frozenset({"active", "disabled"})
 
 
@@ -145,17 +150,44 @@ class CatalogEntry:
     state: str
     revision: str
     history: tuple[str, ...]
+    #: Variant name to the revision that variant renders to. Empty for a
+    #: profile that is the same everywhere.
+    variants: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def is_active(self) -> bool:
         return self.state == "active"
 
     def document(self) -> dict[str, Any]:
-        return {
+        document: dict[str, Any] = {
             "state": self.state,
             "revision": self.revision,
             "history": list(self.history),
         }
+        if self.variants:
+            document["variants"] = dict(sorted(self.variants.items()))
+        return document
+
+    def materialize(self, variant: str | None) -> "CatalogEntry":
+        """This entry as the named variant offers it.
+
+        The installed copy keeps the shape every reader already understands:
+        one revision, and a history that ends with it. Selecting a variant
+        therefore moves that revision to the end rather than adding anything,
+        so a workflow pinned to any published revision still resolves.
+        """
+        if variant is None or variant not in self.variants:
+            return self
+        revision = self.variants[variant]
+        history = tuple(
+            item for item in self.history if item != revision
+        ) + (revision,)
+        return CatalogEntry(
+            profile_id=self.profile_id,
+            state=self.state,
+            revision=revision,
+            history=history,
+        )
 
 
 class AgentProfileRegistry:
@@ -416,6 +448,19 @@ def _historical_general_profiles() -> tuple[AgentProfile, ...]:
             kill_grace_seconds=30,
             allowed_phases=_PHASES,
         ),
+        AgentProfile(
+            profile_id="general",
+            display_name="General",
+            runtime="hermes",
+            prompt_template=_GENERAL_PROMPT_TEMPLATE_V12,
+            toolsets=("terminal", "file", "web"),
+            max_turns=80,
+            timeout_seconds=2_700,
+            claim_lease_seconds=3_300,
+            heartbeat_seconds=60,
+            kill_grace_seconds=30,
+            allowed_phases=_PHASES,
+        ),
     )
 
 
@@ -498,8 +543,8 @@ def _validate_profile(profile: AgentProfile) -> None:
         raise AgentProfileError("agent profile phases are invalid")
     for value, minimum, maximum, label in (
         (profile.max_turns, 1, 200, "turn limit"),
-        (profile.timeout_seconds, 30, 3_300, "timeout"),
-        (profile.claim_lease_seconds, 300, 3_600, "claim lease"),
+        (profile.timeout_seconds, 30, 7_200, "timeout"),
+        (profile.claim_lease_seconds, 300, 10_800, "claim lease"),
         (profile.heartbeat_seconds, 5, 600, "heartbeat"),
         (profile.kill_grace_seconds, 1, 120, "shutdown grace"),
     ):
@@ -620,8 +665,37 @@ def parse_catalog(document: object) -> dict[str, CatalogEntry]:
     return entries
 
 
+def _parse_catalog_variants(
+    value: object, history: list[str]
+) -> dict[str, str]:
+    """Validate variant revisions, each of which must be a published one.
+
+    A variant naming a revision outside the profile's history would offer a
+    host something the store cannot resolve, so it is refused here rather than
+    discovered at install.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict) or not value:
+        raise AgentProfileError("agent profile catalog variants are invalid")
+    variants: dict[str, str] = {}
+    for name, revision in value.items():
+        if (
+            not isinstance(name, str)
+            or _VARIANT_NAME_RE.fullmatch(name) is None
+            or not isinstance(revision, str)
+            or _REVISION_RE.fullmatch(revision) is None
+            or revision not in history
+        ):
+            raise AgentProfileError("agent profile catalog variants are invalid")
+        variants[name] = revision
+    return variants
+
+
 def _parse_catalog_entry(profile_id: str, entry: object) -> CatalogEntry:
-    if not isinstance(entry, dict) or set(entry) != _CATALOG_ENTRY_FIELDS:
+    if not isinstance(entry, dict) or set(entry) not in (
+        _CATALOG_ENTRY_FIELDS, _CATALOG_ENTRY_VARIANT_FIELDS
+    ):
         raise AgentProfileError("agent profile catalog entry is invalid")
     state = entry["state"]
     revision = entry["revision"]
@@ -644,11 +718,13 @@ def _parse_catalog_entry(profile_id: str, entry: object) -> CatalogEntry:
         or revision != history[-1]
     ):
         raise AgentProfileError("agent profile catalog revision is invalid")
+    variants = _parse_catalog_variants(entry.get("variants"), history)
     return CatalogEntry(
         profile_id=profile_id,
         state=state,
         revision=revision,
         history=tuple(history),
+        variants=variants,
     )
 
 
@@ -1041,6 +1117,14 @@ _GENERAL_PROMPT_TEMPLATE_V13 = _GENERAL_PROMPT_TEMPLATE_V12.replace(
 ).replace(
     "In `execute`, do not post the update. Put its complete draft in the reviewable result and list posting it as a structured external action with an exact `target` URL for `task.origin`, so the reader can approve the exact external write.",
     "In `execute`, do not post the update. Put its complete draft in the reviewable result and list posting it in `result-external-actions.json` as a JSON object, for example `{\"action\":\"Post the prepared update\",\"target\":\"https://github.com/OWNER/REPO/issues/NUMBER\"}`. Its `target` must be the exact URL for `task.origin`; a plain-string action description cannot request the follow-through. This lets the reader approve the exact external write.",
+).replace(
+    f"Call `{WORKER_COMMAND_TOKEN} act worktree [--repository LOCATOR]` only when `context` lists `act.worktree`. A task may legitimately span several repositories.",
+    "\n".join((
+        f"Call `{WORKER_COMMAND_TOKEN} act worktree [--repository LOCATOR]` only when `context` lists `act.worktree`. A task may legitimately span several repositories.",
+        "That working tree is the only repository this run may write to, and it is available in every phase, planning included. Take one as soon as the work needs to change a file, run a suite against a modification, or check that a proposal builds.",
+        "Every other checkout on this host is read only for you, however convenient it looks and whoever appears to own it. A checkout outside your run directory is long lived and shared: other work holds branches off it, carries uncommitted changes in it, and shares its stash. Do not `cd` into one to commit, switch its branch, reset it, or stash in it. Read it freely.",
+        "In `plan`, a working tree is for verifying what you are about to propose, not for delivering it. The reviewable output of planning is still the plan.",
+    )),
 )
 
 
@@ -1051,10 +1135,10 @@ _GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V13
 # revision fails at every runner and scheduler startup, rather than leaving a
 # stale test in a different file to discover the mismatch later.
 GENERAL_PROFILE_RELEASE_REVISION = (
-    "603dc13f6f6458085e712d173027fd89821c2f6b4fa000b5adf2d8453e5103bf"
+    "15a5abd4bb06a78046c11004515e487e84b5fed3295f90cd84aed95d2ea603e1"
 )
 GENERAL_PROFILE_RELEASE_PROMPT_SHA256 = (
-    "ff3c0c6e00a5133d3532971a384c5c914706ef8d180d13eddaf80755bd92f515"
+    "c59d38f22fa4e0c3a3a9b322ef962386e3e30c3ed020d77499e8d820547d19c1"
 )
 
 

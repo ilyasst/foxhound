@@ -235,6 +235,13 @@ class DeploymentConfigAliasTests(unittest.TestCase):
         )
         self.assertEqual(workflow.reader_aliases, (READER, OTHER))
 
+    def test_omitted_steer_policy_is_an_empty_current_version_declaration(self):
+        workflow = _parse_workflow(
+            self._current(reader_aliases=[]),
+            version=DEPLOYMENT_SCHEMA_VERSION,
+        )
+        self.assertEqual(workflow.steer_while_running, ())
+
     def test_an_older_configuration_is_still_accepted_and_empty(self):
         workflow = _parse_workflow(self._document(), version=8)
         self.assertEqual(workflow.reader_aliases, ())
