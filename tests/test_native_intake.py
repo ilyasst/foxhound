@@ -1191,6 +1191,20 @@ class NativeCandidateIntakeTests(unittest.TestCase):
         self.assertEqual(task.text, "Revised after the reader closed it")
         self.assertGreater(task.version, closed.version)
 
+        # The reopen is recorded, at the version the task now carries. The
+        # execution scheduler reads exactly this to tell a re-surfaced task
+        # apart from one whose version moved for another reason, so the two
+        # halves are asserted together rather than separately.
+        with closing(sqlite3.connect(self.database)) as connection:
+            event = connection.execute(
+                "SELECT kind,from_status,to_status,task_version "
+                "FROM task_events WHERE task_id=1 AND kind='status_changed' "
+                "ORDER BY sequence DESC LIMIT 1"
+            ).fetchone()
+        self.assertEqual(
+            event, ("status_changed", "done", "open", task.version)
+        )
+
     def test_a_revision_whose_task_is_gone_still_refuses(self):
         """A binding pointing at a task that does not exist is corruption,
         not a race, and must still stop the pass."""

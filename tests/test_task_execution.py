@@ -1964,8 +1964,9 @@ class TaskExecutionTests(unittest.TestCase):
         ))
         self.assertEqual(self._grant_service("issue").schedule_new().scheduled, 0)
 
-        # The reader closes it, then the source moves and the ledger reopens
-        # the task -- the state ADR 0039 now produces.
+        # The reader closes it and the source moves. A version advance alone
+        # is NOT the trigger -- that also happens to a task nobody reopened,
+        # and treating it as one broke stale reconciliation.
         with closing(sqlite3.connect(self.database)) as connection:
             connection.execute(
                 "UPDATE task_execution_workflows SET status='completed',"
@@ -1974,6 +1975,23 @@ class TaskExecutionTests(unittest.TestCase):
             )
             connection.execute(
                 "UPDATE tasks SET status='open',version=version+1 WHERE id=1"
+            )
+            connection.commit()
+
+        self.assertEqual(
+            self._grant_service("issue").schedule_new().scheduled, 0,
+            "a version advance without a reopen must not re-schedule",
+        )
+
+        # What the ledger actually writes when ADR 0039 re-surfaces a task.
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "INSERT INTO task_events(task_id,kind,task_version,"
+                "candidate_id,source_revision,from_status,to_status,"
+                "occurred_at) VALUES(1,'status_changed',"
+                "(SELECT version FROM tasks WHERE id=1),NULL,NULL,"
+                "'done','open',?)",
+                (self._now(),),
             )
             connection.commit()
 

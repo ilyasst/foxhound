@@ -687,6 +687,30 @@ class TaskLedger:
                             "WHERE id=?",
                             (TaskStatus.OPEN, int(binding["task_id"])),
                         )
+                        # Record the reopen the way every other status change
+                        # is recorded. Two things depend on it: the event log
+                        # must not show a task silently changing state, and
+                        # the execution scheduler reads this event to tell a
+                        # re-surfaced task apart from one whose version moved
+                        # for any other reason. The version is the one the
+                        # revision below is about to write, so the event and
+                        # the task agree.
+                        connection.execute(
+                            "INSERT INTO task_events("
+                            "task_id,kind,task_version,candidate_id,"
+                            "source_revision,from_status,to_status,"
+                            "occurred_at) VALUES(?,?,?,?,?,?,?,?)",
+                            (
+                                int(binding["task_id"]),
+                                "status_changed",
+                                int(task["version"]) + 1,
+                                None,
+                                None,
+                                TaskStatus.DONE,
+                                TaskStatus.OPEN,
+                                now,
+                            ),
+                        )
                         task = connection.execute(
                             "SELECT * FROM tasks WHERE id=?",
                             (int(binding["task_id"]),),
