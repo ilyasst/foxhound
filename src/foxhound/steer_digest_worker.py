@@ -24,13 +24,15 @@ class SteerDigestResult:
     undigested: int = 0
 
 
-def run_pass(*, database_path: Path, run_root: Path, limit: int = 20,
+def run_pass(*, database_path: Path, run_root: Path | Sequence[Path],
+             limit: int = 20,
              digester=steer_digest.digest) -> SteerDigestResult:
     service = ExecutionCardService(_private_database(database_path))
     pending = service.steer_cards_awaiting_digest(limit=limit)
     recorded = missing = undigested = 0
     for item in pending:
-        transcript = _read_tail(_transcript_path(run_root, item.run_id))
+        found = _transcript_path(run_root, item.run_id)
+        transcript = "" if found is None else _read_tail(found)
         if not transcript.strip():
             missing += 1
             continue

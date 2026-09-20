@@ -935,5 +935,74 @@ class ObjectShapeTests(unittest.TestCase):
                                       set(self.REQUIRED))
 
 
+class FailureDigestComponentTests(DeploymentConfigTests):
+    """Rendering the pass that explains failed runs from their transcripts."""
+
+    def _with_digest(self, **overrides: object) -> dict[str, object]:
+        document = self._document()
+        consumers = document["database_consumers"]
+        assert isinstance(consumers, dict)
+        consumers["failure_digest"] = {"enabled": True, "limit": 20}
+        for key, value in overrides.items():
+            document[key] = value
+        return document
+
+    def test_every_run_root_the_runners_use_is_searched(self):
+        """A separately declared path is a path that can be wrong.
+
+        Its only symptom would be a pass that finds no transcripts and
+        reports success, which is exactly what a healthy deployment with no
+        failures looks like. The fixture gives its two slots different
+        roots, which is legitimate, so both must be passed.
+        """
+        self._write_config(self._with_digest())
+        config = load_deployment_config(self.config_path)
+
+        self.assertEqual(
+            config.argv("failure-digest"),
+            [
+                "foxhound-failure-digest",
+                "--database", str(self.database),
+                "--run-root", str(self.root / "runs"),
+                "--run-root", str(self.root / "runs-secondary"),
+                "--limit", "20",
+            ],
+        )
+
+    def test_slots_sharing_one_root_pass_it_once(self):
+        document = self._with_digest()
+        runners = document["execution_runners"]
+        assert isinstance(runners, list)
+        runners[1]["run_root"] = runners[0]["run_root"]
+        self._write_config(document)
+        config = load_deployment_config(self.config_path)
+
+        self.assertEqual(
+            config.argv("failure-digest").count("--run-root"), 1)
+
+    def test_a_disabled_or_absent_consumer_renders_nothing(self):
+        for label, value in (
+            ("absent", None),
+            ("disabled", {"enabled": False}),
+        ):
+            with self.subTest(consumer=label):
+                document = self._document()
+                consumers = document["database_consumers"]
+                assert isinstance(consumers, dict)
+                if value is not None:
+                    consumers["failure_digest"] = value
+                self._write_config(document)
+                config = load_deployment_config(self.config_path)
+                with self.assertRaises(DeploymentConfigError):
+                    config.argv("failure-digest")
+
+    def test_an_existing_configuration_still_loads_unchanged(self):
+        """Optional, so no host has to be edited before any host can run it."""
+        self._write_config(self._document())
+        config = load_deployment_config(self.config_path)
+        self.assertIsNotNone(config.database_consumers)
+        self.assertIsNone(config.database_consumers.failure_digest)
+
+
 if __name__ == "__main__":
     unittest.main()

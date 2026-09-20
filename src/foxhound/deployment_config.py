@@ -252,6 +252,9 @@ class DatabaseConsumersConfig:
     lifecycle_outcome_export: tuple[Path, str, int] | None
     fused_task_titles: str | None
     duplicate_card_schedule: int | None
+    #: How many failed attempts one digest pass explains.  Absent means the
+    #: consumer is disabled, as it does for every other entry here.
+    failure_digest: int | None = None
 
     def argv(self, component: str, database: Path) -> list[str]:
         if component == "candidate-feed-import":
@@ -351,9 +354,46 @@ class DeploymentConfig:
                         self.database, self.agent_profile_directory, self.workflow
                     )
             raise DeploymentConfigError("deployment component is unknown")
+        if component == "failure-digest":
+            return self._failure_digest_argv()
         if self.database_consumers is not None:
             return self.database_consumers.argv(component, self.database)
         raise DeploymentConfigError("deployment component is unknown")
+
+    def _failure_digest_argv(self) -> list[str]:
+        """Explain failed runs from the transcripts this deployment wrote.
+
+        The run root is taken from the runners rather than declared again.
+        This pass reads `run-<id>` directories that the runners created, so
+        a separately configured path is a path that can be wrong -- and its
+        only symptom would be a pass that finds nothing and reports success,
+        which is indistinguishable from a deployment with no failures.
+
+        Every distinct root is passed, because a deployment may give each
+        slot its own and the ledger records which run failed, never which
+        slot ran it. The capability endpoint is not configured here at all:
+        it is resolved exactly as `work_digest` resolves it, from
+        FOXHOUND_DIGEST_ENDPOINT or the loopback default.
+        """
+        roots: list[str] = []
+        for runner in self.execution_runners:
+            if not runner.enabled or runner.run_root is None:
+                continue
+            root = str(runner.run_root)
+            if root not in roots:
+                roots.append(root)
+        if not roots:
+            raise DeploymentConfigError("deployment run root is unavailable")
+        limit = 20
+        if self.database_consumers is not None:
+            configured = self.database_consumers.failure_digest
+            if configured is None:
+                raise DeploymentConfigError("database consumer is disabled")
+            limit = configured
+        argv = ["foxhound-failure-digest", "--database", str(self.database)]
+        for root in roots:
+            argv += ["--run-root", root]
+        return argv + ["--limit", str(limit)]
 
 
 def execute_component(config: DeploymentConfig, component: str) -> None:
@@ -773,7 +813,12 @@ def _parse_database_consumers(
         fields.add("fused_task_titles")
     if version >= 5:
         fields.add("duplicate_card_schedule")
-    optional_fields = {"task_card_requeue"} if version >= 5 else set()
+    # Optional rather than a schema bump: a deployment that has not enabled
+    # the digest pass is a valid deployment, and every host would otherwise
+    # have to be edited before any of them could run it.
+    optional_fields = (
+        {"task_card_requeue", "failure_digest"} if version >= 5 else set()
+    )
     document = _object(value, fields, optional_fields)
     candidate = _parse_candidate_feed_import(document["candidate_feed_import"])
     intake = _parse_native_intake_run(document["native_intake_run"])
@@ -791,6 +836,10 @@ def _parse_database_consumers(
         _parse_duplicate_card_schedule(document["duplicate_card_schedule"])
         if version >= 5 else None
     )
+    digests = (
+        _parse_failure_digest(document["failure_digest"])
+        if "failure_digest" in document else None
+    )
     return DatabaseConsumersConfig(
         candidate_feed_import=candidate,
         native_intake_run=intake,
@@ -799,6 +848,7 @@ def _parse_database_consumers(
         lifecycle_outcome_export=lifecycle,
         fused_task_titles=titles,
         duplicate_card_schedule=duplicates,
+        failure_digest=digests,
     )
 
 
@@ -888,6 +938,11 @@ def _parse_fused_task_titles(value: object) -> str | None:
 
 
 def _parse_duplicate_card_schedule(value: object) -> int | None:
+    document = _enabled_document(value, {"limit"})
+    return None if document is None else _positive_int(document["limit"])
+
+
+def _parse_failure_digest(value: object) -> int | None:
     document = _enabled_document(value, {"limit"})
     return None if document is None else _positive_int(document["limit"])
 

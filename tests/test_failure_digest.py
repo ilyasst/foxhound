@@ -183,6 +183,43 @@ class FailureDigestPassTests(unittest.TestCase):
         directory.mkdir(mode=0o700)
         (directory / TRANSCRIPT_NAME).write_text(text, encoding="utf-8")
 
+    def test_a_transcript_in_any_declared_root_is_found(self):
+        """Slots may keep their runs in different places.
+
+        The ledger records which run failed, never which slot ran it, so a
+        pass that knew about one root would report every failure from the
+        others as having left no transcript -- which reads exactly like a
+        run that left none.
+        """
+        second = self.root / "runs-secondary"
+        second.mkdir(mode=0o700)
+        self._failed_workflow()
+        directory = second / f"run-{RUN_ID}"
+        directory.mkdir(mode=0o700)
+        (directory / TRANSCRIPT_NAME).write_text(
+            "editing a file\nReached maximum iterations (80).\n",
+            encoding="utf-8",
+        )
+
+        result = run_pass(
+            database_path=self.database,
+            run_root=[self.runs, second],
+            digester=lambda _text: "It stopped at its turn limit.",
+        )
+        self.assertEqual(result.recorded, 1)
+        self.assertEqual(result.missing, 0)
+        self.assertEqual(
+            self.service.failure_digest(1), "It stopped at its turn limit.")
+
+    def test_a_transcript_in_no_declared_root_is_still_missing(self):
+        self._failed_workflow()
+        result = run_pass(
+            database_path=self.database,
+            run_root=[self.runs, self.root / "runs-secondary"],
+            digester=lambda _text: "unreachable",
+        )
+        self.assertEqual((result.recorded, result.missing), (0, 1))
+
     def test_a_failed_attempt_is_explained_and_recorded_once(self):
         self._failed_workflow()
         self._transcript("editing a file\nReached maximum iterations (80).\n")

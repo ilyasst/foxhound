@@ -65,29 +65,45 @@ def _read_tail(path: Path) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
-def _transcript_path(run_root: Path, run_id: str) -> Path:
+def _transcript_path(
+    run_roots: Path | Sequence[Path], run_id: str
+) -> Path | None:
     """Where the runner put this run's output.
 
     The layout is the runner's: one directory per run, named for the run
     id, with the transcript inside it under a shared constant so the two
     sides cannot drift.
+
+    Several roots, because a deployment may give each runner slot its own.
+    The ledger records which run failed, never which slot ran it, so the
+    only way to find a transcript is to look where runs are kept -- and a
+    pass that knew about one root would silently report every failure from
+    the others as having no transcript, which is indistinguishable from a
+    run that left none.
     """
-    return run_root / f"run-{run_id}" / TRANSCRIPT_NAME
+    roots = (run_roots,) if isinstance(run_roots, Path) else tuple(run_roots)
+    for root in roots:
+        candidate = root / f"run-{run_id}" / TRANSCRIPT_NAME
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def run_pass(
     *,
     database_path: Path,
-    run_root: Path,
+    run_root: Path | Sequence[Path],
     limit: int = 20,
     digester=failure_digest.digest,
 ) -> FailureDigestResult:
+    roots = (run_root,) if isinstance(run_root, Path) else tuple(run_root)
     database = _private_database(database_path)
     service = TaskExecutionService(database)
     pending = service.failures_awaiting_digest(limit=limit)
     recorded = missing = undigested = 0
     for item in pending:
-        transcript = _read_tail(_transcript_path(run_root, item.run_id))
+        found = _transcript_path(roots, item.run_id)
+        transcript = "" if found is None else _read_tail(found)
         if not transcript.strip():
             missing += 1
             continue
@@ -125,7 +141,10 @@ def _parser() -> argparse.ArgumentParser:
         "--run-root",
         required=True,
         type=Path,
-        help="the runner's run root, where run-<id> directories live",
+        action="append",
+        dest="run_roots",
+        help="a runner's run root, where run-<id> directories live; repeat "
+             "for a deployment whose slots keep runs in different places",
     )
     parser.add_argument("--limit", default=20, type=int)
     return parser
@@ -136,7 +155,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         result = run_pass(
             database_path=args.database,
-            run_root=args.run_root,
+            run_root=args.run_roots,
             limit=args.limit,
         )
     except (TaskBootstrapConfigError, ValueError):
