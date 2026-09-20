@@ -71,10 +71,16 @@ class DeploymentConfigTests(unittest.TestCase):
         for runner in document["execution_runners"]:  # type: ignore[index]
             runner.pop("deployment_roots", None)
 
+    def _drop_agent_selection_keys(self, document: dict[str, object]) -> None:
+        """Remove the keys a document written before version 14 never had."""
+        for runner in document["execution_runners"]:  # type: ignore[index]
+            runner.pop("agent_model", None)
+            runner.pop("agent_provider", None)
+
     def _document(self) -> dict[str, object]:
         return {
             "schema": "foxhound.deployment-config",
-            "schema_version": 13,
+            "schema_version": 14,
             "database": str(self.database),
             "agent_profile_directory": None,
             "card_service": {
@@ -109,6 +115,8 @@ class DeploymentConfigTests(unittest.TestCase):
                 "gw_alias": "example-operator",
                 "gw_token_file": str(self.gateway_token),
                 "agent_command": "hermes",
+                "agent_model": None,
+                "agent_provider": None,
                 "worker_command": "foxhound-task-worker",
                 "runner_slot": "primary",
                 "knowledge_root": None,
@@ -124,6 +132,8 @@ class DeploymentConfigTests(unittest.TestCase):
                 "gw_alias": "example-operator",
                 "gw_token_file": str(self.gateway_token),
                 "agent_command": "hermes",
+                "agent_model": None,
+                "agent_provider": None,
                 "worker_command": "foxhound-task-worker",
                 "runner_slot": "secondary",
                 "knowledge_root": None,
@@ -252,9 +262,96 @@ class DeploymentConfigTests(unittest.TestCase):
                 with self.assertRaises(DeploymentConfigError):
                     load_deployment_config(self.config_path)
 
+    def test_one_runner_moves_to_another_backend_without_moving_the_others(
+        self,
+    ) -> None:
+        document = self._document()
+        document["execution_runners"][0]["agent_model"] = "example-model-b"
+        document["execution_runners"][0]["agent_provider"] = "example-provider"
+        self._write_config(document)
+
+        config = load_deployment_config(self.config_path)
+        selected, untouched = config.execution_runners
+        database = Path("/srv/example/db.sqlite3")
+
+        self.assertEqual(
+            (selected.agent_model, selected.agent_provider),
+            ("example-model-b", "example-provider"),
+        )
+        selected_argv = selected.argv(database, None, config.workflow)
+        index = selected_argv.index("--agent-model")
+        self.assertEqual(
+            selected_argv[index:index + 4],
+            [
+                "--agent-model", "example-model-b",
+                "--agent-provider", "example-provider",
+            ],
+        )
+
+        self.assertIsNone(untouched.agent_model)
+        self.assertIsNone(untouched.agent_provider)
+        untouched_argv = untouched.argv(database, None, config.workflow)
+        self.assertNotIn("--agent-model", untouched_argv)
+        self.assertNotIn("--agent-provider", untouched_argv)
+
+    def test_a_model_alone_is_enough_and_a_provider_alone_is_refused(
+        self,
+    ) -> None:
+        document = self._document()
+        document["execution_runners"][0]["agent_model"] = "example-model-b"
+        self._write_config(document)
+
+        config = load_deployment_config(self.config_path)
+        runner = config.execution_runners[0]
+        argv = runner.argv(Path("/srv/example/db.sqlite3"), None, config.workflow)
+        self.assertIn("--agent-model", argv)
+        self.assertNotIn("--agent-provider", argv)
+
+        document = self._document()
+        document["execution_runners"][0]["agent_provider"] = "example-provider"
+        self._write_config(document)
+        with self.assertRaises(DeploymentConfigError):
+            load_deployment_config(self.config_path)
+
+    def test_an_unusable_backend_selection_is_refused_by_validation(self) -> None:
+        for model, provider in (
+            ("--not-a-model", None),
+            ("example model", None),
+            ("example-model-b", "example provider"),
+            ("example-model-b", "--not-a-provider"),
+            ("", None),
+            (17, None),
+            ("example-model-b", True),
+        ):
+            with self.subTest(model=model, provider=provider):
+                document = self._document()
+                runner = document["execution_runners"][0]
+                runner["agent_model"] = model
+                runner["agent_provider"] = provider
+                self._write_config(document)
+                with self.assertRaises(DeploymentConfigError):
+                    load_deployment_config(self.config_path)
+
+    def test_version_thirteen_configuration_remains_valid_without_a_backend(
+        self,
+    ) -> None:
+        document = self._document()
+        document["schema_version"] = 13
+        self._drop_agent_selection_keys(document)
+        self._write_config(document)
+
+        config = load_deployment_config(self.config_path)
+        runner = next(r for r in config.execution_runners if r.enabled)
+        self.assertIsNone(runner.agent_model)
+        self.assertIsNone(runner.agent_provider)
+        argv = runner.argv(Path("/srv/example/db.sqlite3"), None, config.workflow)
+        self.assertNotIn("--agent-model", argv)
+        self.assertNotIn("--agent-provider", argv)
+
     def test_version_twelve_configuration_remains_valid_without_roots(self) -> None:
         document = self._document()
         document["schema_version"] = 12
+        self._drop_agent_selection_keys(document)
         self._drop_deployment_root_keys(document)
         self._write_config(document)
 
@@ -267,6 +364,7 @@ class DeploymentConfigTests(unittest.TestCase):
     def test_version_one_configuration_remains_valid_without_card_gw_settings(self) -> None:
         document = self._document()
         document["schema_version"] = 1
+        self._drop_agent_selection_keys(document)
         self._drop_runtime_log_keys(document)
         self._drop_deployment_root_keys(document)
         del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
@@ -288,6 +386,7 @@ class DeploymentConfigTests(unittest.TestCase):
     def test_version_two_configuration_remains_valid(self) -> None:
         document = self._document()
         document["schema_version"] = 2
+        self._drop_agent_selection_keys(document)
         self._drop_runtime_log_keys(document)
         self._drop_deployment_root_keys(document)
         del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
@@ -309,6 +408,7 @@ class DeploymentConfigTests(unittest.TestCase):
     def test_version_three_configuration_remains_valid_without_title_worker(self) -> None:
         document = self._document()
         document["schema_version"] = 3
+        self._drop_agent_selection_keys(document)
         self._drop_runtime_log_keys(document)
         self._drop_deployment_root_keys(document)
         del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
@@ -332,6 +432,7 @@ class DeploymentConfigTests(unittest.TestCase):
     ) -> None:
         document = self._document()
         document["schema_version"] = 4
+        self._drop_agent_selection_keys(document)
         self._drop_runtime_log_keys(document)
         self._drop_deployment_root_keys(document)
         del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
@@ -353,6 +454,7 @@ class DeploymentConfigTests(unittest.TestCase):
         """A file written before the key existed keeps asking, silently."""
         document = self._document()
         document["schema_version"] = 5
+        self._drop_agent_selection_keys(document)
         self._drop_runtime_log_keys(document)
         self._drop_deployment_root_keys(document)
         del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
@@ -415,6 +517,7 @@ class DeploymentConfigTests(unittest.TestCase):
     def test_version_nine_configuration_retains_its_plan_phase(self) -> None:
         document = self._document()
         document["schema_version"] = 9
+        self._drop_agent_selection_keys(document)
         self._drop_runtime_log_keys(document)
         self._drop_deployment_root_keys(document)
         del document["workflow"]["skip_planning_for"]  # type: ignore[index]
@@ -541,6 +644,7 @@ class DeploymentConfigTests(unittest.TestCase):
         """A file written for the previous key keeps asking about actions."""
         document = self._document()
         document["schema_version"] = 6
+        self._drop_agent_selection_keys(document)
         self._drop_runtime_log_keys(document)
         self._drop_deployment_root_keys(document)
         del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
