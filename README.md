@@ -486,6 +486,38 @@ foxhound-agent-profile-store --source /srv/example/private-agent-source   publis
 Without `--expect`, a publish compiles whatever the draft holds at that moment
 and reports success for it.
 
+When one profile must differ per host, the difference is an overlay the host
+selects, not an edit to its draft. A draft declares each one by name:
+
+```json
+{"variants": {"lab-bench": ["lab-bench.md"]}}
+```
+
+Publishing then emits one revision per variant alongside the base, and the
+catalog records which revision each variant renders to. The host chooses at
+install time, which makes the choice deployment configuration rather than a
+difference between two stores:
+
+```sh
+foxhound-agent-profile-store --source /srv/example/private-agent-source   install --target /srv/example/private-agent-profiles --variant lab-bench
+```
+
+The installed catalog keeps its ordinary shape — one offered revision per
+profile — so nothing downstream needs to know about variants, and every
+published revision is still installed, leaving a workflow pinned to another
+host's variant resolvable. The shared and role text stay one document, so the
+part that is supposed to be identical everywhere is identical by construction
+rather than by discipline.
+
+`doctor --compare` answers whether two stores agree without anyone reading
+digests on two machines. It reports, per profile, `same`, `source_ahead` or
+`target_ahead` with a distance, or `diverged`, and sets `ok` to false only for
+the last:
+
+```sh
+foxhound-agent-profile-store --source /srv/example/private-agent-source   doctor --compare /srv/example/other-agent-source
+```
+
 Instructions that several agents share, including approved reusable Hermes
 prompt material, belong in the store's shared component rather than in this
 repository or in ambient host configuration: publication composes them into

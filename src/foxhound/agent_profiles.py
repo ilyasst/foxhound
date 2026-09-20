@@ -57,6 +57,11 @@ _FIELDS = frozenset({
 })
 _CATALOG_FIELDS = frozenset({"schema", "schema_version", "profiles"})
 _CATALOG_ENTRY_FIELDS = frozenset({"state", "revision", "history"})
+#: A profile that renders differently per host also publishes one revision per
+#: named variant. The key is absent for a profile that has none, so a catalog
+#: that uses no variants is byte-identical to one written before they existed.
+_CATALOG_ENTRY_VARIANT_FIELDS = _CATALOG_ENTRY_FIELDS | {"variants"}
+_VARIANT_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 _CATALOG_STATES = frozenset({"active", "disabled"})
 
 
@@ -145,17 +150,44 @@ class CatalogEntry:
     state: str
     revision: str
     history: tuple[str, ...]
+    #: Variant name to the revision that variant renders to. Empty for a
+    #: profile that is the same everywhere.
+    variants: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def is_active(self) -> bool:
         return self.state == "active"
 
     def document(self) -> dict[str, Any]:
-        return {
+        document: dict[str, Any] = {
             "state": self.state,
             "revision": self.revision,
             "history": list(self.history),
         }
+        if self.variants:
+            document["variants"] = dict(sorted(self.variants.items()))
+        return document
+
+    def materialize(self, variant: str | None) -> "CatalogEntry":
+        """This entry as the named variant offers it.
+
+        The installed copy keeps the shape every reader already understands:
+        one revision, and a history that ends with it. Selecting a variant
+        therefore moves that revision to the end rather than adding anything,
+        so a workflow pinned to any published revision still resolves.
+        """
+        if variant is None or variant not in self.variants:
+            return self
+        revision = self.variants[variant]
+        history = tuple(
+            item for item in self.history if item != revision
+        ) + (revision,)
+        return CatalogEntry(
+            profile_id=self.profile_id,
+            state=self.state,
+            revision=revision,
+            history=history,
+        )
 
 
 class AgentProfileRegistry:
@@ -633,8 +665,37 @@ def parse_catalog(document: object) -> dict[str, CatalogEntry]:
     return entries
 
 
+def _parse_catalog_variants(
+    value: object, history: list[str]
+) -> dict[str, str]:
+    """Validate variant revisions, each of which must be a published one.
+
+    A variant naming a revision outside the profile's history would offer a
+    host something the store cannot resolve, so it is refused here rather than
+    discovered at install.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict) or not value:
+        raise AgentProfileError("agent profile catalog variants are invalid")
+    variants: dict[str, str] = {}
+    for name, revision in value.items():
+        if (
+            not isinstance(name, str)
+            or _VARIANT_NAME_RE.fullmatch(name) is None
+            or not isinstance(revision, str)
+            or _REVISION_RE.fullmatch(revision) is None
+            or revision not in history
+        ):
+            raise AgentProfileError("agent profile catalog variants are invalid")
+        variants[name] = revision
+    return variants
+
+
 def _parse_catalog_entry(profile_id: str, entry: object) -> CatalogEntry:
-    if not isinstance(entry, dict) or set(entry) != _CATALOG_ENTRY_FIELDS:
+    if not isinstance(entry, dict) or set(entry) not in (
+        _CATALOG_ENTRY_FIELDS, _CATALOG_ENTRY_VARIANT_FIELDS
+    ):
         raise AgentProfileError("agent profile catalog entry is invalid")
     state = entry["state"]
     revision = entry["revision"]
@@ -657,11 +718,13 @@ def _parse_catalog_entry(profile_id: str, entry: object) -> CatalogEntry:
         or revision != history[-1]
     ):
         raise AgentProfileError("agent profile catalog revision is invalid")
+    variants = _parse_catalog_variants(entry.get("variants"), history)
     return CatalogEntry(
         profile_id=profile_id,
         state=state,
         revision=revision,
         history=tuple(history),
+        variants=variants,
     )
 
 
