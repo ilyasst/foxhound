@@ -599,11 +599,30 @@ class TaskExecutionService:
                     "LEFT JOIN task_execution_workflows AS w "
                     "ON w.task_id=t.id WHERE t.status='open' "
                     "AND (w.task_id IS NULL OR (w.task_version!=t.version "
-                    "AND EXISTS(SELECT 1 FROM task_candidate_bindings AS review "
+                    # A re-surfaced task needs a fresh workflow whatever its
+                    # source kind. Without this, ADR 0039 reopens a task whose
+                    # terminal workflow still satisfies this join, and it never
+                    # runs again.
+                    #
+                    # Keyed on the reopen EVENT, not on the old workflow's
+                    # status. Status looked like the obvious discriminator and
+                    # is the wrong one: `_cancel_stale` writes `cancelled`
+                    # moments earlier in this same pass for a workflow whose
+                    # task merely moved underneath it, and that reconciliation
+                    # must keep ending in a cancellation rather than becoming
+                    # an immediate re-schedule. The event says the task was
+                    # reopened, which is the thing actually being asked.
+                    "AND (EXISTS(SELECT 1 FROM task_events AS reopened "
+                    "WHERE reopened.task_id=t.id "
+                    "AND reopened.kind='status_changed' "
+                    "AND reopened.from_status='done' "
+                    "AND reopened.to_status='open' "
+                    "AND reopened.task_version>w.task_version) "
+                    "OR EXISTS(SELECT 1 FROM task_candidate_bindings AS review "
                     "JOIN candidate_inbox AS source "
                     "ON source.candidate_id=review.candidate_id "
                     "WHERE review.task_id=t.id AND review.relation='accepted' "
-                    "AND source.source_kind='review_request'))) "
+                    "AND source.source_kind='review_request')))) "
                     "AND NOT EXISTS("
                     " SELECT 1 FROM task_candidate_bindings AS b JOIN "
                     " task_candidate_lifecycle AS l ON l.candidate_id=b.candidate_id "
@@ -712,11 +731,30 @@ class TaskExecutionService:
                     "LEFT JOIN task_execution_workflows AS w "
                     "ON w.task_id=t.id WHERE t.status='open' "
                     "AND (w.task_id IS NULL OR (w.task_version!=t.version "
-                    "AND EXISTS(SELECT 1 FROM task_candidate_bindings AS review "
+                    # A re-surfaced task needs a fresh workflow whatever its
+                    # source kind. Without this, ADR 0039 reopens a task whose
+                    # terminal workflow still satisfies this join, and it never
+                    # runs again.
+                    #
+                    # Keyed on the reopen EVENT, not on the old workflow's
+                    # status. Status looked like the obvious discriminator and
+                    # is the wrong one: `_cancel_stale` writes `cancelled`
+                    # moments earlier in this same pass for a workflow whose
+                    # task merely moved underneath it, and that reconciliation
+                    # must keep ending in a cancellation rather than becoming
+                    # an immediate re-schedule. The event says the task was
+                    # reopened, which is the thing actually being asked.
+                    "AND (EXISTS(SELECT 1 FROM task_events AS reopened "
+                    "WHERE reopened.task_id=t.id "
+                    "AND reopened.kind='status_changed' "
+                    "AND reopened.from_status='done' "
+                    "AND reopened.to_status='open' "
+                    "AND reopened.task_version>w.task_version) "
+                    "OR EXISTS(SELECT 1 FROM task_candidate_bindings AS review "
                     "JOIN candidate_inbox AS source "
                     "ON source.candidate_id=review.candidate_id "
                     "WHERE review.task_id=t.id AND review.relation='accepted' "
-                    "AND source.source_kind='review_request'))) "
+                    "AND source.source_kind='review_request')))) "
                     "AND NOT EXISTS("
                     " SELECT 1 FROM task_candidate_bindings AS blocked JOIN "
                     " task_candidate_lifecycle AS l "
