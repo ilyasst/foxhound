@@ -543,8 +543,8 @@ def _validate_profile(profile: AgentProfile) -> None:
         raise AgentProfileError("agent profile phases are invalid")
     for value, minimum, maximum, label in (
         (profile.max_turns, 1, 200, "turn limit"),
-        (profile.timeout_seconds, 30, 3_300, "timeout"),
-        (profile.claim_lease_seconds, 300, 3_600, "claim lease"),
+        (profile.timeout_seconds, 30, 7_200, "timeout"),
+        (profile.claim_lease_seconds, 300, 10_800, "claim lease"),
         (profile.heartbeat_seconds, 5, 600, "heartbeat"),
         (profile.kill_grace_seconds, 1, 120, "shutdown grace"),
     ):
