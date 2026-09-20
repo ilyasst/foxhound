@@ -66,6 +66,29 @@ class DeliveryHealthTests(unittest.TestCase):
                 (int(card.lastrowid), kind, self._time(at)),
             )
 
+    def _execution_events_on_one_card(self, *pairs) -> None:
+        """Several events against a single card.
+
+        `execution_review_cards` carries a unique index over the active
+        statuses per task, so a card per event is not a legal shape.
+        """
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            first = pairs[0][1]
+            card = connection.execute(
+                "INSERT INTO execution_review_cards("
+                "task_id,task_version,workflow_version,kind,phase,status,version,"
+                "created_at,updated_at"
+                ") VALUES(2,1,1,'start','plan','pending',1,?,?)",
+                (self._time(first), self._time(first)),
+            )
+            for kind, at in pairs:
+                connection.execute(
+                    "INSERT INTO execution_review_card_events("
+                    "card_id,task_id,kind,card_version,workflow_version,action,"
+                    "occurred_at) VALUES(?,2,?,1,1,NULL,?)",
+                    (int(card.lastrowid), kind, self._time(at)),
+                )
+
     def _open_task(self, task_id: int, *, created: datetime,
                    workflow: bool = False) -> None:
         with closing(sqlite3.connect(self.database)) as connection, connection:
@@ -198,6 +221,55 @@ class DeliveryHealthTests(unittest.TestCase):
         )
 
         self.assertEqual(health.execution_cards.pending, 1)
+        self.assertEqual(health.recent_failures, 1)
+        self.assertIn("recent_delivery_failures_exceeded", health.alerts)
+
+    def test_requeued_cards_are_reported_but_do_not_alarm(self) -> None:
+        """Re-presenting unanswered cards is not a delivery failure.
+
+        `requeue_unanswered` runs hourly and re-presents every card left
+        unanswered for an hour. It used to record that as `delivery_failed`,
+        and this check counts those against a threshold of three in fifteen
+        minutes -- so any hour with three unanswered cards reported delivery
+        as unhealthy on a system that was delivering perfectly well. Observed
+        firing at 06:30, 07:30 and 11:30 on one morning.
+
+        The cost was not only noise: a real transport failure became
+        indistinguishable from routine re-presentation, so the check that
+        exists to catch broken delivery could not. The count is still
+        reported, because "three cards have gone unanswered for an hour" is
+        worth knowing -- it is simply not a delivery failure.
+        """
+        self._execution_events_on_one_card(
+            ("requeued", NOW - timedelta(seconds=2)),
+            ("requeued", NOW - timedelta(seconds=1)),
+            ("requeued", NOW),
+        )
+
+        health = collect_delivery_health(
+            self.database,
+            policy=DeliveryHealthPolicy(max_recent_failures=3),
+            clock=lambda: NOW,
+        )
+
+        self.assertEqual(health.recent_requeues, 3)
+        self.assertEqual(health.recent_failures, 0)
+        self.assertNotIn("recent_delivery_failures_exceeded", health.alerts)
+
+    def test_a_real_failure_still_alarms_beside_requeues(self) -> None:
+        """The separation must not blunt the check it is protecting."""
+        self._execution_events_on_one_card(
+            ("requeued", NOW - timedelta(seconds=2)),
+            ("delivery_failed", NOW),
+        )
+
+        health = collect_delivery_health(
+            self.database,
+            policy=DeliveryHealthPolicy(max_recent_failures=1),
+            clock=lambda: NOW,
+        )
+
+        self.assertEqual(health.recent_requeues, 1)
         self.assertEqual(health.recent_failures, 1)
         self.assertIn("recent_delivery_failures_exceeded", health.alerts)
 
