@@ -14,6 +14,7 @@ import shlex
 import signal
 import stat
 import subprocess
+import shutil
 import sys
 import time
 from dataclasses import dataclass, field
@@ -668,6 +669,16 @@ def _run_claim(
             transcript = _open_transcript(directory)
         except OSError:
             transcript = None
+        if transcript is not None:
+            # The run directory and its transcript now exist together. The
+            # pointer is optional (a database race must not cost the run),
+            # but never record one before there is something safe to read.
+            service.attach_run_id(
+                claim.task_id,
+                expected_version=claim.workflow_version,
+                claim_token=claim.token,
+                run_id=run_id,
+            )
         try:
             process = popen(
                 list(command),
@@ -703,7 +714,9 @@ def _run_claim(
                     sleep=sleep, clock=clock
                 )
                 return ExecutionRunResult(
-                    terminal, 0 if terminal == "recorded" else NO_PROGRESS_EXIT_CODE,
+                    terminal,
+                    0 if terminal in {"recorded", "released"}
+                    else NO_PROGRESS_EXIT_CODE,
                     claim.task_id, forced,
                 )
 
@@ -744,7 +757,8 @@ def _run_claim(
                 if terminal is not None:
                     return ExecutionRunResult(
                         terminal,
-                        0 if terminal == "recorded" else NO_PROGRESS_EXIT_CODE,
+                        0 if terminal in {"recorded", "released"}
+                        else NO_PROGRESS_EXIT_CODE,
                         claim.task_id,
                     )
                 if not corrective_attempted:
@@ -880,6 +894,45 @@ def _run_claim(
             # directory is the record; the folder is what the reader opens.
             with contextlib.suppress(TaskArchiveError):
                 publish_deliverables(archive, directory)
+            cleanup_run_clones(directory)
+
+
+def cleanup_run_clones(run_directory: Path) -> None:
+    """Remove prepared worktrees once their run reaches a terminal state.
+
+    A clone is removed only if it holds no unpushed commits. If it holds
+    work absent from a remote, it is preserved and reported. Removal
+    failures do not fail the run.
+    """
+    try:
+        for entry in run_directory.iterdir():
+            if not entry.is_dir() or not entry.name.startswith("repo-"):
+                continue
+            if not (entry / ".git").exists():
+                continue
+            try:
+                result = subprocess.run(
+                    ["git", "-C", str(entry), "log", "--oneline", "--all", "--not", "--remotes"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            except OSError:
+                continue
+            # A check that could not run has not established anything. Only a
+            # successful, empty answer means "no unpushed work"; a non-zero
+            # exit means git could not tell us, and the clone stays. These
+            # directories are live -- an index.lock, a repo mid-operation or a
+            # permissions hiccup all exit non-zero, and deleting on those
+            # would be deleting precisely when we are least sure.
+            if result.returncode != 0 or result.stdout.strip():
+                continue
+            try:
+                shutil.rmtree(entry)
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 
 def _terminal_result(
@@ -1047,7 +1100,8 @@ def _failure_result(
     if terminal in {"recorded", "released"}:
         return ExecutionRunResult(
             terminal,
-            0 if terminal == "recorded" else NO_PROGRESS_EXIT_CODE,
+            0 if terminal in {"recorded", "released"}
+            else NO_PROGRESS_EXIT_CODE,
             claim.task_id,
             forced,
         )

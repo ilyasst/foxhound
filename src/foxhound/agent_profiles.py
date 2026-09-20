@@ -543,8 +543,8 @@ def _validate_profile(profile: AgentProfile) -> None:
         raise AgentProfileError("agent profile phases are invalid")
     for value, minimum, maximum, label in (
         (profile.max_turns, 1, 200, "turn limit"),
-        (profile.timeout_seconds, 30, 3_300, "timeout"),
-        (profile.claim_lease_seconds, 300, 3_600, "claim lease"),
+        (profile.timeout_seconds, 30, 7_200, "timeout"),
+        (profile.claim_lease_seconds, 300, 10_800, "claim lease"),
         (profile.heartbeat_seconds, 5, 600, "heartbeat"),
         (profile.kill_grace_seconds, 1, 120, "shutdown grace"),
     ):
@@ -1112,6 +1112,12 @@ _GENERAL_PROMPT_TEMPLATE_V12 = _GENERAL_PROMPT_TEMPLATE_V11.replace(
 
 
 _GENERAL_PROMPT_TEMPLATE_V13 = _GENERAL_PROMPT_TEMPLATE_V12.replace(
+    "Repository follow-through is required only when execution changes or advances repository work. Planning, research, and an honest non-repository result remain valid without a forge update; for such a repository-origin execution, write JSON `false` to owner-only `result-repository-impact.json` and explain the bounded result in the deliverables. Omit the file for repository-impacting work: its safe default is `true`.",
+    "Repository follow-through is required only when execution changes or advances repository work. Planning, research, and an honest non-repository result remain valid without a forge update; for such a repository-origin execution, write JSON `false` to owner-only `result-repository-impact.json` before `draft --outcome completed`, and explain the bounded result in the deliverables. Omit the file for repository-impacting work: its safe default is `true`; without the explicit `false`, `completed` is correctly refused pending follow-through.",
+).replace(
+    "In `execute`, do not post the update. Put its complete draft in the reviewable result and list posting it as a structured external action with an exact `target` URL for `task.origin`, so the reader can approve the exact external write.",
+    "In `execute`, do not post the update. Put its complete draft in the reviewable result and list posting it in `result-external-actions.json` as a JSON object, for example `{\"action\":\"Post the prepared update\",\"target\":\"https://github.com/OWNER/REPO/issues/NUMBER\"}`. Its `target` must be the exact URL for `task.origin`; a plain-string action description cannot request the follow-through. This lets the reader approve the exact external write.",
+).replace(
     f"Call `{WORKER_COMMAND_TOKEN} act worktree [--repository LOCATOR]` only when `context` lists `act.worktree`. A task may legitimately span several repositories.",
     "\n".join((
         f"Call `{WORKER_COMMAND_TOKEN} act worktree [--repository LOCATOR]` only when `context` lists `act.worktree`. A task may legitimately span several repositories.",
@@ -1129,10 +1135,10 @@ _GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V13
 # revision fails at every runner and scheduler startup, rather than leaving a
 # stale test in a different file to discover the mismatch later.
 GENERAL_PROFILE_RELEASE_REVISION = (
-    "aebb138882a0c6c66be45a8c05d7c4aac726f88954f9f8217a2e37ff776e77c9"
+    "15a5abd4bb06a78046c11004515e487e84b5fed3295f90cd84aed95d2ea603e1"
 )
 GENERAL_PROFILE_RELEASE_PROMPT_SHA256 = (
-    "a28cf00e1baa76eaa618aa55440519cdb2fa8ab1a441d5b87c66bfdaed4aa758"
+    "c59d38f22fa4e0c3a3a9b322ef962386e3e30c3ed020d77499e8d820547d19c1"
 )
 
 

@@ -43,6 +43,7 @@ from foxhound.execution_cards import (
     ExecutionCardService,
     ExecutionCardStatus,
     ExecutionReviewCard,
+    _card_lines,
     _markdown_inline,
     parse_execution_agent_callback,
     parse_execution_review_callback,
@@ -4097,6 +4098,229 @@ class ExecutionCardTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM task_events"
             ).fetchone()[0]
         self.assertEqual(after_events, event_count)
+
+    def _announced_running_workflow(self, task_id: int = 1):
+        scheduled = self._schedule_workflow(task_id)
+        self.execution.start_action(
+            task_id, expected_version=scheduled.version, action="start"
+        )
+        claim = self.execution.claim_next()
+        self.assertIsNotNone(claim)
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "UPDATE task_execution_workflows SET steer_while_running=1,"
+                "claimed_at=?,current_run_id=? WHERE task_id=?",
+                ((self.clock() - timedelta(minutes=21)).isoformat(timespec="seconds"),
+                 "a" * 32, task_id),
+            )
+        return claim
+
+    def test_announced_long_run_raises_one_self_retiring_steer_card(self):
+        claim = self._announced_running_workflow()
+        self.assertEqual(self.cards.schedule().created, 1)
+        self.assertEqual(self.cards.schedule().created, 0)
+        card = self.cards.due()[0]
+        self.assertEqual(card.kind, ExecutionCardKind.STEER)
+        rendered, keyboard = render_execution_review_card(card)
+        self.assertIn("Run in progress", rendered)
+        self.assertIn("Running for at least:</b> 21 minutes", rendered)
+        self.assertNotIn("What it is doing", rendered)
+        self.assertIn(
+            "Running for at least: 21 minutes", "\n".join(_card_lines(card))
+        )
+        actions = {
+            parse_execution_review_callback(button["callback_data"])[2]
+            for row in keyboard["inline_keyboard"] for button in row
+        }
+        self.assertEqual(
+            actions, {"discuss", "comment_go", "done", "drop", "brief"}
+        )
+        self.execution.release(
+            claim.task_id, expected_version=claim.workflow_version,
+            claim_token=claim.token,
+        )
+        self.assertEqual(self.cards.schedule().cancelled, 1)
+
+    def test_external_action_run_uses_the_execute_steer_threshold(self):
+        self._announced_running_workflow()
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "UPDATE task_execution_workflows SET phase='external_action' "
+                "WHERE task_id=1"
+            )
+        self.assertEqual(self.cards.schedule().created, 1)
+        self.assertEqual(
+            self.cards.due()[0].phase, WorkflowPhase.EXTERNAL_ACTION
+        )
+
+    def test_steer_capacity_cannot_block_a_start_card(self):
+        self.execution = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: CLAIM_TOKEN,
+            execution_slot_cap=6,
+        )
+        for task_id in range(1, 6):
+            self._announced_running_workflow(task_id)
+        self.assertEqual(self.cards.schedule().created, 5)
+        claims = [self.cards.claim_next(
+            consumer_digest="a" * 64, consumer_role="drip"
+        ) for _ in range(5)]
+        self.assertTrue(all(claim is not None for claim in claims))
+        self.assertEqual(
+            {claim.card.kind for claim in claims}, {ExecutionCardKind.STEER}
+        )
+        self._schedule_workflow(6)
+        self.assertEqual(self.cards.schedule().created, 1)
+        decision = self.cards.claim_next(
+            consumer_digest="a" * 64, consumer_role="drip"
+        )
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.card.kind, ExecutionCardKind.START)
+        stats = self.cards.stats_scoped(consumer_digest="a" * 64)
+        self.assertEqual(stats.steer_delivering, 5)
+        self.assertEqual(stats.delivering, 1)
+
+    def test_steer_note_preempts_without_recording_a_failure(self):
+        claim = self._announced_running_workflow()
+        self.cards.schedule()
+        delivered = self._claim_and_deliver()
+        result = self.cards.submit_input(
+            delivered.card.id, expected_version=delivered.card.version,
+            kind="discussion", value="Use the synthetic fallback.",
+        )
+        self.assertTrue(result.accepted)
+        workflow = self.execution.get(claim.task_id)
+        self.assertEqual((workflow.status, workflow.phase, workflow.failure_count),
+                         (WorkflowStatus.QUEUED, WorkflowPhase.PLAN, 0))
+        self.assertEqual(
+            self.execution.renew(claim.task_id, expected_version=claim.workflow_version,
+                                 claim_token=claim.token).accepted,
+            False,
+        )
+        stale_result = self.execution.record_result(ExecutionResultEnvelope(
+            result_id="synthetic-stale-plan",
+            task_id=claim.task_id,
+            task_version=1,
+            workflow_version=claim.workflow_version,
+            phase=WorkflowPhase.PLAN,
+            claim_token=claim.token,
+            outcome=ExecutionOutcome.AWAITING_PLAN,
+            summary="Synthetic stale plan.",
+            work_markdown="Synthetic stale work.",
+        ))
+        self.assertFalse(stale_result.accepted)
+        with closing(sqlite3.connect(self.database)) as connection:
+            self.assertEqual(connection.execute(
+                "SELECT kind FROM task_execution_events WHERE task_id=? "
+                "ORDER BY sequence DESC LIMIT 1", (claim.task_id,)
+            ).fetchone()[0], "discussion_requested")
+
+    def test_done_from_a_steer_card_finishes_the_live_workflow(self):
+        claim = self._announced_running_workflow()
+        self.cards.schedule()
+        delivered = self._claim_and_deliver()
+        result = self.cards.act(
+            delivered.card.id,
+            expected_version=delivered.card.version,
+            action="done",
+        )
+        self.assertTrue(result.accepted)
+        self.assertEqual(self.ledger.get(claim.task_id).status, TaskStatus.DONE)
+        workflow = self.execution.get(claim.task_id)
+        self.assertEqual(workflow.status, WorkflowStatus.COMPLETED)
+        self.assertIsNone(workflow.current_run_id)
+        self.assertFalse(self.execution.renew(
+            claim.task_id,
+            expected_version=claim.workflow_version,
+            claim_token=claim.token,
+        ).accepted)
+
+    def test_drop_from_a_steer_card_cancels_the_live_workflow(self):
+        claim = self._announced_running_workflow()
+        self.cards.schedule()
+        delivered = self._claim_and_deliver()
+        result = self.cards.act(
+            delivered.card.id,
+            expected_version=delivered.card.version,
+            action="drop",
+        )
+        self.assertTrue(result.accepted)
+        self.assertEqual(self.ledger.get(claim.task_id).status, TaskStatus.DROPPED)
+        workflow = self.execution.get(claim.task_id)
+        self.assertEqual(workflow.status, WorkflowStatus.CANCELLED)
+        self.assertIsNone(workflow.current_run_id)
+        self.assertFalse(self.execution.renew(
+            claim.task_id,
+            expected_version=claim.workflow_version,
+            claim_token=claim.token,
+        ).accepted)
+
+    def test_retraction_is_leased_once_and_clears_its_handle_on_completion(self):
+        self._announced_running_workflow()
+        self.cards.schedule()
+        delivered = self._claim_and_deliver()
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "UPDATE task_execution_workflows SET status='queued',version=version+1,"
+                "claim_token_digest=NULL,claimed_at=NULL,claim_heartbeat_at=NULL,"
+                "claim_expires_at=NULL,current_run_id=NULL WHERE task_id=1"
+            )
+        self.cards.schedule()
+        retraction = self.cards.claim_retraction()
+        self.assertIsNotNone(retraction)
+        self.assertEqual(retraction.card_id, delivered.card.id)
+        self.assertIsNone(self.cards.claim_retraction())
+        self.assertTrue(self.cards.complete_retraction(retraction))
+        with closing(sqlite3.connect(self.database)) as connection:
+            self.assertEqual(connection.execute(
+                "SELECT state FROM execution_card_retractions WHERE card_id=?",
+                (delivered.card.id,),
+            ).fetchone()[0], "completed")
+            self.assertEqual(connection.execute(
+                "SELECT kind FROM execution_review_card_events "
+                "WHERE card_id=? ORDER BY sequence DESC LIMIT 1",
+                (delivered.card.id,),
+            ).fetchone()[0], "retracted")
+
+    def test_retraction_failure_retries_three_times_then_is_abandoned(self):
+        self._announced_running_workflow()
+        self.cards.schedule()
+        delivered = self._claim_and_deliver()
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "UPDATE task_execution_workflows SET status='queued',"
+                "version=version+1,claim_token_digest=NULL,claimed_at=NULL,"
+                "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
+                "current_run_id=NULL WHERE task_id=1"
+            )
+        self.cards.schedule()
+        for attempt in range(1, 4):
+            with self.subTest(attempt=attempt):
+                retraction = self.cards.claim_retraction()
+                self.assertIsNotNone(retraction)
+                self.assertTrue(self.cards.fail_retraction(retraction))
+        self.assertIsNone(self.cards.claim_retraction())
+        with closing(sqlite3.connect(self.database)) as connection:
+            state, attempts = connection.execute(
+                "SELECT state,attempts FROM execution_card_retractions "
+                "WHERE card_id=?", (delivered.card.id,)
+            ).fetchone()
+            self.assertEqual((state, attempts), ("abandoned", 3))
+            self.assertEqual(connection.execute(
+                "SELECT superseded_delivery_ref FROM execution_review_cards "
+                "WHERE id=?", (delivered.card.id,)
+            ).fetchone()[0], f"message-{delivered.card.id}")
+
+    def test_steer_digest_refreshes_twice_then_stops(self):
+        self._announced_running_workflow()
+        self.cards.schedule()
+        for count in range(1, 4):
+            item = self.cards.steer_cards_awaiting_digest()[0]
+            self.assertTrue(self.cards.record_steer_digest(
+                item, f"Synthetic digest {count}."))
+            self.clock.advance(timedelta(minutes=31))
+        self.assertEqual(self.cards.steer_cards_awaiting_digest(), ())
 
 
 if __name__ == "__main__":
