@@ -372,3 +372,46 @@ attempt does nothing.
 a private timer after native intake. It binds only proposed duplicate pairs to
 reader cards; it does not create ordinary task-review cards. The existing
 delivery consumer then claims and sends those cards to Telegram.
+
+## Multi-runner deployment
+
+The execution runner has two separate concurrency concepts. First, `--execution-slot-cap` limits the number of tasks in the active `execute` phase system-wide to prevent out-of-memory cascades across concurrent worker processes. Second, each execution runner process handles only one task workflow at a time because it blocks on bounded agent work. Thus, raising the slot cap alone does not enable concurrent agent execution.
+
+To actually run multiple tasks at once, you must deploy multiple independent runner processes. This is safely supported through a generic systemd template unit for the runners, combined with explicitly configured, distinct `runner_slot` identifiers in the shared configuration file.
+
+### Adding runners safely
+
+Because the single-runner behavior is explicit and backward compatible, scaling out involves configuring slots and transitioning to instantiated services:
+
+1. **Assign distinct slot identities:** In your private deployment JSON file, declare each runner under the `execution_runners` list. Set each runner's `enabled` to `true`, and ensure each gets a unique string as its `runner_slot`.
+2. **Apply the shared slot cap:** Pass the same `--execution-slot-cap=N` (for example, 2 or 3) to the command-line arguments of every worker instance. The database enforces this ceiling globally across all stable slot names.
+3. **Use a systemd template:** Instead of a single static `foxhound-execution-runner.service`, define a generic template `foxhound-execution-runner@.service`. The instance name `%i` becomes the runner slot.
+
+```ini
+[Unit]
+Description=Foxhound Execution Runner (%i)
+After=network.target
+
+[Service]
+Type=simple
+User=foxhound
+# The runner reads its configured agent environment and paths from the shared JSON.
+# Pass the instance name (%i) and the global slot cap.
+ExecStart=/opt/foxhound/venv/bin/foxhound-deployment-config exec \
+    --component execution-runner \
+    --runner-slot %i \
+    -- /opt/foxhound/venv/bin/foxhound-execution-runner \
+       --execution-slot-cap 3
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+4. **Start instances without interrupting:** A fenced run on an existing runner is shielded. When adding runners, do not restart an active instance. Simply instantiate the additional workers:
+   ```bash
+   systemctl enable --now foxhound-execution-runner@slot-2.service
+   systemctl enable --now foxhound-execution-runner@slot-3.service
+   ```
+   The original single runner can eventually be migrated to `foxhound-execution-runner@slot-1.service` during a natural idle window, or safely disabled while the others pick up the load. To scale down, `systemctl stop` a worker; active execution state remains durable and the scheduled task will either finish its phase and exit or time out gracefully.
