@@ -1,4 +1,4 @@
-# ADR 0048: Announced runs and Steer cards
+# ADR 0052: Announced runs and Steer cards
 
 ## Status
 

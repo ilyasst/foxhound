@@ -442,9 +442,7 @@ class TaskCardApplication:
                     HTTPStatus.FORBIDDEN,
                 )
             action = request["action"]
-            if not isinstance(action, str) or action not in {
-                "done", "keep_open", "drop", "snooze"
-            }:
+            if not isinstance(action, str) or action not in TASK_CARD_ACTIONS:
                 raise TaskCardServerRequestError(
                     "invalid_request", "task card action is invalid"
                 )

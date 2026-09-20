@@ -138,8 +138,13 @@ def _local_calendar() -> dict[str, object]:
 
 def _worker_operations(phase: WorkflowPhase) -> list[str]:
     operations = ["context", "search", "draft", "record", "release"]
-    if phase is not WorkflowPhase.PLAN:
-        operations.append("act.worktree")
+    # A working tree is available in every phase, planning included. It is a
+    # clone in the run's own directory and causes no external effect; nothing
+    # is pushed from it except through act.pull-request, which is gated below.
+    # Withholding it from planning did not stop a run that needed to write —
+    # it only removed the sanctioned place to do so, leaving the host's shared
+    # checkouts as the nearest writable repository.
+    operations.append("act.worktree")
     if phase is WorkflowPhase.EXTERNAL_ACTION:
         operations.append("act.pull-request")
         operations.extend(("act.comment", "act.review"))
@@ -412,14 +417,18 @@ class ExecutionWorker:
     def act_worktree(self, *, repository: str | None = None) -> dict[str, Any]:
         """Prepare a working tree for this task's repository.
 
-        Available from `execute` onward: the change has to be written before
-        it can be proposed. Nothing is pushed here.
+        Available in every phase, planning included. The phase boundary this
+        worker enforces is the EFFECT, not the edit: nothing is pushed from
+        here, and a proposal still requires act.pull-request in
+        external_action. A planning run that has to write in order to answer
+        its own question -- apply a candidate patch, run the suite against it,
+        check that a proposed fix builds -- gets a tree of its own to do it in.
+
+        Refusing it did not prevent that writing. It only meant the run found
+        somewhere else to write, and the nearest writable repository on a host
+        is a shared long-lived checkout that other work depends on.
         """
         state, service = self._active()
-        if state.phase is WorkflowPhase.PLAN:
-            raise ExecutionWorkerClaimError(
-                "a working tree is not prepared while planning"
-            )
         origin = TaskLedger(state.database_path).origin(state.task_id)
         if origin is None:
             raise ExecutionWorkerClaimError(

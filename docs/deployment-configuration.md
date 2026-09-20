@@ -12,7 +12,7 @@ make it owner-only (`0600`), and do not commit it, paste it into issues, or
 send its rendered command lines to logs. It contains paths but never token
 values.
 
-Version 13 is current. Six things about it are worth knowing before an
+Version 15 is current. Eight things about it are worth knowing before an
 upgrade, because none of them announces itself:
 
 - `card_service.task_work_root` is **required** once delivery is enabled, and
@@ -42,12 +42,19 @@ upgrade, because none of them announces itself:
   evidence. `runtime_log_retention_bytes` is the per-task history limit and
   defaults to 30 MiB. These logs can contain private tool arguments and
   results: they are not artifacts and must never be committed or delivered.
-- Version 13 adds `workflow.steer_while_running`. It is a list of source
-  kinds whose newly admitted runs may raise a Steer card after they have been
-  running for the configured threshold. It is independent of
-  `plan_without_asking`: without planning authority, the Start gate remains
-  and the declaration is inert. Changing the list never retroactively changes
-  a workflow that is already admitted.
+- Version 13 adds `execution_runners[].deployment_roots`: named roots a
+  portable profile can refer to while each host resolves them. An empty object
+  is what its absence meant.
+- Version 14 adds `execution_runners[].agent_model` and
+  `agent_provider`, which choose the inference backend for **that runner's**
+  agents. Both `null` is the default and means the agent runtime's own
+  configured backend: nothing is added to the command, and the runtime's
+  configuration is neither read nor written. This distinction is the point of
+  the fields — a deployment that wants one slot on a different backend states
+  it here, next to the slot, instead of changing a runtime default that every
+  other user of that runtime on the machine also gets. A provider without a
+  model is rejected at load; see
+  [ADR 0048](architecture/0048-per-runner-inference-backend.md).
 
 Version 5 covers every enabled component that reads or writes the shared
 database: the task-card service, scheduler, one or more runners, feed import,
@@ -58,10 +65,16 @@ and all paths are absolute. The one exception is noted with the component it
 applies to: `task_card_requeue` may be omitted while a deployment written
 before it existed is brought forward.
 
+- Version 15 adds `workflow.steer_while_running`. It is a list of source
+  kinds whose newly admitted runs may raise a Steer card after they have been
+  running for the configured threshold. It is independent of
+  `plan_without_asking`: without planning authority, the Start gate remains
+  and the declaration is inert. Changing the list never retroactively changes
+  a workflow that is already admitted.
 ```json
 {
   "schema": "foxhound.deployment-config",
-  "schema_version": 13,
+  "schema_version": 15,
   "database": "/srv/example/private-foxhound-state/foxhound.sqlite3",
   "agent_profile_directory": null,
   "card_service": {
@@ -105,9 +118,12 @@ before it existed is brought forward.
     "gw_alias": "example-operator",
     "gw_token_file": "/srv/example/private-foxhound-state/gw.token",
     "agent_command": "hermes",
+    "agent_model": null,
+    "agent_provider": null,
     "worker_command": "foxhound-task-worker",
     "runner_slot": "primary",
     "knowledge_root": null,
+    "deployment_roots": {},
     "task_work_root": null,
     "task_kb_root": null,
     "runtime_session_database": null,
@@ -254,6 +270,24 @@ grep -h '^ExecStart=' ~/.config/systemd/user/foxhound-*.service{,.d/*.conf} \
 Any output is a unit to repoint. Prefer an interpreter owned by a deployed
 component or by a service that is itself deployed; if a host genuinely has no
 such interpreter, that is the thing to fix, not the unit.
+
+## Deployment roots
+
+`deployment_roots` maps a stable symbolic name to an absolute directory on this
+machine, for example `{"sync_drive": "/srv/example/drive"}`. The runner passes
+each one to the worker, which publishes them to the agent as
+`capabilities.deployment_roots`.
+
+They exist so a profile prompt never names a path. A profile revision renders
+identically on every host, and a path does not: the reviewed prompt names the
+root, and each host resolves it. A name absent here is absent in the work
+context, so an agent can tell "not configured on this host" from "configured
+and empty". The values are runtime facts and do not enter the profile revision.
+
+A store fragment that names a path instead is refused by `validate` and
+`publish`; see [ADR 0043](architecture/0043-pinned-release-checkout.md) for the
+order that requires, because the store is brought into compliance before the
+release that enforces it is promoted.
 
 ## Gates a machine may stand down
 
