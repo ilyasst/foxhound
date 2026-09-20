@@ -1097,6 +1097,75 @@ class ExecutionCardService:
                 connection.rollback()
                 raise
 
+    def recover_delivery(
+        self, card_id: int, *, expected_version: int
+    ) -> ExecutionCardOperationResult:
+        """Release or retry an expired, unacknowledged execution-card delivery.
+
+        This is a local operator repair. It expires a stalled claim without
+        waiting for the next active consumer fetch, ensuring subsequent cards
+        can proceed without duplicating an acknowledged delivery.
+        """
+        if not _valid_identity(card_id, expected_version):
+            return _refused(card_id, ExecutionCardRefusal.INVALID_ARGUMENT)
+        now = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    self._card_select() + " WHERE c.id=?", (card_id,)
+                ).fetchone()
+                refusal = _card_guard(row, expected_version)
+                if (
+                    refusal is None
+                    and row["status"] != ExecutionCardStatus.DELIVERING
+                ):
+                    refusal = ExecutionCardRefusal.INVALID_STATE
+                if refusal is None and row["claim_expires_at"] > now:
+                    refusal = ExecutionCardRefusal.INVALID_STATE
+                if refusal is None and not _current_card(row):
+                    refusal = ExecutionCardRefusal.STALE_VERSION
+                if refusal is not None:
+                    connection.rollback()
+                    return _refused_row(card_id, row, refusal)
+                version = expected_version + 1
+                updated = connection.execute(
+                    "UPDATE execution_review_cards SET status='pending',"
+                    "version=?,claim_token_digest=NULL,claim_expires_at=NULL,"
+                    "consumer_digest=NULL,updated_at=? WHERE id=? AND version=? "
+                    "AND status='delivering'",
+                    (version, now, card_id, expected_version),
+                )
+                if updated.rowcount != 1:
+                    connection.rollback()
+                    return _refused_row(
+                        card_id, row, ExecutionCardRefusal.INVALID_STATE
+                    )
+                self._event(
+                    connection,
+                    card_id=card_id,
+                    task_id=int(row["task_id"]),
+                    kind="delivery_expired",
+                    card_version=version,
+                    workflow_version=int(row["workflow_version"]),
+                    action=None,
+                    now=now,
+                )
+                connection.commit()
+                values = dict(row)
+                values.update(
+                    status=ExecutionCardStatus.PENDING,
+                    version=version,
+                    claim_token_digest=None,
+                    claim_expires_at=None,
+                    consumer_digest=None,
+                )
+                return _operation(values, ExecutionCardDisposition.APPLIED)
+            except Exception:
+                connection.rollback()
+                raise
+
     def requeue_unanswered(self, *, limit: int = 100) -> ExecutionCardRequeueResult:
         """Re-present current cards left unanswered for at least one hour.
 

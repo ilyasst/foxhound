@@ -1007,6 +1007,32 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertEqual(replacement.card.id, claim.card.id)
         self.assertGreater(replacement.card.version, retried.card_version)
 
+    def test_recover_unacknowledged_delivery(self):
+        self._schedule_workflow(1)
+        self.cards.schedule()
+        claim = self.cards.claim_next(lease_seconds=60)
+        self.assertIsNotNone(claim)
+
+        # Cannot recover an unexpired claim
+        early_recovery = self.cards.recover_delivery(
+            claim.card.id, expected_version=claim.card.version
+        )
+        self.assertEqual(early_recovery.refusal, ExecutionCardRefusal.INVALID_STATE)
+
+        self.clock.advance(timedelta(seconds=61))
+        recovered = self.cards.recover_delivery(
+            claim.card.id, expected_version=claim.card.version
+        )
+        self.assertEqual(
+            (recovered.card_status, recovered.card_version),
+            (ExecutionCardStatus.PENDING, claim.card.version + 1),
+        )
+        
+        duplicate = self.cards.recover_delivery(
+            claim.card.id, expected_version=claim.card.version + 1
+        )
+        self.assertEqual(duplicate.refusal, ExecutionCardRefusal.INVALID_STATE)
+
     def test_unanswered_delivered_card_is_represented_after_one_hour(self):
         self._schedule_workflow(1)
         self.cards.schedule()
