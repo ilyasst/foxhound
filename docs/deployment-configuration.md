@@ -399,7 +399,7 @@ To actually run multiple tasks at once, you must deploy multiple independent run
 Because the single-runner behavior is explicit and backward compatible, scaling out involves configuring slots and transitioning to instantiated services:
 
 1. **Assign distinct slot identities:** In your private deployment JSON file, declare each runner under the `execution_runners` list. Set each runner's `enabled` to `true`, and ensure each gets a unique string as its `runner_slot`.
-2. **Apply the shared slot cap:** Pass the same `--execution-slot-cap=N` (for example, 2 or 3) to the command-line arguments of every worker instance. The database enforces this ceiling globally across all stable slot names.
+2. **Apply the shared slot cap:** Declare `execution_slot_cap` once under the `workflow` section of the deployment JSON (for example, 2 or 3). Every rendered runner inherits it, so the ceiling cannot drift between instances. The database enforces it globally across all stable slot names.
 3. **Use a systemd template:** Instead of a single static `foxhound-execution-runner.service`, define a generic template `foxhound-execution-runner@.service`. The instance name `%i` becomes the runner slot.
 
 ```ini
@@ -410,13 +410,11 @@ After=network.target
 [Service]
 Type=simple
 User=foxhound
-# The runner reads its configured agent environment and paths from the shared JSON.
-# Pass the instance name (%i) and the global slot cap.
-ExecStart=/opt/foxhound/venv/bin/foxhound-deployment-config exec \
-    --component execution-runner \
-    --runner-slot %i \
-    -- /opt/foxhound/venv/bin/foxhound-execution-runner \
-       --execution-slot-cap 3
+# The runner reads its slot, cap, agent environment, and paths from the shared
+# JSON. Name the slot in the component itself; do not repeat those as flags.
+ExecStart=/opt/foxhound/venv/bin/foxhound-deployment-config \
+    --config /srv/example/private-foxhound-state/deployment.json \
+    exec --component execution-runner:%i
 Restart=on-failure
 RestartSec=10
 
