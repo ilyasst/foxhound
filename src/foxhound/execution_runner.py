@@ -14,6 +14,7 @@ import shlex
 import signal
 import stat
 import subprocess
+import shutil
 import sys
 import time
 from dataclasses import dataclass, field
@@ -880,6 +881,39 @@ def _run_claim(
             # directory is the record; the folder is what the reader opens.
             with contextlib.suppress(TaskArchiveError):
                 publish_deliverables(archive, directory)
+            cleanup_run_clones(directory)
+
+
+def cleanup_run_clones(run_directory: Path) -> None:
+    """Remove prepared worktrees once their run reaches a terminal state.
+
+    A clone is removed only if it holds no unpushed commits. If it holds
+    work absent from a remote, it is preserved and reported. Removal
+    failures do not fail the run.
+    """
+    try:
+        for entry in run_directory.iterdir():
+            if not entry.is_dir() or not entry.name.startswith("repo-"):
+                continue
+            if not (entry / ".git").exists():
+                continue
+            try:
+                result = subprocess.run(
+                    ["git", "-C", str(entry), "log", "--oneline", "--all", "--not", "--remotes"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            except OSError:
+                continue
+            if result.returncode == 0 and result.stdout.strip():
+                continue
+            try:
+                shutil.rmtree(entry)
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 
 def _terminal_result(
