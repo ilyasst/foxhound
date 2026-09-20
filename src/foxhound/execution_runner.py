@@ -660,6 +660,23 @@ def _run_claim(
         # the line above.
         "NO_COLOR": "1",
         "TERM": "dumb",
+        # Demand attribution for caproute, read by the agent and stamped on
+        # every model call it makes. caproute can already name the process
+        # on the far end of the socket, so it knows these turns are hermes;
+        # what it cannot know is which task they were spent on, and "the
+        # agents used 199 GPU-hours" is not a number anyone can place
+        # models from. One agent is spawned per claim, so the run and the
+        # task are constant for the life of the process and the
+        # environment carries them exactly once.
+        #
+        # Ids only. These become HTTP headers and land in a router's log,
+        # so the task TEXT is deliberately not among them.
+        "CAPROUTE_APP": "foxhound",
+        "CAPROUTE_OPERATION": "execution",
+        "CAPROUTE_JOB": profile.profile_id,
+        "CAPROUTE_RUN_ID": run_id,
+        "CAPROUTE_WORK_ITEM_TYPE": "task",
+        "CAPROUTE_WORK_ITEM_ID": str(claim.task_id),
     })
     process: subprocess.Popen | None = None
     transcript = None
