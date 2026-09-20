@@ -457,6 +457,7 @@ class ExecutionWorkerTests(unittest.TestCase):
         external = _worker_operations(WorkflowPhase.EXTERNAL_ACTION)
         self.assertIn("act.pull-request", external)
         self.assertIn("act.comment", external)
+        self.assertIn("act.issue", external)
         self.assertIn("act.review", external)
 
     def test_a_working_tree_does_not_unlock_any_external_effect(self):
@@ -472,6 +473,7 @@ class ExecutionWorkerTests(unittest.TestCase):
                 self.assertIn("act.worktree", operations)
                 self.assertNotIn("act.pull-request", operations)
                 self.assertNotIn("act.comment", operations)
+                self.assertNotIn("act.issue", operations)
                 self.assertNotIn("act.review", operations)
 
     def test_planning_prepares_a_working_tree_of_its_own(self):
@@ -786,6 +788,12 @@ class ExecutionWorkerTests(unittest.TestCase):
                     head="foxhound/issue-43", title="Synthetic proposal",
                     body_file=None,
                 ),
+            ),
+            (
+                "issue", "review_request", "44/revision", "open_issue",
+                lambda worker: worker.act_issue(
+                    title="Synthetic finding",
+                    body_file=self._write_effect_body("issue.md")),
             ),
         )
         for index, (name, kind, item_id, forge_call, action) in enumerate(
