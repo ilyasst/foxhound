@@ -2347,6 +2347,65 @@ class TaskExecutionService:
             ).fetchone()
         return None if found is None else str(found["digest"])
 
+    #: How many prior failure digests one run is told about.  An agent
+    #: handed twenty failure notes is worse off than one handed two: the
+    #: point is "these approaches have already been tried", and past a
+    #: handful that message is already delivered while the context is not.
+    PRIOR_FAILURE_LIMIT = 3
+
+    def prior_failures(
+        self,
+        task_id: int,
+        *,
+        expected_version: int,
+        claim_token: str,
+        limit: int | None = None,
+    ) -> tuple[str, ...]:
+        """Why earlier attempts at this phase stopped, most recent first.
+
+        The larger half of what a failed run loses.  A reader seeing the
+        cause on a card is the visible half; the next run beginning from
+        the task text alone, making the same plan and failing the same
+        way, is the expensive one.
+
+        Claim-guarded exactly as ``reader_instruction`` is: this is run
+        context, and only the run it belongs to may read it.
+
+        Scoped to the phase the workflow is in now, and excluding the
+        current attempt, which has not failed yet.  Failing open is the
+        rule everywhere in this path -- an absent digest costs the hint
+        and nothing else -- so an empty tuple is an ordinary answer.
+        """
+        if (
+            not _valid_identity(task_id, expected_version)
+            or not _valid_secret(claim_token)
+        ):
+            raise TaskLedgerError("execution claim is unavailable")
+        if limit is None:
+            limit = self.PRIOR_FAILURE_LIMIT
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise TaskLedgerError("prior failure limit is invalid")
+        now = self._now()
+        with closing(self._connect()) as connection:
+            row = self._workflow_with_task(connection, task_id)
+            refusal = _running_guard(
+                row,
+                expected_version,
+                _token_digest(claim_token),
+                now,
+            )
+            if refusal is None:
+                refusal = _task_guard(row, int(row["task_version"]))
+            if refusal is not None:
+                raise TaskLedgerError("execution claim is unavailable")
+            found = connection.execute(
+                "SELECT digest FROM execution_failure_digests "
+                "WHERE task_id=? AND phase=? AND workflow_version<? "
+                "ORDER BY workflow_version DESC LIMIT ?",
+                (task_id, str(row["phase"]), expected_version, limit),
+            ).fetchall()
+        return tuple(str(item["digest"]) for item in found)
+
     def event_count(self) -> int:
         with closing(self._connect()) as connection:
             return int(connection.execute(

@@ -2467,5 +2467,171 @@ class TaskExecutionTests(unittest.TestCase):
         self.assertNotIn(TOKEN, repr(health))
 
 
+class PriorFailureEvidenceTests(TaskExecutionTests):
+    """What a run is told about the attempts that failed before it.
+
+    The card showing a reader why the last attempt stopped is the visible
+    half of this.  The next run starting from the task text alone, making
+    the same plan and failing the same way, is the expensive one: two
+    workflows on one deployment took roughly a fifth of all execution
+    capacity over two days doing exactly that.
+    """
+
+    def _running_claim(self):
+        self._schedule_and_start()
+        return self._claim()
+
+    def _digest(self, version: int, text: str, *, phase: str = "plan") -> None:
+        self.assertTrue(self.service.record_failure_digest(
+            1,
+            workflow_version=version,
+            phase=phase,
+            run_id="b" * 32,
+            digest=text,
+        ))
+
+    def test_earlier_failures_reach_the_run_most_recent_first(self):
+        claim = self._running_claim()
+        self._digest(claim.workflow_version - 2, "Synthetic: it ran out of turns.")
+        self._digest(
+            claim.workflow_version - 1,
+            "Synthetic: the request was too large to serve.")
+
+        self.assertEqual(
+            self.service.prior_failures(
+                1,
+                expected_version=claim.workflow_version,
+                claim_token=claim.token,
+            ),
+            (
+                "Synthetic: the request was too large to serve.",
+                "Synthetic: it ran out of turns.",
+            ),
+        )
+
+    def test_the_history_carried_is_bounded(self):
+        """Twenty failure notes are worse than two, not better."""
+        # A workflow with real history behind it: claimed, failed and
+        # requeued several times before this attempt.
+        patient = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: TOKEN,
+            max_attempts=20,
+        )
+        self._schedule_and_start()
+        for _ in range(5):
+            self.clock.advance(hours=1)
+            failing = patient.claim_next()
+            self.assertIsNotNone(failing)
+            patient.fail(
+                1,
+                expected_version=failing.workflow_version,
+                claim_token=failing.token,
+                reason="process_exit",
+            )
+        self.clock.advance(hours=1)
+        claim = patient.claim_next()
+        self.assertIsNotNone(claim)
+        self.assertGreater(
+            claim.workflow_version - 1,
+            TaskExecutionService.PRIOR_FAILURE_LIMIT,
+            "fixture must offer more history than the bound allows",
+        )
+        for version in range(1, claim.workflow_version):
+            self._digest(version, f"Synthetic failure {version}.")
+
+        carried = patient.prior_failures(
+            1,
+            expected_version=claim.workflow_version,
+            claim_token=claim.token,
+        )
+        self.assertEqual(len(carried), TaskExecutionService.PRIOR_FAILURE_LIMIT)
+        self.assertEqual(
+            carried[0], f"Synthetic failure {claim.workflow_version - 1}.")
+
+    def test_only_this_phase_is_carried(self):
+        """An execute failure says nothing about a plan pass that works."""
+        claim = self._running_claim()
+        self.assertEqual(claim.phase, WorkflowPhase.PLAN)
+        self._digest(
+            claim.workflow_version - 1,
+            "Synthetic: execute stopped.", phase="execute")
+
+        self.assertEqual(
+            self.service.prior_failures(
+                1,
+                expected_version=claim.workflow_version,
+                claim_token=claim.token,
+            ),
+            (),
+        )
+
+    def test_the_current_attempt_is_not_its_own_evidence(self):
+        claim = self._running_claim()
+        self._digest(claim.workflow_version, "Synthetic: this very attempt.")
+
+        self.assertEqual(
+            self.service.prior_failures(
+                1,
+                expected_version=claim.workflow_version,
+                claim_token=claim.token,
+            ),
+            (),
+        )
+
+    def test_no_digests_is_an_ordinary_answer(self):
+        """Failing open, everywhere on this path.
+
+        A gateway that is down costs the hint and nothing else -- never the
+        claim, never the run.
+        """
+        claim = self._running_claim()
+        self.assertEqual(
+            self.service.prior_failures(
+                1,
+                expected_version=claim.workflow_version,
+                claim_token=claim.token,
+            ),
+            (),
+        )
+
+    def test_only_the_run_it_belongs_to_may_read_it(self):
+        """Run context, guarded exactly as a reader instruction is."""
+        claim = self._running_claim()
+        self._digest(
+            claim.workflow_version - 1, "Synthetic: it ran out of turns.")
+
+        with self.assertRaises(TaskLedgerError):
+            self.service.prior_failures(
+                1,
+                expected_version=claim.workflow_version,
+                claim_token="execution-token-" + "z" * 32,
+            )
+        with self.assertRaises(TaskLedgerError):
+            self.service.prior_failures(
+                1,
+                expected_version=claim.workflow_version + 5,
+                claim_token=claim.token,
+            )
+
+    def test_the_payload_carries_no_digest_text_into_any_log(self):
+        """The whole point is bounded evidence, not a transcript.
+
+        A digest is already bounded by the pass that wrote it; this asserts
+        the accessor adds nothing of its own and hands back exactly what
+        was recorded.
+        """
+        claim = self._running_claim()
+        self._digest(claim.workflow_version - 1, "Synthetic: a named blocker.")
+        carried = self.service.prior_failures(
+            1,
+            expected_version=claim.workflow_version,
+            claim_token=claim.token,
+        )
+        self.assertEqual(carried, ("Synthetic: a named blocker.",))
+        self.assertNotIn("Synthetic", repr(self.service))
+
+
 if __name__ == "__main__":
     unittest.main()

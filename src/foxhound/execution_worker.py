@@ -352,6 +352,25 @@ class ExecutionWorker:
                     expected_version=state.workflow_version,
                     claim_token=state.claim_token,
                 ),
+                # Why earlier attempts at this phase stopped, most recent
+                # first and bounded. Evidence about what has already been
+                # tried and failed -- not a plan, and not a limit on what
+                # may be read. Without it the next attempt begins from the
+                # task text alone, makes the same plan, and fails the same
+                # way; on one deployment that pattern took roughly a fifth
+                # of all execution capacity over two days.
+                #
+                # Deliberately not classified into causes the agent can act
+                # on and causes it cannot. A saturated backend is not the
+                # agent's to fix and telling it to work around one invites
+                # exactly the scope substitution in #360 -- but nothing
+                # here can tell that apart from an exhausted turn budget
+                # reliably, and a wrong hint is worse than none.
+                "prior_failures": list(service.prior_failures(
+                    state.task_id,
+                    expected_version=state.workflow_version,
+                    claim_token=state.claim_token,
+                )),
             },
             "operator": {
                 "revision": context.revision,
