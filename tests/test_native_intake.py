@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from foxhound import migrate_database
+from foxhound.task_ledger import MAX_UNPRODUCTIVE_RESURFACES
 
 import copy
 import hashlib
@@ -1201,9 +1202,106 @@ class NativeCandidateIntakeTests(unittest.TestCase):
                 "FROM task_events WHERE task_id=1 AND kind='status_changed' "
                 "ORDER BY sequence DESC LIMIT 1"
             ).fetchone()
+            reopened_at, bound = connection.execute(
+                "SELECT e.source_revision,b.source_revision "
+                "FROM task_events e JOIN task_candidate_bindings b "
+                "ON b.task_id=e.task_id "
+                "WHERE e.task_id=1 AND e.kind='status_changed' "
+                "ORDER BY e.sequence DESC LIMIT 1"
+            ).fetchone()
         self.assertEqual(
             event, ("status_changed", "done", "open", task.version)
         )
+        # The event must name the revision that caused the reopen. Every
+        # `status_changed` row used to carry NULL here, so nothing recorded
+        # which source state a task was answered against -- and a re-surfaced
+        # task cannot tell new discussion from the discussion it already read
+        # without it.
+        self.assertIsNotNone(
+            reopened_at, "the reopen must record the revision that caused it"
+        )
+        self.assertEqual(reopened_at, bound)
+
+    def test_closing_a_task_records_the_source_state_it_answered(self):
+        """The baseline: what was this task completed against?
+
+        Re-surfacing is only useful if the ledger can say which source state
+        was already answered -- otherwise a re-surfaced task cannot separate
+        new discussion from the discussion it read before closing. Authorship
+        cannot supply this here: the agents post from the operator's account,
+        so a self-authored revision is indistinguishable from anyone else's.
+
+        Every `status_changed` row carried NULL in these columns before this,
+        so the question had no answer anywhere in the ledger.
+        """
+        self.activate()
+        self.inbox.import_feed(feed(0, candidate(1)))
+        self.intake()
+
+        task = self.ledger.get(1)
+        self.assertTrue(
+            self.ledger.transition(
+                task.id, expected_version=task.version, action="done"
+            ).accepted
+        )
+
+        with closing(sqlite3.connect(self.database)) as connection:
+            recorded, bound = connection.execute(
+                "SELECT e.source_revision,b.source_revision "
+                "FROM task_events e JOIN task_candidate_bindings b "
+                "ON b.task_id=e.task_id "
+                "WHERE e.task_id=? AND e.kind='status_changed' "
+                "AND e.to_status='done' ORDER BY e.sequence DESC LIMIT 1",
+                (task.id,),
+            ).fetchone()
+
+        self.assertIsNotNone(
+            recorded,
+            "closing a task must record the source state it answered",
+        )
+        self.assertEqual(recorded, bound)
+
+    def test_repeated_resurfacing_that_produces_nothing_stops(self):
+        """A runaway must be impossible, not merely unlikely.
+
+        The cycle this bounds is short and real: an agent finishes a task and
+        posts a follow-through comment, the comment moves the source revision,
+        the task re-surfaces, the agent works it and comments again. Authorship
+        cannot break it -- the agents post from the operator's account, so a
+        self-authored revision looks like anyone else's.
+
+        So the ledger counts re-surfaces that folded no work in, and stops.
+        Judgement is still the normal way out; this is the floor under it.
+        """
+        self.activate()
+        self.inbox.import_feed(feed(0, candidate(1)))
+        self.intake()
+
+        reopens = 0
+        for cycle in range(MAX_UNPRODUCTIVE_RESURFACES + 2):
+            task = self.ledger.get(1)
+            if task.status is TaskStatus.OPEN:
+                self.assertTrue(
+                    self.ledger.transition(
+                        1, expected_version=task.version, action="done"
+                    ).accepted
+                )
+            self.inbox.import_feed(
+                feed(cycle + 1, candidate(1, text=f"Source moved {cycle}"))
+            )
+            self.intake()
+            if self.ledger.get(1).status is TaskStatus.OPEN:
+                reopens += 1
+
+        self.assertEqual(
+            reopens,
+            MAX_UNPRODUCTIVE_RESURFACES,
+            "re-surfacing must stop once it has produced nothing "
+            f"{MAX_UNPRODUCTIVE_RESURFACES} times",
+        )
+        # Past the bound the task stays closed and the revision is still
+        # recorded, so nothing is lost -- it is acknowledged, not applied.
+        self.assertEqual(self.ledger.get(1).status, TaskStatus.DONE)
 
     def test_a_revision_whose_task_is_gone_still_refuses(self):
         """A binding pointing at a task that does not exist is corruption,

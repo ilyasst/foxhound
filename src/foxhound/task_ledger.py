@@ -672,7 +672,11 @@ class TaskLedger:
                         # A binding pointing at a task that does not exist is
                         # corruption, not a race, and must still stop the pass.
                         raise _NativeIntakeConflict
-                    if task["status"] == TaskStatus.DONE:
+                    if task["status"] == TaskStatus.DONE and (
+                        _unproductive_resurfaces(
+                            connection, int(binding["task_id"])
+                        ) < MAX_UNPRODUCTIVE_RESURFACES
+                    ):
                         # ADR 0039: a task in `done` re-surfaces when its
                         # source moves. The work it recorded may never have
                         # reached the outside world, and refusing to reopen
@@ -704,8 +708,12 @@ class TaskLedger:
                                 int(binding["task_id"]),
                                 "status_changed",
                                 int(task["version"]) + 1,
-                                None,
-                                None,
+                                # The revision that caused the reopen, so the
+                                # log says what moved and not merely that
+                                # something did. The revision that was
+                                # answered is on the completion event.
+                                candidate.candidate_id,
+                                candidate.source.revision,
                                 TaskStatus.DONE,
                                 TaskStatus.OPEN,
                                 now,
@@ -2111,6 +2119,73 @@ def _valid_timestamp(value: object) -> bool:
     return parsed.tzinfo is not None and parsed.utcoffset() is not None
 
 
+#: How many times a finished task may re-surface without any of those passes
+#: folding work in, before the ledger stops re-surfacing it.
+#:
+#: Re-surfacing is bounded here rather than at the agent, because the agent
+#: cannot be the bound. The obvious structural fence -- ignore revisions the
+#: agent itself caused -- does not exist in this deployment: the agents post
+#: from the operator's account, so a self-authored revision is
+#: indistinguishable from a reader's. Judgement remains the normal way out of
+#: the cycle; this is what makes a runaway impossible rather than unlikely.
+MAX_UNPRODUCTIVE_RESURFACES = 3
+
+
+def _unproductive_resurfaces(
+    connection: sqlite3.Connection, task_id: int
+) -> int:
+    """Re-surfaces since this task last ran its execution to completion.
+
+    The marker has to be work the *agent* did, not work the ledger did. A
+    `work_revisions` row is not it: folding the revision in writes one on every
+    re-surface, so counting those resets the bound on the very event it is
+    meant to bound, and nothing is ever capped.
+
+    A completed execution workflow is the honest signal. A task worked across
+    several source updates completes an execution each time and keeps
+    re-surfacing, which is correct; a task woken repeatedly by activity that
+    never becomes work completes nothing, and stops.
+    """
+    since = connection.execute(
+        "SELECT completed_at FROM task_execution_workflows WHERE task_id=?",
+        (task_id,),
+    ).fetchone()
+    since = since[0] if since is not None else None
+    return connection.execute(
+        "SELECT count(*) FROM task_events WHERE task_id=? "
+        "AND kind='status_changed' AND from_status=? AND to_status=? "
+        "AND (? IS NULL OR occurred_at > ?)",
+        (task_id, TaskStatus.DONE, TaskStatus.OPEN, since, since),
+    ).fetchone()[0]
+
+
+def _bound_source(
+    connection: sqlite3.Connection, task_id: int
+) -> tuple[str | None, str | None]:
+    """The candidate and revision this task is bound to right now.
+
+    Recorded on every status change so the ledger can answer the question the
+    re-surfacing path depends on: *which source state was already answered?*
+    Without it a re-surfaced task cannot tell new discussion from the
+    discussion it read before closing, and nothing downstream can compute a
+    delta. The columns have always existed on `task_events`; they were simply
+    never filled for a status change, so all 269 such rows carried NULL.
+
+    Authorship cannot serve this purpose here -- the agents post from the
+    operator's account, so a self-authored revision is indistinguishable from
+    anyone else's. Remembering the state that was answered is the honest
+    substitute, and it does not depend on who wrote anything.
+    """
+    row = connection.execute(
+        "SELECT candidate_id,source_revision FROM task_candidate_bindings "
+        "WHERE task_id=?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None, None
+    return row["candidate_id"], row["source_revision"]
+
+
 def _apply_task_transition(
     connection: sqlite3.Connection,
     *,
@@ -2185,8 +2260,7 @@ def _apply_task_transition(
             task_id,
             "status_changed",
             next_version,
-            None,
-            None,
+            *_bound_source(connection, task_id),
             current_status,
             target,
             now,
