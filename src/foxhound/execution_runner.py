@@ -98,6 +98,17 @@ _CONTEXT_EVIDENCE_BYTES = 256 * 1024
 _SESSION_ID_LINE = re.compile(
     rb"(?m)^session_id:\s*([A-Za-z0-9][A-Za-z0-9._-]{0,127})\s*$"
 )
+#: The same identity, written in the closing block the runtime prints when a
+#: pass stops because it exhausted its turn budget.  That block replaces the
+#: plain ``session_id:`` line rather than accompanying it, so a runner that
+#: reads only the plain form has no identity for exactly the runs most likely
+#: to have left unrecorded work.  The following ``Duration:`` line is required:
+#: it keeps a transcript that merely contains the word "Session:" -- agent
+#: output is quoted into this file verbatim -- from being read as an identity.
+_SESSION_SUMMARY_LINE = re.compile(
+    rb"(?m)^Session:[ \t]+([A-Za-z0-9][A-Za-z0-9._-]{0,127})[ \t]*\r?\n"
+    rb"Duration:[ \t]"
+)
 _SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 #: One inference model or provider name, as the agent runtime names it.  A
 #: single argument: no whitespace to split on, no leading dash to be read as
@@ -973,8 +984,9 @@ def _transcript_session_id(path: Path, transcript: object | None) -> str | None:
     """Return the final Hermes session identity from this private transcript.
 
     The runner does not query Hermes state or infer an identity from a path.
-    Hermes writes its own final ``session_id:`` line to the transcript, which
-    makes a missing or malformed line a normal no-resume outcome.
+    Hermes writes its own identity to the transcript in one of two closing
+    forms, and the last one written wins.  A transcript carrying neither is a
+    normal no-resume outcome, as is one whose identity does not parse.
     """
     try:
         if transcript is not None:
@@ -982,11 +994,18 @@ def _transcript_session_id(path: Path, transcript: object | None) -> str | None:
         data = path.read_bytes()
     except (OSError, AttributeError):
         return None
-    matches = tuple(_SESSION_ID_LINE.finditer(data))
+    matches = [
+        match
+        for pattern in (_SESSION_ID_LINE, _SESSION_SUMMARY_LINE)
+        for match in pattern.finditer(data)
+    ]
     if not matches:
         return None
+    # Position, not pattern order: a pass may print either form, and the one
+    # that closed the transcript is the session this run actually ran in.
+    last = max(matches, key=lambda match: match.start())
     try:
-        return matches[-1].group(1).decode("ascii")
+        return last.group(1).decode("ascii")
     except UnicodeDecodeError:
         return None
 
