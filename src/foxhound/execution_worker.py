@@ -147,7 +147,7 @@ def _worker_operations(phase: WorkflowPhase) -> list[str]:
     operations.append("act.worktree")
     if phase is WorkflowPhase.EXTERNAL_ACTION:
         operations.append("act.pull-request")
-        operations.extend(("act.comment", "act.review"))
+        operations.extend(("act.comment", "act.issue", "act.review"))
     # Read-only thread access is available in plan and execute, not just
     # external_action: the point is to read review feedback *before* repeating
     # the work, and by external_action the work is already done.
@@ -501,6 +501,59 @@ class ExecutionWorker:
         _append_repository_receipt(self._state_path.parent, result)
         # Renewed only after the write succeeded, so a lease that lapses
         # mid-post is not extended by the attempt itself.
+        self._renew(service, state)
+        return result
+
+    def act_issue(self, *, title: str, body_file: str,
+                  repository: str | None = None) -> dict[str, Any]:
+        """Open one approved issue for a finding this task cannot itself fix.
+
+        Refused outside `external_action`, like every other forge write: the
+        phase IS the approval.
+
+        This is the write that turns a finding into work. A comment is inert
+        by design -- a pull request candidate is shaped from title, body and
+        diff, and comments are never read -- so a finding with no pull request
+        behind it had nowhere to go and was lost with the run directory.
+
+        It is also the only write here that can create work for the system
+        that issued it, because an open issue on an enrolled repository
+        becomes a candidate and then a task. `forge_action` holds the bounds
+        that follow from that, and checks them against the forge rather than
+        against run state, since a task outlives any one run.
+        """
+        state, service = self._fresh_active("effect")
+        if state.phase is not WorkflowPhase.EXTERNAL_ACTION:
+            raise ExecutionWorkerClaimError(
+                "an external action is only available in the external_action "
+                "phase"
+            )
+        origin = TaskLedger(state.database_path).origin(state.task_id)
+        if origin is None:
+            raise ExecutionWorkerClaimError(
+                "this task has no origin, so it names no repository to file on"
+            )
+        body = _read_private_text(
+            self._state_path.parent / body_file,
+            maximum=60_000, label="issue body")
+        try:
+            receipt = forge_action.open_issue(
+                repository=repository or origin.record_id,
+                task_id=state.task_id,
+                title=title,
+                body=body,
+            )
+        except forge_action.ForgeActionError as exc:
+            raise ExecutionWorkerClaimError(str(exc)) from exc
+        result = {
+            "kind": "issue",
+            "repository": receipt.repository,
+            "number": receipt.number,
+            "url": receipt.url,
+        }
+        _append_repository_receipt(self._state_path.parent, result)
+        # Renewed only after the write succeeded, so a lease that lapses
+        # mid-write is not extended by the attempt itself.
         self._renew(service, state)
         return result
 
@@ -1927,7 +1980,8 @@ def _repository_receipts(run_directory: Path) -> tuple[dict[str, str], ...]:
             or not isinstance(value.get("kind"), str)
             or not isinstance(value.get("repository"), str)
             or not isinstance(value.get("url"), str)
-            or value["kind"] not in {"issue-comment", "pull-request", "review"}
+            or value["kind"] not in {
+                "issue", "issue-comment", "pull-request", "review"}
             or not value["repository"].startswith("github.com/")
             or not value["url"].startswith("https://github.com/")
         ):
@@ -1950,7 +2004,8 @@ def _append_repository_receipt(
     except (KeyError, TypeError):
         raise ExecutionWorkerClaimError("repository action receipt is invalid")
     if (
-        normalized["kind"] not in {"issue-comment", "pull-request", "review"}
+        normalized["kind"] not in {
+            "issue", "issue-comment", "pull-request", "review"}
         or not normalized["repository"].startswith("github.com/")
         or not normalized["url"].startswith("https://github.com/")
     ):
@@ -2096,6 +2151,14 @@ def _parser() -> argparse.ArgumentParser:
         help="file beside the run state holding the review")
     review.add_argument(
         "--repository", help="canonical locator; defaults to the task origin")
+    issue = act_kinds.add_parser(
+        "issue", help="open an approved issue for a finding this task cannot fix")
+    issue.add_argument("--title", required=True)
+    issue.add_argument(
+        "--body-file", required=True,
+        help="file beside the run state holding the issue body")
+    issue.add_argument(
+        "--repository", help="canonical locator; defaults to the task origin")
     comment = act_kinds.add_parser(
         "comment", help="post an approved status update on the origin issue")
     comment.add_argument(
@@ -2143,6 +2206,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.operation == "act" and args.action_kind == "review":
             result = worker.act_review(
                 body_file=args.body_file, repository=args.repository)
+        elif args.operation == "act" and args.action_kind == "issue":
+            result = worker.act_issue(
+                title=args.title, body_file=args.body_file,
+                repository=args.repository)
         elif args.operation == "act" and args.action_kind == "comment":
             result = worker.act_comment(body_file=args.body_file)
         elif args.operation == "act":

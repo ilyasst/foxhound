@@ -61,12 +61,38 @@ ISSUE_COMMENT_PROVENANCE = (
     "agent's._\n"
 )
 
+#: The same attribution on an issue an agent opened. It says what the issue
+#: came out of, so a reader meeting it cold can find the work that raised it
+#: and judge it, rather than finding an unexplained report from an account.
+ISSUE_PROVENANCE = (
+    "\n\n---\n_Opened by Foxhound for task {task_id}, from work on "
+    "{repository}. A person has approved opening this; its contents are the "
+    "agent's._\n"
+)
+
+#: How many issues one task may open. An issue is the only write here that
+#: creates work for the system that made it: enrolment turns an open issue
+#: into a candidate, a candidate into a task, and that task can reach this
+#: same code. A review finding a dozen small things should raise the two that
+#: matter and say the rest in its review, not mint a dozen tasks.
+MAX_ISSUES_PER_TASK = 2
+
 _PUSH_TIMEOUT_S = 120
 _CLONE_TIMEOUT_S = 600
 
 
 class ForgeActionError(RuntimeError):
     """The action is refused, or the forge would not perform it."""
+
+
+@dataclass(frozen=True)
+class IssueReceipt:
+    """What was opened, in terms an immutable result can carry."""
+
+    repository: str
+    number: int
+    url: str
+    title: str
 
 
 @dataclass(frozen=True)
@@ -316,6 +342,109 @@ def post_review(
             pass
     return ReviewReceipt(
         repository=repository, number=int(digits), url=url)
+
+
+def _task_marker(task_id: int) -> str:
+    """The substring every issue this task opened carries in its body."""
+    return f"Opened by Foxhound for task {task_id},"
+
+
+def _existing_issues(name_with_owner: str) -> list[dict]:
+    """Open issues on the repository, or an empty list if they cannot be read.
+
+    A preflight that cannot see is not allowed to become a preflight that
+    forbids: an unreadable list would otherwise block every issue on the
+    repository rather than the duplicates it is meant to catch. The ceiling
+    below is the bound that must not depend on this call succeeding, so it
+    counts from the same list and is checked against what the list shows.
+    """
+    rc, out, _err = _run(
+        "gh", "issue", "list", "--repo", name_with_owner, "--state", "open",
+        "--limit", "100", "--json", "number,title,body,url")
+    if rc != 0:
+        return []
+    try:
+        parsed = json.loads(out)
+    except (ValueError, TypeError):
+        return []
+    return [item for item in parsed if isinstance(item, dict)]
+
+
+def _normalized_title(title: str) -> str:
+    return " ".join((title or "").split()).casefold()
+
+
+def open_issue(
+    *,
+    repository: str,
+    task_id: int,
+    title: str,
+    body: str,
+) -> IssueReceipt:
+    """Open one issue on ``repository``, which the caller does not choose.
+
+    ``repository`` comes from the task's binding, so no parameter here can
+    name another one. Title and body are content.
+
+    This is the only write in this module that creates work for the system
+    that issued it, so it refuses two things the others need not consider: a
+    title already open on the repository, and more than `MAX_ISSUES_PER_TASK`
+    issues from one task. Both are checked against the forge rather than
+    against run state, because a task outlives any single run and the run
+    directory is reclaimed.
+    """
+    if not repository or repository.count("/") != 2:
+        raise ForgeActionError("the task's repository is not a canonical locator")
+    host, _, name_with_owner = repository.partition("/")
+    if host != "github.com":
+        raise ForgeActionError(f"{host}: opening issues is not supported here")
+    title = " ".join((title or "").split())
+    if not title:
+        raise ForgeActionError("an issue title is required")
+    if not (body or "").strip():
+        # An issue with no body is a title someone else has to interpret.
+        raise ForgeActionError("an issue body is required")
+
+    existing = _existing_issues(name_with_owner)
+    wanted = _normalized_title(title)
+    for item in existing:
+        if _normalized_title(str(item.get("title") or "")) == wanted:
+            raise ForgeActionError(
+                f"{repository}#{item.get('number')} is already open with this "
+                f"title ({item.get('url') or 'no url'}); comment there instead "
+                "of opening a second one"
+            )
+    marker = _task_marker(task_id)
+    opened = sum(
+        1 for item in existing if marker in str(item.get("body") or ""))
+    if opened >= MAX_ISSUES_PER_TASK:
+        raise ForgeActionError(
+            f"task {task_id} has already opened {opened} issues on "
+            f"{repository}, which is the limit; report the rest in the result "
+            "rather than opening more"
+        )
+
+    body = (body or "").rstrip() + ISSUE_PROVENANCE.format(
+        task_id=task_id, repository=repository)
+    rc, out, err = _run(
+        "gh", "issue", "create", "--repo", name_with_owner,
+        "--title", title, "--body", body)
+    if rc != 0:
+        raise ForgeActionError(
+            f"{repository}: the forge refused the issue ({_detail(err)})")
+    url = (out or "").strip().splitlines()[-1] if out.strip() else ""
+    number = 0
+    rc, detail, _err = _run("gh", "issue", "view", url, "--repo",
+                            name_with_owner, "--json", "number,url")
+    if rc == 0:
+        try:
+            parsed = json.loads(detail)
+            number = int(parsed.get("number") or 0)
+            url = str(parsed.get("url") or url)
+        except (ValueError, TypeError):
+            pass
+    return IssueReceipt(
+        repository=repository, number=number, url=url, title=title)
 
 
 def open_pull_request(
