@@ -672,7 +672,42 @@ class TaskLedger:
                         # A binding pointing at a task that does not exist is
                         # corruption, not a race, and must still stop the pass.
                         raise _NativeIntakeConflict
-                    if task["status"] == TaskStatus.DONE and (
+                    previous = self._bound_candidate(connection, binding)
+                    review_head_changed = _review_head_changed(
+                        previous, candidate
+                    )
+                    desired_owner = (
+                        _row_owner_values(task)
+                        if bool(task["owner_pinned"])
+                        else _candidate_owner_values(candidate)
+                    )
+                    # Does this revision change the task, or only what is known
+                    # about it? Two branches below deliberately keep the task
+                    # version stable -- a pull-request edit that leaves the head
+                    # OID alone, and an evidence-only enrichment -- so that an
+                    # active workflow stays valid. A re-surface must agree with
+                    # them: reopening for a revision that changes nothing leaves
+                    # the task open carrying exactly the content it was
+                    # completed against, and names a version that is never
+                    # written. A pull-request comment is the common case.
+                    advances_version = not (
+                        (
+                            candidate.source.kind == "review_request"
+                            and not review_head_changed
+                        )
+                        or (
+                            task["text"] == candidate.task.text
+                            and task["due"] == candidate.task.due
+                            and _row_owner_values(task) == desired_owner
+                            and _row_structure_values(task)
+                            == _candidate_structure_values(candidate)
+                            and _stored_participants(
+                                connection, int(task["id"])
+                            ) == _candidate_participants(candidate)
+                            and not review_head_changed
+                        )
+                    )
+                    if task["status"] == TaskStatus.DONE and advances_version and (
                         _unproductive_resurfaces(
                             connection, int(binding["task_id"])
                         ) < MAX_UNPRODUCTIVE_RESURFACES
@@ -712,6 +747,10 @@ class TaskLedger:
                                 # log says what moved and not merely that
                                 # something did. The revision that was
                                 # answered is on the completion event.
+                                #
+                                # `version + 1` is now sound: the reopen is
+                                # gated on `advances_version`, so the branch
+                                # below writes exactly this.
                                 candidate.candidate_id,
                                 candidate.source.revision,
                                 TaskStatus.DONE,
@@ -746,15 +785,6 @@ class TaskLedger:
                         )
                         candidates_after_close += 1
                         continue
-                    previous = self._bound_candidate(connection, binding)
-                    review_head_changed = _review_head_changed(
-                        previous, candidate
-                    )
-                    desired_owner = (
-                        _row_owner_values(task)
-                        if bool(task["owner_pinned"])
-                        else _candidate_owner_values(candidate)
-                    )
                     if (
                         candidate.source.kind == "review_request"
                         and not review_head_changed
