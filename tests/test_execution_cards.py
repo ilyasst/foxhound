@@ -42,7 +42,10 @@ from foxhound.execution_cards import (
     ExecutionCardRefusal,
     ExecutionCardService,
     ExecutionCardStatus,
+    ClaimAtCeiling,
+    EXECUTION_CARD_CLAIM_CEILINGS,
     ExecutionReviewCard,
+    _button_rows,
     _card_lines,
     _markdown_inline,
     parse_execution_agent_callback,
@@ -4321,6 +4324,277 @@ class ExecutionCardTests(unittest.TestCase):
                 item, f"Synthetic digest {count}."))
             self.clock.advance(timedelta(minutes=31))
         self.assertEqual(self.cards.steer_cards_awaiting_digest(), ())
+
+
+CONSUMER = "d" * 64
+
+
+class RunSummaryCardTests(ExecutionCardTests):
+    """Informational run summaries, and the capacity they must not take.
+
+    A summary reports what an automatically advanced run did.  It asks the
+    reader nothing, so the whole of its contract is negative: it must not
+    displace a card that does want an answer, must not relax the ceiling that
+    bounds how many such cards a reader sees, must not be offered anywhere a
+    decision is taken, and must not be counted as work waiting on a reply.
+    """
+
+    def _bind_issue_origin(self, task_id: int) -> None:
+        payload = json.dumps({"synthetic": True})
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "INSERT INTO candidate_inbox(candidate_id,source_system,"
+                "source_kind,source_record_id,source_item_id,source_revision,"
+                "payload_json,created_at,first_imported_at,updated_at) "
+                "VALUES(?,'gw','issue','forge.example/acme/widget',?,"
+                "?,?,'2030-01-01T00:00:00Z','2030-01-01T00:00:00Z',"
+                "'2030-01-01T00:00:00Z')",
+                (f"origin-{task_id}", str(task_id), "b" * 64, payload),
+            )
+            connection.execute(
+                "INSERT INTO task_candidate_bindings(candidate_id,"
+                "source_revision,task_id,relation,decided_at) "
+                "VALUES(?,?,?,'accepted','2030-01-01T00:00:00Z')",
+                (f"origin-{task_id}", "b" * 64, task_id),
+            )
+            connection.commit()
+
+    def _granted(self) -> TaskExecutionService:
+        return TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: CLAIM_TOKEN,
+            execution_grants=["issue"],
+            action_grants=["issue"],
+        )
+
+    def _advance_once(self, task_id: int, result_id: str) -> None:
+        """Drive one granted task through a recorded, auto-advanced result."""
+        service = self._granted()
+        scheduled = service.schedule(task_id, expected_task_version=1)
+        service.start_action(
+            task_id, expected_version=scheduled.version, action="start")
+        claim = service.claim_next()
+        recorded = service.record_result(ExecutionResultEnvelope(
+            result_id=result_id,
+            task_id=task_id,
+            task_version=1,
+            workflow_version=claim.workflow_version,
+            phase=claim.phase,
+            claim_token=claim.token,
+            outcome=ExecutionOutcome.AWAITING_PLAN,
+            summary="Synthetic plan recorded",
+            work_markdown="Synthetic plan.",
+        ))
+        self.assertTrue(recorded.accepted)
+
+    def _summary_rows(self, task_id: int | None = None) -> list[tuple]:
+        where = "" if task_id is None else f" AND task_id={int(task_id)}"
+        with closing(sqlite3.connect(self.database)) as connection:
+            return connection.execute(
+                "SELECT id,task_id,status,result_id FROM "
+                "execution_review_cards WHERE summary_only=1" + where
+                + " ORDER BY id"
+            ).fetchall()
+
+    def _actionable_cards(self, *task_ids: int) -> int:
+        for task_id in task_ids:
+            self._schedule_workflow(task_id)
+        return self.cards.schedule().created
+
+    # -- what a summary is ------------------------------------------------
+
+    def test_an_auto_advanced_result_leaves_one_informational_card(self):
+        self._bind_issue_origin(1)
+        self._advance_once(1, "summary-plan-1")
+
+        rows = self._summary_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0][1], rows[0][2]), (1, "pending"))
+
+        claim = self.cards.claim_next(consumer_digest=CONSUMER)
+        self.assertTrue(claim.card.summary_only)
+        body, keyboard = render_execution_review_card(claim.card)
+        self.assertIn("Run summary", body)
+        self.assertIn("no reply needed", body)
+        self.assertEqual(keyboard, {"inline_keyboard": []})
+
+    def test_a_summary_offers_the_reader_no_decision(self):
+        """A control here would re-open a choice already made without them."""
+        self._bind_issue_origin(1)
+        self._advance_once(1, "summary-plan-1")
+        claim = self.cards.claim_next(consumer_digest=CONSUMER)
+        for approvable in (True, False):
+            with self.subTest(approvable=approvable):
+                self.assertEqual(
+                    _button_rows(claim.card, approvable=approvable), ())
+
+    def test_a_summary_is_always_a_completed_work_card(self):
+        """A cross-repository constraint, not a stylistic one.
+
+        The transport validates `kind` against a closed set and accepts the
+        informational flag only on a completed-work card.  A summary raised
+        under any other kind is refused after it has been claimed, and a
+        refused claim holds the delivery slot for every card, not just this
+        one.
+        """
+        self._bind_issue_origin(1)
+        self._advance_once(1, "summary-plan-1")
+        with closing(sqlite3.connect(self.database)) as connection:
+            kinds = {
+                row[0] for row in connection.execute(
+                    "SELECT DISTINCT kind FROM execution_review_cards "
+                    "WHERE summary_only=1"
+                )
+            }
+            missing = connection.execute(
+                "SELECT count(*) FROM execution_review_cards "
+                "WHERE summary_only=1 AND result_id IS NULL"
+            ).fetchone()[0]
+        self.assertEqual(kinds, {"result_review"})
+        self.assertEqual(missing, 0)
+
+    # -- the capacity it must not take ------------------------------------
+
+    def test_a_pending_summary_does_not_relax_the_actionable_ceiling(self):
+        """The defect this class exists for.
+
+        The ceiling bounds what a reader is looking at.  Whether an unrelated
+        informational row happens to be queued cannot be part of that number,
+        or the surface grows by one every time a run finishes.
+        """
+        ceiling = EXECUTION_CARD_CLAIM_CEILINGS["queue_view"]
+        self._bind_issue_origin(1)
+        self._advance_once(1, "summary-plan-1")
+        self.assertEqual(len(self._summary_rows()), 1)
+        self._actionable_cards(*range(2, 2 + ceiling + 1))
+
+        claimed = []
+        for _ in range(ceiling):
+            claim = self.cards.claim_next(
+                consumer_digest=CONSUMER, consumer_role="queue_view")
+            self.assertFalse(claim.card.summary_only)
+            claimed.append(claim.card.task_id)
+        self.assertEqual(len(claimed), ceiling)
+
+        # One actionable card is still pending and must stay pending: the
+        # reader's surface is full, and a queued summary does not make it
+        # less full.
+        overflow = self.cards.claim_next(
+            consumer_digest=CONSUMER, consumer_role="queue_view")
+        self.assertTrue(
+            overflow is None or overflow.card.summary_only,
+            "an actionable card was delivered past the ceiling",
+        )
+
+    def test_a_full_reader_surface_still_lets_a_summary_through(self):
+        """The other half: bounded separately, so it is not starved."""
+        ceiling = EXECUTION_CARD_CLAIM_CEILINGS["queue_view"]
+        self._bind_issue_origin(1)
+        self._advance_once(1, "summary-plan-1")
+        self._actionable_cards(*range(2, 2 + ceiling + 1))
+        for _ in range(ceiling):
+            self.cards.claim_next(
+                consumer_digest=CONSUMER, consumer_role="queue_view")
+
+        claim = self.cards.claim_next(
+            consumer_digest=CONSUMER, consumer_role="queue_view")
+        self.assertIsNotNone(claim)
+        self.assertTrue(claim.card.summary_only)
+
+    def test_a_full_surface_with_no_summary_still_reports_the_ceiling(self):
+        ceiling = EXECUTION_CARD_CLAIM_CEILINGS["queue_view"]
+        self._actionable_cards(*range(1, 1 + ceiling + 1))
+        for _ in range(ceiling):
+            self.cards.claim_next(
+                consumer_digest=CONSUMER, consumer_role="queue_view")
+        at_ceiling = self.cards.claim_next(
+            consumer_digest=CONSUMER, consumer_role="queue_view")
+        self.assertIsInstance(at_ceiling, ClaimAtCeiling)
+        self.assertEqual(at_ceiling.ceiling, ceiling)
+
+    def test_a_summary_never_displaces_a_waiting_actionable_card(self):
+        self._bind_issue_origin(1)
+        self._advance_once(1, "summary-plan-1")
+        self._actionable_cards(2)
+
+        first = self.cards.claim_next(consumer_digest=CONSUMER)
+        self.assertFalse(first.card.summary_only)
+        second = self.cards.claim_next(consumer_digest=CONSUMER)
+        self.assertTrue(second.card.summary_only)
+
+    def test_a_summary_in_flight_does_not_consume_console_capacity(self):
+        """It is never offered to the console, so it must not bound it."""
+        ceiling = EXECUTION_CARD_CLAIM_CEILINGS["queue_view"]
+        self._bind_issue_origin(1)
+        self._advance_once(1, "summary-plan-1")
+        self.cards.claim_next(
+            consumer_digest=CONSUMER, consumer_role="queue_view")
+        self._actionable_cards(*range(2, 2 + ceiling))
+
+        for index in range(ceiling):
+            claim = self.cards.claim_next(
+                consumer_digest=CONSUMER, consumer_role="queue_view")
+            with self.subTest(index=index):
+                self.assertIsNotNone(claim)
+                self.assertFalse(claim.card.summary_only)
+
+    # -- the bound ---------------------------------------------------------
+
+    def test_a_later_summary_supersedes_the_one_it_replaces(self):
+        """One summary per task, not one per phase it passed through."""
+        self._bind_issue_origin(1)
+        self._advance_once(1, "summary-plan-1")
+        service = self._granted()
+        claim = service.claim_next()
+        self.assertTrue(service.record_result(ExecutionResultEnvelope(
+            result_id="summary-execute-1",
+            task_id=1,
+            task_version=1,
+            workflow_version=claim.workflow_version,
+            phase=claim.phase,
+            claim_token=claim.token,
+            outcome=ExecutionOutcome.AWAITING_EXTERNAL,
+            summary="Synthetic execution recorded",
+            work_markdown="Synthetic execution.",
+            external_actions=("Synthetic external action",),
+        )).accepted)
+
+        rows = self._summary_rows()
+        self.assertEqual(len(rows), 2)
+        statuses = {row[3]: row[2] for row in rows}
+        self.assertEqual(statuses["summary-plan-1"], "cancelled")
+        self.assertEqual(statuses["summary-execute-1"], "pending")
+
+        active = [row for row in rows if row[2] != "cancelled"]
+        self.assertEqual(len(active), 1)
+
+    # -- what it must not be counted as ------------------------------------
+
+    def test_a_summary_is_not_counted_as_waiting_for_an_answer(self):
+        self._bind_issue_origin(1)
+        before = self.cards.stats_scoped(consumer_digest=CONSUMER)
+        surface_before = self.cards.stats()
+        self._advance_once(1, "summary-plan-1")
+        after = self.cards.stats_scoped(consumer_digest=CONSUMER)
+        self.assertEqual(
+            (after.pending, after.active), (before.pending, before.active))
+        self.assertEqual(self.cards.stats(), surface_before)
+
+    def test_a_delivered_summary_is_not_requeued_as_unanswered(self):
+        """Re-presenting it would ask again for an answer it never wanted."""
+        self._bind_issue_origin(1)
+        self._advance_once(1, "summary-plan-1")
+        claim = self.cards.claim_next(consumer_digest=CONSUMER)
+        self.cards.complete_delivery(
+            claim.card.id,
+            expected_version=claim.card.version,
+            claim_token=claim.token,
+            transport="synthetic",
+            delivery_ref="summary-delivery-1",
+        )
+        self.clock.advance(timedelta(days=2))
+        self.assertEqual(self.cards.requeue_unanswered().requeued, 0)
 
 
 if __name__ == "__main__":

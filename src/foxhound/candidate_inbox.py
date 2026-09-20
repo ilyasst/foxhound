@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 53
+SCHEMA_VERSION = 54
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -774,6 +774,12 @@ _SCHEMA_V11_COLUMNS = {
     )
     for name, columns in _SCHEMA_V14_COLUMNS.items()
 }
+
+# V54 appends the informational-delivery marker.  It is added after every
+# historical map above has been derived, so that a database migrating from an
+# earlier version is not asked to already have a column that did not exist at
+# that point.
+_SCHEMA_COLUMNS["execution_review_cards"] += ("summary_only",)
 
 # The versioned maps above are used to validate historical schemas while they
 # migrate.  V45 is additive, so remove its tables and task columns from every
@@ -2991,6 +2997,33 @@ FROM execution_review_card_events_v52;
 )
 
 
+# A run summary is a delivery record, not a reader gate.  It rides the
+# established private transport as an ordinary execution card row -- the
+# transport validates `kind` against a closed set, so inventing a kind here
+# would refuse the claim, and a refused claim holds the drip's only slot and
+# stops every card reaching the reader.  The distinction is carried by this
+# column instead, and by two separate partial indexes: one active reader-action
+# card per task as before, and independently at most one active summary per
+# task.  The second index is what bounds the summary queue: a newer summary
+# supersedes the one it replaces rather than queueing behind it.
+_SCHEMA_V54 = (
+    "ALTER TABLE execution_review_cards ADD COLUMN summary_only INTEGER "
+    "NOT NULL DEFAULT 0 CHECK(summary_only IN (0,1));",
+    # Replayable, as the additive migrations around it are: a rehearsal may
+    # reset `user_version` while leaving these definitions in place.
+    "DROP INDEX IF EXISTS execution_review_cards_one_active;",
+    "CREATE UNIQUE INDEX execution_review_cards_one_active "
+    "ON execution_review_cards(task_id) "
+    "WHERE status IN ('pending','delivering','delivered') "
+    "AND summary_only=0;",
+    "DROP INDEX IF EXISTS execution_review_cards_one_active_summary;",
+    "CREATE UNIQUE INDEX execution_review_cards_one_active_summary "
+    "ON execution_review_cards(task_id) "
+    "WHERE status IN ('pending','delivering','delivered') "
+    "AND summary_only=1;",
+)
+
+
 # Context exhaustion is a separate terminal condition for one attempt. The
 # workflow table has a closed reason vocabulary, so admitting it requires a
 # table rebuild rather than silently recording it as an ordinary timeout.
@@ -4442,7 +4475,28 @@ class CandidateInbox:
                 finally:
                     connection.execute("PRAGMA legacy_alter_table = OFF")
                     connection.execute("PRAGMA foreign_keys = ON")
-                version = 52
+                version = 53
+            if version == 53:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    columns = {
+                        row["name"] for row in connection.execute(
+                            "PRAGMA table_info(execution_review_cards)"
+                        )
+                    }
+                    # Migration rehearsals may keep a later additive column
+                    # while resetting user_version, so this upgrade stays
+                    # replayable exactly as its additive predecessors are.
+                    if "summary_only" not in columns:
+                        connection.execute(_SCHEMA_V54[0])
+                    for statement in _SCHEMA_V54[1:]:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 54")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 54
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:
