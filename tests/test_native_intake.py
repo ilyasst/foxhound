@@ -926,6 +926,72 @@ class NativeCandidateIntakeTests(unittest.TestCase):
                 stored = self.inbox.get(enriched["candidate_id"])
                 self.assertEqual(stored.evidence.sources[0].role, role)
 
+    def test_a_finished_review_does_not_re_surface_on_a_metadata_edit(self):
+        """A pull-request edit that leaves the head alone changes no work.
+
+        The revision path deliberately keeps the task version stable for this
+        case. Reopening anyway left the task carrying exactly the content it
+        was completed against, and named a version that was never written.
+        A comment on a pull request is the common shape of this.
+        """
+        self.activate()
+        self.inbox.import_feed(feed(0, review_candidate("a" * 40)))
+        self.intake()
+        closed = self.ledger.get(1)
+        self.assertTrue(
+            self.ledger.transition(
+                1, expected_version=closed.version, action="done"
+            ).accepted
+        )
+
+        # The `done` transition advances the version; that is the baseline
+        # the metadata edit must not move.
+        settled = self.ledger.get(1)
+        self.inbox.import_feed(feed(1, review_candidate(
+            "a" * 40, title="Retitled synthetic change", generation=2
+        )))
+        self.intake()
+
+        task = self.ledger.get(1)
+        self.assertEqual(task.status, TaskStatus.DONE)
+        self.assertEqual(task.version, settled.version)
+        with closing(sqlite3.connect(self.database)) as connection:
+            reopens = connection.execute(
+                "SELECT COUNT(*) FROM task_events WHERE task_id=1 "
+                "AND kind='status_changed' AND from_status='done' "
+                "AND to_status='open'"
+            ).fetchone()[0]
+        self.assertEqual(reopens, 0)
+
+    def test_a_finished_review_re_surfaces_when_the_head_moves(self):
+        """New code is a real change, and must still bring the task back."""
+        self.activate()
+        self.inbox.import_feed(feed(0, review_candidate("a" * 40)))
+        self.intake()
+        closed = self.ledger.get(1)
+        self.assertTrue(
+            self.ledger.transition(
+                1, expected_version=closed.version, action="done"
+            ).accepted
+        )
+
+        self.inbox.import_feed(feed(1, review_candidate(
+            "b" * 40, title="Review synthetic change", generation=2
+        )))
+        self.intake()
+
+        task = self.ledger.get(1)
+        self.assertEqual(task.status, TaskStatus.OPEN)
+        with closing(sqlite3.connect(self.database)) as connection:
+            event_version = connection.execute(
+                "SELECT task_version FROM task_events WHERE task_id=1 "
+                "AND kind='status_changed' AND from_status='done' "
+                "AND to_status='open' ORDER BY sequence DESC LIMIT 1"
+            ).fetchone()[0]
+        # The event must name the version the task actually carries, because
+        # the execution scheduler keys on it.
+        self.assertEqual(event_version, task.version)
+
     def test_review_metadata_change_preserves_its_current_workflow(self):
         self.activate()
         initial = review_candidate("a" * 40, title="Review synthetic change")
