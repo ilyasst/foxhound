@@ -1366,6 +1366,92 @@ class ExecutionWorkerTests(unittest.TestCase):
                     }],
                 }, self.run_directory)
 
+    def test_repository_work_that_changed_the_repository_cannot_be_ineligible(self):
+        """`ineligible` claims the prerequisites were absent; a change disproves it.
+
+        Without this the outcome ends repository work without publishing it and
+        without advancing a phase, so the workflow reaches review and an
+        ordinary `done` closes it as finished.
+        """
+        origin = SimpleNamespace(
+            kind="issue",
+            record_id="github.com/example-org/example-repo",
+            item_id="42",
+        )
+        draft = {
+            "outcome": "ineligible",
+            "deliverables": [
+                "Authored the change on branch issue-42-example-slug"
+            ],
+            "external_actions": [],
+            "repository_impact": True,
+        }
+        for phase in (WorkflowPhase.PLAN, WorkflowPhase.EXECUTE):
+            with self.subTest(phase=phase):
+                state = SimpleNamespace(
+                    database_path=self.database, task_id=1, phase=phase,
+                )
+                with mock.patch(
+                    "foxhound.execution_worker._repository_origin",
+                    return_value=origin,
+                ):
+                    with self.assertRaisesRegex(
+                        ExecutionWorkerDraftError, "cannot be ineligible",
+                    ):
+                        _repository_result(state, draft, self.run_directory)
+
+    def test_ineligible_is_accepted_when_the_repository_was_not_changed(self):
+        """A genuinely blocked run keeps the outcome by reporting its effect."""
+        origin = SimpleNamespace(
+            kind="issue",
+            record_id="github.com/example-org/example-repo",
+            item_id="42",
+        )
+        draft = {
+            "outcome": "ineligible",
+            "deliverables": [
+                "Dependency issue is unmerged; nothing smaller is valid"
+            ],
+            "external_actions": [],
+            "repository_impact": False,
+        }
+        for phase in (WorkflowPhase.PLAN, WorkflowPhase.EXECUTE):
+            with self.subTest(phase=phase):
+                state = SimpleNamespace(
+                    database_path=self.database, task_id=1, phase=phase,
+                )
+                with mock.patch(
+                    "foxhound.execution_worker._repository_origin",
+                    return_value=origin,
+                ):
+                    result = _repository_result(
+                        state, draft, self.run_directory
+                    )
+                self.assertEqual(result["outcome"], "ineligible")
+
+    def test_external_action_ineligible_is_unaffected_by_the_guard(self):
+        """The publishing phase keeps its existing outcomes."""
+        origin = SimpleNamespace(
+            kind="issue",
+            record_id="github.com/example-org/example-repo",
+            item_id="42",
+        )
+        state = SimpleNamespace(
+            database_path=self.database,
+            task_id=1,
+            phase=WorkflowPhase.EXTERNAL_ACTION,
+        )
+        with mock.patch(
+            "foxhound.execution_worker._repository_origin", return_value=origin,
+        ):
+            result = _repository_result(state, {
+                "outcome": "ineligible",
+                "deliverables": ["The approved action can no longer apply"],
+                "external_actions": [],
+                "repository_impact": True,
+            }, self.run_directory)
+        self.assertEqual(result["outcome"], "ineligible")
+
     def test_analysis_only_repository_result_does_not_require_a_forge_update(self):
         state = SimpleNamespace(
             database_path=self.database,

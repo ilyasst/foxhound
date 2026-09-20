@@ -1702,6 +1702,29 @@ def _repository_result(
         raise ExecutionWorkerDraftError(
             "repository result must name a deliverable"
         )
+    if (
+        repository_impact
+        and outcome == "ineligible"
+        and state.phase in (WorkflowPhase.PLAN, WorkflowPhase.EXECUTE)
+    ):
+        # `ineligible` means the prerequisites for the work do not exist and
+        # nothing smaller is valid. A run that changed the repository has
+        # already demonstrated otherwise, so the two cannot both be true.
+        #
+        # This closes the last way to end repository work without publishing
+        # it. `completed` is refused just below; `ineligible` was not, and it
+        # does not advance a phase either, so the workflow went to review and
+        # an ordinary `done` closed it as finished while nothing had been
+        # pushed. The run directory is reclaimed afterwards, so the branch the
+        # result named stopped existing -- a silent loss that reads as success
+        # in every count.
+        #
+        # A genuinely blocked run keeps its outcome by reporting the truth
+        # about its effect: `repository_impact: false` with `ineligible` is
+        # still accepted.
+        raise ExecutionWorkerDraftError(
+            "repository work that changed the repository cannot be ineligible"
+        )
     if state.phase is WorkflowPhase.EXECUTE and repository_impact:
         if outcome == "completed":
             raise ExecutionWorkerDraftError(
