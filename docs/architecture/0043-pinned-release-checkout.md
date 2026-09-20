@@ -11,6 +11,22 @@ A release has no git metadata.  It is not a checkout and cannot be fetched or
 checked out in place; advancing production moves the selector to a different
 release, and building one is the separate procedure below.
 
+The mechanism that starts, validates, and transitions components is
+`foxhound-deployment-config`, which reads a private JSON deployment document
+and provides three subcommands:
+
+- **`validate`** — preflight check of the configuration, database, and profile
+  store before any deploy
+- **`render`** — generates the exact command-line arguments for any declared
+  component from the configuration
+- **`exec`** — replaces the process with the component binary from the same
+  release directory (via `os.execv`), ensuring the correct release is running
+
+See [deployment-configuration.md](../deployment-configuration.md) for the
+configuration document, its schema, and the full set of declared components.
+This ADR describes what a deploy consists of, the ordering, and which units
+must be restarted.
+
 That held for every unit but one: the worker is run by the agent, not by
 the runner, and was located through the agent's `PATH` rather than from the
 release.  [ADR 0046](0046-worker-resolved-from-the-running-release.md)
@@ -29,6 +45,22 @@ A release checkout makes the moment of deployment explicit.  `main` moving does
 not move production; advancing production is a separate operation that names a
 commit.
 
+A unit driven by the selector must not also carry a `PYTHONPATH` into the same
+interpreter.  The selected-release unit drop-in deliberately unsets
+`PYTHONPATH` and replaces `ExecStart`, so the two designs actively contradict
+each other on the same unit.  If a unit both follows the selector and has a
+`PYTHONPATH` pointing at a development checkout, the `PYTHONPATH` wins and the
+selector becomes a no-op.
+
+Audit a host in one line:
+
+```sh
+grep -h '^ExecStart=' ~/.config/systemd/user/foxhound-*.service{,.d/*.conf} \
+  | grep -- '-checkout\|/src/\|/Repositories/'
+```
+
+Any output is a unit to repoint.
+
 ## What a deploy is
 
 Advancing and rolling back are one operation with a different commit:
@@ -39,8 +71,11 @@ Advancing and rolling back are one operation with a different commit:
 2. Repoint the selector symlink at it, replacing it atomically with a rename
    rather than deleting and recreating it.  **This is the step that deploys.**
    Everything else restarts processes or confirms the result.
-3. Restart the long-running units.  One-shot units started by a timer pick up
-   the new code on their next run and do not need restarting.
+3. Restart the long-running units.  Each is started through
+   `foxhound-deployment-config exec --component <name>` from the release
+   directory, which replaces the process with the correct binary from the
+   selected release.  One-shot units started by a timer pick up the new code
+   on their next run and do not need restarting.
 4. Read back the revision each restarted service reports.
 
 Step 4 is part of the deploy, not a check afterwards.  A restart that fails
@@ -87,24 +122,32 @@ live database without touching it, and says whether it needs an upgrade:
 1. Build the new release and its environment.  This touches nothing that is
    running, so do it before taking anything down, and confirm the built
    release reports the revision you expect.
-2. Stop the timers.  A one-shot that starts during the migration comes up on
+2. Run preflight validation on the candidate release:
+   ```sh
+   <release>/venv/bin/foxhound-deployment-config \
+     --config <config> validate
+   ```
+   Validation checks the database, profile configuration, token files, and
+   capacity settings before anything is stopped.
+3. Stop the timers.  A one-shot that starts during the migration comes up on
    old code against a new schema, which is the failure this ordering exists to
    avoid.
-3. Stop the in-flight runs, rather than waiting for them.  A claim that ends
+4. Stop the in-flight runs, rather than waiting for them.  A claim that ends
    without releasing is re-queued when its lease expires, so a stopped run is
    retried rather than lost.  Waiting instead means a maintenance window as
    long as the slowest agent.
-4. Stop the long-running units.
-5. Back up the database, with the SQLite backup API rather than a file copy:
+5. Stop the long-running units.
+6. Back up the database, with the SQLite backup API rather than a file copy:
    a copy taken beside a live write-ahead log is not necessarily a database.
-6. Migrate, using the new release's environment.
-7. Repoint the selector symlink, replacing it atomically with a rename rather
+7. Migrate, using the new release's environment.
+8. Repoint the selector symlink, replacing it atomically with a rename rather
    than deleting and recreating it.  As in the short procedure, this is the
    step that deploys.
-8. Start the long-running units, then the timers.
-9. Read back both the reported revision and the schema state.
+9. Start the long-running units through
+   `foxhound-deployment-config exec --component <name>`, then the timers.
+10. Read back both the reported revision and the schema state.
 
-Capture two things before step 6, because after it they are the only way back:
+Capture two things before step 7, because after it they are the only way back:
 the release directory currently deployed, and the path of the backup.  Rolling
 back is repointing the symlink at the first and restoring the second, in that
 order.
@@ -132,7 +175,9 @@ itself.
 3. **Create the environment inside the release and install the release into
    it, not as an editable install.**  An editable install resolves back to the
    tree it was installed from, which reintroduces precisely the coupling to a
-   working tree that a release exists to remove.
+   working tree that a release exists to remove.  The installed environment
+   provides `foxhound-deployment-config` and every component console script
+   side by side, so `exec` resolves the correct binary from the same release.
 4. **Repoint the symlink last**, once the release answers with the revision
    expected of it.  Until that point nothing running has been touched, which is
    what makes the first three steps safe to do at any time.
@@ -213,7 +258,11 @@ that has outlived several deploys is otherwise identical to a fresh one, and
 the difference has taken a card surface down for hours while every unit
 reported active.
 
-The revision is derived from the release checkout, and a service that cannot
+The revision is derived from the release directory via
+`release_revision.describe()`. For a promoted release without git metadata, it
+extracts the revision from the parent directory name under `releases/`
+(e.g. `abc123def (release)`). For a development checkout it reports the
+abbreviated commit with branch and clean/modified state. A service that cannot
 determine one says so rather than omitting the line: a missing revision is the
 symptom worth seeing.
 
@@ -223,3 +272,29 @@ Configuration is private host state and stays outside the checkout.  The two
 have the same property and need the same discipline: what is deployed should be
 nameable, and a change to it should be an operation rather than an edit whose
 effect is discovered later.
+
+`foxhound-deployment-config` makes the settings that belong to one deployment
+explicit.  The JSON configuration file is private host state: keep it outside
+the checkout, make it owner-only (`0600`), and do not commit it or paste it
+into issues.  It contains paths but never token values.
+
+The tool lives inside the release environment and is the interface operators
+use to validate and launch components.  Private service units start through
+`exec` rather than calling the component binary directly:
+
+```sh
+/srv/example/releases/current/bin/foxhound-deployment-config \
+  --config /srv/example/private-foxhound-state/deployment.json \
+  exec --component execution-runner:primary
+```
+
+`exec` replaces the process with the matching console script beside
+`foxhound-deployment-config`; it does not use a shell or search `PATH`.  The
+release selector determines which release is running, and the configuration
+document determines how it runs.  A promotion changes the selector only after
+preflight succeeds, so every database component starts from one selected release
+with arguments rendered from the same document.
+
+See [deployment-configuration.md](../deployment-configuration.md) for the full
+configuration schema, version history, supported components, and deployment
+roots.
