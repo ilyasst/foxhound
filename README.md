@@ -150,7 +150,7 @@ generation. Withdrawal never completes or deletes a Foxhound task: untouched
 open tasks are withheld from cards and execution, while reader-modified or
 already-active tasks are preserved as explicit conflicts. Existing version 1
 and 2 producers retain active generation-zero behavior. See
-[ADR 0023](docs/architecture/0023-candidate-lifecycle.md).
+[ADR 0049](docs/architecture/0049-candidate-lifecycle.md).
 
 Meeting candidate version 4 carries one to three validated source basenames
 with bounded supporting extracts. Cards render those readable sources instead
