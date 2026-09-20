@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 52
+SCHEMA_VERSION = 53
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -2957,6 +2957,40 @@ FROM execution_review_card_events_v51;
 )
 
 
+# Re-presenting an unanswered card is not a delivery failure. `requeue_unanswered`
+# borrowed the `delivery_failed` kind to record it, and `delivery_health` counts
+# every such event in a 15-minute window against a threshold of three -- so an
+# hourly requeue of three or more unanswered cards raised
+# `recent_delivery_failures_exceeded` on a system that was delivering fine.
+#
+# The visible cost was a watchdog that cried wolf. The real cost is that a
+# genuine transport failure became indistinguishable from routine re-presentation,
+# so the check that exists to catch broken delivery could not.
+_SCHEMA_V53_CARD_EVENT_TABLE = _SCHEMA_V52_CARD_EVENT_TABLE.replace(
+    "'cancelled','refreshed','retracted'",
+    "'cancelled','refreshed','retracted','requeued'",
+)
+_SCHEMA_V53 = (
+    "DROP TRIGGER execution_review_card_events_no_update;",
+    "DROP TRIGGER execution_review_card_events_no_delete;",
+    "ALTER TABLE execution_review_card_events "
+    "RENAME TO execution_review_card_events_v52;",
+    _SCHEMA_V53_CARD_EVENT_TABLE,
+    """
+INSERT INTO execution_review_card_events(
+    sequence,card_id,task_id,kind,card_version,workflow_version,action,
+    occurred_at
+)
+SELECT sequence,card_id,task_id,kind,card_version,workflow_version,action,
+       occurred_at
+FROM execution_review_card_events_v52;
+""",
+    "DROP TABLE execution_review_card_events_v52;",
+    _SCHEMA_V9[3],
+    _SCHEMA_V9[4],
+)
+
+
 # Context exhaustion is a separate terminal condition for one attempt. The
 # workflow table has a closed reason vocabulary, so admitting it requires a
 # table rebuild rather than silently recording it as an ordinary timeout.
@@ -4385,6 +4419,22 @@ class CandidateInbox:
                     for statement in _SCHEMA_V52:
                         connection.execute(statement)
                     connection.execute("PRAGMA user_version = 52")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                finally:
+                    connection.execute("PRAGMA legacy_alter_table = OFF")
+                    connection.execute("PRAGMA foreign_keys = ON")
+                version = 52
+            if version == 52:
+                connection.execute("PRAGMA foreign_keys = OFF")
+                connection.execute("PRAGMA legacy_alter_table = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V53:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 53")
                     connection.commit()
                 except Exception:
                     connection.rollback()

@@ -21,7 +21,7 @@ HEALTH_SCHEMA = "foxhound.delivery-health"
 # 2 adds `superseded_profiles`; 3 adds the count of workflows parked because
 # their measured context did not fit; 4 adds `admission`. Consumers must not
 # infer any of them from a missing aggregate field.
-HEALTH_SCHEMA_VERSION = 4
+HEALTH_SCHEMA_VERSION = 5
 MAX_THRESHOLD_SECONDS = 7 * 24 * 60 * 60
 MAX_RECENT_FAILURES = 10_000
 
@@ -111,6 +111,7 @@ class DeliveryHealth:
     task_cards: DeliveryCardHealth
     execution_cards: DeliveryCardHealth
     recent_failures: int
+    recent_requeues: int
     failure_window_seconds: int
     last_successful_delivery_age_seconds: int | None
     workflows: ExecutionReadiness
@@ -132,6 +133,7 @@ class DeliveryHealth:
             "execution_cards": asdict(self.execution_cards),
             "delivery": {
                 "recent_failures": self.recent_failures,
+                "recent_requeues": self.recent_requeues,
                 "failure_window_seconds": self.failure_window_seconds,
                 "last_successful_delivery_age_seconds": self.last_successful_delivery_age_seconds,
             },
@@ -160,7 +162,7 @@ def collect_delivery_health(
             execution_cards = _card_health(
                 connection, "execution_review_cards", "created_at", now
             )
-            recent_failures, last_delivery = _delivery_events(
+            recent_failures, recent_requeues, last_delivery = _delivery_events(
                 connection, now - timedelta(seconds=policy.failure_window_seconds)
             )
             admission = _admission_health(connection, now)
@@ -200,6 +202,7 @@ def collect_delivery_health(
         task_cards=task_cards,
         execution_cards=execution_cards,
         recent_failures=recent_failures,
+        recent_requeues=recent_requeues,
         failure_window_seconds=policy.failure_window_seconds,
         last_successful_delivery_age_seconds=last_age,
         workflows=workflows,
@@ -270,21 +273,34 @@ def _card_health(
     )
 
 
-def _delivery_events(connection: object, since: datetime) -> tuple[int, datetime | None]:
+def _delivery_events(
+    connection: object, since: datetime
+) -> tuple[int, int, datetime | None]:
+    """Failures and requeues counted apart, because they mean opposite things.
+
+    A `delivery_failed` says the transport could not present a card. A
+    `requeued` says a card was re-presented because nobody answered it for an
+    hour -- routine, and a fact about the reader rather than the system. Only
+    the first belongs in the alert; the second is still worth reporting, and
+    was the thing actually happening every time this alarm fired.
+    """
     row = connection.execute(
         "SELECT "
         "SUM(CASE WHEN kind='delivery_failed' AND occurred_at>=? THEN 1 ELSE 0 END) AS recent_failures,"
+        "SUM(CASE WHEN kind='requeued' AND occurred_at>=? THEN 1 ELSE 0 END) AS recent_requeues,"
         "MAX(CASE WHEN kind='delivered' THEN occurred_at END) AS last_delivery "
         "FROM ("
         "SELECT kind,occurred_at FROM task_review_card_events "
         "UNION ALL "
         "SELECT kind,occurred_at FROM execution_review_card_events"
         ")",
-        (since.isoformat(timespec="seconds"),),
+        (since.isoformat(timespec="seconds"),) * 2,
     ).fetchone()
     last = row["last_delivery"]
-    return int(row["recent_failures"] or 0), (
-        None if last is None else _timestamp(str(last))
+    return (
+        int(row["recent_failures"] or 0),
+        int(row["recent_requeues"] or 0),
+        None if last is None else _timestamp(str(last)),
     )
 
 

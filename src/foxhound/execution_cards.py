@@ -1198,8 +1198,13 @@ class ExecutionCardService:
 
         The old chat message remains a historical presentation, but its
         callbacks are version-stale before a replacement can be claimed.
-        Reusing the existing `delivery_failed` event shape records that the
-        presentation became unavailable without changing workflow state.
+
+        This records `requeued`, not `delivery_failed`. It borrowed the
+        failure kind once, and `delivery_health` counts those against a
+        threshold of three in fifteen minutes -- so an hourly requeue of three
+        unanswered cards reported delivery as unhealthy on a system that was
+        delivering fine, and a real transport failure became indistinguishable
+        from routine re-presentation.
         """
         if not _valid_limit(limit):
             return ExecutionCardRequeueResult()
@@ -1240,7 +1245,7 @@ class ExecutionCardService:
                         connection,
                         card_id=card_id,
                         task_id=int(row["task_id"]),
-                        kind="delivery_failed",
+                        kind="requeued",
                         card_version=version,
                         workflow_version=int(row["workflow_version"]),
                         action=None,
