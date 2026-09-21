@@ -235,6 +235,52 @@ class ExecutionScheduleCommandTests(unittest.TestCase):
         )
         self.assertNotIn(private_text, stderr.getvalue())
 
+    def test_skip_planning_requires_execution_grants_to_start(self):
+        stdout = StringIO()
+        stderr = StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            self.assertEqual(main([
+                "--database", str(self.database),
+                "--skip-planning-for", "issue",
+                "--plan-without-asking", "issue",
+            ]), 78)
+        self.assertEqual(stderr.getvalue(), "foxhound execution schedule: configuration unavailable\n")
+
+    def test_skip_planning_succeeds_with_execute_grants(self):
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute("DELETE FROM tasks WHERE id = 2")
+            connection.execute(
+                "INSERT INTO candidate_inbox(candidate_id,source_system,"
+                "source_kind,source_record_id,source_item_id,source_revision,"
+                "payload_json,created_at,first_imported_at,updated_at) VALUES("
+                "'cand-1','gw','issue','example-repo','1','rev-1','{}',"
+                "'2030-01-01T12:00:00+00:00','2030-01-01T12:00:00+00:00',"
+                "'2030-01-01T12:00:00+00:00')"
+            )
+            connection.execute(
+                "INSERT INTO task_candidate_bindings(task_id,candidate_id,"
+                "source_revision,relation,decided_at) "
+                "VALUES(1,'cand-1','rev-1','accepted','2030-01-01T12:00:00+00:00')"
+            )
+            connection.commit()
+
+        stdout = StringIO()
+        stderr = StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            self.assertEqual(main([
+                "--database", str(self.database),
+                "--skip-planning-for", "issue",
+                "--plan-without-asking", "issue",
+                "--execute-without-asking", "issue",
+                "--limit", "1"
+            ]), 0)
+
+        with closing(sqlite3.connect(self.database)) as connection:
+            rows = connection.execute(
+                "SELECT task_id, phase FROM task_execution_workflows"
+            ).fetchall()
+            self.assertEqual(rows, [(1, "execute")])
+
     @staticmethod
     def _profile(
         *, phases: tuple[str, ...] = ("plan", "execute", "external_action")

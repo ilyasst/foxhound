@@ -141,6 +141,8 @@ class WorkflowConfig:
             result.extend(("--profile-route", f"{source_kind}={profile_id}"))
         for kind in self.plan_without_asking:
             result.extend(("--plan-without-asking", kind))
+        for kind in self.execute_without_asking:
+            result.extend(("--execute-without-asking", kind))
         for kind in self.steer_while_running:
             result.extend(("--steer-while-running", kind))
         for kind in self.skip_planning_for:
