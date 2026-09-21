@@ -1700,7 +1700,8 @@ class ExecutionWorkerTests(unittest.TestCase):
             "foxhound.execution_worker._repository_origin", return_value=origin,
         ):
             with self.assertRaisesRegex(
-                ExecutionWorkerDraftError, "targeting its origin",
+                ExecutionWorkerDraftError,
+                r"targeting its origin: result-external-actions\.json must contain an action object with 'target': 'https://github\.com/example-org/example-repo/pull/42'",
             ):
                 _repository_result(state, {
                     "outcome": "awaiting_external",
