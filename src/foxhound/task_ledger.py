@@ -1548,6 +1548,18 @@ class TaskLedger:
             expected_revision=row["source_revision"],
         )
 
+    def bound_candidate_payload(self, task_id: int) -> str | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT h.payload_json "
+                "FROM task_candidate_bindings AS b "
+                "JOIN candidate_revision_history AS h "
+                "ON h.candidate_id=b.candidate_id AND h.source_revision=b.source_revision "
+                "WHERE b.task_id=? AND b.relation='accepted'",
+                (task_id,),
+            ).fetchone()
+        return None if row is None else row["payload_json"]
+
     def count(self) -> int:
         with closing(self._connect()) as connection:
             row = connection.execute("SELECT COUNT(*) AS total FROM tasks").fetchone()

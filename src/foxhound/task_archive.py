@@ -16,7 +16,7 @@ import stat
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 
 ARTIFACT_MANIFEST_NAME = "result-artifacts.json"
@@ -83,6 +83,7 @@ def prepare_task_archive(
     origin_kind: str | None = None,
     origin_record: str | None = None,
     origin_item: str | None = None,
+    origin_sources: Sequence[Any] = (),
 ) -> TaskArchivePaths:
     """Create the stable task locations and register this run."""
     if isinstance(task_id, bool) or not isinstance(task_id, int) or task_id < 1:
@@ -96,7 +97,7 @@ def prepare_task_archive(
     _make_directory(task_directory)
     _make_directory(task_directory / "runs")
     _make_directory(run_directory)
-    source = _origin_markdown(origin_kind, origin_record, origin_item)
+    source = _origin_markdown(origin_kind, origin_record, origin_item, origin_sources)
     stamp = datetime.now().astimezone().isoformat(timespec="seconds")
     log = _read_log(task_directory)
     log["task_id"] = task_id
@@ -604,14 +605,27 @@ def _task_header(
 
 
 def _origin_markdown(
-    kind: str | None, record: str | None, item: str | None
+    kind: str | None, record: str | None, item: str | None, sources: Sequence[Any] = ()
 ) -> str | None:
     if not record or not item:
         return None
     match = _GITHUB_RECORD_RE.fullmatch(record)
-    if kind == "issue" and match:
-        return f"[Issue #{item}](https://{record}/issues/{item})"
-    return f"{record} #{item}"
+    if sources:
+        shown_kind = (kind or "").replace("_", " ").title()
+        source_id = shown_kind or "Unknown source"
+    elif kind == "issue" and match:
+        source_id = f"[Issue #{item}](https://{record}/issues/{item})"
+    else:
+        source_id = f"{record} #{item}"
+    if sources:
+        lines = [source_id, "", "Source evidence:"]
+        for source in sources:
+            role = source.role.replace("_", " ")
+            lines.append(f"- {source.basename} ({role})")
+            for extract in source.extracts:
+                lines.append(f"  > {extract.replace(chr(10), chr(10) + '  > ')}")
+        return "\n".join(lines)
+    return source_id
 
 
 def review_links(
