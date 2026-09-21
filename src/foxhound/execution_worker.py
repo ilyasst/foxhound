@@ -1824,14 +1824,16 @@ def _repository_result(
         and _publication_is_the_deliverable(origin_kind)
     )
     if state.phase is WorkflowPhase.EXECUTE and repository_impact:
-        if outcome == "completed":
+        if outcome == "completed" and not references:
             raise ExecutionWorkerDraftError(
                 "repository execution must await an approved follow-through; "
-                "for analysis-only work write JSON false to "
+                "request an external action, or name the existing follow-through in "
+                "repository references if it is already published. "
+                "For analysis-only work write JSON false to "
                 "result-repository-impact.json"
             )
     if state.phase is WorkflowPhase.PLAN and repository_impact:
-        if outcome == "completed":
+        if outcome == "completed" and not references:
             raise ExecutionWorkerDraftError(
                 "a planning run that changed the repository must record "
                 "awaiting_plan; for analysis-only work write JSON false to "
@@ -1890,6 +1892,8 @@ def _repository_result(
             )
         required = _required_repository_receipt_kinds(origin.kind)
         received = {receipt["kind"] for receipt in receipts}
+        if origin.kind == "review_request" and "issue-comment" in received:
+            received = received | {"review"}
         missing = required - received
         if missing:
             names = " and ".join(sorted(missing))
