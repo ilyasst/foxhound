@@ -228,6 +228,8 @@ class ExecutionWorkflow:
     last_failure_reason: str | None
     last_failure_exit_code: int | None
     last_failure_run_id: str | None
+    steer_while_running: bool
+    current_run_id: str | None
     last_failure_at: str | None
     next_attempt_at: str | None
     parked_at: str | None
@@ -362,6 +364,14 @@ class ExecutionReadiness:
     #: This is a subset of ``parked``, kept separate so operators can count
     #: unsatisfiable work rather than infer it from busy runner slots.
     context_exhausted: int
+    #: Workflows that have stopped and been restarted more than once in the
+    #: phase they are in now without ever recording a result for it.  Not a
+    #: subset of ``parked``: the loop this counts spends most of its time
+    #: queued or running, because a reader answering the Start card requeues
+    #: it immediately.  Two such workflows once took about a fifth of all
+    #: slot time over two days while recording nothing, and no number
+    #: anywhere made that visible.
+    unproductive: int
     completed: int
     cancelled: int
 
@@ -479,6 +489,7 @@ class TaskExecutionService:
         profile_registry: AgentProfileRegistry | None = None,
         default_profile_id: str = "general",
         planning_grants: object = None,
+        steer_while_running: object = None,
         execution_grants: object = None,
         skip_planning_for: object = None,
         action_grants: object = None,
@@ -556,6 +567,10 @@ class TaskExecutionService:
         # decided is asked, rather than having the decision made for them
         # by whichever machine edited a shared file first.
         self._planning_grants = _planning_grants(planning_grants)
+        # This is a notification policy, not an execution authority.  It is
+        # still validated against the closed source-kind vocabulary so a typo
+        # cannot silently make a run invisible.
+        self._steer_while_running = _planning_grants(steer_while_running)
         # Independent of planning authority above. A machine that has
         # said a kind may be planned has not said its plan may be run.
         self._execution_grants = _execution_grants(execution_grants)
@@ -633,11 +648,30 @@ class TaskExecutionService:
                     "LEFT JOIN task_execution_workflows AS w "
                     "ON w.task_id=t.id WHERE t.status='open' "
                     "AND (w.task_id IS NULL OR (w.task_version!=t.version "
-                    "AND EXISTS(SELECT 1 FROM task_candidate_bindings AS review "
+                    # A re-surfaced task needs a fresh workflow whatever its
+                    # source kind. Without this, ADR 0039 reopens a task whose
+                    # terminal workflow still satisfies this join, and it never
+                    # runs again.
+                    #
+                    # Keyed on the reopen EVENT, not on the old workflow's
+                    # status. Status looked like the obvious discriminator and
+                    # is the wrong one: `_cancel_stale` writes `cancelled`
+                    # moments earlier in this same pass for a workflow whose
+                    # task merely moved underneath it, and that reconciliation
+                    # must keep ending in a cancellation rather than becoming
+                    # an immediate re-schedule. The event says the task was
+                    # reopened, which is the thing actually being asked.
+                    "AND (EXISTS(SELECT 1 FROM task_events AS reopened "
+                    "WHERE reopened.task_id=t.id "
+                    "AND reopened.kind='status_changed' "
+                    "AND reopened.from_status='done' "
+                    "AND reopened.to_status='open' "
+                    "AND reopened.task_version>w.task_version) "
+                    "OR EXISTS(SELECT 1 FROM task_candidate_bindings AS review "
                     "JOIN candidate_inbox AS source "
                     "ON source.candidate_id=review.candidate_id "
                     "WHERE review.task_id=t.id AND review.relation='accepted' "
-                    "AND source.source_kind='review_request'))) "
+                    "AND source.source_kind='review_request')))) "
                     "AND NOT EXISTS("
                     " SELECT 1 FROM task_candidate_bindings AS b JOIN "
                     " task_candidate_lifecycle AS l ON l.candidate_id=b.candidate_id "
@@ -707,12 +741,14 @@ class TaskExecutionService:
                     profile = self._profile_for(origin_kind)
                     connection.execute(
                         "UPDATE task_execution_workflows SET status='queued',"
-                        "version=?,due_at=NULL,agent_profile_id=?,"
+                        "version=?,due_at=NULL,steer_while_running=?,"
+                        "agent_profile_id=?,"
                         "agent_profile_revision=?,updated_at=? "
                         "WHERE task_id=? AND version=? "
                         "AND status='awaiting_start' AND phase='plan'",
                         (
-                            version, profile.profile_id, profile.revision,
+                            version, int(origin_kind in self._steer_while_running),
+                            profile.profile_id, profile.revision,
                             now, int(row["task_id"]), int(row["version"]),
                         ),
                     )
@@ -744,11 +780,30 @@ class TaskExecutionService:
                     "LEFT JOIN task_execution_workflows AS w "
                     "ON w.task_id=t.id WHERE t.status='open' "
                     "AND (w.task_id IS NULL OR (w.task_version!=t.version "
-                    "AND EXISTS(SELECT 1 FROM task_candidate_bindings AS review "
+                    # A re-surfaced task needs a fresh workflow whatever its
+                    # source kind. Without this, ADR 0039 reopens a task whose
+                    # terminal workflow still satisfies this join, and it never
+                    # runs again.
+                    #
+                    # Keyed on the reopen EVENT, not on the old workflow's
+                    # status. Status looked like the obvious discriminator and
+                    # is the wrong one: `_cancel_stale` writes `cancelled`
+                    # moments earlier in this same pass for a workflow whose
+                    # task merely moved underneath it, and that reconciliation
+                    # must keep ending in a cancellation rather than becoming
+                    # an immediate re-schedule. The event says the task was
+                    # reopened, which is the thing actually being asked.
+                    "AND (EXISTS(SELECT 1 FROM task_events AS reopened "
+                    "WHERE reopened.task_id=t.id "
+                    "AND reopened.kind='status_changed' "
+                    "AND reopened.from_status='done' "
+                    "AND reopened.to_status='open' "
+                    "AND reopened.task_version>w.task_version) "
+                    "OR EXISTS(SELECT 1 FROM task_candidate_bindings AS review "
                     "JOIN candidate_inbox AS source "
                     "ON source.candidate_id=review.candidate_id "
                     "WHERE review.task_id=t.id AND review.relation='accepted' "
-                    "AND source.source_kind='review_request'))) "
+                    "AND source.source_kind='review_request')))) "
                     "AND NOT EXISTS("
                     " SELECT 1 FROM task_candidate_bindings AS blocked JOIN "
                     " task_candidate_lifecycle AS l "
@@ -794,13 +849,14 @@ class TaskExecutionService:
                             "INSERT INTO task_execution_workflows("
                             "task_id,task_version,status,phase,version,due_at,"
                             "failure_count,created_at,updated_at,agent_profile_id,"
-                            "agent_profile_revision) "
-                            "VALUES(?,?,?,?,?,NULL,0,?,?,?,?)",
+                            "agent_profile_revision,steer_while_running) "
+                            "VALUES(?,?,?,?,?,NULL,0,?,?,?,?,?)",
                             (
                                 task_id, task_version, status.value, phase.value,
                                 version, now, now,
                                 profile.profile_id,
                                 profile.revision,
+                                int(row["origin_kind"] in self._steer_while_running),
                             ),
                         )
                     else:
@@ -810,15 +866,19 @@ class TaskExecutionService:
                             "status=?,phase=?,version=?,due_at=NULL,"
                             "claim_token_digest=NULL,claimed_at=NULL,"
                             "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
+                            "current_run_id=NULL,"
                             "failure_count=0,last_failure_reason=NULL,"
                             "last_failure_exit_code=NULL,last_failure_run_id=NULL,"
                             "last_failure_at=NULL,next_attempt_at=NULL,"
                             "parked_at=NULL,last_result_id=NULL,updated_at=?,"
                             "completed_at=NULL,agent_profile_id=?,"
-                            "agent_profile_revision=? WHERE task_id=?",
+                            "agent_profile_revision=?,steer_while_running=? "
+                            "WHERE task_id=?",
                             (
                                 task_version, status.value, phase.value, version,
-                                now, profile.profile_id, profile.revision, task_id,
+                                now, profile.profile_id, profile.revision,
+                                int(row["origin_kind"] in self._steer_while_running),
+                                task_id,
                             ),
                         )
                     self._event(
@@ -910,12 +970,13 @@ class TaskExecutionService:
                         "INSERT INTO task_execution_workflows("
                         "task_id,task_version,status,phase,version,due_at,"
                         "failure_count,created_at,updated_at,agent_profile_id,"
-                        "agent_profile_revision) "
-                        "VALUES(?,?,?,?,?,NULL,0,?,?,?,?)",
+                        "agent_profile_revision,steer_while_running) "
+                        "VALUES(?,?,?,?,?,NULL,0,?,?,?,?,?)",
                         (
                             task_id, expected_task_version, status.value,
                             phase.value, version, now, now,
                             profile.profile_id, profile.revision,
+                            int(task["origin_kind"] in self._steer_while_running),
                         ),
                     )
                 else:
@@ -933,16 +994,20 @@ class TaskExecutionService:
                         "status=?,phase=?,version=?,"
                         "due_at=NULL,claim_token_digest=NULL,claimed_at=NULL,"
                         "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
+                        "current_run_id=NULL,"
                         "failure_count=0,last_failure_reason=NULL,"
                         "last_failure_exit_code=NULL,last_failure_run_id=NULL,"
                         "last_failure_at=NULL,next_attempt_at=NULL,"
                         "parked_at=NULL,last_result_id=NULL,updated_at=?,"
                         "completed_at=NULL,agent_profile_id=?,"
-                        "agent_profile_revision=? WHERE task_id=?",
+                        "agent_profile_revision=?,steer_while_running=? "
+                        "WHERE task_id=?",
                         (
                             expected_task_version, status.value, phase.value,
                             version, now,
-                            profile.profile_id, profile.revision, task_id,
+                            profile.profile_id, profile.revision,
+                            int(task["origin_kind"] in self._steer_while_running),
+                            task_id,
                         ),
                     )
                 self._event(
@@ -1171,6 +1236,7 @@ class TaskExecutionService:
                     "UPDATE task_execution_workflows SET status='running',"
                     "version=?,claim_token_digest=?,claimed_at=?,"
                     "claim_heartbeat_at=?,claim_expires_at=?,updated_at=?,"
+                    "current_run_id=NULL,"
                     # Claiming a parked workflow starts a fresh round of
                     # attempts. One attempt from the limit would park it
                     # again on the first slip, which is a retry in name
@@ -1211,6 +1277,50 @@ class TaskExecutionService:
                     agent_profile_id=profile.profile_id,
                     agent_profile_revision=profile.revision,
                     lease_seconds=profile.claim_lease_seconds,
+                )
+            except Exception:
+                connection.rollback()
+                raise
+
+    def attach_run_id(
+        self, task_id: int, *, expected_version: int, claim_token: str,
+        run_id: str,
+    ) -> WorkflowOperationResult:
+        """Best-effortly name the private directory of one live claim."""
+        if (
+            not _valid_identity(task_id, expected_version)
+            or not _valid_secret(claim_token)
+            or not isinstance(run_id, str)
+            or not re.fullmatch(r"[0-9a-f]{32}", run_id)
+        ):
+            return _refused(task_id, WorkflowRefusal.INVALID_ARGUMENT)
+        now = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._workflow_with_task(connection, task_id)
+                refusal = _running_guard(
+                    row, expected_version, _token_digest(claim_token), now
+                )
+                if refusal is not None:
+                    connection.rollback()
+                    return _refused_row(task_id, row, refusal)
+                changed = connection.execute(
+                    "UPDATE task_execution_workflows SET current_run_id=?,"
+                    "updated_at=? WHERE task_id=? AND version=? "
+                    "AND status='running' AND claim_token_digest=?",
+                    (run_id, now, task_id, expected_version,
+                     _token_digest(claim_token)),
+                )
+                if changed.rowcount != 1:
+                    connection.rollback()
+                    return _refused_row(
+                        task_id, row, WorkflowRefusal.CLAIM_MISMATCH
+                    )
+                connection.commit()
+                return _operation(
+                    self._workflow_with_task(connection, task_id),
+                    WorkflowDisposition.APPLIED,
                 )
             except Exception:
                 connection.rollback()
@@ -1444,6 +1554,7 @@ class TaskExecutionService:
                         "UPDATE task_execution_workflows SET status='queued',"
                         "version=?,claim_token_digest=NULL,claimed_at=NULL,"
                         "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
+                        "current_run_id=NULL,"
                         "updated_at=? WHERE task_id=? AND version=?",
                         (version, now, task_id, expected_version),
                     )
@@ -1620,6 +1731,7 @@ class TaskExecutionService:
                     "UPDATE task_execution_workflows SET status=?,phase=?,"
                     "version=?,claim_token_digest=NULL,claimed_at=NULL,"
                     "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
+                    "current_run_id=NULL,"
                     "failure_count=0,last_failure_reason=NULL,"
                     "last_failure_exit_code=NULL,last_failure_run_id=NULL,"
                     "last_failure_at=NULL,next_attempt_at=NULL,parked_at=NULL,"
@@ -1893,6 +2005,25 @@ class TaskExecutionService:
                 "SUM(status='parked') AS parked,"
                 "SUM(status='parked' AND "
                 "last_failure_reason='context_exhausted') AS context_exhausted,"
+                # Derived from the event log for the same reason the card is:
+                # `failure_count` resets on park, so nothing live carries the
+                # history across one.
+                # Every outer column is spelled out. `e.phase=phase` reads
+                # as the obvious correlation and is not one: the inner table
+                # has a `phase` column too, SQLite resolves the bare name to
+                # it, and the predicate quietly becomes a tautology.
+                "SUM((SELECT count(*) FROM task_execution_events AS e "
+                "     WHERE e.task_id=task_execution_workflows.task_id "
+                "     AND e.kind='parked' "
+                "     AND e.phase=task_execution_workflows.phase "
+                "     AND e.task_version=task_execution_workflows.task_version"
+                "    )>1 "
+                "    AND NOT EXISTS(SELECT 1 FROM task_execution_results AS r "
+                "     WHERE r.task_id=task_execution_workflows.task_id "
+                "     AND r.phase=task_execution_workflows.phase "
+                "     AND r.task_version="
+                "         task_execution_workflows.task_version)"
+                ") AS unproductive,"
                 "SUM(status='completed') AS completed,"
                 "SUM(status='cancelled') AS cancelled "
                 "FROM task_execution_workflows",
@@ -1903,7 +2034,7 @@ class TaskExecutionService:
             for name in (
                 "awaiting_start", "snoozed", "ready", "cooling",
                 "running", "expired", "awaiting_review", "parked",
-                "context_exhausted", "completed", "cancelled",
+                "context_exhausted", "unproductive", "completed", "cancelled",
             )
         ))
 
@@ -2268,6 +2399,65 @@ class TaskExecutionService:
             ).fetchone()
         return None if found is None else str(found["digest"])
 
+    #: How many prior failure digests one run is told about.  An agent
+    #: handed twenty failure notes is worse off than one handed two: the
+    #: point is "these approaches have already been tried", and past a
+    #: handful that message is already delivered while the context is not.
+    PRIOR_FAILURE_LIMIT = 3
+
+    def prior_failures(
+        self,
+        task_id: int,
+        *,
+        expected_version: int,
+        claim_token: str,
+        limit: int | None = None,
+    ) -> tuple[str, ...]:
+        """Why earlier attempts at this phase stopped, most recent first.
+
+        The larger half of what a failed run loses.  A reader seeing the
+        cause on a card is the visible half; the next run beginning from
+        the task text alone, making the same plan and failing the same
+        way, is the expensive one.
+
+        Claim-guarded exactly as ``reader_instruction`` is: this is run
+        context, and only the run it belongs to may read it.
+
+        Scoped to the phase the workflow is in now, and excluding the
+        current attempt, which has not failed yet.  Failing open is the
+        rule everywhere in this path -- an absent digest costs the hint
+        and nothing else -- so an empty tuple is an ordinary answer.
+        """
+        if (
+            not _valid_identity(task_id, expected_version)
+            or not _valid_secret(claim_token)
+        ):
+            raise TaskLedgerError("execution claim is unavailable")
+        if limit is None:
+            limit = self.PRIOR_FAILURE_LIMIT
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise TaskLedgerError("prior failure limit is invalid")
+        now = self._now()
+        with closing(self._connect()) as connection:
+            row = self._workflow_with_task(connection, task_id)
+            refusal = _running_guard(
+                row,
+                expected_version,
+                _token_digest(claim_token),
+                now,
+            )
+            if refusal is None:
+                refusal = _task_guard(row, int(row["task_version"]))
+            if refusal is not None:
+                raise TaskLedgerError("execution claim is unavailable")
+            found = connection.execute(
+                "SELECT digest FROM execution_failure_digests "
+                "WHERE task_id=? AND phase=? AND workflow_version<? "
+                "ORDER BY workflow_version DESC LIMIT ?",
+                (task_id, str(row["phase"]), expected_version, limit),
+            ).fetchall()
+        return tuple(str(item["digest"]) for item in found)
+
     def event_count(self) -> int:
         with closing(self._connect()) as connection:
             return int(connection.execute(
@@ -2357,6 +2547,7 @@ class TaskExecutionService:
                 "phase=?,version=?,due_at=NULL,claim_token_digest=NULL,"
                 "claimed_at=NULL,claim_heartbeat_at=NULL,"
                 "claim_expires_at=NULL,failure_count=0,"
+                "current_run_id=NULL,"
                 "last_failure_reason=NULL,last_failure_exit_code=NULL,"
                 "last_failure_run_id=NULL,last_failure_at=NULL,"
                 "next_attempt_at=NULL,parked_at=NULL,agent_profile_id=?,"
@@ -2399,8 +2590,9 @@ class TaskExecutionService:
             version = int(row["version"]) + 1
             connection.execute(
                 "UPDATE task_execution_workflows SET status='cancelled',"
-                "version=?,claim_token_digest=NULL,claimed_at=NULL,"
-                "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
+                    "version=?,claim_token_digest=NULL,claimed_at=NULL,"
+                    "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
+                    "current_run_id=NULL,"
                 "next_attempt_at=NULL,parked_at=NULL,updated_at=?,"
                 "completed_at=? WHERE task_id=? AND version=?",
                 (
@@ -2468,6 +2660,7 @@ class TaskExecutionService:
             "UPDATE task_execution_workflows SET status=?,version=?,"
             "claim_token_digest=NULL,claimed_at=NULL,"
             "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
+            "current_run_id=NULL,"
             "failure_count=?,last_failure_reason=?,last_failure_at=?,"
             "last_failure_exit_code=?,last_failure_run_id=?,"
             "next_attempt_at=?,parked_at=?,updated_at=? "
@@ -2828,6 +3021,7 @@ def _apply_start_action(
         "UPDATE task_execution_workflows SET status=?,phase=?,version=?,"
         "due_at=?,claim_token_digest=NULL,claimed_at=NULL,"
         "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
+        "current_run_id=NULL,"
         # Restarting clears what parked it, so a retry gets a full set of
         # attempts rather than immediately parking again on the next slip.
         "failure_count=0,last_failure_reason=NULL,"
@@ -2955,6 +3149,7 @@ def _apply_review_action(
         "UPDATE task_execution_workflows SET status=?,phase=?,version=?,"
         "due_at=?,claim_token_digest=NULL,claimed_at=NULL,"
         "claim_heartbeat_at=NULL,claim_expires_at=NULL,failure_count=0,"
+        "current_run_id=NULL,"
         "last_failure_reason=NULL,last_failure_exit_code=NULL,"
         "last_failure_run_id=NULL,last_failure_at=NULL,next_attempt_at=NULL,"
         "parked_at=NULL,updated_at=?,completed_at=? "
@@ -3062,6 +3257,8 @@ def _workflow(row: sqlite3.Row) -> ExecutionWorkflow:
             last_failure_reason=row["last_failure_reason"],
             last_failure_exit_code=row["last_failure_exit_code"],
             last_failure_run_id=row["last_failure_run_id"],
+            steer_while_running=bool(row["steer_while_running"]),
+            current_run_id=row["current_run_id"],
             last_failure_at=row["last_failure_at"],
             next_attempt_at=row["next_attempt_at"],
             parked_at=row["parked_at"],
@@ -3520,7 +3717,7 @@ def _cancel_superseded_start_cards(
 ) -> None:
     """Retire Start cards in the same transaction as a planning grant."""
     rows = connection.execute(
-        "SELECT id,version FROM execution_review_cards "
+        "SELECT id,version,transport,delivery_ref FROM execution_review_cards "
         "WHERE task_id=? AND workflow_version=? AND kind='start' "
         "AND status IN ('pending','delivering','delivered') ORDER BY id",
         (task_id, workflow_version),
@@ -3531,12 +3728,21 @@ def _cancel_superseded_start_cards(
         updated = connection.execute(
             "UPDATE execution_review_cards SET status='cancelled',"
             "version=?,claim_token_digest=NULL,claim_expires_at=NULL,"
+            "superseded_delivery_ref=delivery_ref,"
+            "superseded_transport=transport,transport=NULL,delivery_ref=NULL,"
             "resolved_at=?,updated_at=? WHERE id=? AND version=? "
             "AND status IN ('pending','delivering','delivered')",
             (card_version, now, now, card_id, int(row["version"])),
         )
         if updated.rowcount != 1:
             raise TaskLedgerError("execution card state changed")
+        if row["transport"] is not None and row["delivery_ref"] is not None:
+            connection.execute(
+                "INSERT OR IGNORE INTO execution_card_retractions("
+                "card_id,transport,delivery_ref,state,created_at,updated_at) "
+                "VALUES(?,?,?,'pending',?,?)",
+                (card_id, row["transport"], row["delivery_ref"], now, now),
+            )
         connection.execute(
             "INSERT INTO execution_review_card_events("
             "card_id,task_id,kind,card_version,workflow_version,action,"

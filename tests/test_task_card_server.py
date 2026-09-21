@@ -29,6 +29,7 @@ from foxhound.agent_profiles import (
     parse_profile,
 )
 from foxhound.execution_cards import (
+    ExecutionCardStats,
     ExecutionCardService,
     parse_execution_agent_callback,
     parse_execution_review_callback,
@@ -393,6 +394,44 @@ class TaskCardServerTests(unittest.TestCase):
         self.execution_cards.schedule()
         card = self.execution_cards.due(limit=1)[0]
         return card
+
+    def test_execution_retraction_routes_acknowledge_a_stale_delivery(self):
+        self.execution.schedule(1, expected_task_version=1)
+        self.execution_cards.schedule()
+        delivery = self.execution_cards.claim_next()
+        self.execution_cards.complete_delivery(
+            delivery.card.id,
+            expected_version=delivery.card.version,
+            claim_token=delivery.token,
+            transport="synthetic",
+            delivery_ref="synthetic-stale-message",
+        )
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "UPDATE task_execution_workflows SET status='queued',"
+                "version=version+1,claim_token_digest=NULL,claimed_at=NULL,"
+                "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
+                "current_run_id=NULL WHERE task_id=1"
+            )
+        self.execution_cards.schedule()
+
+        claimed = self.app.dispatch(
+            "execution_retraction_claim",
+            request_document(lease_seconds=60),
+            authorization=f"Bearer {TOKEN}",
+        )
+        self.assertEqual(claimed["status"], "claimed")
+        self.assertEqual(claimed["claim"]["delivery_ref"],
+                         "synthetic-stale-message")
+        completed = self.app.dispatch(
+            "execution_retracted",
+            request_document(
+                card_id=claimed["claim"]["card_id"],
+                claim_token=claimed["claim"]["claim_token"],
+            ),
+            authorization=f"Bearer {TOKEN}",
+        )
+        self.assertEqual(completed["status"], "applied")
 
     def test_execution_queue_resolve_claims_and_resolves_atomically(self):
         card = self._queue_card()
@@ -1056,6 +1095,36 @@ class TaskCardServerTests(unittest.TestCase):
             )
             self.assertEqual(status, 401)
         self.assertEqual((self.cards.count(), self.cards.event_count()), before)
+
+    def test_v1_stats_keeps_its_key_set_when_steer_work_exists(self):
+        """A versioned response may not grow a field on some deployments.
+
+        The client validates this key set exactly.  Adding steer counts
+        only when a steer card happens to exist makes the response valid
+        on quiet deployments and refused on busy ones -- and a refused
+        response stops the sweep, so no execution card reaches the reader
+        at all.  Observed: a steer card entered `delivering`, and
+        sixty-one seconds later delivery stopped entirely.
+        """
+        steer = ExecutionCardStats(
+            pending=0, delivering=0, delivered=0, active=0,
+            steer_pending=2, steer_delivering=1, steer_delivered=3,
+        )
+        with mock.patch.object(
+            ExecutionCardService, "stats", return_value=steer
+        ):
+            with running_server(self.app) as endpoint:
+                status, _, body = request(
+                    endpoint,
+                    "/v1/execution-cards/stats",
+                    request_document(),
+                )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(set(body), {
+            "schema", "schema_version", "ok",
+            "pending", "delivering", "delivered", "active",
+        })
 
     def test_execution_stats_and_missing_adapter_are_content_free(self):
         before = (
@@ -2002,6 +2071,106 @@ class TaskCardQueueProjectionTests(unittest.TestCase):
         self.assertEqual(row[0], "delivered")
         self.assertEqual(row[1], hashlib.sha256(QUEUE_VIEW_TOKEN.encode()).hexdigest())
         self.assertEqual(row[2], "resolved")
+
+    def test_resolve_accepts_duplicate_actions_over_http(self):
+        """Acceptance criterion: /v1/task-cards/resolve forwards both
+        duplicate_confirm and duplicate_reject to the domain layer and
+        returns an operation document instead of invalid_request."""
+        from foxhound import task_duplicate_proposals
+        for action, expected_state, expected_relations in (
+            ("duplicate_confirm", "confirmed", 1),
+            ("duplicate_reject", "rejected", 0),
+        ):
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as root:
+                database = Path(root) / "foxhound.sqlite3"
+                migrate_database(database)
+                with closing(sqlite3.connect(database)) as connection, connection:
+                    connection.row_factory = sqlite3.Row
+                    for text in (
+                        "Prepare the synthetic rollout checklist",
+                        "Draft the synthetic rollout checklist",
+                    ):
+                        connection.execute(
+                            "INSERT INTO tasks(status,text,owner,version,created_at,"
+                            "updated_at,owner_ref_version,owner_kind,"
+                            "owner_speaker_id,owner_canonical_speaker_id,"
+                            "owner_speaker_registry_id,owner_pinned,"
+                            "owner_provisional) VALUES('open',?,'Person A',1,"
+                            "?,?,1,'person','SPK_1','SPK_1','registry-A',0,0)",
+                            (text, NOW.isoformat(), NOW.isoformat()),
+                        )
+                    proposal = task_duplicate_proposals.propose(
+                        connection,
+                        task_id_a=1,
+                        task_id_b=2,
+                        basis="Same synthetic deliverable and confirmed owner.",
+                        detector="synthetic-detector",
+                        now=NOW.isoformat(),
+                    )
+
+                cards = TaskCardService(
+                    database,
+                    clock=self.clock,
+                    token_factory=lambda: CLAIM_TOKEN,
+                )
+                app = TaskCardApplication(
+                    cards, {DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: QUEUE_VIEW_TOKEN}
+                )
+
+                # Schedule and claim the duplicate-review card
+                cards.schedule_duplicate_proposals()
+                due = cards.due(limit=3)
+                duplicate_card = None
+                for card in due:
+                    if card.duplicate is not None:
+                        duplicate_card = card
+                        break
+                self.assertIsNotNone(duplicate_card)
+
+                # Test via the resolve endpoint (the route that was broken)
+                result = app.dispatch(
+                    "resolve",
+                    {"schema": REQUEST_SCHEMA, "schema_version": 1,
+                     "card_id": duplicate_card.id,
+                     "card_version": duplicate_card.version,
+                     "action": action},
+                    authorization=f"Bearer {QUEUE_VIEW_TOKEN}",
+                )
+
+                # Must return an operation document, not invalid_request
+                self.assertNotIn("error", result)
+                self.assertEqual(result["status"], "resolved")
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["resolution"]["card_status"], "cancelled")
+
+                # Verify the duplicate proposal was actually processed
+                with closing(sqlite3.connect(database)) as connection:
+                    state = connection.execute(
+                        "SELECT state FROM task_duplicate_proposals WHERE id=?",
+                        (proposal.proposal_id,),
+                    ).fetchone()[0]
+                    relation_count = connection.execute(
+                        "SELECT count(*) FROM task_relations"
+                    ).fetchone()[0]
+                self.assertEqual(state, expected_state)
+                self.assertEqual(relation_count, expected_relations)
+
+    def test_resolve_refuses_unknown_action(self):
+        """Unknown action strings are still refused with invalid_request."""
+        card = self.cards.due(limit=1)[0]
+        with running_server(self.app) as endpoint:
+            status, _, body = request(
+                endpoint,
+                "/v1/task-cards/resolve",
+                request_document(
+                    card_id=card.id,
+                    card_version=card.version,
+                    action="unknown_action",
+                ),
+                token=QUEUE_VIEW_TOKEN,
+            )
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "invalid_request")
 
 
 class TaskCardTokenRoleTests(unittest.TestCase):

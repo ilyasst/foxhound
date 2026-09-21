@@ -28,7 +28,7 @@ import sqlite3
 import stat
 import sys
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -49,6 +49,7 @@ from .agent_profiles import (
     parse_catalog,
     parse_profile,
     _PROFILE_ID_RE,
+    _REVISION_RE,
     _canonical_bytes,
     _private_directory,
     _private_subdirectory,
@@ -85,6 +86,12 @@ _DRAFT_FIELDS = frozenset(
     ("schema", "schema_version", "profile_id", "shared", "role", "overlays")
     + _POLICY_FIELDS
 )
+#: Optional. A draft that renders differently per host declares each difference
+#: as a named set of overlay fragments; the shared part stays one document, so
+#: it compares byte-identical on every host by construction.
+_DRAFT_VARIANT_FIELDS = _DRAFT_FIELDS | {"variants"}
+_VARIANT_NAME = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+MAX_VARIANTS = 8
 _PROFILE_COLUMNS = ("agent_profile_id", "agent_profile_revision")
 
 
@@ -101,14 +108,19 @@ class ProfileDraft:
     role: str
     overlays: tuple[str, ...]
     policy: Mapping[str, Any]
+    #: Variant name to the overlay fragments that variant adds.
+    variants: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
-    def fragments(self) -> tuple[str, ...]:
-        return (*self.shared, self.role, *self.overlays)
+    def fragments(self, variant: str | None = None) -> tuple[str, ...]:
+        extra = () if variant is None else tuple(self.variants.get(variant, ()))
+        return (*self.shared, self.role, *self.overlays, *extra)
 
 
 def parse_draft(document: object) -> ProfileDraft:
     """Validate one draft policy document without reading its fragments."""
-    if not isinstance(document, dict) or set(document) != _DRAFT_FIELDS:
+    if not isinstance(document, dict) or set(document) not in (
+        _DRAFT_FIELDS, _DRAFT_VARIANT_FIELDS
+    ):
         raise ProfileStoreError("agent profile draft shape is invalid")
     if (
         document.get("schema") != DRAFT_SCHEMA
@@ -129,11 +141,29 @@ def parse_draft(document: object) -> ProfileDraft:
         role=_fragment_name(document["role"]),
         overlays=_fragment_names(document["overlays"]),
         policy={field: document[field] for field in _POLICY_FIELDS},
+        variants=_draft_variants(document.get("variants")),
     )
-    names = draft.fragments()
-    if len(names) > MAX_FRAGMENTS or len(set(names)) != len(names):
-        raise ProfileStoreError("agent profile draft fragments are invalid")
+    for variant in (None, *sorted(draft.variants)):
+        names = draft.fragments(variant)
+        if len(names) > MAX_FRAGMENTS or len(set(names)) != len(names):
+            raise ProfileStoreError("agent profile draft fragments are invalid")
     return draft
+
+
+def _draft_variants(value: object) -> dict[str, tuple[str, ...]]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict) or not value or len(value) > MAX_VARIANTS:
+        raise ProfileStoreError("agent profile draft variants are invalid")
+    variants: dict[str, tuple[str, ...]] = {}
+    for name, fragments in value.items():
+        if not isinstance(name, str) or _VARIANT_NAME.fullmatch(name) is None:
+            raise ProfileStoreError("agent profile draft variants are invalid")
+        names = _fragment_names(fragments)
+        if not names:
+            raise ProfileStoreError("agent profile draft variants are invalid")
+        variants[name] = names
+    return variants
 
 
 def _fragment_names(value: object) -> tuple[str, ...]:
@@ -148,8 +178,17 @@ def _fragment_name(value: object) -> str:
     return value
 
 
-def compose(source: Path, draft: ProfileDraft) -> AgentProfile:
-    """Compile one draft and its fragments into an effective profile."""
+def compose(
+    source: Path, draft: ProfileDraft, *, variant: str | None = None
+) -> AgentProfile:
+    """Compile one draft and its fragments into an effective profile.
+
+    A variant appends its own overlay fragments to the same shared and role
+    text, so two hosts running different variants differ only by what the
+    variant adds.
+    """
+    if variant is not None and variant not in draft.variants:
+        raise ProfileStoreError("agent profile variant is unknown")
     parts = [
         _read_fragment(source / SHARED_DIRECTORY / name, draft.profile_id, name)
         for name in draft.shared
@@ -161,9 +200,12 @@ def compose(source: Path, draft: ProfileDraft) -> AgentProfile:
             draft.role,
         )
     )
+    overlays = draft.overlays + (
+        () if variant is None else tuple(draft.variants[variant])
+    )
     parts.extend(
         _read_fragment(source / OVERLAYS_DIRECTORY / name, draft.profile_id, name)
-        for name in draft.overlays
+        for name in overlays
     )
     return _effective_profile(draft.profile_id, draft.policy, parts)
 
@@ -295,12 +337,20 @@ def _pending_inputs(
     root: Path,
     catalog: Mapping[str, CatalogEntry],
     drafts: Mapping[str, ProfileDraft],
-) -> dict[str, dict[str, list[str]]]:
-    result: dict[str, dict[str, list[str]]] = {}
+) -> dict[str, dict[str, Any]]:
+    """Drafts that no longer render to their catalog entry, and what they render to.
+
+    The reported ``revision`` is what publishing this draft would produce right
+    now.  It is the value an operator passes back to ``publish --expect`` to be
+    told, rather than to discover later, that the draft changed underneath the
+    edit they made.
+    """
+    result: dict[str, dict[str, Any]] = {}
     for profile_id, draft in drafts.items():
         revision = compose(root, draft).revision
         if profile_id not in catalog or revision != catalog[profile_id].revision:
             result[profile_id] = {
+                "revision": revision,
                 "shared": list(draft.shared),
                 "role": [draft.role],
                 "overlays": list(draft.overlays),
@@ -424,27 +474,51 @@ def publish(
     profile_ids: Sequence[str] = (),
     *,
     all_active: bool = False,
+    expect: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Compile the selected drafts and advance the catalog atomically."""
+    """Compile the selected drafts and advance the catalog atomically.
+
+    ``expect`` maps a profile to the revision its draft rendered to when the
+    operator last looked.  A store is editable by more than one operator and
+    holds no lock, so a draft can be replaced between an edit and the publish
+    that was meant to ship it; publishing then reports success for content
+    nobody reviewed.  A stated expectation turns that into a refusal.
+    """
     root = _store_root(source)
     catalog = _load_catalog(root)
     drafts = load_drafts(root)
     selected = _publication_targets(catalog, drafts, profile_ids, all_active)
+    _require_expected_drafts(root, drafts, selected, expect)
     published: list[dict[str, Any]] = []
     unchanged: list[str] = []
     updated = dict(catalog)
     for profile_id in selected:
-        profile = compose(root, drafts[profile_id])
+        draft = drafts[profile_id]
+        profile = compose(root, draft)
+        variants = {
+            name: compose(root, draft, variant=name).revision
+            for name in sorted(draft.variants)
+        }
         entry = catalog.get(profile_id)
-        if entry is not None and entry.revision == profile.revision:
+        if (
+            entry is not None
+            and entry.revision == profile.revision
+            and dict(entry.variants) == variants
+        ):
             unchanged.append(profile_id)
             continue
+        for name in sorted(draft.variants):
+            _write_revision(root, compose(root, draft, variant=name))
         _write_revision(root, profile)
+        # The base revision stays last: a catalog entry offers the revision its
+        # history ends with, and a variant is selected at install rather than
+        # being the profile's own answer.
+        fresh = tuple(dict.fromkeys((*variants.values(), profile.revision)))
         history = tuple(
             revision
             for revision in (entry.history if entry is not None else ())
-            if revision != profile.revision
-        ) + (profile.revision,)
+            if revision not in fresh
+        ) + fresh
         if len(history) > MAX_REVISIONS_PER_PROFILE:
             raise ProfileStoreError("agent profile revision history is full")
         updated[profile_id] = CatalogEntry(
@@ -452,16 +526,56 @@ def publish(
             state=entry.state if entry is not None else "active",
             revision=profile.revision,
             history=history,
+            variants=variants,
         )
         published.append({
             "profile_id": profile_id,
             "revision": profile.revision,
             "state": updated[profile_id].state,
             "revisions": len(history),
+            "variants": dict(sorted(variants.items())),
         })
     if published:
         _write_catalog(root, updated)
     return {"ok": True, "published": published, "unchanged": unchanged}
+
+
+def _expectations(values: Sequence[str] | None) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for value in values or ():
+        profile_id, separator, revision = value.partition("=")
+        if not separator or profile_id in result:
+            raise ProfileStoreError("agent profile expectation is invalid")
+        result[profile_id] = revision
+    return result
+
+
+def _require_expected_drafts(
+    root: Path,
+    drafts: Mapping[str, ProfileDraft],
+    selected: Sequence[str],
+    expect: Mapping[str, str] | None,
+) -> None:
+    """Refuse a publish whose draft no longer matches what was reviewed."""
+    if not expect:
+        return
+    unknown = sorted(set(expect) - set(selected))
+    if unknown:
+        raise ProfileStoreError(
+            f"agent profile expectation names an unpublished profile ({unknown[0]})"
+        )
+    for profile_id in selected:
+        expected = expect.get(profile_id)
+        if expected is None:
+            continue
+        if not isinstance(expected, str) or _REVISION_RE.fullmatch(expected) is None:
+            raise ProfileStoreError("agent profile expectation is invalid")
+        actual = compose(root, drafts[profile_id]).revision
+        if actual != expected:
+            raise ProfileStoreError(
+                "agent profile draft changed since it was reviewed "
+                f"(profile {profile_id}, expected {expected}, found {actual})"
+            )
 
 
 def _publication_targets(
@@ -518,10 +632,27 @@ def set_state(source: Path, profile_id: str, state: str) -> dict[str, Any]:
     }
 
 
-def install(source: Path, target: Path) -> dict[str, Any]:
-    """Copy the catalog and its revisions into the owner-only directory."""
+def install(
+    source: Path, target: Path, *, variant: str | None = None
+) -> dict[str, Any]:
+    """Copy the catalog and its revisions into the owner-only directory.
+
+    ``variant`` selects which rendering this host runs. The installed catalog
+    keeps the shape every reader already understands — one offered revision per
+    profile — so selecting a variant is a deployment decision here and changes
+    nothing downstream. Every published revision is still copied, so a workflow
+    pinned to another host's variant continues to resolve.
+    """
     root = _store_root(source)
     catalog = _load_catalog(root)
+    if variant is not None and not any(
+        variant in entry.variants for entry in catalog.values()
+    ):
+        raise ProfileStoreError("agent profile variant is unknown")
+    materialized = {
+        profile_id: entry.materialize(variant)
+        for profile_id, entry in catalog.items()
+    }
     installed = _install_root(target)
     _ensure_directory(installed / REVISIONS_DIRECTORY, owner_only=True)
     copied = 0
@@ -545,18 +676,31 @@ def install(source: Path, target: Path) -> dict[str, Any]:
             _write_file(path, payload)
             copied += 1
     _write_file(
-        installed / CATALOG_NAME, _canonical_bytes(catalog_document(catalog))
+        installed / CATALOG_NAME,
+        _canonical_bytes(catalog_document(materialized)),
     )
     return {
         "ok": True,
         "profiles": len(catalog),
         "revisions_copied": copied,
-        "unreferenced_files": _unreferenced(installed, catalog),
+        "variant": variant,
+        "unreferenced_files": _unreferenced(installed, materialized),
     }
 
 
-def diagnose(source: Path, target: Path | None = None) -> dict[str, Any]:
-    """Report permission and installation state without any private path."""
+def diagnose(
+    source: Path,
+    target: Path | None = None,
+    *,
+    variant: str | None = None,
+    compare: Path | None = None,
+) -> dict[str, Any]:
+    """Report permission and installation state without any private path.
+
+    ``compare`` answers the question two stores cannot otherwise answer without
+    someone reading digests on both machines: are these running the same thing,
+    is one simply behind, or have they genuinely diverged.
+    """
     root = _store_root(source)
     catalog = _load_catalog(root)
     report: dict[str, Any] = {
@@ -567,9 +711,21 @@ def diagnose(source: Path, target: Path | None = None) -> dict[str, Any]:
     if target is not None:
         installed = _private_directory(target, owner_only=False)
         installed_catalog = _load_catalog(installed)
+        expected = {
+            profile_id: entry.materialize(variant)
+            for profile_id, entry in catalog.items()
+        }
         report["target"] = _permissions(installed, installed_catalog)
-        report["target"]["current"] = installed_catalog == catalog
-        report["comparison"] = _catalog_comparison(catalog, installed_catalog)
+        report["target"]["current"] = installed_catalog == expected
+        report["target"]["variant"] = variant
+        report["comparison"] = _catalog_comparison(expected, installed_catalog)
+    if compare is not None:
+        other = _load_catalog(_store_root(compare))
+        report["compared"] = _catalog_comparison(catalog, other)
+        report["compared"]["ok"] = not any(
+            item["status"] == "diverged"
+            for item in report["compared"]["profiles"]
+        )
     return report
 
 
@@ -961,15 +1117,31 @@ def _parser() -> argparse.ArgumentParser:
     publication = commands.add_parser("publish")
     publication.add_argument("--profile", action="append", default=[])
     publication.add_argument("--all-active", action="store_true")
+    publication.add_argument(
+        "--expect", action="append", default=[], metavar="PROFILE=REVISION",
+        help="publish only while this profile's draft still renders to this "
+             "revision (repeatable); validate reports the value to pass",
+    )
     for name in ("disable", "enable"):
         state = commands.add_parser(name)
         state.add_argument("--profile", required=True)
     installation = commands.add_parser("install")
     installation.add_argument("--target", type=Path, required=True)
+    installation.add_argument(
+        "--variant", metavar="NAME",
+        help="install the rendering this host runs, for a profile that "
+             "declares one (deployment configuration, not a draft difference)",
+    )
     mirroring = commands.add_parser("mirror")
     mirroring.add_argument("--target", type=Path, required=True)
     doctor = commands.add_parser("doctor")
     doctor.add_argument("--target", type=Path)
+    doctor.add_argument("--variant", metavar="NAME")
+    doctor.add_argument(
+        "--compare", type=Path, metavar="STORE",
+        help="report, per profile, whether another reachable store is the "
+             "same, behind, ahead, or diverged",
+    )
     removal = commands.add_parser("delete")
     removal.add_argument("--profile", required=True)
     removal.add_argument("--database", type=Path, action="append", default=[])
@@ -988,7 +1160,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         return list_profiles(args.source)
     if args.command == "publish":
         return publish(
-            args.source, args.profile, all_active=args.all_active
+            args.source, args.profile, all_active=args.all_active,
+            expect=_expectations(args.expect),
         )
     if args.command in {"disable", "enable"}:
         return set_state(
@@ -997,11 +1170,14 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             "disabled" if args.command == "disable" else "active",
         )
     if args.command == "install":
-        return install(args.source, args.target)
+        return install(args.source, args.target, variant=args.variant)
     if args.command == "mirror":
         return mirror(args.source, args.target)
     if args.command == "doctor":
-        return diagnose(args.source, args.target)
+        return diagnose(
+            args.source, args.target,
+            variant=args.variant, compare=args.compare,
+        )
     if args.command == "delete":
         return delete(args.source, args.profile, args.database)
     return migrate(args.flat_directory, args.source, dry_run=args.dry_run)

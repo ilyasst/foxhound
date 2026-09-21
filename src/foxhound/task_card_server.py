@@ -16,6 +16,7 @@ import stat
 import sys
 import time
 from dataclasses import dataclass
+from datetime import timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -133,6 +134,9 @@ ROUTES = {
     "/v2/execution-cards/stats": "execution_stats_scoped",
     "/v1/execution-cards/schedule": "execution_schedule",
     "/v1/execution-cards/claim": "execution_claim",
+    "/v1/execution-cards/retraction-claim": "execution_retraction_claim",
+    "/v1/execution-cards/retracted": "execution_retracted",
+    "/v1/execution-cards/retraction-failed": "execution_retraction_failed",
     "/v1/execution-cards/delivered": "execution_delivered",
     "/v1/execution-cards/delivery-failed": "execution_delivery_failed",
     "/v1/execution-cards/action": "execution_action",
@@ -448,9 +452,7 @@ class TaskCardApplication:
                     HTTPStatus.FORBIDDEN,
                 )
             action = request["action"]
-            if not isinstance(action, str) or action not in {
-                "done", "keep_open", "drop", "snooze"
-            }:
+            if not isinstance(action, str) or action not in TASK_CARD_ACTIONS:
                 raise TaskCardServerRequestError(
                     "invalid_request", "task card action is invalid"
                 )
@@ -612,7 +614,7 @@ class TaskCardApplication:
         if operation == "execution_stats":
             _request(payload, required=set())
             stats = self._execution_cards().stats()
-            return {
+            response = {
                 "schema": EXECUTION_STATS_SCHEMA,
                 "schema_version": SERVICE_VERSION,
                 "ok": True,
@@ -621,16 +623,32 @@ class TaskCardApplication:
                 "delivered": stats.delivered,
                 "active": stats.active,
             }
+            # Steer counts are deliberately absent from v1.  This response
+            # is a versioned contract and its client validates the key set
+            # exactly, so a field that appears only when a steer card
+            # happens to exist is not a compatible addition -- it is a
+            # response the client refuses, on exactly the deployments that
+            # have steer work and nowhere else.  Observed: a steer card
+            # entered `delivering`, and sixty-one seconds later the drip
+            # sweep began refusing every response and no execution card
+            # reached the reader at all.  Steer counts belong to v2, which
+            # is where they are.
+            return response
         if operation == "execution_stats_scoped":
             _request(payload, required=set())
             identity = self.resolve_execution_consumer(authorization)
             if identity is None:
                 raise TaskCardServerRequestError("consumer_unresolved", "execution card consumer role is unresolved", HTTPStatus.FORBIDDEN)
             stats = self._execution_cards().stats_scoped(consumer_digest=identity.digest)
-            return {"schema": EXECUTION_STATS_SCHEMA, "schema_version": 2,
+            response = {"schema": EXECUTION_STATS_SCHEMA, "schema_version": 2,
                     "ok": True, "pending": stats.pending,
                     "delivering": stats.delivering, "delivered": stats.delivered,
                     "elsewhere": stats.elsewhere, "active": stats.active}
+            if stats.steer_pending or stats.steer_delivering or stats.steer_delivered:
+                response.update(steer_pending=stats.steer_pending,
+                                steer_delivering=stats.steer_delivering,
+                                steer_delivered=stats.steer_delivered)
+            return response
         if operation == "execution_schedule":
             request = _request(payload, required={"limit"})
             limit = _integer(request["limit"], minimum=1, maximum=1_000)
@@ -812,6 +830,34 @@ class TaskCardApplication:
                     "reply_markup": reply_markup,
                 },
             }
+        if operation == "execution_retraction_claim":
+            request = _request(payload, required={"lease_seconds"})
+            identity = self.resolve_execution_consumer(authorization)
+            if identity is None:
+                raise TaskCardServerRequestError("consumer_unresolved", "execution card consumer role is unresolved", HTTPStatus.FORBIDDEN)
+            claim = self._execution_cards().claim_retraction(
+                lease_seconds=_integer(request["lease_seconds"], minimum=5, maximum=300)
+            )
+            return {"schema": EXECUTION_CLAIM_SCHEMA, "schema_version": SERVICE_VERSION,
+                    "ok": True, "status": "empty" if claim is None else "claimed",
+                    "claim": None if claim is None else {
+                        "card_id": claim.card_id, "transport": claim.transport,
+                        "delivery_ref": claim.delivery_ref, "claim_token": claim.token,
+                        "expires_at": claim.expires_at,
+                    }}
+        if operation in {"execution_retracted", "execution_retraction_failed"}:
+            request = _request(payload, required={"card_id", "claim_token"})
+            from .execution_cards import ExecutionCardRetractionClaim
+            claim = ExecutionCardRetractionClaim(
+                _integer(request["card_id"], minimum=1), "", "",
+                _secret(request["claim_token"]), "",
+            )
+            completed = (self._execution_cards().complete_retraction(claim)
+                         if operation == "execution_retracted"
+                         else self._execution_cards().fail_retraction(claim))
+            return {"schema": EXECUTION_OPERATION_SCHEMA,
+                    "schema_version": SERVICE_VERSION, "ok": True,
+                    "status": "applied" if completed else "refused"}
         if operation == "execution_delivered":
             request = _request(
                 payload,
@@ -1999,6 +2045,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--bind", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8790)
     parser.add_argument("--request-timeout", type=float, default=5.0)
+    parser.add_argument(
+        "--steer-plan-threshold-seconds", type=int, default=20 * 60,
+        help="running-plan age before its Steer card is eligible",
+    )
+    parser.add_argument(
+        "--steer-execute-threshold-seconds", type=int, default=20 * 60,
+        help="running-execute age before its Steer card is eligible",
+    )
     parser.add_argument("--agent-profile-directory", type=Path)
     parser.add_argument(
         "--task-work-root", type=Path,
@@ -2034,6 +2088,10 @@ def main(argv: list[str] | None = None) -> int:
             owner_condition=owner_condition,
             reader_aliases=reader_aliases,
             artifact_root=arguments.task_work_root,
+            steer_plan_threshold=timedelta(
+                seconds=arguments.steer_plan_threshold_seconds),
+            steer_execute_threshold=timedelta(
+                seconds=arguments.steer_execute_threshold_seconds),
         )
         execution_cards.count()
         execution_workflows = TaskExecutionService(

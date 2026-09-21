@@ -144,6 +144,7 @@ class ExecutionCardKind(StrEnum):
     PLAN_REVIEW = "plan_review"
     EXTERNAL_REVIEW = "external_review"
     RESULT_REVIEW = "result_review"
+    STEER = "steer"
 
 
 class ExecutionCardStatus(StrEnum):
@@ -196,6 +197,9 @@ class ExecutionCardStats:
     delivering: int
     delivered: int
     active: int
+    steer_pending: int = 0
+    steer_delivering: int = 0
+    steer_delivered: int = 0
 
 
 @dataclass(frozen=True)
@@ -205,6 +209,19 @@ class ExecutionCardScopedStats:
     delivered: int
     elsewhere: int
     active: int
+    steer_pending: int = 0
+    steer_delivering: int = 0
+    steer_delivered: int = 0
+
+
+@dataclass(frozen=True)
+class SteerDigestWorkItem:
+    card_id: int
+    card_version: int
+    task_id: int
+    workflow_version: int
+    phase: WorkflowPhase
+    run_id: str
 
 
 @dataclass(frozen=True)
@@ -213,7 +230,14 @@ class ClaimAtCeiling:
     ceiling: int
 
 
-EXECUTION_CARD_CLAIM_CEILINGS = {"queue_view": 2, "drip": 20}
+# Steer cards normally disappear without a reader action.  They therefore
+# never share the scarce decision-card allowance: a cluster of slow runs must
+# not prevent an approval or result from being shown.
+EXECUTION_CARD_CLAIM_CEILINGS = {
+    "queue_view": 2, "drip": 20, "queue_view_steer": 3, "drip_steer": 5,
+}
+STEER_DIGEST_REFRESH_INTERVAL = timedelta(minutes=30)
+STEER_DIGEST_MAX_ATTEMPTS = 3
 
 
 @dataclass(frozen=True)
@@ -222,6 +246,7 @@ class ExecutionReviewCard:
     task_id: int
     task_version: int
     workflow_version: int
+    work_revision_id: int | None
     kind: ExecutionCardKind
     phase: WorkflowPhase
     result_id: str | None
@@ -244,6 +269,8 @@ class ExecutionReviewCard:
     #: A few sentences derived from `work_markdown`; empty when the
     #: worker could not produce one, which the card must survive.
     work_digest: str = field(default="", repr=False)
+    steer_digest: str = field(default="", repr=False)
+    claimed_at: str | None = field(default=None, repr=False)
     questions: tuple[str, ...] = field(default=(), repr=False)
     external_actions: tuple[CardRecord, ...] = field(default=(), repr=False)
     deliverables: tuple[CardRecord, ...] = field(default=(), repr=False)
@@ -265,6 +292,13 @@ class ExecutionReviewCard:
     #: happened cannot tell a task nobody reached from one that was
     #: abandoned.
     failure_count: int = 0
+    #: Attempts, parks, recorded results and agent seconds for the phase
+    #: this workflow is in now, across every park.  `failure_count` above
+    #: is the live counter, which resets on park; these do not.
+    phase_attempts: int = 0
+    phase_parks: int = 0
+    phase_results: int = 0
+    phase_seconds: int = 0
     failure_reason: str = field(default="", repr=False)
     failure_exit_code: int | None = field(default=None, repr=False)
     failure_run_id: str | None = field(default=None, repr=False)
@@ -295,6 +329,17 @@ class ExecutionCardDeliveryClaim:
     #: surface that did not issue it.
     superseded_delivery_ref: str | None = None
     superseded_transport: str | None = None
+
+
+@dataclass(frozen=True)
+class ExecutionCardRetractionClaim:
+    """One consumer-owned request to remove an obsolete presentation."""
+
+    card_id: int
+    transport: str
+    delivery_ref: str
+    token: str = field(repr=False)
+    expires_at: str
 
 
 @dataclass(frozen=True)
@@ -469,6 +514,8 @@ class ExecutionCardService:
         ] | None = None,
         reader_aliases: Sequence[str] = (),
         artifact_root: str | os.PathLike[str] | None = None,
+        steer_plan_threshold: timedelta = timedelta(minutes=20),
+        steer_execute_threshold: timedelta = timedelta(minutes=20),
     ) -> None:
         self.database_path = Path(database_path)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
@@ -494,6 +541,16 @@ class ExecutionCardService:
         self._reader_aliases = frozenset(
             normalized_owner(alias) for alias in aliases
         )
+        if min(steer_plan_threshold, steer_execute_threshold) <= timedelta(0):
+            raise ValueError("steer card threshold is invalid")
+        self._steer_thresholds = {
+            WorkflowPhase.PLAN: steer_plan_threshold,
+            WorkflowPhase.EXECUTE: steer_execute_threshold,
+            # External work is an execute-like pass. It has no separate
+            # operator knob, but must remain announceable: a Steer card has
+            # no result and is valid for every workflow phase.
+            WorkflowPhase.EXTERNAL_ACTION: steer_execute_threshold,
+        }
         if artifact_root is None:
             self._artifact_root = None
         else:
@@ -518,7 +575,8 @@ class ExecutionCardService:
                 cancelled = self._cancel_stale(connection, now)
                 rows = connection.execute(
                     "SELECT w.task_id,w.task_version,w.status,w.phase,"
-                    "w.version,w.last_result_id,r.outcome "
+                    "w.version,w.last_result_id,w.steer_while_running,"
+                    "w.claimed_at,r.outcome "
                     "FROM task_execution_workflows AS w "
                     "JOIN tasks AS t ON t.id=w.task_id "
                     "LEFT JOIN task_execution_results AS r "
@@ -562,6 +620,13 @@ class ExecutionCardService:
                     "  AND r.outcome='awaiting_external') OR "
                     " (w.status IN ('awaiting_review','completed') "
                     "  AND r.outcome IN ('completed','declined','ineligible'))"
+                    " OR (w.status='running' AND w.steer_while_running=1 "
+                    "  AND ((w.phase='plan' AND w.claimed_at<=?) "
+                    "    OR (w.phase='execute' AND w.claimed_at<=?) "
+                    "    OR (w.phase='external_action' AND w.claimed_at<=?)) "
+                    "  AND NOT EXISTS(SELECT 1 FROM execution_review_cards AS prior "
+                    "   WHERE prior.task_id=w.task_id AND prior.workflow_version=w.version "
+                    "   AND prior.kind='steer'))"
                     ") ORDER BY CASE "
                     # A result is the only finished work in this queue.
                     # Make its report visible before asking a reader to
@@ -576,14 +641,25 @@ class ExecutionCardService:
                     " (w.phase='plan' AND r.outcome='awaiting_plan') OR "
                     " (w.phase='execute' AND r.outcome='awaiting_external')"
                     ") THEN 1 "
-                    "ELSE 2 END,w.updated_at,w.task_id LIMIT ?",
-                    (now, now, limit),
+                    "WHEN w.status='running' THEN 3 ELSE 2 END,w.updated_at,w.task_id LIMIT ?",
+                    (
+                        now,
+                        now,
+                        (stamp - self._steer_thresholds[WorkflowPhase.PLAN])
+                        .isoformat(timespec="seconds"),
+                        (stamp - self._steer_thresholds[WorkflowPhase.EXECUTE])
+                        .isoformat(timespec="seconds"),
+                        (stamp - self._steer_thresholds[
+                            WorkflowPhase.EXTERNAL_ACTION
+                        ]).isoformat(timespec="seconds"),
+                        limit,
+                    ),
                 ).fetchall()
                 for row in rows:
                     kind = _kind_for_workflow(row)
                     result_id = (
                         None
-                        if kind is ExecutionCardKind.START
+                        if kind in {ExecutionCardKind.START, ExecutionCardKind.STEER}
                         else row["last_result_id"]
                     )
                     cursor = connection.execute(
@@ -642,7 +718,7 @@ class ExecutionCardService:
         with closing(self._connect()) as connection:
             rows = connection.execute(
                 self._card_select()
-                + " WHERE c.status='pending' AND ("
+                + " AND c.status='pending' AND ("
                 + "w.status<>'snoozed' OR w.due_at<=?) "
                 + "ORDER BY c.id LIMIT ?",
                 (now, limit),
@@ -680,7 +756,7 @@ class ExecutionCardService:
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("BEGIN IMMEDIATE")
             try:
-                row = connection.execute(self._card_select() + " WHERE c.id=?", (card_id,)).fetchone()
+                row = connection.execute(self._card_select() + " AND c.id=?", (card_id,)).fetchone()
                 refusal = _card_guard(row, expected_version)
                 if refusal is None and row["status"] != ExecutionCardStatus.PENDING:
                     refusal = ExecutionCardRefusal.INVALID_STATE
@@ -689,14 +765,23 @@ class ExecutionCardService:
                     refusal = ExecutionCardRefusal.INVALID_STATE
                 if refusal is None and not _current_card(row):
                     refusal = ExecutionCardRefusal.STALE_VERSION
+                kind = ExecutionCardKind(row["kind"]) if row is not None else None
+                steer = kind is ExecutionCardKind.STEER
+                ceiling_key = "queue_view_steer" if steer else "queue_view"
+                # Retired run summaries are excluded here as they are from
+                # the row lookup above: a row left behind by an earlier build
+                # must not consume the capacity the console holds for cards
+                # that do need an answer.
                 held = connection.execute(
-                    "SELECT count(*) FROM execution_review_cards WHERE status IN ('delivering','delivered') AND consumer_digest=?",
+                    "SELECT count(*) FROM execution_review_cards WHERE "
+                    "status IN ('delivering','delivered') AND consumer_digest=? "
+                    "AND summary_only=0 AND kind "
+                    + ("='steer'" if steer else "<>'steer'"),
                     (consumer_digest,),
                 ).fetchone()[0]
-                if refusal is None and held >= EXECUTION_CARD_CLAIM_CEILINGS["queue_view"]:
+                if refusal is None and held >= EXECUTION_CARD_CLAIM_CEILINGS[ceiling_key]:
                     connection.commit()
-                    return ClaimAtCeiling(int(held), EXECUTION_CARD_CLAIM_CEILINGS["queue_view"])
-                kind = ExecutionCardKind(row["kind"]) if row is not None else None
+                    return ClaimAtCeiling(int(held), EXECUTION_CARD_CLAIM_CEILINGS[ceiling_key])
                 if refusal is None and action in {"start", "approve", "done"} and not _card_fits(self._render_card(row)):
                     refusal = ExecutionCardRefusal.INVALID_STATE
                 if refusal is None and action not in {"discussion", "reassignment", "comment_and_go", "select_agent"} and action not in _direct_actions_for_kind(kind):
@@ -733,15 +818,35 @@ class ExecutionCardService:
                             raise TaskLedgerError("task ownership state changed")
                         status, phase, resolution = WorkflowStatus.AWAITING_START, WorkflowPhase.PLAN, "reassign"
                     else:
-                        task_version = int(row["task_version"]); status, phase, resolution = (WorkflowStatus.AWAITING_START if kind is ExecutionCardKind.START else WorkflowStatus.QUEUED), WorkflowPhase.PLAN, "discuss"
-                    workflow = connection.execute("UPDATE task_execution_workflows SET task_version=?,status=?,phase=?,version=?,due_at=NULL,claim_token_digest=NULL,claimed_at=NULL,claim_heartbeat_at=NULL,claim_expires_at=NULL,updated_at=? WHERE task_id=? AND version=?", (task_version, status, phase, target, now, int(row["task_id"]), int(row["workflow_version"])))
+                        task_version = int(row["task_version"])
+                        status = (WorkflowStatus.AWAITING_START
+                                  if kind is ExecutionCardKind.START
+                                  else WorkflowStatus.QUEUED)
+                        phase = (WorkflowPhase(row["phase"])
+                                 if kind is ExecutionCardKind.STEER
+                                 else WorkflowPhase.PLAN)
+                        resolution = "discuss"
+                    workflow = connection.execute("UPDATE task_execution_workflows SET task_version=?,status=?,phase=?,version=?,due_at=NULL,claim_token_digest=NULL,claimed_at=NULL,claim_heartbeat_at=NULL,claim_expires_at=NULL,current_run_id=NULL,updated_at=? WHERE task_id=? AND version=?", (task_version, status, phase, target, now, int(row["task_id"]), int(row["workflow_version"])))
                     if workflow.rowcount != 1: raise TaskLedgerError("execution workflow state changed")
                     TaskExecutionService._event(connection, int(row["task_id"]), "reassigned" if input_kind == "reassignment" else "discussion_requested", target, task_version, phase, status, now)
                     workflow_version, workflow_status, workflow_phase = target, status, phase
                 else:
                     if action == "comment_and_go":
                         connection.execute("INSERT INTO execution_reader_inputs(card_id,task_id,card_version,task_version,workflow_version,target_workflow_version,kind,value,prior_value,occurred_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (card_id, int(row["task_id"]), version, int(row["task_version"]), int(row["workflow_version"]), int(row["workflow_version"])+1, "discussion", value, None, now))
-                    workflow = (_apply_review_lifecycle_action(connection, row, action=action, now=now) if action in {"done", "drop"} else (_apply_start_action(connection, int(row["task_id"]), expected_version=int(row["workflow_version"]), action=action if action != "comment_and_go" else "start", stamp=stamp) if kind is ExecutionCardKind.START else _apply_review_action(connection, int(row["task_id"]), expected_version=int(row["workflow_version"]), action=action if action != "comment_and_go" else "approve", stamp=stamp)))
+                    workflow = (
+                        _apply_review_lifecycle_action(connection, row, action=action, now=now)
+                        if action in {"done", "drop"}
+                        else _apply_start_action(connection, int(row["task_id"]),
+                                                 expected_version=int(row["workflow_version"]),
+                                                 action="start", stamp=stamp)
+                        if kind is ExecutionCardKind.START
+                        else _apply_steer_discussion(connection, row, stamp=stamp)
+                        if kind is ExecutionCardKind.STEER
+                        else _apply_review_action(connection, int(row["task_id"]),
+                                                  expected_version=int(row["workflow_version"]),
+                                                  action="approve" if action == "comment_and_go" else action,
+                                                  stamp=stamp)
+                    )
                     if workflow.disposition is WorkflowDisposition.REFUSED:
                         connection.rollback(); return _refused_row(card_id, row, _workflow_refusal(workflow.refusal))
                     workflow_version, workflow_status, workflow_phase = workflow.version, workflow.status, workflow.phase
@@ -809,17 +914,9 @@ class ExecutionCardService:
                         action=None,
                         now=now,
                     )
-                held = connection.execute(
-                    "SELECT count(*) FROM execution_review_cards "
-                    "WHERE status IN ('delivering','delivered') AND consumer_digest=?",
-                    (consumer_digest,),
-                ).fetchone()[0]
-                if held >= ceiling:
-                    connection.commit()
-                    return ClaimAtCeiling(int(held), ceiling)
                 row = connection.execute(
                     self._card_select()
-                    + " WHERE c.status='pending' "
+                    + " AND c.status='pending' "
                     "ORDER BY CASE c.kind "
                     "WHEN 'result_review' THEN 0 "
                     "WHEN 'plan_review' THEN 1 "
@@ -831,7 +928,17 @@ class ExecutionCardService:
                     connection.commit()
                     return None
                 if not _current_card(row):
-                    raise TaskLedgerError("execution card state is invalid")
+                    raise TaskLedgerError(
+                        "execution card state is invalid")
+                band, held = self._band(connection, row, consumer_role,
+                                        consumer_digest)
+                band_ceiling = EXECUTION_CARD_CLAIM_CEILINGS[band]
+                if held >= band_ceiling:
+                    # The reader's surface is full.  The card that did not
+                    # fit stays pending and is offered again; the ceiling is
+                    # never relaxed to spend the claim on something else.
+                    connection.commit()
+                    return ClaimAtCeiling(int(held), band_ceiling)
                 self._render_card(row)
                 version = int(row["version"]) + 1
                 updated = connection.execute(
@@ -1047,7 +1154,7 @@ class ExecutionCardService:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 row = connection.execute(
-                    self._card_select() + " WHERE c.id=?", (card_id,)
+                    self._card_select() + " AND c.id=?", (card_id,)
                 ).fetchone()
                 refusal = _card_guard(row, expected_version)
                 if (
@@ -1102,8 +1209,13 @@ class ExecutionCardService:
 
         The old chat message remains a historical presentation, but its
         callbacks are version-stale before a replacement can be claimed.
-        Reusing the existing `delivery_failed` event shape records that the
-        presentation became unavailable without changing workflow state.
+
+        This records `requeued`, not `delivery_failed`. It borrowed the
+        failure kind once, and `delivery_health` counts those against a
+        threshold of three in fifteen minutes -- so an hourly requeue of three
+        unanswered cards reported delivery as unhealthy on a system that was
+        delivering fine, and a real transport failure became indistinguishable
+        from routine re-presentation.
         """
         if not _valid_limit(limit):
             return ExecutionCardRequeueResult()
@@ -1117,7 +1229,8 @@ class ExecutionCardService:
                 self._cancel_stale(connection, now)
                 rows = connection.execute(
                     self._card_select()
-                    + " WHERE c.status='delivered' AND c.delivered_at<=? "
+                    + " AND c.status='delivered' AND c.kind<>'steer' "
+                    "AND c.delivered_at<=? "
                     "ORDER BY c.delivered_at,c.id LIMIT ?",
                     (due, limit),
                 ).fetchall()
@@ -1143,7 +1256,7 @@ class ExecutionCardService:
                         connection,
                         card_id=card_id,
                         task_id=int(row["task_id"]),
-                        kind="delivery_failed",
+                        kind="requeued",
                         card_version=version,
                         workflow_version=int(row["workflow_version"]),
                         action=None,
@@ -1155,6 +1268,200 @@ class ExecutionCardService:
             except Exception:
                 connection.rollback()
                 raise
+
+    def steer_cards_awaiting_digest(
+        self, *, limit: int = 20
+    ) -> tuple[SteerDigestWorkItem, ...]:
+        """Return current live cards whose optional digest is still absent."""
+        if not _valid_limit(limit):
+            return ()
+        refresh_due = (
+            self._clock_value() - STEER_DIGEST_REFRESH_INTERVAL
+        ).isoformat(timespec="seconds")
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT c.id,c.version,c.task_id,c.workflow_version,c.phase,"
+                "w.current_run_id FROM execution_review_cards AS c "
+                "JOIN task_execution_workflows AS w ON w.task_id=c.task_id "
+                "JOIN tasks AS t ON t.id=c.task_id "
+                "WHERE c.kind='steer' AND (c.steer_digest IS NULL OR EXISTS("
+                "SELECT 1 FROM execution_steer_digest_refreshes AS d "
+                "WHERE d.card_id=c.id AND d.attempts<? "
+                "AND d.last_refreshed_at<=?)) "
+                "AND c.status IN ('pending','delivering','delivered') "
+                "AND w.status='running' AND w.version=c.workflow_version "
+                "AND w.phase=c.phase AND w.current_run_id IS NOT NULL "
+                "AND t.status='open' AND t.version=c.task_version "
+                "ORDER BY c.created_at,c.id LIMIT ?",
+                (STEER_DIGEST_MAX_ATTEMPTS, refresh_due, limit),
+            ).fetchall()
+        return tuple(
+            SteerDigestWorkItem(
+                int(row["id"]), int(row["version"]), int(row["task_id"]),
+                int(row["workflow_version"]), WorkflowPhase(row["phase"]),
+                str(row["current_run_id"]),
+            ) for row in rows
+        )
+
+    def record_steer_digest(
+        self, item: SteerDigestWorkItem, digest: str,
+    ) -> bool:
+        """Store one bounded derived digest only while its card stays live."""
+        if (
+            not isinstance(item, SteerDigestWorkItem)
+            or not isinstance(digest, str)
+            or not 1 <= len(digest) <= 800
+        ):
+            return False
+        now = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                changed = connection.execute(
+                    "UPDATE execution_review_cards SET steer_digest=?,"
+                    "updated_at=? WHERE id=? AND version=? AND kind='steer' "
+                    "AND status IN "
+                    "('pending','delivering','delivered') AND EXISTS("
+                    "SELECT 1 FROM task_execution_workflows AS w "
+                    "JOIN tasks AS t ON t.id=w.task_id WHERE w.task_id="
+                    "execution_review_cards.task_id AND w.status='running' "
+                    "AND w.version=execution_review_cards.workflow_version "
+                    "AND w.phase=execution_review_cards.phase "
+                    "AND w.current_run_id=? AND t.status='open' "
+                    "AND t.version=execution_review_cards.task_version)",
+                    (digest, now, item.card_id, item.card_version, item.run_id),
+                )
+                if changed.rowcount != 1:
+                    connection.rollback()
+                    return False
+                refresh = connection.execute(
+                    "INSERT INTO execution_steer_digest_refreshes("
+                    "card_id,attempts,last_refreshed_at) VALUES(?,1,?) "
+                    "ON CONFLICT(card_id) DO UPDATE SET attempts=attempts+1,"
+                    "last_refreshed_at=excluded.last_refreshed_at "
+                    "WHERE attempts<?",
+                    (item.card_id, now, STEER_DIGEST_MAX_ATTEMPTS),
+                )
+                if refresh.rowcount != 1:
+                    connection.rollback()
+                    return False
+                connection.commit()
+                return True
+            except Exception:
+                connection.rollback()
+                raise
+
+    def claim_retraction(
+        self, *, lease_seconds: int = 60,
+    ) -> ExecutionCardRetractionClaim | None:
+        """Lease one obsolete presentation to exactly one consumer."""
+        if not _valid_lease(lease_seconds):
+            raise TaskLedgerError("execution card delivery lease is invalid")
+        stamp = self._clock_value()
+        now = stamp.isoformat(timespec="seconds")
+        expires = (stamp + timedelta(seconds=lease_seconds)).isoformat(
+            timespec="seconds")
+        token = self._token_factory()
+        if not _valid_secret(token):
+            raise TaskLedgerError("execution card token factory returned invalid state")
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                # A timed-out consumer did not retract anything; make it
+                # eligible again unless it has exhausted the small retry cap.
+                connection.execute(
+                    "UPDATE execution_card_retractions SET state=CASE "
+                    "WHEN attempts>=3 THEN 'abandoned' ELSE 'pending' END,"
+                    "claim_token_digest=NULL,claim_expires_at=NULL,updated_at=? "
+                    "WHERE state='delivering' AND claim_expires_at<=?",
+                    (now, now),
+                )
+                row = connection.execute(
+                    "SELECT card_id,transport,delivery_ref FROM "
+                    "execution_card_retractions WHERE state='pending' "
+                    "AND attempts<3 ORDER BY updated_at,card_id LIMIT 1"
+                ).fetchone()
+                if row is None:
+                    connection.commit()
+                    return None
+                changed = connection.execute(
+                    "UPDATE execution_card_retractions SET state='delivering',"
+                    "attempts=attempts+1,claim_token_digest=?,"
+                    "claim_expires_at=?,updated_at=? WHERE card_id=? "
+                    "AND state='pending' AND attempts<3",
+                    (_token_digest(token), expires, now, int(row["card_id"])),
+                )
+                if changed.rowcount != 1:
+                    connection.rollback()
+                    return None
+                connection.commit()
+                return ExecutionCardRetractionClaim(
+                    int(row["card_id"]), str(row["transport"]),
+                    str(row["delivery_ref"]), token, expires,
+                )
+            except Exception:
+                connection.rollback()
+                raise
+
+    def complete_retraction(self, claim: ExecutionCardRetractionClaim) -> bool:
+        """Acknowledge successful removal and retire its durable handle."""
+        if not isinstance(claim, ExecutionCardRetractionClaim):
+            return False
+        now = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                card = connection.execute(
+                    "SELECT task_id,version,workflow_version FROM "
+                    "execution_review_cards WHERE id=?",
+                    (claim.card_id,),
+                ).fetchone()
+                changed = connection.execute(
+                    "UPDATE execution_card_retractions SET state='completed',"
+                    "claim_token_digest=NULL,claim_expires_at=NULL,updated_at=? "
+                    "WHERE card_id=? AND state='delivering' "
+                    "AND claim_token_digest=?",
+                    (now, claim.card_id, _token_digest(claim.token)),
+                )
+                if changed.rowcount:
+                    connection.execute(
+                        "UPDATE execution_review_cards SET "
+                        "superseded_delivery_ref=NULL,superseded_transport=NULL "
+                        "WHERE id=?", (claim.card_id,)
+                    )
+                    if card is None:
+                        raise TaskLedgerError("execution card is missing")
+                    self._event(
+                        connection,
+                        card_id=claim.card_id,
+                        task_id=int(card["task_id"]),
+                        kind="retracted",
+                        card_version=int(card["version"]),
+                        workflow_version=int(card["workflow_version"]),
+                        action=None,
+                        now=now,
+                    )
+                connection.commit()
+                return changed.rowcount == 1
+            except Exception:
+                connection.rollback()
+                raise
+
+    def fail_retraction(self, claim: ExecutionCardRetractionClaim) -> bool:
+        """Keep a failed transport attempt retryable, within the fixed cap."""
+        if not isinstance(claim, ExecutionCardRetractionClaim):
+            return False
+        now = self._now()
+        with closing(self._connect()) as connection:
+            changed = connection.execute(
+                "UPDATE execution_card_retractions SET state=CASE "
+                "WHEN attempts>=3 THEN 'abandoned' ELSE 'pending' END,"
+                "claim_token_digest=NULL,claim_expires_at=NULL,updated_at=? "
+                "WHERE card_id=? AND state='delivering' AND claim_token_digest=?",
+                (now, claim.card_id, _token_digest(claim.token)),
+            )
+            connection.commit()
+            return changed.rowcount == 1
 
     def act(
         self, card_id: int, *, expected_version: int, action: str
@@ -1172,7 +1479,7 @@ class ExecutionCardService:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 row = connection.execute(
-                    self._card_select() + " WHERE c.id=?", (card_id,)
+                    self._card_select() + " AND c.id=?", (card_id,)
                 ).fetchone()
                 refusal = _card_guard(row, expected_version)
                 if refusal is None and row["status"] != ExecutionCardStatus.DELIVERED:
@@ -1299,7 +1606,7 @@ class ExecutionCardService:
             )
         with closing(self._connect()) as connection:
             row = connection.execute(
-                self._card_select() + " WHERE c.id=?", (card_id,)
+                self._card_select() + " AND c.id=?", (card_id,)
             ).fetchone()
             refusal = _agent_card_refusal(row, expected_version)
             if refusal is not None:
@@ -1344,7 +1651,7 @@ class ExecutionCardService:
             return refused(ExecutionCardRefusal.INVALID_ARGUMENT)
         with closing(self._connect()) as connection:
             row = connection.execute(
-                self._card_select() + " WHERE c.id=?", (card_id,)
+                self._card_select() + " AND c.id=?", (card_id,)
             ).fetchone()
             refusal = _card_guard(row, expected_version)
             if refusal is None and row["status"] != ExecutionCardStatus.DELIVERED:
@@ -1377,7 +1684,7 @@ class ExecutionCardService:
             return refused(ExecutionCardRefusal.INVALID_ARGUMENT)
         with closing(self._connect()) as connection:
             row = connection.execute(
-                self._card_select() + " WHERE c.id=?", (card_id,)
+                self._card_select() + " AND c.id=?", (card_id,)
             ).fetchone()
             if row is None:
                 return refused(ExecutionCardRefusal.NOT_FOUND)
@@ -1415,7 +1722,7 @@ class ExecutionCardService:
             return refused(ExecutionCardRefusal.INVALID_ARGUMENT)
         with closing(self._connect()) as connection:
             row = connection.execute(
-                self._card_select() + " WHERE c.id=?", (card_id,)
+                self._card_select() + " AND c.id=?", (card_id,)
             ).fetchone()
             refusal = _card_guard(row, expected_version)
             if (
@@ -1469,7 +1776,7 @@ class ExecutionCardService:
             )
         with closing(self._connect()) as connection:
             row = connection.execute(
-                self._card_select() + " WHERE c.id=?", (card_id,)
+                self._card_select() + " AND c.id=?", (card_id,)
             ).fetchone()
             refusal = _artifact_card_refusal(row, expected_version)
             if refusal is not None:
@@ -1507,7 +1814,7 @@ class ExecutionCardService:
             )
         with closing(self._connect()) as connection:
             row = connection.execute(
-                self._card_select() + " WHERE c.id=?", (card_id,)
+                self._card_select() + " AND c.id=?", (card_id,)
             ).fetchone()
             refusal = _artifact_card_refusal(row, expected_version)
             if refusal is not None:
@@ -1601,7 +1908,7 @@ class ExecutionCardService:
         now = self._clock_value().isoformat(timespec="seconds")
         with closing(self._connect()) as connection:
             row = connection.execute(
-                self._card_select() + " WHERE c.id=?", (card_id,)
+                self._card_select() + " AND c.id=?", (card_id,)
             ).fetchone()
             refusal = _card_guard(row, expected_version)
             if refusal is None and row["status"] != ExecutionCardStatus.PENDING:
@@ -1656,7 +1963,7 @@ class ExecutionCardService:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 row = connection.execute(
-                    self._card_select() + " WHERE c.id=?", (card_id,)
+                    self._card_select() + " AND c.id=?", (card_id,)
                 ).fetchone()
                 refusal = _agent_card_refusal(row, expected_version)
                 if refusal is not None:
@@ -1771,7 +2078,7 @@ class ExecutionCardService:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 row = connection.execute(
-                    self._card_select() + " WHERE c.id=?", (card_id,)
+                    self._card_select() + " AND c.id=?", (card_id,)
                 ).fetchone()
                 refusal = _card_guard(row, expected_version)
                 if (
@@ -1823,14 +2130,20 @@ class ExecutionCardService:
                         is ExecutionCardKind.START
                         else WorkflowStatus.QUEUED
                     )
-                    phase = WorkflowPhase.PLAN
+                    phase = (
+                        WorkflowPhase(row["phase"])
+                        if ExecutionCardKind(row["kind"])
+                        is ExecutionCardKind.STEER
+                        else WorkflowPhase.PLAN
+                    )
                     event_kind = "discussion_requested"
                     resolution = "discuss"
                     workflow_update = connection.execute(
                         "UPDATE task_execution_workflows SET "
-                        "status=?,phase='plan',version=?,due_at=NULL,"
+                        "status=?,phase=?,version=?,due_at=NULL,"
                         "claim_token_digest=NULL,claimed_at=NULL,"
                         "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
+                        "current_run_id=NULL,"
                         "failure_count=0,last_failure_reason=NULL,"
                         "last_failure_exit_code=NULL,last_failure_run_id=NULL,"
                         "last_failure_at=NULL,next_attempt_at=NULL,"
@@ -1838,6 +2151,7 @@ class ExecutionCardService:
                         "WHERE task_id=? AND version=?",
                         (
                             status,
+                            phase,
                             target_workflow_version,
                             now,
                             int(row["task_id"]),
@@ -1886,6 +2200,7 @@ class ExecutionCardService:
                         "status='awaiting_start',phase='plan',version=?,"
                         "due_at=NULL,claim_token_digest=NULL,claimed_at=NULL,"
                         "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
+                        "current_run_id=NULL,"
                         "failure_count=0,last_failure_reason=NULL,"
                         "last_failure_exit_code=NULL,last_failure_run_id=NULL,"
                         "last_failure_at=NULL,next_attempt_at=NULL,"
@@ -1979,7 +2294,7 @@ class ExecutionCardService:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 row = connection.execute(
-                    self._card_select() + " WHERE c.id=?", (card_id,)
+                    self._card_select() + " AND c.id=?", (card_id,)
                 ).fetchone()
                 refusal = _card_guard(row, expected_version)
                 if (
@@ -1994,6 +2309,7 @@ class ExecutionCardService:
                     ExecutionCardKind.START: "start",
                     ExecutionCardKind.PLAN_REVIEW: "approve",
                     ExecutionCardKind.EXTERNAL_REVIEW: "approve",
+                    ExecutionCardKind.STEER: "discuss",
                 }.get(kind)
                 if refusal is None and action is None:
                     refusal = ExecutionCardRefusal.INVALID_ACTION
@@ -2032,6 +2348,10 @@ class ExecutionCardService:
                         expected_version=int(row["workflow_version"]),
                         action=action,
                         stamp=stamp,
+                    )
+                elif kind is ExecutionCardKind.STEER:
+                    workflow = _apply_steer_discussion(
+                        connection, row, stamp=stamp
                     )
                 else:
                     workflow = _apply_review_action(
@@ -2112,19 +2432,24 @@ class ExecutionCardService:
                 row
                 for row in connection.execute(
                     self._card_select()
-                    + " WHERE c.status IN ('pending','delivering','delivered')"
+                    + " AND c.status IN ('pending','delivering','delivered')"
                 ).fetchall()
                 if _current_card(row)
             ]
         counts: dict[str, int] = {}
+        steer_counts: dict[str, int] = {}
         for row in rows:
             status = str(row["status"])
-            counts[status] = counts.get(status, 0) + 1
+            target = steer_counts if row["kind"] == "steer" else counts
+            target[status] = target.get(status, 0) + 1
         return ExecutionCardStats(
             pending=counts.get("pending", 0),
             delivering=counts.get("delivering", 0),
             delivered=counts.get("delivered", 0),
             active=sum(counts.values()),
+            steer_pending=steer_counts.get("pending", 0),
+            steer_delivering=steer_counts.get("delivering", 0),
+            steer_delivered=steer_counts.get("delivered", 0),
         )
 
     def stats_scoped(self, *, consumer_digest: str) -> ExecutionCardScopedStats:
@@ -2133,16 +2458,25 @@ class ExecutionCardService:
         with closing(self._connect()) as connection:
             row = connection.execute(
                 "SELECT "
-                "SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,"
-                "SUM(CASE WHEN status='delivering' AND consumer_digest=? THEN 1 ELSE 0 END) AS delivering,"
-                "SUM(CASE WHEN status='delivered' AND consumer_digest=? THEN 1 ELSE 0 END) AS delivered,"
-                "SUM(CASE WHEN status IN ('delivering','delivered') AND consumer_digest IS NOT NULL AND consumer_digest<>? THEN 1 ELSE 0 END) AS elsewhere,"
-                "SUM(CASE WHEN status IN ('pending','delivering','delivered') THEN 1 ELSE 0 END) AS active "
-                "FROM execution_review_cards",
-                (consumer_digest, consumer_digest, consumer_digest),
+                "SUM(CASE WHEN status='pending' AND kind<>'steer' THEN 1 ELSE 0 END) AS pending,"
+                "SUM(CASE WHEN status='delivering' AND kind<>'steer' AND consumer_digest=? THEN 1 ELSE 0 END) AS delivering,"
+                "SUM(CASE WHEN status='delivered' AND kind<>'steer' AND consumer_digest=? THEN 1 ELSE 0 END) AS delivered,"
+                "SUM(CASE WHEN status IN ('delivering','delivered') AND kind<>'steer' AND consumer_digest IS NOT NULL AND consumer_digest<>? THEN 1 ELSE 0 END) AS elsewhere,"
+                "SUM(CASE WHEN status IN ('pending','delivering','delivered') AND kind<>'steer' THEN 1 ELSE 0 END) AS active,"
+                "SUM(CASE WHEN status='pending' AND kind='steer' THEN 1 ELSE 0 END) AS steer_pending,"
+                "SUM(CASE WHEN status='delivering' AND kind='steer' AND consumer_digest=? THEN 1 ELSE 0 END) AS steer_delivering,"
+                "SUM(CASE WHEN status='delivered' AND kind='steer' AND consumer_digest=? THEN 1 ELSE 0 END) AS steer_delivered "
+                # These numbers describe the surface a reader is looking
+                # at, and a retired run summary is not on it.  Counting one
+                # left behind by an earlier build would report it forever as
+                # backlog waiting for an answer.
+                "FROM execution_review_cards WHERE summary_only=0",
+                (consumer_digest, consumer_digest, consumer_digest,
+                 consumer_digest, consumer_digest),
             ).fetchone()
         return ExecutionCardScopedStats(*(int(row[name] or 0) for name in (
-            "pending", "delivering", "delivered", "elsewhere", "active"
+            "pending", "delivering", "delivered", "elsewhere", "active",
+            "steer_pending", "steer_delivering", "steer_delivered",
         )))
 
     def count(self) -> int:
@@ -2283,6 +2617,7 @@ class ExecutionCardService:
                     "status='awaiting_start',phase='plan',version=?,"
                     "due_at=NULL,claim_token_digest=NULL,claimed_at=NULL,"
                     "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
+                    "current_run_id=NULL,"
                     "failure_count=0,last_failure_reason=NULL,"
                     "last_failure_exit_code=NULL,last_failure_run_id=NULL,"
                     "last_failure_at=NULL,next_attempt_at=NULL,"
@@ -2339,7 +2674,7 @@ class ExecutionCardService:
     ) -> int:
         rows = connection.execute(
             self._card_select()
-            + " WHERE c.status IN ('pending','delivering','delivered') "
+            + " AND c.status IN ('pending','delivering','delivered') "
             "ORDER BY c.id"
         ).fetchall()
         cancelled = 0
@@ -2350,9 +2685,19 @@ class ExecutionCardService:
             connection.execute(
                 "UPDATE execution_review_cards SET status='cancelled',"
                 "version=?,claim_token_digest=NULL,claim_expires_at=NULL,"
+                "superseded_delivery_ref=delivery_ref,"
+                "superseded_transport=transport,"
+                "transport=NULL,delivery_ref=NULL,"
                 "resolved_at=?,updated_at=? WHERE id=? AND version=?",
                 (version, now, now, int(row["id"]), int(row["version"])),
             )
+            if row["transport"] is not None and row["delivery_ref"] is not None:
+                connection.execute(
+                    "INSERT OR IGNORE INTO execution_card_retractions("
+                    "card_id,transport,delivery_ref,state,created_at,updated_at) "
+                    "VALUES(?,?,?,'pending',?,?)",
+                    (int(row["id"]), row["transport"], row["delivery_ref"], now, now),
+                )
             self._event(
                 connection,
                 card_id=int(row["id"]),
@@ -2367,14 +2712,58 @@ class ExecutionCardService:
         return cancelled
 
     @staticmethod
+    def _band(
+        connection: sqlite3.Connection,
+        row: Mapping[str, object],
+        consumer_role: str,
+        consumer_digest: str,
+    ) -> tuple[str, int]:
+        """Name this card's capacity band and how much of it is already held.
+
+        The two bands are disjoint by construction, which is the property
+        that matters: a card can only ever be counted against the ceiling it
+        is itself bounded by, so no band can be made to appear emptier -- or
+        fuller -- by what is happening in another.
+
+        Both exclude ``summary_only=1``.  Run summaries are retired and no
+        longer produced, but rows written by an earlier build survive in the
+        table, and a delivered one counted here would occupy a band that
+        nothing can ever free.
+        """
+        if row["kind"] == ExecutionCardKind.STEER:
+            suffix, predicate = "_steer", "summary_only=0 AND kind='steer'"
+        else:
+            suffix, predicate = "", "summary_only=0 AND kind<>'steer'"
+        held = connection.execute(
+            "SELECT count(*) FROM execution_review_cards WHERE "
+            "status IN ('delivering','delivered') AND consumer_digest=? "
+            "AND " + predicate,
+            (consumer_digest,),
+        ).fetchone()[0]
+        return consumer_role + suffix, int(held)
+
+    @staticmethod
     def _card_select() -> str:
-        return (
+        """Read reader-action cards, and only those.
+
+        ``summary_only=1`` marked a run summary: an informational row that
+        reported an automatically advanced phase and asked nothing.  Those
+        are retired and nothing writes one any more, but rows written before
+        that remain in the table, and a straggling build mid-promotion can
+        still insert one.  Excluding them here is what keeps such a row
+        inert rather than claimable -- it carries ``kind='result_review'``,
+        so a read that admitted it would render a decision card for a phase
+        the workflow has already moved past.
+        """
+        scope = "c.summary_only=0"
+        return ((
             "SELECT c.*,t.text AS task_text,t.owner,t.owner_ref_version,"
             "t.owner_kind,t.owner_speaker_id,t.owner_canonical_speaker_id,"
             "t.owner_speaker_registry_id,t.owner_pinned,t.owner_provisional,"
             "t.due,"
             "t.status AS task_status_current,t.version AS task_version_current,"
             "w.status AS workflow_status_current,"
+            "w.claimed_at AS workflow_claimed_at,"
             "w.failure_count AS workflow_failure_count,"
             "("
             # The attempt that failed is one below the version its failure
@@ -2385,6 +2774,47 @@ class ExecutionCardService:
             " WHERE d.task_id=w.task_id AND d.phase=w.phase "
             " ORDER BY d.workflow_version DESC LIMIT 1"
             ") AS workflow_failure_digest,"
+            # Cumulative history for the phase the workflow is in now,
+            # derived rather than counted live.  `claim_next` resets
+            # `failure_count` on park -- deliberately, so a retry does not
+            # begin one slip from parking again -- which means the live
+            # counter says how many attempts happened since the last park,
+            # not how many have happened.  A workflow looping through
+            # park, reader-answers-start, reclaim therefore reported "1
+            # failed attempt" on its twentieth.  The event log cannot
+            # drift from what happened, and scoping to the phase keeps a
+            # plan that succeeded from being reported against an execute
+            # that is stuck.
+            "("
+            " SELECT count(*) FROM task_execution_events AS e "
+            " WHERE e.task_id=w.task_id AND e.kind='claimed' "
+            " AND e.phase=w.phase AND e.task_version=w.task_version"
+            ") AS workflow_phase_attempts,"
+            "("
+            " SELECT count(*) FROM task_execution_events AS e "
+            " WHERE e.task_id=w.task_id AND e.kind='parked' "
+            " AND e.phase=w.phase AND e.task_version=w.task_version"
+            ") AS workflow_phase_parks,"
+            "("
+            " SELECT count(*) FROM task_execution_results AS r "
+            " WHERE r.task_id=w.task_id AND r.phase=w.phase "
+            " AND r.task_version=w.task_version"
+            ") AS workflow_phase_results,"
+            # How much agent time those attempts consumed: each claim until
+            # whatever ended it.  A reader deciding whether to authorise
+            # another run is deciding how to spend the next one of these.
+            "("
+            " SELECT CAST(ROUND(COALESCE(SUM(("
+            "  julianday(COALESCE(("
+            "   SELECT MIN(f.occurred_at) FROM task_execution_events AS f "
+            "   WHERE f.task_id=e.task_id AND f.sequence>e.sequence "
+            "   AND f.kind IN ('released','claim_expired',"
+            "                  'retry_scheduled','parked','result_recorded')"
+            "  ),e.occurred_at))-julianday(e.occurred_at))*86400),0)) "
+            " AS INTEGER) FROM task_execution_events AS e "
+            " WHERE e.task_id=w.task_id AND e.kind='claimed' "
+            " AND e.phase=w.phase AND e.task_version=w.task_version"
+            ") AS workflow_phase_seconds,"
             "w.last_failure_reason AS workflow_failure_reason,"
             "w.last_failure_exit_code AS workflow_failure_exit_code,"
             "w.last_failure_run_id AS workflow_failure_run_id,"
@@ -2494,7 +2924,7 @@ class ExecutionCardService:
             "JOIN tasks AS t ON t.id=c.task_id "
             "JOIN task_execution_workflows AS w ON w.task_id=c.task_id "
             "LEFT JOIN task_execution_results AS r ON r.result_id=c.result_id"
-        )
+        ) + " WHERE " + scope)
 
     @staticmethod
     def _event(
@@ -2692,6 +3122,11 @@ def parse_execution_agent_callback(
 
 def _kind_for_workflow(row: Mapping[str, object]) -> ExecutionCardKind:
     if (
+        row["status"] == WorkflowStatus.RUNNING
+        and int(row["steer_while_running"]) == 1
+    ):
+        return ExecutionCardKind.STEER
+    if (
         row["status"] in {
             WorkflowStatus.AWAITING_START,
             WorkflowStatus.SNOOZED,
@@ -2761,6 +3196,11 @@ def _current_card(row: Mapping[str, object]) -> bool:
                     WorkflowStatus.SNOOZED,
                     WorkflowStatus.PARKED,
                 }
+            )
+        if kind is ExecutionCardKind.STEER:
+            return (
+                row["result_id"] is None
+                and row["workflow_status_current"] == WorkflowStatus.RUNNING
             )
         expected = {
             ExecutionCardKind.PLAN_REVIEW: {ExecutionOutcome.AWAITING_PLAN},
@@ -2853,6 +3293,9 @@ def _card(
             task_id=int(row["task_id"]),
             task_version=int(row["task_version"]),
             workflow_version=int(row["workflow_version"]),
+            work_revision_id=(
+                int(row["work_revision_id"]) if row["work_revision_id"] is not None else None
+            ),
             kind=kind,
             phase=WorkflowPhase(row["phase"]),
             result_id=row["result_id"],
@@ -2861,6 +3304,10 @@ def _card(
             created_at=str(row["created_at"]),
             workflow_status=WorkflowStatus(row["workflow_status_current"]),
             failure_count=int(row["workflow_failure_count"] or 0),
+            phase_attempts=int(row["workflow_phase_attempts"] or 0),
+            phase_parks=int(row["workflow_phase_parks"] or 0),
+            phase_results=int(row["workflow_phase_results"] or 0),
+            phase_seconds=int(row["workflow_phase_seconds"] or 0),
             failure_reason=str(row["workflow_failure_reason"] or ""),
             failure_exit_code=row["workflow_failure_exit_code"],
             failure_run_id=row["workflow_failure_run_id"],
@@ -2892,6 +3339,11 @@ def _card(
                 "" if row["work_digest"] is None
                 else str(row["work_digest"])
             ),
+            steer_digest=(
+                "" if row["steer_digest"] is None
+                else str(row["steer_digest"])
+            ),
+            claimed_at=row["workflow_claimed_at"],
             questions=_stored_lines(row["questions_json"]),
             external_actions=_stored_collection(row["external_actions_json"]),
             deliverables=_stored_collection(row["deliverables_json"]),
@@ -2997,6 +3449,7 @@ def _apply_owner_hold(
         "UPDATE task_execution_workflows SET status='snoozed',phase='plan',"
         "version=?,due_at=?,claim_token_digest=NULL,claimed_at=NULL,"
         "claim_heartbeat_at=NULL,claim_expires_at=NULL,failure_count=0,"
+        "current_run_id=NULL,"
         "last_failure_reason=NULL,last_failure_exit_code=NULL,"
         "last_failure_run_id=NULL,last_failure_at=NULL,next_attempt_at=NULL,"
         "parked_at=NULL,updated_at=?,completed_at=NULL "
@@ -3401,6 +3854,24 @@ def _card_date(value: str | None) -> str:
     return "" if not value else str(value)[:10]
 
 
+def _approximate_duration(seconds: int) -> str:
+    """Agent time as a reader thinks about it, or nothing at all.
+
+    Deliberately coarse.  This number exists to answer "is this worth
+    another run?", and a figure to the second would invite it to be read as
+    accounting rather than as the order of magnitude it is.
+    """
+    if seconds < 60:
+        return ""
+    hours, remainder = divmod(int(seconds), 3600)
+    minutes = remainder // 60
+    if hours and minutes:
+        return f"{hours}h {minutes}m"
+    if hours:
+        return f"{hours}h"
+    return f"{minutes}m"
+
+
 def _start_card_lines(
     card: ExecutionReviewCard, *, html: bool
 ) -> list[str]:
@@ -3446,12 +3917,34 @@ def _start_card_lines(
     if card.workflow_status is WorkflowStatus.PARKED:
         # A reader who is never told has no way to distinguish a task
         # nobody has reached from one the agent abandoned.
+        # The count across every park, not the count since the last one.
+        # A reader told "1 failed attempt" answers Start, because that is
+        # what a first hiccup deserves; the same card on the twentieth
+        # attempt deserves a different answer, and used to look identical.
+        attempts = max(card.phase_attempts, card.failure_count)
         stopped = (
-            f"⚠️ Stopped after {card.failure_count} failed attempt"
-            f"{'s' if card.failure_count != 1 else ''}"
+            f"⚠️ Stopped after {attempts} failed attempt"
+            f"{'s' if attempts != 1 else ''}"
+            + (f" in {card.phase.value}" if card.phase_attempts else "")
+            + (f", across {card.phase_parks} parks"
+               if card.phase_parks > 1 else "")
             + (f" ({card.failure_reason})" if card.failure_reason else "")
         )
         lines.append(f"<b>{_escape(stopped)}</b>" if html else stopped)
+        # Whether anything was ever recorded for this phase is the fact
+        # that most changes the answer, and it was not on the card at all.
+        recorded = (
+            "no result recorded for this phase" if not card.phase_results
+            else f"{card.phase_results} result"
+                 f"{'s' if card.phase_results != 1 else ''} recorded"
+                 " for this phase"
+        )
+        spent = _approximate_duration(card.phase_seconds)
+        history = (
+            f"⏱ {spent} of agent time, {recorded}" if spent
+            else f"⏱ {recorded[0].upper()}{recorded[1:]}"
+        )
+        lines.append(f"<b>{_escape(history)}</b>" if html else history)
         if card.failure_exit_code is not None:
             diagnostic = f"Last agent exit code: {card.failure_exit_code}"
             lines.append(
@@ -3478,9 +3971,20 @@ def _start_card_lines(
                 "retries are stopped; reduce its scope or split it before "
                 "starting another run.",
             ]
+        # The blanket claim that nothing was recorded is now checked rather
+        # than asserted: a workflow can park in a phase that did record, and
+        # telling the reader otherwise contradicts the line above it.
         explanation = (
             "Continue tries again. The runs so far left nothing recorded."
+            if not card.phase_results
+            else "Continue tries again from where this phase already got to."
         )
+        if card.phase_parks > 1 and not card.phase_results:
+            explanation += (
+                " This has already stopped and been restarted "
+                f"{card.phase_parks} times without recording anything, so a "
+                "further identical attempt is unlikely to end differently."
+            )
         return lines + ["", explanation]
     explanation = "No agent has looked at this yet. "
     explanation += (
@@ -3569,6 +4073,74 @@ def _heading_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
         lines.extend(_origin_lines(card, html=html))
     lines.extend(_continues_lines(card, html=html))
     return lines
+
+
+def _steer_card_lines(
+    card: ExecutionReviewCard, *, html: bool
+) -> list[str]:
+    """Render a live-run control without implying live note injection."""
+    handle = f"T{card.task_id}"
+    phase = card.phase.value.replace("_", " ")
+    agent = _escape(card.agent_display_name) if html else card.agent_display_name
+    heading = (
+        f"🧭 <b>Run in progress</b>  <code>{handle}</code>"
+        if html else f"🧭 Run in progress  {handle}"
+    )
+    task = f"<b>{_escape(card.task_text)}</b>" if html else card.task_text
+    lines = [heading, "", task, f"🤖 {'<b>Agent:</b>' if html else 'Agent:'} {agent}",
+             f"⏳ {'<b>Phase:</b>' if html else 'Phase:'} {phase}"]
+    elapsed = _elapsed_steer_duration(card.claimed_at, card.created_at)
+    if elapsed is not None:
+        lines.append(
+            f"🕑 <b>Running for at least:</b> {elapsed}"
+            if html else f"🕑 Running for at least: {elapsed}"
+        )
+    if card.steer_digest:
+        lines.extend(("", (
+            f"🔍 <b>What it is doing:</b> {_escape(card.steer_digest)}"
+            if html else f"🔍 What it is doing: {card.steer_digest}"
+        )))
+    lines.extend(("", (
+        "Update stops this pass and starts a new one with your note; "
+        "the running agent cannot read it mid-pass."
+    )))
+    return lines
+
+
+def _elapsed_steer_duration(
+    started_at: str | None, observed_at: str,
+) -> str | None:
+    """Describe the elapsed runtime at the point this card was raised.
+
+    The card is a durable presentation, so use its creation time rather than
+    a renderer's wall clock. That keeps repeated views truthful and avoids a
+    clock-dependent rendering result while still reporting the duration that
+    made the run worth announcing.
+    """
+    if not started_at:
+        return None
+    try:
+        started = datetime.fromisoformat(started_at)
+        observed = datetime.fromisoformat(observed_at)
+    except ValueError:
+        return None
+    if started.tzinfo is None or observed.tzinfo is None:
+        return None
+    seconds = int((observed - started).total_seconds())
+    if seconds < 0:
+        return None
+    if seconds < 60:
+        return f"{seconds} second{'s' if seconds != 1 else ''}"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes} minute{'s' if minutes != 1 else ''}"
+    hours, minutes = divmod(minutes, 60)
+    if minutes:
+        return (
+            f"{hours} hour{'s' if hours != 1 else ''} "
+            f"{minutes} minute{'s' if minutes != 1 else ''}"
+        )
+    return f"{hours} hour{'s' if hours != 1 else ''}"
 
 
 def _asked_for_lines(card: ExecutionReviewCard, *, html: bool) -> list[str]:
@@ -3674,6 +4246,8 @@ def _repository_review_line(card: ExecutionReviewCard, *, html: bool) -> str:
 def _card_lines(card: ExecutionReviewCard) -> list[str]:
     if card.kind is ExecutionCardKind.START:
         return _start_card_lines(card, html=False)
+    if card.kind is ExecutionCardKind.STEER:
+        return _steer_card_lines(card, html=False)
     if card.kind is ExecutionCardKind.EXTERNAL_REVIEW:
         lines = [
             *_heading_lines(card, html=False),
@@ -3900,6 +4474,8 @@ def _drafted(values: Sequence[CardRecord]) -> list[str]:
 def _html_card_lines(card: ExecutionReviewCard) -> list[str]:
     if card.kind is ExecutionCardKind.START:
         return _start_card_lines(card, html=True)
+    if card.kind is ExecutionCardKind.STEER:
+        return _steer_card_lines(card, html=True)
     if card.kind is ExecutionCardKind.EXTERNAL_REVIEW:
         lines = [
             *_heading_lines(card, html=True),
@@ -4344,6 +4920,16 @@ def _button_rows(
             rows += ((("🤖 Agent", "agent"),),)
         rows += ((("📋 Task brief", "brief"),),)
         return rows if approvable else rows[1:]
+    if kind is ExecutionCardKind.STEER:
+        rows = (
+            (("✏️ Update", "discuss"),),
+            (("💬 Comment and Go", "comment_go"),),
+            (("✅ Done", "done"), ("🗑 Drop", "drop")),
+        )
+        return rows + ((("📋 Task brief", "brief"),),) if approvable else (
+            (("✏️ Update", "discuss"),), (("🗑 Drop", "drop"),),
+            (("📋 Task brief", "brief"),),
+        )
     stop_row = (("👥 Reassign", "reassign"), ("🗑 Drop task", "drop"))
     if kind is ExecutionCardKind.EXTERNAL_REVIEW:
         rows = (
@@ -4422,6 +5008,8 @@ def _direct_actions_for_kind(kind: ExecutionCardKind) -> set[str]:
         }
     if kind is ExecutionCardKind.RESULT_REVIEW:
         return {"done", "drop", "snooze", *REVIEW_SNOOZE_ACTIONS}
+    if kind is ExecutionCardKind.STEER:
+        return {"done", "drop"}
     return {
         "approve", "revise", "cancel", "done", "drop", "snooze",
         *REVIEW_SNOOZE_ACTIONS,
@@ -4476,6 +5064,7 @@ def _apply_review_lifecycle_action(
         "UPDATE task_execution_workflows SET task_version=?,status=?,"
         "version=?,due_at=NULL,claim_token_digest=NULL,claimed_at=NULL,"
         "claim_heartbeat_at=NULL,claim_expires_at=NULL,failure_count=0,"
+        "current_run_id=NULL,"
         "last_failure_reason=NULL,last_failure_exit_code=NULL,"
         "last_failure_run_id=NULL,last_failure_at=NULL,next_attempt_at=NULL,"
         "parked_at=NULL,updated_at=?,completed_at=? "
@@ -4512,6 +5101,38 @@ def _apply_review_lifecycle_action(
         workflow_version,
         workflow_status,
         phase,
+    )
+
+
+def _apply_steer_discussion(
+    connection: sqlite3.Connection,
+    row: Mapping[str, object],
+    *,
+    stamp: datetime,
+) -> WorkflowOperationResult:
+    """Pre-empt a live pass so its next claim reads the stored note."""
+    now = stamp.isoformat(timespec="seconds")
+    version = int(row["workflow_version"]) + 1
+    phase = WorkflowPhase(row["phase"])
+    changed = connection.execute(
+        "UPDATE task_execution_workflows SET status='queued',version=?,"
+        "due_at=NULL,claim_token_digest=NULL,claimed_at=NULL,"
+        "claim_heartbeat_at=NULL,claim_expires_at=NULL,current_run_id=NULL,"
+        "updated_at=? WHERE task_id=? AND version=? AND status='running'",
+        (version, now, int(row["task_id"]), int(row["workflow_version"])),
+    )
+    if changed.rowcount != 1:
+        return WorkflowOperationResult(
+            WorkflowDisposition.REFUSED, int(row["task_id"]),
+            refusal=WorkflowRefusal.STALE_WORKFLOW,
+        )
+    TaskExecutionService._event(
+        connection, int(row["task_id"]), "discussion_requested", version,
+        int(row["task_version"]), phase, WorkflowStatus.QUEUED, now,
+    )
+    return WorkflowOperationResult(
+        WorkflowDisposition.APPLIED, int(row["task_id"]), version,
+        WorkflowStatus.QUEUED, phase,
     )
 
 

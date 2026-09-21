@@ -37,6 +37,7 @@ from foxhound.execution_worker import (
     main,
     _local_calendar,
     _append_repository_receipt,
+    _publication_is_the_deliverable,
     _repository_result,
     _repository_receipts,
     _worker_operations,
@@ -416,7 +417,6 @@ class ExecutionWorkerTests(unittest.TestCase):
                 "local_research_clients": {
                     "outlook": [
                         "folders", "inbox", "search", "read", "thread",
-                        "draft",
                     ],
                     "moodle": [
                         "renew", "whoami", "courses", "assignments",
@@ -430,7 +430,7 @@ class ExecutionWorkerTests(unittest.TestCase):
                 "deployment_roots": {},
                 "worker_operations": [
                     "context", "search", "draft", "record", "release",
-                    "thread",
+                    "act.worktree", "thread",
                 ],
                 "external_effects_allowed": False,
             },
@@ -450,17 +450,68 @@ class ExecutionWorkerTests(unittest.TestCase):
         self.assertNotIn(CLAIM_TOKEN, repr(load_run_state(self.state_path)))
 
     def test_worker_capabilities_follow_the_phase_gate(self):
-        self.assertNotIn(
-            "act.worktree", _worker_operations(WorkflowPhase.PLAN)
-        )
-        self.assertIn(
-            "act.worktree", _worker_operations(WorkflowPhase.EXECUTE)
-        )
+        for phase in WorkflowPhase:
+            with self.subTest(phase=phase):
+                self.assertIn("act.worktree", _worker_operations(phase))
         external = _worker_operations(WorkflowPhase.EXTERNAL_ACTION)
-        self.assertIn("act.worktree", external)
         self.assertIn("act.pull-request", external)
         self.assertIn("act.comment", external)
+        self.assertIn("act.issue", external)
         self.assertIn("act.review", external)
+
+    def test_a_working_tree_does_not_unlock_any_external_effect(self):
+        """The gate is the effect, not the edit.
+
+        A working tree is now available while planning. Nothing that reaches
+        outside the run directory may follow it there, or the phase boundary
+        has moved rather than the convenience.
+        """
+        for phase in (WorkflowPhase.PLAN, WorkflowPhase.EXECUTE):
+            with self.subTest(phase=phase):
+                operations = _worker_operations(phase)
+                self.assertIn("act.worktree", operations)
+                self.assertNotIn("act.pull-request", operations)
+                self.assertNotIn("act.comment", operations)
+                self.assertNotIn("act.issue", operations)
+                self.assertNotIn("act.review", operations)
+
+    def test_planning_prepares_a_working_tree_of_its_own(self):
+        """A planning run that must write gets a tree inside its run directory.
+
+        Refusing this is what sent a planning run looking for somewhere else
+        writable, and the only such place on a host is a shared checkout.
+        """
+        self._bind_origin("issue")
+        prepared = self.run_directory / "repo-record-1-item-1"
+
+        with (
+            mock.patch(
+                "foxhound.execution_worker.forge_action.prepare_worktree",
+                return_value=(prepared, "foxhound/issue-item-1", "main"),
+            ) as prepare,
+            knowledge_server() as endpoint,
+        ):
+            worker = self._worker(endpoint)
+            self.assertEqual(
+                worker.context()["workflow"]["phase"], "plan"
+            )
+            result = worker.act_worktree()
+
+        self.assertEqual(result["repository"], "record-1")
+        self.assertEqual(result["issue"], "item-1")
+        self.assertEqual(result["path"], str(prepared))
+        self.assertEqual(result["branch"], "foxhound/issue-item-1")
+        self.assertEqual(result["base"], "main")
+        self.assertEqual(
+            prepare.call_args.kwargs["parent"], self.run_directory
+        )
+
+    def test_a_working_tree_still_requires_an_origin_to_name(self):
+        with knowledge_server() as endpoint:
+            with self.assertRaisesRegex(
+                ExecutionWorkerClaimError, "no origin"
+            ):
+                self._worker(endpoint).act_worktree()
 
     def test_context_omits_local_clients_missing_from_the_runner(self):
         with (
@@ -736,6 +787,12 @@ class ExecutionWorkerTests(unittest.TestCase):
                     head="foxhound/issue-43", title="Synthetic proposal",
                     body_file=None,
                 ),
+            ),
+            (
+                "issue", "review_request", "44/revision", "open_issue",
+                lambda worker: worker.act_issue(
+                    title="Synthetic finding",
+                    body_file=self._write_effect_body("issue.md")),
             ),
         )
         for index, (name, kind, item_id, forge_call, action) in enumerate(
@@ -1268,7 +1325,8 @@ class ExecutionWorkerTests(unittest.TestCase):
             return_value=object(),
         ):
             with self.assertRaisesRegex(
-                ExecutionWorkerDraftError, "await an approved follow-through"
+                ExecutionWorkerDraftError,
+                "write JSON false to result-repository-impact.json",
             ):
                 _repository_result(
                     state,
@@ -1317,6 +1375,192 @@ class ExecutionWorkerTests(unittest.TestCase):
                     }],
                 }, self.run_directory)
 
+    def test_repository_work_that_changed_the_repository_cannot_be_ineligible(self):
+        """`ineligible` claims the prerequisites were absent; a change disproves it.
+
+        Without this the outcome ends repository work without publishing it and
+        without advancing a phase, so the workflow reaches review and an
+        ordinary `done` closes it as finished.
+        """
+        origin = SimpleNamespace(
+            kind="issue",
+            record_id="github.com/example-org/example-repo",
+            item_id="42",
+        )
+        draft = {
+            "outcome": "ineligible",
+            "deliverables": [
+                "Authored the change on branch issue-42-example-slug"
+            ],
+            "external_actions": [],
+            "repository_impact": True,
+        }
+        for phase in (WorkflowPhase.PLAN, WorkflowPhase.EXECUTE):
+            with self.subTest(phase=phase):
+                state = SimpleNamespace(
+                    database_path=self.database, task_id=1, phase=phase,
+                )
+                with mock.patch(
+                    "foxhound.execution_worker._repository_origin",
+                    return_value=origin,
+                ):
+                    with self.assertRaisesRegex(
+                        ExecutionWorkerDraftError, "cannot be ineligible",
+                    ):
+                        _repository_result(state, draft, self.run_directory)
+
+    def test_planning_run_with_repository_impact_cannot_record_completed(self):
+        origin = SimpleNamespace(
+            kind="issue",
+            record_id="github.com/example-org/example-repo",
+            item_id="42",
+        )
+        draft = {
+            "outcome": "completed",
+            "deliverables": [
+                "Authored the change on branch issue-42-example-slug"
+            ],
+            "external_actions": [],
+            "repository_impact": True,
+        }
+        state = SimpleNamespace(
+            database_path=self.database, task_id=1, phase=WorkflowPhase.PLAN,
+        )
+        with mock.patch(
+            "foxhound.execution_worker._repository_origin", return_value=origin,
+        ):
+            with self.assertRaisesRegex(
+                ExecutionWorkerDraftError, "must record awaiting_plan",
+            ):
+                _repository_result(state, draft, self.run_directory)
+
+    def test_planning_run_without_repository_impact_can_record_completed(self):
+        origin = SimpleNamespace(
+            kind="issue",
+            record_id="github.com/example-org/example-repo",
+            item_id="42",
+        )
+        draft = {
+            "outcome": "completed",
+            "deliverables": ["Analysis result"],
+            "external_actions": [],
+            "repository_impact": False,
+        }
+        state = SimpleNamespace(
+            database_path=self.database, task_id=1, phase=WorkflowPhase.PLAN,
+        )
+        with mock.patch(
+            "foxhound.execution_worker._repository_origin", return_value=origin,
+        ):
+            result = _repository_result(state, draft, self.run_directory)
+            self.assertEqual(result["outcome"], "completed")
+
+    def test_planning_run_with_repository_impact_and_references_can_record_completed(self):
+        origin = SimpleNamespace(
+            kind="issue",
+            record_id="github.com/example-org/example-repo",
+            item_id="42",
+        )
+        draft = {
+            "outcome": "completed",
+            "deliverables": ["Change already exists upstream"],
+            "external_actions": [],
+            "repository_impact": True,
+            "repository_references": [
+                {
+                    "kind": "pull-request",
+                    "url": "https://github.com/example-org/example-repo/pull/42",
+                }
+            ],
+        }
+        state = SimpleNamespace(
+            database_path=self.database, task_id=1, phase=WorkflowPhase.PLAN,
+        )
+        with mock.patch(
+            "foxhound.execution_worker._repository_origin", return_value=origin,
+        ):
+            result = _repository_result(state, draft, self.run_directory)
+            self.assertEqual(result["outcome"], "completed")
+
+    def test_execution_run_with_repository_impact_and_references_can_record_completed(self):
+        origin = SimpleNamespace(
+            kind="issue",
+            record_id="github.com/example-org/example-repo",
+            item_id="42",
+        )
+        draft = {
+            "outcome": "completed",
+            "deliverables": ["Work already completed upstream"],
+            "external_actions": [],
+            "repository_impact": True,
+            "repository_references": [
+                {
+                    "kind": "pull-request",
+                    "url": "https://github.com/example-org/example-repo/pull/42",
+                }
+            ],
+        }
+        state = SimpleNamespace(
+            database_path=self.database, task_id=1, phase=WorkflowPhase.EXECUTE,
+        )
+        with mock.patch(
+            "foxhound.execution_worker._repository_origin", return_value=origin,
+        ):
+            result = _repository_result(state, draft, self.run_directory)
+            self.assertEqual(result["outcome"], "completed")
+
+    def test_ineligible_is_accepted_when_the_repository_was_not_changed(self):
+        """A genuinely blocked run keeps the outcome by reporting its effect."""
+        origin = SimpleNamespace(
+            kind="issue",
+            record_id="github.com/example-org/example-repo",
+            item_id="42",
+        )
+        draft = {
+            "outcome": "ineligible",
+            "deliverables": [
+                "Dependency issue is unmerged; nothing smaller is valid"
+            ],
+            "external_actions": [],
+            "repository_impact": False,
+        }
+        for phase in (WorkflowPhase.PLAN, WorkflowPhase.EXECUTE):
+            with self.subTest(phase=phase):
+                state = SimpleNamespace(
+                    database_path=self.database, task_id=1, phase=phase,
+                )
+                with mock.patch(
+                    "foxhound.execution_worker._repository_origin",
+                    return_value=origin,
+                ):
+                    result = _repository_result(
+                        state, draft, self.run_directory
+                    )
+                self.assertEqual(result["outcome"], "ineligible")
+
+    def test_external_action_ineligible_is_unaffected_by_the_guard(self):
+        """The publishing phase keeps its existing outcomes."""
+        origin = SimpleNamespace(
+            kind="issue",
+            record_id="github.com/example-org/example-repo",
+            item_id="42",
+        )
+        state = SimpleNamespace(
+            database_path=self.database,
+            task_id=1,
+            phase=WorkflowPhase.EXTERNAL_ACTION,
+        )
+        with mock.patch(
+            "foxhound.execution_worker._repository_origin", return_value=origin,
+        ):
+            result = _repository_result(state, {
+                "outcome": "ineligible",
+                "deliverables": ["The approved action can no longer apply"],
+                "external_actions": [],
+                "repository_impact": True,
+            }, self.run_directory)
+        self.assertEqual(result["outcome"], "ineligible")
+
     def test_analysis_only_repository_result_does_not_require_a_forge_update(self):
         state = SimpleNamespace(
             database_path=self.database,
@@ -1338,6 +1582,180 @@ class ExecutionWorkerTests(unittest.TestCase):
                 "repository_impact": False,
             }, self.run_directory)
         self.assertEqual(result["repository_references"], [])
+
+    def test_draft_allows_an_analysis_only_repository_result_to_complete(self):
+        """An issue can ask a question, and the answer belongs on the card."""
+        self._write_result_inputs()
+        self._write_result_input("result-repository-impact.json", False)
+        state = replace(
+            load_run_state(self.state_path), phase=WorkflowPhase.EXECUTE,
+        )
+        origin = SimpleNamespace(
+            kind="issue",
+            record_id="github.com/example-org/example-repo",
+            item_id="42",
+        )
+        with knowledge_server() as endpoint:
+            worker = self._worker(endpoint)
+            with (
+                mock.patch.object(
+                    worker, "_active", return_value=(
+                        state,
+                        SimpleNamespace(
+                            delivered_reader_instruction_sequence=(
+                                lambda *_args, **_kwargs: None
+                            ),
+                        ),
+                    ),
+                ),
+                mock.patch(
+                    "foxhound.execution_worker._repository_origin",
+                    return_value=origin,
+                ),
+                mock.patch.object(worker, "_renew"),
+            ):
+                ready = worker.draft(outcome="completed")
+
+        document = json.loads(
+            (self.run_directory / ready["draft"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(document["outcome"], "completed")
+        self.assertFalse(document["repository_impact"])
+
+    def test_review_cannot_complete_without_publishing_the_review(self):
+        """A review that changed no files still owes the review itself.
+
+        `repository_impact: false` is truthful for a review and used to carry
+        it past the follow-through guard, so the run recorded `completed`
+        with no action and no receipt and the findings never left the run
+        directory.
+        """
+        origin = SimpleNamespace(
+            kind="review_request",
+            record_id="github.com/example-org/example-repo",
+            item_id="42",
+        )
+        draft = {
+            "outcome": "completed",
+            "deliverables": ["Review with two findings"],
+            "external_actions": [],
+            "repository_impact": False,
+        }
+        for phase in (WorkflowPhase.PLAN, WorkflowPhase.EXECUTE):
+            with self.subTest(phase=phase):
+                state = SimpleNamespace(
+                    database_path=self.database, task_id=1, phase=phase,
+                )
+                with mock.patch(
+                    "foxhound.execution_worker._repository_origin",
+                    return_value=origin,
+                ):
+                    with self.assertRaisesRegex(
+                        ExecutionWorkerDraftError,
+                        "requires published follow-through",
+                    ):
+                        _repository_result(state, draft, self.run_directory)
+
+    def test_review_completes_by_naming_follow_through_that_exists(self):
+        """A re-surfaced review stops instead of repeating published work."""
+        origin = SimpleNamespace(
+            kind="review_request",
+            record_id="github.com/example-org/example-repo",
+            item_id="42",
+        )
+        state = SimpleNamespace(
+            database_path=self.database, task_id=1,
+            phase=WorkflowPhase.EXECUTE,
+        )
+        with mock.patch(
+            "foxhound.execution_worker._repository_origin", return_value=origin,
+        ):
+            result = _repository_result(state, {
+                "outcome": "completed",
+                "deliverables": ["The review is already posted"],
+                "external_actions": [],
+                "repository_impact": False,
+                "repository_references": [{
+                    "kind": "review",
+                    "url": (
+                        "https://github.com/example-org/example-repo"
+                        "/pull/42#issuecomment-1"
+                    ),
+                }],
+            }, self.run_directory)
+        self.assertEqual(result["outcome"], "completed")
+
+    def test_review_awaiting_external_must_target_its_origin(self):
+        """The action list is what the approval card shows the reader."""
+        origin = SimpleNamespace(
+            kind="review_request",
+            record_id="github.com/example-org/example-repo",
+            item_id="42",
+        )
+        state = SimpleNamespace(
+            database_path=self.database, task_id=1,
+            phase=WorkflowPhase.EXECUTE,
+        )
+        with mock.patch(
+            "foxhound.execution_worker._repository_origin", return_value=origin,
+        ):
+            with self.assertRaisesRegex(
+                ExecutionWorkerDraftError, "targeting its origin",
+            ):
+                _repository_result(state, {
+                    "outcome": "awaiting_external",
+                    "deliverables": ["Review prepared"],
+                    "external_actions": [{"action": "Post it"}],
+                    "repository_impact": False,
+                }, self.run_directory)
+
+    def test_publication_is_the_deliverable_is_derived_from_receipts(self):
+        """Classified by what an origin owes, not by a remembered list."""
+        self.assertTrue(_publication_is_the_deliverable("review_request"))
+        self.assertFalse(_publication_is_the_deliverable("issue"))
+        self.assertFalse(_publication_is_the_deliverable("meeting"))
+        self.assertFalse(_publication_is_the_deliverable(""))
+
+    def test_draft_preserves_a_structured_origin_follow_through_action(self):
+        self._write_result_inputs()
+        action = {
+            "action": "Post the prepared update",
+            "target": "https://github.com/example-org/example-repo/issues/42",
+        }
+        self._write_result_input("result-external-actions.json", [action])
+        state = replace(
+            load_run_state(self.state_path), phase=WorkflowPhase.EXECUTE,
+        )
+        origin = SimpleNamespace(
+            kind="issue",
+            record_id="github.com/example-org/example-repo",
+            item_id="42",
+        )
+        with knowledge_server() as endpoint:
+            worker = self._worker(endpoint)
+            with (
+                mock.patch.object(
+                    worker, "_active", return_value=(
+                        state,
+                        SimpleNamespace(
+                            delivered_reader_instruction_sequence=(
+                                lambda *_args, **_kwargs: None
+                            ),
+                        ),
+                    ),
+                ),
+                mock.patch(
+                    "foxhound.execution_worker._repository_origin",
+                    return_value=origin,
+                ),
+                mock.patch.object(worker, "_renew"),
+            ):
+                ready = worker.draft(outcome="awaiting_external")
+
+        document = json.loads(
+            (self.run_directory / ready["draft"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(document["external_actions"], [action])
 
     def test_github_external_completion_needs_worker_receipt(self):
         state = SimpleNamespace(
@@ -1403,9 +1821,9 @@ class ExecutionWorkerTests(unittest.TestCase):
         )
         origin = SimpleNamespace(kind="review_request")
         _append_repository_receipt(self.run_directory, {
-            "kind": "issue-comment",
+            "kind": "pull-request",
             "repository": "github.com/example-org/example-repo",
-            "url": "https://github.com/example-org/example-repo/issues/42#issuecomment-1",
+            "url": "https://github.com/example-org/example-repo/pull/42",
         })
         with mock.patch(
             "foxhound.execution_worker._repository_origin", return_value=origin,
@@ -1431,6 +1849,27 @@ class ExecutionWorkerTests(unittest.TestCase):
                 self.run_directory,
             )
         self.assertEqual(len(result["deliverables"]), 2)
+
+    def test_github_review_completion_accepts_issue_comment_receipt(self):
+        state = SimpleNamespace(
+            database_path=self.database,
+            task_id=1,
+            phase=WorkflowPhase.EXTERNAL_ACTION,
+        )
+        origin = SimpleNamespace(kind="review_request")
+        _append_repository_receipt(self.run_directory, {
+            "kind": "issue-comment",
+            "repository": "github.com/example-org/example-repo",
+            "url": "https://github.com/example-org/example-repo/issues/42#issuecomment-1",
+        })
+        with mock.patch(
+            "foxhound.execution_worker._repository_origin", return_value=origin,
+        ):
+            result = _repository_result(
+                state, {"outcome": "completed", "deliverables": []},
+                self.run_directory,
+            )
+        self.assertEqual(len(result["deliverables"]), 1)
 
     def test_draft_cli_errors_are_content_free(self):
         private_value = "synthetic-private-outcome-value"

@@ -57,6 +57,11 @@ _FIELDS = frozenset({
 })
 _CATALOG_FIELDS = frozenset({"schema", "schema_version", "profiles"})
 _CATALOG_ENTRY_FIELDS = frozenset({"state", "revision", "history"})
+#: A profile that renders differently per host also publishes one revision per
+#: named variant. The key is absent for a profile that has none, so a catalog
+#: that uses no variants is byte-identical to one written before they existed.
+_CATALOG_ENTRY_VARIANT_FIELDS = _CATALOG_ENTRY_FIELDS | {"variants"}
+_VARIANT_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 _CATALOG_STATES = frozenset({"active", "disabled"})
 
 
@@ -115,7 +120,8 @@ class AgentProfile:
             or not is_worker_command(worker_command)
         ):
             raise AgentProfileError("agent worker command is invalid")
-        return self.prompt_template.replace(WORKER_COMMAND_TOKEN, worker_command)
+        return PHASE_CONTRACT_PRECEDENCE + self.prompt_template.replace(
+            WORKER_COMMAND_TOKEN, worker_command)
 
     def public_summary(self, *, include_policy: bool = False) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -145,17 +151,44 @@ class CatalogEntry:
     state: str
     revision: str
     history: tuple[str, ...]
+    #: Variant name to the revision that variant renders to. Empty for a
+    #: profile that is the same everywhere.
+    variants: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def is_active(self) -> bool:
         return self.state == "active"
 
     def document(self) -> dict[str, Any]:
-        return {
+        document: dict[str, Any] = {
             "state": self.state,
             "revision": self.revision,
             "history": list(self.history),
         }
+        if self.variants:
+            document["variants"] = dict(sorted(self.variants.items()))
+        return document
+
+    def materialize(self, variant: str | None) -> "CatalogEntry":
+        """This entry as the named variant offers it.
+
+        The installed copy keeps the shape every reader already understands:
+        one revision, and a history that ends with it. Selecting a variant
+        therefore moves that revision to the end rather than adding anything,
+        so a workflow pinned to any published revision still resolves.
+        """
+        if variant is None or variant not in self.variants:
+            return self
+        revision = self.variants[variant]
+        history = tuple(
+            item for item in self.history if item != revision
+        ) + (revision,)
+        return CatalogEntry(
+            profile_id=self.profile_id,
+            state=self.state,
+            revision=revision,
+            history=history,
+        )
 
 
 class AgentProfileRegistry:
@@ -228,6 +261,50 @@ class AgentProfileRegistry:
         ):
             raise AgentProfileError("agent profile revision is unavailable")
         return profile
+
+
+#: Prepended to every rendered profile prompt, whoever authored the profile.
+#:
+#: A profile prompt is supplied to the runtime as the caller's system message,
+#: and the runtime puts its own guidance ahead of it. That guidance is written
+#: for an assistant answering a person directly, and it tells the model to keep
+#: working until an artifact exists and never to end a turn with a plan. This
+#: system is built the other way around: a phase ends by handing something to a
+#: reader, and `awaiting_plan` and `awaiting_external` are its finished states.
+#: The two readings of "stopped with a plan" are indistinguishable from inside
+#: the model, and the phase contract is the one that loses by default, because
+#: the other text came first and sounds like diligence.
+#:
+#: It lives here rather than in a prompt template because profile content is
+#: deployment-owned: a template can be authored anywhere, and this has to hold
+#: for all of them. Rendering is also the last point the code controls before
+#: the text becomes the run's authority, and the bootstrap has already told the
+#: agent that what `context` returns is exactly that.
+#:
+#: Deliberately not quoting the runtime's current wording. It is upstream, it
+#: changes, and a rule that only fires on a remembered sentence would go quiet
+#: without anyone noticing.
+PHASE_CONTRACT_PRECEDENCE = (
+    "# Precedence\n"
+    "These instructions are the authority for this run. Guidance that reached "
+    "you before them -- about finishing the job, not stopping at a plan, and "
+    "not ending a turn without completing the work -- is written for an "
+    "assistant answering a person directly. Where it differs from what "
+    "follows, what follows wins.\n"
+    "The difference is concrete, and it decides how a run ends. Work here is "
+    "split into phases, and a phase finishes by handing something to a reader: "
+    "a plan to approve, or validated local work plus the exact outside effect "
+    "it still needs. Recording `awaiting_plan` or `awaiting_external` with the "
+    "complete draft attached is a finished deliverable. It is not a "
+    "description of work you have yet to do, and it is not stopping early -- "
+    "it is how the work gets done here, because the next phase cannot begin "
+    "until a person has seen it.\n"
+    "So when the phase you are in cannot perform an outside effect, the "
+    "absence of that effect is not unfinished work. Record the phase-valid "
+    "outcome with everything the reader needs to approve the next step. "
+    "Continuing past that point, or recording a terminal outcome to avoid "
+    "handing over, both lose the work.\n\n"
+)
 
 
 def render_bootstrap(worker_command: str = "foxhound-task-worker") -> str:
@@ -416,6 +493,19 @@ def _historical_general_profiles() -> tuple[AgentProfile, ...]:
             kill_grace_seconds=30,
             allowed_phases=_PHASES,
         ),
+        AgentProfile(
+            profile_id="general",
+            display_name="General",
+            runtime="hermes",
+            prompt_template=_GENERAL_PROMPT_TEMPLATE_V12,
+            toolsets=("terminal", "file", "web"),
+            max_turns=80,
+            timeout_seconds=2_700,
+            claim_lease_seconds=3_300,
+            heartbeat_seconds=60,
+            kill_grace_seconds=30,
+            allowed_phases=_PHASES,
+        ),
     )
 
 
@@ -498,8 +588,8 @@ def _validate_profile(profile: AgentProfile) -> None:
         raise AgentProfileError("agent profile phases are invalid")
     for value, minimum, maximum, label in (
         (profile.max_turns, 1, 200, "turn limit"),
-        (profile.timeout_seconds, 30, 3_300, "timeout"),
-        (profile.claim_lease_seconds, 300, 3_600, "claim lease"),
+        (profile.timeout_seconds, 30, 7_200, "timeout"),
+        (profile.claim_lease_seconds, 300, 10_800, "claim lease"),
         (profile.heartbeat_seconds, 5, 600, "heartbeat"),
         (profile.kill_grace_seconds, 1, 120, "shutdown grace"),
     ):
@@ -620,8 +710,37 @@ def parse_catalog(document: object) -> dict[str, CatalogEntry]:
     return entries
 
 
+def _parse_catalog_variants(
+    value: object, history: list[str]
+) -> dict[str, str]:
+    """Validate variant revisions, each of which must be a published one.
+
+    A variant naming a revision outside the profile's history would offer a
+    host something the store cannot resolve, so it is refused here rather than
+    discovered at install.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict) or not value:
+        raise AgentProfileError("agent profile catalog variants are invalid")
+    variants: dict[str, str] = {}
+    for name, revision in value.items():
+        if (
+            not isinstance(name, str)
+            or _VARIANT_NAME_RE.fullmatch(name) is None
+            or not isinstance(revision, str)
+            or _REVISION_RE.fullmatch(revision) is None
+            or revision not in history
+        ):
+            raise AgentProfileError("agent profile catalog variants are invalid")
+        variants[name] = revision
+    return variants
+
+
 def _parse_catalog_entry(profile_id: str, entry: object) -> CatalogEntry:
-    if not isinstance(entry, dict) or set(entry) != _CATALOG_ENTRY_FIELDS:
+    if not isinstance(entry, dict) or set(entry) not in (
+        _CATALOG_ENTRY_FIELDS, _CATALOG_ENTRY_VARIANT_FIELDS
+    ):
         raise AgentProfileError("agent profile catalog entry is invalid")
     state = entry["state"]
     revision = entry["revision"]
@@ -644,11 +763,13 @@ def _parse_catalog_entry(profile_id: str, entry: object) -> CatalogEntry:
         or revision != history[-1]
     ):
         raise AgentProfileError("agent profile catalog revision is invalid")
+    variants = _parse_catalog_variants(entry.get("variants"), history)
     return CatalogEntry(
         profile_id=profile_id,
         state=state,
         revision=revision,
         history=tuple(history),
+        variants=variants,
     )
 
 
@@ -1035,17 +1156,34 @@ _GENERAL_PROMPT_TEMPLATE_V12 = _GENERAL_PROMPT_TEMPLATE_V11.replace(
 )
 
 
-_GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V12
+_GENERAL_PROMPT_TEMPLATE_V13 = _GENERAL_PROMPT_TEMPLATE_V12.replace(
+    "Repository follow-through is required only when execution changes or advances repository work. Planning, research, and an honest non-repository result remain valid without a forge update; for such a repository-origin execution, write JSON `false` to owner-only `result-repository-impact.json` and explain the bounded result in the deliverables. Omit the file for repository-impacting work: its safe default is `true`.",
+    "Repository follow-through is required only when execution changes or advances repository work. Planning, research, and an honest non-repository result remain valid without a forge update; for such a repository-origin execution, write JSON `false` to owner-only `result-repository-impact.json` before `draft --outcome completed`, and explain the bounded result in the deliverables. Omit the file for repository-impacting work: its safe default is `true`; without the explicit `false`, `completed` is correctly refused pending follow-through.",
+).replace(
+    "In `execute`, do not post the update. Put its complete draft in the reviewable result and list posting it as a structured external action with an exact `target` URL for `task.origin`, so the reader can approve the exact external write.",
+    "In `execute`, do not post the update. Put its complete draft in the reviewable result and list posting it in `result-external-actions.json` as a JSON object, for example `{\"action\":\"Post the prepared update\",\"target\":\"https://github.com/OWNER/REPO/issues/NUMBER\"}`. Its `target` must be the exact URL for `task.origin`; a plain-string action description cannot request the follow-through. This lets the reader approve the exact external write.",
+).replace(
+    f"Call `{WORKER_COMMAND_TOKEN} act worktree [--repository LOCATOR]` only when `context` lists `act.worktree`. A task may legitimately span several repositories.",
+    "\n".join((
+        f"Call `{WORKER_COMMAND_TOKEN} act worktree [--repository LOCATOR]` only when `context` lists `act.worktree`. A task may legitimately span several repositories.",
+        "That working tree is the only repository this run may write to, and it is available in every phase, planning included. Take one as soon as the work needs to change a file, run a suite against a modification, or check that a proposal builds.",
+        "Every other checkout on this host is read only for you, however convenient it looks and whoever appears to own it. A checkout outside your run directory is long lived and shared: other work holds branches off it, carries uncommitted changes in it, and shares its stash. Do not `cd` into one to commit, switch its branch, reset it, or stash in it. Read it freely.",
+        "In `plan`, a working tree is for verifying what you are about to propose, not for delivering it. The reviewable output of planning is still the plan.",
+    )),
+)
+
+
+_GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V13
 
 # A built-in profile is a release artifact.  Keep its fingerprints beside the
 # prompt so changing the prompt or policy without publishing a new profile
 # revision fails at every runner and scheduler startup, rather than leaving a
 # stale test in a different file to discover the mismatch later.
 GENERAL_PROFILE_RELEASE_REVISION = (
-    "ff86e18c5665b5613b4966d7664fc71a3c8e427bf2e70248e59b80e84190700b"
+    "15a5abd4bb06a78046c11004515e487e84b5fed3295f90cd84aed95d2ea603e1"
 )
 GENERAL_PROFILE_RELEASE_PROMPT_SHA256 = (
-    "7f536c67589aa76e92ca8a632980dc26287fa4b33f207c7108f995abc6079f3e"
+    "2556cb8715a69b9658d93d9d202569cea1766ccf9b9be46f8a1065fdf00da7d3"
 )
 
 

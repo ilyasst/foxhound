@@ -14,6 +14,7 @@ import shlex
 import signal
 import stat
 import subprocess
+import shutil
 import sys
 import time
 from dataclasses import dataclass, field
@@ -97,7 +98,24 @@ _CONTEXT_EVIDENCE_BYTES = 256 * 1024
 _SESSION_ID_LINE = re.compile(
     rb"(?m)^session_id:\s*([A-Za-z0-9][A-Za-z0-9._-]{0,127})\s*$"
 )
+#: The same identity, written in the closing block the runtime prints when a
+#: pass stops because it exhausted its turn budget.  That block replaces the
+#: plain ``session_id:`` line rather than accompanying it, so a runner that
+#: reads only the plain form has no identity for exactly the runs most likely
+#: to have left unrecorded work.  The following ``Duration:`` line is required:
+#: it keeps a transcript that merely contains the word "Session:" -- agent
+#: output is quoted into this file verbatim -- from being read as an identity.
+_SESSION_SUMMARY_LINE = re.compile(
+    rb"(?m)^Session:[ \t]+([A-Za-z0-9][A-Za-z0-9._-]{0,127})[ \t]*\r?\n"
+    rb"Duration:[ \t]"
+)
 _SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+#: One inference model or provider name, as the agent runtime names it.  A
+#: single argument: no whitespace to split on, no leading dash to be read as
+#: another flag, and nothing that needs quoting to survive the process
+#: boundary.  Deliberately narrower than what some catalog might accept --
+#: this value is chosen by the deployment, not discovered.
+_AGENT_SELECTION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,127}$")
 _CORRECTIVE_TURN_PROMPT = (
     "The preceding execution turn ended without recording a result. "
     "Do not do new work. Use exactly one worker operation now: record the "
@@ -123,6 +141,14 @@ class ExecutionRunnerConfig:
     gw_alias: str = field(repr=False)
     gw_token_file: Path = field(repr=False)
     agent_command: str = field(default="hermes", repr=False)
+    #: Which inference backend this runner's agents run on.  Unset -- the
+    #: default -- means the agent runtime's own configured backend: no
+    #: argument is added and no runtime configuration is read.  Set, they are
+    #: passed to the agent command for this runner's processes alone, so a
+    #: single slot can be moved without changing a default that every other
+    #: user of that runtime on the machine shares.
+    agent_model: str | None = None
+    agent_provider: str | None = None
     profile_registry: AgentProfileRegistry = field(
         default_factory=load_registry, repr=False
     )
@@ -167,6 +193,7 @@ class ExecutionRunnerConfig:
         ):
             raise ValueError("execution runner configuration is invalid")
         _agent_command_argv(self.agent_command)
+        agent_selection_argv(self.agent_model, self.agent_provider)
         if not isinstance(self.profile_registry, AgentProfileRegistry):
             raise ValueError("agent profile registry is invalid")
         if (
@@ -302,12 +329,42 @@ def agent_prompt(worker_command: str = "foxhound-task-worker") -> str:
         raise ValueError("execution worker command is invalid") from exc
 
 
+def agent_selection_argv(
+    model: str | None, provider: str | None
+) -> tuple[str, ...]:
+    """Return the arguments that put one agent on a chosen inference backend.
+
+    Empty when neither is declared, which is both the default and exactly the
+    invocation this runner made before a selection could be expressed at all.
+
+    A provider without a model is refused here rather than at agent start.
+    Carrying whatever model the runtime happens to be configured with across
+    to a different provider is a mismatch, and one discovered by the agent
+    runtime costs a claimed workflow to learn.
+    """
+    if provider is not None and model is None:
+        raise ValueError("execution agent inference selection is invalid")
+    argv: list[str] = []
+    for option, value in (("--model", model), ("--provider", provider)):
+        if value is None:
+            continue
+        if (
+            not isinstance(value, str)
+            or _AGENT_SELECTION.fullmatch(value) is None
+        ):
+            raise ValueError("execution agent inference selection is invalid")
+        argv.extend((option, value))
+    return tuple(argv)
+
+
 def hermes_argv(
     command: str,
     *,
     max_turns: int,
     worker_command: str = "foxhound-task-worker",
     toolsets: str | None = None,
+    model: str | None = None,
+    provider: str | None = None,
 ) -> tuple[str, ...]:
     if (
         not isinstance(max_turns, int)
@@ -318,6 +375,11 @@ def hermes_argv(
     base = _agent_command_argv(command)
     argv = [
         *base,
+        # Before the subcommand: these select the runtime itself, and the
+        # runtime accepts them there for exactly that reason.  Keeping them
+        # out of the subcommand's arguments also keeps this runner's own
+        # per-run arguments a fixed, readable shape.
+        *agent_selection_argv(model, provider),
         "chat",
         "--query",
         agent_prompt(worker_command),
@@ -340,6 +402,8 @@ def profile_argv(
     *,
     worker_command: str = "foxhound-task-worker",
     source: str = "tool",
+    model: str | None = None,
+    provider: str | None = None,
 ) -> tuple[str, ...]:
     """Build the exact Hermes invocation for one validated profile.
 
@@ -360,6 +424,7 @@ def profile_argv(
     base = _agent_command_argv(command)
     return (
         *base,
+        *agent_selection_argv(model, provider),
         "chat",
         "--query",
         agent_prompt(worker_command),
@@ -379,6 +444,8 @@ def corrective_argv(
     *,
     session_id: str,
     source: str,
+    model: str | None = None,
+    provider: str | None = None,
 ) -> tuple[str, ...]:
     """Resume one lost turn solely to finish its worker lifecycle action.
 
@@ -398,6 +465,11 @@ def corrective_argv(
         raise ValueError("execution corrective resume is invalid")
     return (
         *_agent_command_argv(command),
+        # The same backend the lost turn ran on.  This turn resumes that
+        # session to close it out; finishing it somewhere else would hand the
+        # accumulated context to a different model for the one call that
+        # decides what is recorded.
+        *agent_selection_argv(model, provider),
         "chat",
         "--query",
         _CORRECTIVE_TURN_PROMPT,
@@ -518,6 +590,8 @@ def _run_claim(
             profile,
             worker_command=_worker_command(config),
             source="foxhound-" + run_id,
+            model=config.agent_model,
+            provider=config.agent_provider,
         )
     except ValueError:
         _fail_claim(service, claim, "startup_failed")
@@ -527,7 +601,14 @@ def _run_claim(
     try:
         directory.mkdir(mode=0o700)
         if config.task_work_root is not None and config.task_kb_root is not None:
-            origin = TaskLedger(config.database_path).origin(claim.task_id)
+            ledger = TaskLedger(config.database_path)
+            origin = ledger.origin(claim.task_id)
+            origin_sources = ()
+            if origin:
+                payload = ledger.bound_candidate_payload(claim.task_id)
+                if payload:
+                    from .card_provenance import stored_origin_sources
+                    origin_sources = stored_origin_sources(payload)
             archive = prepare_task_archive(
                 working_root=config.task_work_root,
                 kb_root=config.task_kb_root,
@@ -539,6 +620,7 @@ def _run_claim(
                 origin_kind=None if origin is None else origin.kind,
                 origin_record=None if origin is None else origin.record_id,
                 origin_item=None if origin is None else origin.item_id,
+                origin_sources=origin_sources,
             )
         state_path = directory / "run-state.json"
         instructions_path = directory / INSTRUCTIONS_NAME
@@ -586,6 +668,23 @@ def _run_claim(
         # the line above.
         "NO_COLOR": "1",
         "TERM": "dumb",
+        # Demand attribution for caproute, read by the agent and stamped on
+        # every model call it makes. caproute can already name the process
+        # on the far end of the socket, so it knows these turns are hermes;
+        # what it cannot know is which task they were spent on, and "the
+        # agents used 199 GPU-hours" is not a number anyone can place
+        # models from. One agent is spawned per claim, so the run and the
+        # task are constant for the life of the process and the
+        # environment carries them exactly once.
+        #
+        # Ids only. These become HTTP headers and land in a router's log,
+        # so the task TEXT is deliberately not among them.
+        "CAPROUTE_APP": "foxhound",
+        "CAPROUTE_OPERATION": "execution",
+        "CAPROUTE_JOB": profile.profile_id,
+        "CAPROUTE_RUN_ID": run_id,
+        "CAPROUTE_WORK_ITEM_TYPE": "task",
+        "CAPROUTE_WORK_ITEM_ID": str(claim.task_id),
     })
     process: subprocess.Popen | None = None
     transcript = None
@@ -606,6 +705,16 @@ def _run_claim(
             transcript = _open_transcript(directory)
         except OSError:
             transcript = None
+        if transcript is not None:
+            # The run directory and its transcript now exist together. The
+            # pointer is optional (a database race must not cost the run),
+            # but never record one before there is something safe to read.
+            service.attach_run_id(
+                claim.task_id,
+                expected_version=claim.workflow_version,
+                claim_token=claim.token,
+                run_id=run_id,
+            )
         try:
             process = popen(
                 list(command),
@@ -641,7 +750,9 @@ def _run_claim(
                     sleep=sleep, clock=clock
                 )
                 return ExecutionRunResult(
-                    terminal, 0 if terminal == "recorded" else NO_PROGRESS_EXIT_CODE,
+                    terminal,
+                    0 if terminal in {"recorded", "released"}
+                    else NO_PROGRESS_EXIT_CODE,
                     claim.task_id, forced,
                 )
 
@@ -669,8 +780,10 @@ def _run_claim(
                         process, profile.kill_grace_seconds,
                         sleep=sleep, clock=clock,
                     )
+                    current = service.get(claim.task_id)
+                    terminal = _terminal_result(initial, current, claim.task_id)
                     return ExecutionRunResult(
-                        "claim_lost", NO_PROGRESS_EXIT_CODE,
+                        terminal or "claim_lost", 0 if terminal in {"recorded", "released"} else NO_PROGRESS_EXIT_CODE,
                         claim.task_id, forced,
                     )
                 next_heartbeat = now + profile.heartbeat_seconds
@@ -682,7 +795,8 @@ def _run_claim(
                 if terminal is not None:
                     return ExecutionRunResult(
                         terminal,
-                        0 if terminal == "recorded" else NO_PROGRESS_EXIT_CODE,
+                        0 if terminal in {"recorded", "released"}
+                        else NO_PROGRESS_EXIT_CODE,
                         claim.task_id,
                     )
                 if not corrective_attempted:
@@ -696,6 +810,8 @@ def _run_claim(
                                 profile,
                                 session_id=session_id,
                                 source="foxhound-" + run_id,
+                                model=config.agent_model,
+                                provider=config.agent_provider,
                             )
                             process = popen(
                                 list(corrective),
@@ -816,6 +932,45 @@ def _run_claim(
             # directory is the record; the folder is what the reader opens.
             with contextlib.suppress(TaskArchiveError):
                 publish_deliverables(archive, directory)
+            cleanup_run_clones(directory)
+
+
+def cleanup_run_clones(run_directory: Path) -> None:
+    """Remove prepared worktrees once their run reaches a terminal state.
+
+    A clone is removed only if it holds no unpushed commits. If it holds
+    work absent from a remote, it is preserved and reported. Removal
+    failures do not fail the run.
+    """
+    try:
+        for entry in run_directory.iterdir():
+            if not entry.is_dir() or not entry.name.startswith("repo-"):
+                continue
+            if not (entry / ".git").exists():
+                continue
+            try:
+                result = subprocess.run(
+                    ["git", "-C", str(entry), "log", "--oneline", "--all", "--not", "--remotes"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            except OSError:
+                continue
+            # A check that could not run has not established anything. Only a
+            # successful, empty answer means "no unpushed work"; a non-zero
+            # exit means git could not tell us, and the clone stays. These
+            # directories are live -- an index.lock, a repo mid-operation or a
+            # permissions hiccup all exit non-zero, and deleting on those
+            # would be deleting precisely when we are least sure.
+            if result.returncode != 0 or result.stdout.strip():
+                continue
+            try:
+                shutil.rmtree(entry)
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 
 def _terminal_result(
@@ -856,8 +1011,9 @@ def _transcript_session_id(path: Path, transcript: object | None) -> str | None:
     """Return the final Hermes session identity from this private transcript.
 
     The runner does not query Hermes state or infer an identity from a path.
-    Hermes writes its own final ``session_id:`` line to the transcript, which
-    makes a missing or malformed line a normal no-resume outcome.
+    Hermes writes its own identity to the transcript in one of two closing
+    forms, and the last one written wins.  A transcript carrying neither is a
+    normal no-resume outcome, as is one whose identity does not parse.
     """
     try:
         if transcript is not None:
@@ -865,11 +1021,18 @@ def _transcript_session_id(path: Path, transcript: object | None) -> str | None:
         data = path.read_bytes()
     except (OSError, AttributeError):
         return None
-    matches = tuple(_SESSION_ID_LINE.finditer(data))
+    matches = [
+        match
+        for pattern in (_SESSION_ID_LINE, _SESSION_SUMMARY_LINE)
+        for match in pattern.finditer(data)
+    ]
     if not matches:
         return None
+    # Position, not pattern order: a pass may print either form, and the one
+    # that closed the transcript is the session this run actually ran in.
+    last = max(matches, key=lambda match: match.start())
     try:
-        return matches[-1].group(1).decode("ascii")
+        return last.group(1).decode("ascii")
     except UnicodeDecodeError:
         return None
 
@@ -983,7 +1146,8 @@ def _failure_result(
     if terminal in {"recorded", "released"}:
         return ExecutionRunResult(
             terminal,
-            0 if terminal == "recorded" else NO_PROGRESS_EXIT_CODE,
+            0 if terminal in {"recorded", "released"}
+            else NO_PROGRESS_EXIT_CODE,
             claim.task_id,
             forced,
         )
@@ -1246,6 +1410,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--gw-alias", required=True)
     parser.add_argument("--gw-token-file", required=True, type=Path)
     parser.add_argument("--agent-command", default="hermes")
+    parser.add_argument(
+        "--agent-model",
+        help="inference model for this runner's agents; omitted means the "
+             "agent runtime's own default",
+    )
+    parser.add_argument(
+        "--agent-provider",
+        help="inference provider serving --agent-model; requires it",
+    )
     parser.add_argument("--agent-profile-directory", type=Path)
     parser.add_argument("--default-agent-profile", default="general")
     parser.add_argument(
@@ -1407,6 +1580,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             gw_alias=args.gw_alias,
             gw_token_file=args.gw_token_file,
             agent_command=args.agent_command,
+            agent_model=args.agent_model,
+            agent_provider=args.agent_provider,
             profile_registry=load_registry(args.agent_profile_directory),
             default_agent_profile=args.default_agent_profile,
             profile_routes=_profile_routes(args.profile_route),

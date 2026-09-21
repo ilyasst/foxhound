@@ -138,11 +138,16 @@ def _local_calendar() -> dict[str, object]:
 
 def _worker_operations(phase: WorkflowPhase) -> list[str]:
     operations = ["context", "search", "draft", "record", "release"]
-    if phase is not WorkflowPhase.PLAN:
-        operations.append("act.worktree")
+    # A working tree is available in every phase, planning included. It is a
+    # clone in the run's own directory and causes no external effect; nothing
+    # is pushed from it except through act.pull-request, which is gated below.
+    # Withholding it from planning did not stop a run that needed to write —
+    # it only removed the sanctioned place to do so, leaving the host's shared
+    # checkouts as the nearest writable repository.
+    operations.append("act.worktree")
     if phase is WorkflowPhase.EXTERNAL_ACTION:
         operations.append("act.pull-request")
-        operations.extend(("act.comment", "act.review"))
+        operations.extend(("act.comment", "act.issue", "act.review"))
     # Read-only thread access is available in plan and execute, not just
     # external_action: the point is to read review feedback *before* repeating
     # the work, and by external_action the work is already done.
@@ -163,7 +168,7 @@ _LOCAL_RESEARCH_CLIENTS = {
 }
 
 
-def _local_research_clients() -> dict[str, list[str]]:
+def _local_research_clients(phase: WorkflowPhase) -> dict[str, list[str]]:
     """Approved clients this runner can actually invoke.
 
     Profiles are portable across workers, while local research clients are
@@ -171,11 +176,25 @@ def _local_research_clients() -> dict[str, list[str]]:
     an agent's first useful action into a misleading failure, so this is a
     small runtime fact rather than a profile promise.
     """
-    return {
-        name: list(operations)
-        for name, operations in _LOCAL_RESEARCH_CLIENTS.items()
-        if shutil.which(name) is not None
-    }
+    clients = {}
+    
+    for name, operations in _LOCAL_RESEARCH_CLIENTS.items():
+        if shutil.which(name) is None:
+            continue
+            
+        allowed = list(operations)
+        if name == "outlook":
+            if phase not in (WorkflowPhase.PLAN, WorkflowPhase.EXECUTE):
+                continue
+            if "draft" in allowed and phase is not WorkflowPhase.EXECUTE:
+                allowed.remove("draft")
+        elif name == "moodle":
+            if phase not in (WorkflowPhase.PLAN, WorkflowPhase.EXECUTE):
+                continue
+                
+        clients[name] = allowed
+        
+    return clients
 
 
 class ExecutionWorkerError(RuntimeError):
@@ -292,7 +311,7 @@ class ExecutionWorker:
                 # lack of mail or knowledge access.  Client guidance remains
                 # profile-versioned; this contract names only the approved
                 # read/research surface.
-                "local_research_clients": _local_research_clients(),
+                "local_research_clients": _local_research_clients(state.phase),
                 # Stable symbolic roots supplied by deployment configuration.
                 # They are runtime facts, rather than profile policy, so an
                 # identical reviewed profile works on hosts with different
@@ -347,6 +366,25 @@ class ExecutionWorker:
                     expected_version=state.workflow_version,
                     claim_token=state.claim_token,
                 ),
+                # Why earlier attempts at this phase stopped, most recent
+                # first and bounded. Evidence about what has already been
+                # tried and failed -- not a plan, and not a limit on what
+                # may be read. Without it the next attempt begins from the
+                # task text alone, makes the same plan, and fails the same
+                # way; on one deployment that pattern took roughly a fifth
+                # of all execution capacity over two days.
+                #
+                # Deliberately not classified into causes the agent can act
+                # on and causes it cannot. A saturated backend is not the
+                # agent's to fix and telling it to work around one invites
+                # exactly the scope substitution in #360 -- but nothing
+                # here can tell that apart from an exhausted turn budget
+                # reliably, and a wrong hint is worse than none.
+                "prior_failures": list(service.prior_failures(
+                    state.task_id,
+                    expected_version=state.workflow_version,
+                    claim_token=state.claim_token,
+                )),
             },
             "operator": {
                 "revision": context.revision,
@@ -412,14 +450,18 @@ class ExecutionWorker:
     def act_worktree(self, *, repository: str | None = None) -> dict[str, Any]:
         """Prepare a working tree for this task's repository.
 
-        Available from `execute` onward: the change has to be written before
-        it can be proposed. Nothing is pushed here.
+        Available in every phase, planning included. The phase boundary this
+        worker enforces is the EFFECT, not the edit: nothing is pushed from
+        here, and a proposal still requires act.pull-request in
+        external_action. A planning run that has to write in order to answer
+        its own question -- apply a candidate patch, run the suite against it,
+        check that a proposed fix builds -- gets a tree of its own to do it in.
+
+        Refusing it did not prevent that writing. It only meant the run found
+        somewhere else to write, and the nearest writable repository on a host
+        is a shared long-lived checkout that other work depends on.
         """
         state, service = self._active()
-        if state.phase is WorkflowPhase.PLAN:
-            raise ExecutionWorkerClaimError(
-                "a working tree is not prepared while planning"
-            )
         origin = TaskLedger(state.database_path).origin(state.task_id)
         if origin is None:
             raise ExecutionWorkerClaimError(
@@ -492,6 +534,59 @@ class ExecutionWorker:
         _append_repository_receipt(self._state_path.parent, result)
         # Renewed only after the write succeeded, so a lease that lapses
         # mid-post is not extended by the attempt itself.
+        self._renew(service, state)
+        return result
+
+    def act_issue(self, *, title: str, body_file: str,
+                  repository: str | None = None) -> dict[str, Any]:
+        """Open one approved issue for a finding this task cannot itself fix.
+
+        Refused outside `external_action`, like every other forge write: the
+        phase IS the approval.
+
+        This is the write that turns a finding into work. A comment is inert
+        by design -- a pull request candidate is shaped from title, body and
+        diff, and comments are never read -- so a finding with no pull request
+        behind it had nowhere to go and was lost with the run directory.
+
+        It is also the only write here that can create work for the system
+        that issued it, because an open issue on an enrolled repository
+        becomes a candidate and then a task. `forge_action` holds the bounds
+        that follow from that, and checks them against the forge rather than
+        against run state, since a task outlives any one run.
+        """
+        state, service = self._fresh_active("effect")
+        if state.phase is not WorkflowPhase.EXTERNAL_ACTION:
+            raise ExecutionWorkerClaimError(
+                "an external action is only available in the external_action "
+                "phase"
+            )
+        origin = TaskLedger(state.database_path).origin(state.task_id)
+        if origin is None:
+            raise ExecutionWorkerClaimError(
+                "this task has no origin, so it names no repository to file on"
+            )
+        body = _read_private_text(
+            self._state_path.parent / body_file,
+            maximum=60_000, label="issue body")
+        try:
+            receipt = forge_action.open_issue(
+                repository=repository or origin.record_id,
+                task_id=state.task_id,
+                title=title,
+                body=body,
+            )
+        except forge_action.ForgeActionError as exc:
+            raise ExecutionWorkerClaimError(str(exc)) from exc
+        result = {
+            "kind": "issue",
+            "repository": receipt.repository,
+            "number": receipt.number,
+            "url": receipt.url,
+        }
+        _append_repository_receipt(self._state_path.parent, result)
+        # Renewed only after the write succeeded, so a lease that lapses
+        # mid-write is not extended by the attempt itself.
         self._renew(service, state)
         return result
 
@@ -1436,6 +1531,13 @@ def _read_result_text(path: Path, *, label: str) -> str:
 def _read_optional_string_array(
     path: Path, *, label: str
 ) -> list[object]:
+    """Read result lines and structured action records.
+
+    Most result collections are short display lines.  External actions may
+    instead be records so an execute-phase handoff can name its exact target.
+    Keep that distinction here: accepting only strings makes the documented
+    origin-targeted action impossible to express.
+    """
     try:
         path.lstat()
     except FileNotFoundError:
@@ -1693,16 +1795,92 @@ def _repository_result(
         raise ExecutionWorkerDraftError(
             "repository result must name a deliverable"
         )
+    if (
+        repository_impact
+        and outcome == "ineligible"
+        and state.phase in (WorkflowPhase.PLAN, WorkflowPhase.EXECUTE)
+    ):
+        # `ineligible` means the prerequisites for the work do not exist and
+        # nothing smaller is valid. A run that changed the repository has
+        # already demonstrated otherwise, so the two cannot both be true.
+        #
+        # This closes the last way to end repository work without publishing
+        # it. `completed` is refused just below; `ineligible` was not, and it
+        # does not advance a phase either, so the workflow went to review and
+        # an ordinary `done` closed it as finished while nothing had been
+        # pushed. The run directory is reclaimed afterwards, so the branch the
+        # result named stopped existing -- a silent loss that reads as success
+        # in every count.
+        #
+        # A genuinely blocked run keeps its outcome by reporting the truth
+        # about its effect: `repository_impact: false` with `ineligible` is
+        # still accepted.
+        raise ExecutionWorkerDraftError(
+            "repository work that changed the repository cannot be ineligible"
+        )
+    origin_kind = getattr(origin, "kind", "")
+    publication_is_the_work = (
+        isinstance(origin_kind, str)
+        and _publication_is_the_deliverable(origin_kind)
+    )
     if state.phase is WorkflowPhase.EXECUTE and repository_impact:
-        if outcome == "completed":
+        if outcome == "completed" and not references:
             raise ExecutionWorkerDraftError(
-                "repository execution must await an approved follow-through"
+                "repository execution must await an approved follow-through; "
+                "request an external action, or name the existing follow-through in "
+                "repository references if it is already published. "
+                "For analysis-only work write JSON false to "
+                "result-repository-impact.json"
             )
-        if (outcome == "awaiting_external"
-                and not _has_origin_follow_through_action(actions, origin)):
+    if state.phase is WorkflowPhase.PLAN and repository_impact:
+        if outcome == "completed" and not references:
             raise ExecutionWorkerDraftError(
-                "repository execution must request an action targeting its origin"
+                "a planning run that changed the repository must record "
+                "awaiting_plan; for analysis-only work write JSON false to "
+                "result-repository-impact.json"
             )
+    if (
+        state.phase in (WorkflowPhase.PLAN, WorkflowPhase.EXECUTE)
+        and publication_is_the_work
+        and not repository_impact
+        and outcome == "completed"
+        and not references
+    ):
+        # The guard above asks a run that changed the repository to publish
+        # what it changed, and offers `repository_impact: false` to work that
+        # changed nothing. For most origins that exemption is right: an issue
+        # can ask a question, and the answer belongs on the card.
+        #
+        # A review is the exception. It reads a pull request and changes no
+        # files, so the flag is truthfully false and the run took the
+        # exemption -- but its entire deliverable was the remote write the
+        # exemption excused. `completed` was accepted with no action and no
+        # receipt, the workflow went to review, and an ordinary `done` closed
+        # it while the findings existed only in the run directory, which is
+        # reclaimed afterwards. Analysis-only and review are the same shape to
+        # every check here and opposite in what they owe.
+        #
+        # `_required_repository_receipt_kinds` already knows what each origin
+        # owes; it was consulted only in `external_action`, which a completed
+        # execute phase never reaches.
+        #
+        # Naming follow-through that already exists still completes the task.
+        # That is how a re-surfaced task stops instead of repeating published
+        # work, so it stays open to a run that writes nothing itself.
+        raise ExecutionWorkerDraftError(
+            f"repository {origin_kind} completion requires published "
+            "follow-through: request the action on its origin, or name the "
+            "existing follow-through in repository references"
+        )
+    if (
+        state.phase is WorkflowPhase.EXECUTE
+        and (repository_impact or publication_is_the_work)
+        and outcome == "awaiting_external"
+        and not _has_origin_follow_through_action(actions, origin)
+    ):
+        raise ExecutionWorkerDraftError(
+            "repository execution must request an action targeting its origin"
+        )
     if (
         state.phase is WorkflowPhase.EXTERNAL_ACTION
         and outcome == "completed"
@@ -1714,6 +1892,8 @@ def _repository_result(
             )
         required = _required_repository_receipt_kinds(origin.kind)
         received = {receipt["kind"] for receipt in receipts}
+        if origin.kind == "review_request" and "issue-comment" in received:
+            received = received | {"review"}
         missing = required - received
         if missing:
             names = " and ".join(sorted(missing))
@@ -1789,6 +1969,25 @@ def _required_repository_receipt_kinds(origin_kind: str) -> frozenset[str]:
     return frozenset()
 
 
+#: Receipt kinds that can only exist because the run changed the repository.
+#: A pull request needs a branch; a comment or a review needs neither.
+_CHANGE_BACKED_RECEIPT_KINDS = frozenset({"pull-request"})
+
+
+def _publication_is_the_deliverable(origin_kind: str) -> bool:
+    """True when this origin owes a write that no repository change produces.
+
+    Derived rather than listed, so a new origin kind is classified by what it
+    owes instead of by being remembered here. An origin whose follow-through
+    includes a pull request has a deliverable that can exist locally first,
+    and analysis about it is a coherent result on its own. An origin whose
+    follow-through is only a comment or a review has nothing to show for the
+    run except the write itself.
+    """
+    required = _required_repository_receipt_kinds(origin_kind)
+    return bool(required) and not (required & _CHANGE_BACKED_RECEIPT_KINDS)
+
+
 def _repository_receipts(run_directory: Path) -> tuple[dict[str, str], ...]:
     path = run_directory / REPOSITORY_RECEIPTS_NAME
     try:
@@ -1825,7 +2024,8 @@ def _repository_receipts(run_directory: Path) -> tuple[dict[str, str], ...]:
             or not isinstance(value.get("kind"), str)
             or not isinstance(value.get("repository"), str)
             or not isinstance(value.get("url"), str)
-            or value["kind"] not in {"issue-comment", "pull-request", "review"}
+            or value["kind"] not in {
+                "issue", "issue-comment", "pull-request", "review"}
             or not value["repository"].startswith("github.com/")
             or not value["url"].startswith("https://github.com/")
         ):
@@ -1848,7 +2048,8 @@ def _append_repository_receipt(
     except (KeyError, TypeError):
         raise ExecutionWorkerClaimError("repository action receipt is invalid")
     if (
-        normalized["kind"] not in {"issue-comment", "pull-request", "review"}
+        normalized["kind"] not in {
+            "issue", "issue-comment", "pull-request", "review"}
         or not normalized["repository"].startswith("github.com/")
         or not normalized["url"].startswith("https://github.com/")
     ):
@@ -1994,6 +2195,14 @@ def _parser() -> argparse.ArgumentParser:
         help="file beside the run state holding the review")
     review.add_argument(
         "--repository", help="canonical locator; defaults to the task origin")
+    issue = act_kinds.add_parser(
+        "issue", help="open an approved issue for a finding this task cannot fix")
+    issue.add_argument("--title", required=True)
+    issue.add_argument(
+        "--body-file", required=True,
+        help="file beside the run state holding the issue body")
+    issue.add_argument(
+        "--repository", help="canonical locator; defaults to the task origin")
     comment = act_kinds.add_parser(
         "comment", help="post an approved status update on the origin issue")
     comment.add_argument(
@@ -2041,6 +2250,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.operation == "act" and args.action_kind == "review":
             result = worker.act_review(
                 body_file=args.body_file, repository=args.repository)
+        elif args.operation == "act" and args.action_kind == "issue":
+            result = worker.act_issue(
+                title=args.title, body_file=args.body_file,
+                repository=args.repository)
         elif args.operation == "act" and args.action_kind == "comment":
             result = worker.act_comment(body_file=args.body_file)
         elif args.operation == "act":

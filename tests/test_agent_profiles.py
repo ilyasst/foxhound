@@ -18,6 +18,8 @@ from foxhound.agent_profiles import (
     GENERAL_PROFILE_RELEASE_PROMPT_SHA256,
     GENERAL_PROFILE_RELEASE_REVISION,
     MAX_MANIFEST_BYTES,
+    PHASE_CONTRACT_PRECEDENCE,
+    AgentProfile,
     AgentProfileError,
     AgentProfileRegistry,
     WORKER_COMMAND_TOKEN,
@@ -131,6 +133,55 @@ class AgentProfileTests(unittest.TestCase):
             "catalog.json",
         )
 
+    def test_every_rendered_prompt_leads_with_phase_contract_precedence(self):
+        """Profile content is deployment-owned; this cannot be left to it.
+
+        The runtime puts its own guidance ahead of the profile prompt, and
+        that guidance tells the model never to end a turn with a plan. The
+        phase contract needs the opposite, so the resolution is prepended by
+        the code that renders any profile rather than authored into one.
+        """
+        profile = AgentProfile(
+            profile_id="synthetic",
+            display_name="Synthetic",
+            runtime="hermes",
+            prompt_template=f"Run {WORKER_COMMAND_TOKEN} context.",
+            toolsets=("terminal",),
+            max_turns=4,
+            timeout_seconds=60,
+            claim_lease_seconds=600,
+            heartbeat_seconds=30,
+            kill_grace_seconds=10,
+            allowed_phases=("plan", "execute", "external_action"),
+        )
+        prompt = profile.render_prompt("synthetic-worker")
+
+        self.assertTrue(prompt.startswith(PHASE_CONTRACT_PRECEDENCE))
+        self.assertLess(
+            prompt.index("# Precedence"),
+            prompt.index("Run synthetic-worker context."),
+        )
+        for required in (
+            "awaiting_plan",
+            "awaiting_external",
+            "what follows wins",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, prompt)
+
+    def test_phase_contract_precedence_does_not_move_a_profile_revision(self):
+        """A published profile stays pinned when this text changes.
+
+        The revision digests the stored document, not the rendered prompt, so
+        the resolution reaches profiles that were published before it existed
+        and no deployment has to republish to receive it.
+        """
+        profile = general_profile()
+        self.assertEqual(profile.revision, GENERAL_PROFILE_RELEASE_REVISION)
+        self.assertNotIn(
+            PHASE_CONTRACT_PRECEDENCE, profile.document()["prompt_template"],
+        )
+
     def test_general_profile_is_exact_runner_compatibility_profile(self):
         profile = general_profile()
         prompt = profile.render_prompt("foxhound-task-worker")
@@ -174,14 +225,24 @@ class AgentProfileTests(unittest.TestCase):
             "Nothing there needs shortening for the card",
             "# Repository follow-through",
             "that exact origin is the repository artifact",
+            "before `draft --outcome completed`",
+            "without the explicit `false`",
             "State the outcome, verification performed",
-            "list posting it as a structured external action",
+            "`result-external-actions.json` as a JSON object",
+            "a plain-string action description cannot request the follow-through",
             "act comment --body-file FILE",
             "act review --body-file FILE",
             "record the precise blocker and the bounded continuation needed",
             "stop lower-priority exploration",
             "Before changing each checkout, read its contributor instructions",
             "In `result-work.md`, state which instructions you found and applied",
+            # The working tree is available in every phase now, so the prompt
+            # has to say where writing belongs. Withholding it from planning
+            # did not stop the writing; it sent it to a shared checkout.
+            "available in every phase, planning included",
+            "Every other checkout on this host is read only for you",
+            "Do not `cd` into one to commit, switch its branch, reset it",
+            "The reviewable output of planning is still the plan",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, prompt)
@@ -410,9 +471,9 @@ class AgentProfileTests(unittest.TestCase):
             ("max_turns", 201),
             ("max_turns", True),
             ("timeout_seconds", 29),
-            ("timeout_seconds", 3_301),
+            ("timeout_seconds", 7_201),
             ("claim_lease_seconds", 299),
-            ("claim_lease_seconds", 3_601),
+            ("claim_lease_seconds", 10_801),
             ("heartbeat_seconds", 4),
             ("heartbeat_seconds", 601),
             ("kill_grace_seconds", 0),
