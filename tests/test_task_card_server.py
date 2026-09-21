@@ -50,12 +50,14 @@ from foxhound.task_card_server import (
     EXECUTION_OPERATION_SCHEMA,
     EXECUTION_PRIORITY_SCHEMA,
     EXECUTION_QUEUE_SCHEMA,
+    EXECUTION_BOARD_SCHEMA,
     EXECUTION_SCHEDULE_SCHEMA,
     EXECUTION_STATS_SCHEMA,
     HEALTH_SCHEMA,
     OPERATION_SCHEMA,
     QUEUE_SCHEMA,
     QUEUE_SCHEMA_VERSION,
+    BOARD_SCHEMA,
     QUEUE_VIEW_ROLE,
     REQUEST_SCHEMA,
     SCHEDULE_SCHEMA,
@@ -233,6 +235,72 @@ class TaskCardServerTests(unittest.TestCase):
         self.assertFalse(stale["ok"])
         self.assertIsNone(stale["text"])
         self.assertEqual(stale["refusal"], "stale_version")
+
+    def test_execution_board_is_queue_scoped_bounded_and_non_mutating(self):
+        self.execution.schedule(1, expected_task_version=1)
+        self.execution_cards.schedule()
+        app = TaskCardApplication(
+            self.cards,
+            {DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: QUEUE_VIEW_TOKEN},
+            execution_cards=self.execution_cards,
+            execution_tokens={DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: QUEUE_VIEW_TOKEN},
+        )
+        before = (self.execution_cards.count(), self.execution_cards.event_count())
+        board = app.dispatch(
+            "execution_board", request_document(limit=1),
+            authorization=f"Bearer {QUEUE_VIEW_TOKEN}",
+        )
+        self.assertEqual((board["schema"], board["ok"]),
+                         (EXECUTION_BOARD_SCHEMA, True))
+        self.assertEqual(board["columns"][0],
+                         {"status": "ready_to_start", "total": 1})
+        self.assertEqual(len(board["cards"]), 1)
+        card = board["cards"][0]
+        self.assertEqual(card["board_status"], "ready_to_start")
+        self.assertEqual(set(card), {
+            "id", "version", "handle", "board_status", "delivery_status",
+            "kind", "phase", "task", "owner", "agent", "source",
+            "summary", "state_since",
+        })
+        self.assertNotIn("agent_profile_id", card)
+        with self.assertRaises(TaskCardServerRequestError):
+            app.dispatch(
+                "execution_board", request_document(limit=1, extra=True),
+                authorization=f"Bearer {QUEUE_VIEW_TOKEN}",
+            )
+        with self.assertRaises(TaskCardServerRequestError):
+            app.dispatch(
+                "execution_board", request_document(limit=1),
+                authorization=f"Bearer {TOKEN}",
+            )
+        self.assertEqual(
+            (self.execution_cards.count(), self.execution_cards.event_count()),
+            before,
+        )
+
+    def test_execution_board_http_contract_is_queue_view_only(self):
+        self.execution.schedule(1, expected_task_version=1)
+        self.execution_cards.schedule()
+        app = TaskCardApplication(
+            self.cards,
+            {DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: QUEUE_VIEW_TOKEN},
+            execution_cards=self.execution_cards,
+            execution_tokens={DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: QUEUE_VIEW_TOKEN},
+        )
+        with running_server(app) as endpoint:
+            status, _, board = request(
+                endpoint, "/v1/execution-cards/board",
+                request_document(limit=1), token=QUEUE_VIEW_TOKEN,
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual((board["schema"], board["schema_version"]),
+                             (EXECUTION_BOARD_SCHEMA, 1))
+            status, _, refused = request(
+                endpoint, "/v1/execution-cards/board",
+                request_document(limit=1), token=TOKEN,
+            )
+            self.assertEqual((status, refused["error"]["code"]),
+                             (403, "role_forbidden"))
 
     def test_execution_deliverables_route_is_a_delivered_card_read(self):
         workflow = self.execution.schedule(1, expected_task_version=1)
@@ -2015,6 +2083,58 @@ class TaskCardQueueProjectionTests(unittest.TestCase):
             )
         self.assertEqual(status, 200)
         self.assertNotIn(held_id, {card["id"] for card in body["cards"]})
+
+    def test_board_includes_snoozed_work_and_hides_held_card_content(self):
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "UPDATE task_review_cards SET status='snoozed',"
+                "due_at='2030-03-02T12:00:00+00:00' WHERE task_id=2"
+            )
+        claim = self.cards.claim_next(
+            consumer_digest=hashlib.sha256(TOKEN.encode()).hexdigest(),
+            consumer_role=DRIP_ROLE,
+        )
+        self.assertIsNotNone(claim)
+        before = (self.cards.count(), self.cards.event_count())
+        board = self.app.dispatch(
+            "board", request_document(limit=3),
+            authorization=f"Bearer {QUEUE_VIEW_TOKEN}",
+        )
+        self.assertEqual((board["schema"], board["ok"]), (BOARD_SCHEMA, True))
+        self.assertEqual(board["columns"], [
+            {"status": "review", "total": 1},
+            {"status": "snoozed", "total": 1},
+        ])
+        self.assertEqual(board["held_elsewhere"], 1)
+        self.assertEqual({card["board_status"] for card in board["cards"]},
+                         {"review", "snoozed"})
+        self.assertEqual(
+            set(board["cards"][0]),
+            {"id", "version", "handle", "board_status", "delivery_status",
+             "task", "owner", "source", "state_since"},
+        )
+        self.assertEqual((self.cards.count(), self.cards.event_count()), before)
+        with self.assertRaises(TaskCardServerRequestError):
+            self.app.dispatch(
+                "board", request_document(limit=1, unknown=True),
+                authorization=f"Bearer {QUEUE_VIEW_TOKEN}",
+            )
+
+    def test_board_http_contract_is_queue_view_only(self):
+        with running_server(self.app) as endpoint:
+            status, _, board = request(
+                endpoint, "/v1/task-cards/board", request_document(limit=2),
+                token=QUEUE_VIEW_TOKEN,
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual((board["schema"], board["schema_version"]),
+                             (BOARD_SCHEMA, 1))
+            status, _, refused = request(
+                endpoint, "/v1/task-cards/board", request_document(limit=2),
+                token=TOKEN,
+            )
+            self.assertEqual((status, refused["error"]["code"]),
+                             (403, "role_forbidden"))
 
     def _resolve_request(self, card, action="done"):
         return self.app.dispatch(
