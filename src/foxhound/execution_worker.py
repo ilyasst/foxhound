@@ -1816,6 +1816,13 @@ def _repository_result(
                 "for analysis-only work write JSON false to "
                 "result-repository-impact.json"
             )
+    if state.phase is WorkflowPhase.PLAN and repository_impact:
+        if outcome == "completed":
+            raise ExecutionWorkerDraftError(
+                "a planning run that changed the repository must record "
+                "awaiting_plan; for analysis-only work write JSON false to "
+                "result-repository-impact.json"
+            )
     if (
         state.phase in (WorkflowPhase.PLAN, WorkflowPhase.EXECUTE)
         and publication_is_the_work

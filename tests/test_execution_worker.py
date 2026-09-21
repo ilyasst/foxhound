@@ -1410,6 +1410,31 @@ class ExecutionWorkerTests(unittest.TestCase):
                     ):
                         _repository_result(state, draft, self.run_directory)
 
+    def test_planning_run_with_repository_impact_cannot_record_completed(self):
+        origin = SimpleNamespace(
+            kind="issue",
+            record_id="github.com/example-org/example-repo",
+            item_id="42",
+        )
+        draft = {
+            "outcome": "completed",
+            "deliverables": [
+                "Authored the change on branch issue-42-example-slug"
+            ],
+            "external_actions": [],
+            "repository_impact": True,
+        }
+        state = SimpleNamespace(
+            database_path=self.database, task_id=1, phase=WorkflowPhase.PLAN,
+        )
+        with mock.patch(
+            "foxhound.execution_worker._repository_origin", return_value=origin,
+        ):
+            with self.assertRaisesRegex(
+                ExecutionWorkerDraftError, "must record awaiting_plan",
+            ):
+                _repository_result(state, draft, self.run_directory)
+
     def test_ineligible_is_accepted_when_the_repository_was_not_changed(self):
         """A genuinely blocked run keeps the outcome by reporting its effect."""
         origin = SimpleNamespace(
