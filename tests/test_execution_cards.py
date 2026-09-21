@@ -3912,6 +3912,15 @@ class ExecutionCardTests(unittest.TestCase):
         self._external_review(1, "comment-go-external")
         self._assert_comment_and_go(1, WorkflowPhase.EXTERNAL_ACTION)
 
+    def test_comment_and_go_preempts_steer_card(self):
+        claim = self._announced_running_workflow()
+        self.cards.schedule()
+        delivered = self._claim_and_deliver()
+        result = self.cards.comment_and_go(delivered.card.id, expected_version=delivered.card.version, value="New steering note")
+        self.assertTrue(result.accepted)
+        workflow = self.execution.get(claim.task_id)
+        self.assertEqual(workflow.status, WorkflowStatus.QUEUED)
+
     def test_result_review_omits_comment_and_go(self):
         _body, keyboard = render_execution_review_card(self._plan_card(
             kind=ExecutionCardKind.RESULT_REVIEW,

@@ -772,8 +772,10 @@ def _run_claim(
                         process, profile.kill_grace_seconds,
                         sleep=sleep, clock=clock,
                     )
+                    current = service.get(claim.task_id)
+                    terminal = _terminal_result(initial, current, claim.task_id)
                     return ExecutionRunResult(
-                        "claim_lost", NO_PROGRESS_EXIT_CODE,
+                        terminal or "claim_lost", 0 if terminal in {"recorded", "released"} else NO_PROGRESS_EXIT_CODE,
                         claim.task_id, forced,
                     )
                 next_heartbeat = now + profile.heartbeat_seconds
