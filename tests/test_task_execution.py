@@ -410,9 +410,12 @@ class TaskExecutionTests(unittest.TestCase):
             )
             # v54 added the informational-delivery marker and split the one
             # active-card index in two; an older database has one index and
-            # no such column.
+            # no such column. v55 retired run summaries and dropped the
+            # second index again, so it is present only on a database that
+            # stopped between the two.
             connection.execute(
-                "DROP INDEX execution_review_cards_one_active_summary")
+                "DROP INDEX IF EXISTS "
+                "execution_review_cards_one_active_summary")
             connection.execute(
                 "DROP INDEX execution_review_cards_one_active")
             connection.execute(
@@ -1630,7 +1633,8 @@ class TaskExecutionTests(unittest.TestCase):
             1, expected_version=snoozed.version, action="start"
         )
         self.assertEqual(early.refusal, WorkflowRefusal.INVALID_STATE)
-        self.clock.advance(days=1)
+        assert snoozed.wake_at is not None
+        self.clock.value = datetime.fromisoformat(snoozed.wake_at.replace("Z", "+00:00"))
         started = self.service.start_action(
             1, expected_version=snoozed.version, action="start"
         )

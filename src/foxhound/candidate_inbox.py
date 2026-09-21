@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 54
+SCHEMA_VERSION = 56
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -780,6 +780,11 @@ _SCHEMA_V11_COLUMNS = {
 # earlier version is not asked to already have a column that did not exist at
 # that point.
 _SCHEMA_COLUMNS["execution_review_cards"] += ("summary_only",)
+
+# V56 appends the claiming-consumer identity to task review cards (ADR 0036).
+# Added here for the same reason as V54: historical schema maps derived above
+# should not expect it.
+_SCHEMA_COLUMNS["task_review_cards"] += ("claiming_consumer",)
 
 # The versioned maps above are used to validate historical schemas while they
 # migrate.  V45 is additive, so remove its tables and task columns from every
@@ -3024,6 +3029,35 @@ _SCHEMA_V54 = (
 )
 
 
+# Run summaries are retired.  Nothing writes one now, so the index that
+# bounded the summary queue has nothing left to bound, and the rows already
+# in the table would otherwise sit `pending` forever -- never claimed,
+# because every read excludes them, and never retired, because the sweep
+# that retires stale cards reads the same population.  Settling them here is
+# what leaves the table saying only what is still true.
+#
+# The column stays.  Dropping it would rewrite a table that the card service
+# reads on every claim, to erase a distinction the history still needs: these
+# rows really were summaries, and a `result_review` row that lost the marker
+# would read as a decision card nobody ever answered.
+_SCHEMA_V55 = (
+    "UPDATE execution_review_cards SET status='cancelled',"
+    "version=version+1,claim_token_digest=NULL,claim_expires_at=NULL,"
+    "consumer_digest=NULL,"
+    "resolved_at=COALESCE(resolved_at,updated_at) "
+    "WHERE summary_only=1 "
+    "AND status IN ('pending','delivering','delivered');",
+    "DROP INDEX IF EXISTS execution_review_cards_one_active_summary;",
+)
+
+
+# ADR 0036 decision 2: record the claiming consumer's identity on a
+# task review card at claim time. Migration adds structure (ADR 0010).
+_SCHEMA_V56 = (
+    "ALTER TABLE task_review_cards ADD COLUMN claiming_consumer TEXT;",
+)
+
+
 # Context exhaustion is a separate terminal condition for one attempt. The
 # workflow table has a closed reason vocabulary, so admitting it requires a
 # table rebuild rather than silently recording it as an ordinary timeout.
@@ -4497,6 +4531,33 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 54
+            if version == 54:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V55:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 55")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 55
+            if version == 55:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    columns = {
+                        row["name"] for row in connection.execute(
+                            "PRAGMA table_info(task_review_cards)"
+                        )
+                    }
+                    if "claiming_consumer" not in columns:
+                        connection.execute(_SCHEMA_V56[0])
+                    connection.execute("PRAGMA user_version = 56")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 56
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:
@@ -5160,6 +5221,10 @@ class CandidateInbox:
                 and set(columns) == set(expected_columns) | {"steer_digest"}
                 and len(columns) == len(expected_columns) + 1
             ) and not (
+                table == "task_review_cards"
+                and set(columns) == set(expected_columns) | {"claiming_consumer"}
+                and len(columns) == len(expected_columns) + 1
+            ) and not (
                 table == "tasks"
                 and tuple(column for column in columns if column not in {
                     "object", "action", "confidence"
@@ -5173,11 +5238,7 @@ class CandidateInbox:
                 and set(columns) == set(expected_columns)
                 and len(columns) == len(expected_columns)
             ) and not (
-                # SQLite re-adds owner columns at the end when a synthetic
-                # historical-migration rehearsal first drops them. V45 may
-                # already have appended its nullable fields, so the final
-                # shape is equivalent but its harmless column order differs.
-                table == "tasks"
+                table in {"tasks", "task_review_cards"}
                 and set(columns) == set(expected_columns)
                 and len(columns) == len(expected_columns)
             ):

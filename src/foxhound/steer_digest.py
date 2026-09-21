@@ -11,6 +11,7 @@ import json
 import os
 import urllib.request
 
+from .caproute_attribution import request_headers
 from .failure_digest import (
     MAX_DIGEST_CHARS,
     MAX_INPUT_CHARS,
@@ -48,7 +49,7 @@ def digest(transcript: str, *, opener=None) -> str:
             ],
             "temperature": 0.2, "max_tokens": 300, "stream": False,
         }).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        headers=request_headers("steer_digest"),
         method="POST",
     )
     try:
