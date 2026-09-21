@@ -602,6 +602,10 @@ def _run_claim(
         directory.mkdir(mode=0o700)
         if config.task_work_root is not None and config.task_kb_root is not None:
             origin = TaskLedger(config.database_path).origin(claim.task_id)
+            origin_sources = ()
+            if origin and origin.payload:
+                from .card_provenance import stored_origin_sources
+                origin_sources = stored_origin_sources(origin.payload)
             archive = prepare_task_archive(
                 working_root=config.task_work_root,
                 kb_root=config.task_kb_root,
@@ -613,6 +617,7 @@ def _run_claim(
                 origin_kind=None if origin is None else origin.kind,
                 origin_record=None if origin is None else origin.record_id,
                 origin_item=None if origin is None else origin.item_id,
+                origin_sources=origin_sources,
             )
         state_path = directory / "run-state.json"
         instructions_path = directory / INSTRUCTIONS_NAME

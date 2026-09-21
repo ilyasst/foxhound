@@ -190,6 +190,7 @@ class TaskOrigin:
     kind: str
     record_id: str
     item_id: str
+    payload: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1507,10 +1508,11 @@ class TaskLedger:
         """
         with closing(self._connect()) as connection:
             row = connection.execute(
-                "SELECT i.source_system, i.source_kind, i.source_record_id, "
-                "i.source_item_id "
+                "SELECT i.source_system, i.source_kind, i.source_record_id, i.source_item_id, "
+                "h.payload_json AS origin_payload "
                 "FROM task_candidate_bindings AS b "
                 "JOIN candidate_inbox AS i ON i.candidate_id=b.candidate_id "
+                "LEFT JOIN candidate_revision_history AS h ON h.candidate_id=b.candidate_id AND h.source_revision=b.source_revision "
                 "WHERE b.task_id=? AND b.relation='accepted'",
                 (task_id,),
             ).fetchone()
@@ -1521,6 +1523,7 @@ class TaskLedger:
             kind=str(row["source_kind"]),
             record_id=str(row["source_record_id"]),
             item_id=str(row["source_item_id"]),
+            payload=row["origin_payload"] if row["origin_payload"] else None,
         )
 
     def source_snapshot_request(
