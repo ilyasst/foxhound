@@ -1455,6 +1455,60 @@ class ExecutionWorkerTests(unittest.TestCase):
             result = _repository_result(state, draft, self.run_directory)
             self.assertEqual(result["outcome"], "completed")
 
+    def test_planning_run_with_repository_impact_and_references_can_record_completed(self):
+        origin = SimpleNamespace(
+            kind="issue",
+            record_id="github.com/example-org/example-repo",
+            item_id="42",
+        )
+        draft = {
+            "outcome": "completed",
+            "deliverables": ["Change already exists upstream"],
+            "external_actions": [],
+            "repository_impact": True,
+            "repository_references": [
+                {
+                    "kind": "pull-request",
+                    "url": "https://github.com/example-org/example-repo/pull/42",
+                }
+            ],
+        }
+        state = SimpleNamespace(
+            database_path=self.database, task_id=1, phase=WorkflowPhase.PLAN,
+        )
+        with mock.patch(
+            "foxhound.execution_worker._repository_origin", return_value=origin,
+        ):
+            result = _repository_result(state, draft, self.run_directory)
+            self.assertEqual(result["outcome"], "completed")
+
+    def test_execution_run_with_repository_impact_and_references_can_record_completed(self):
+        origin = SimpleNamespace(
+            kind="issue",
+            record_id="github.com/example-org/example-repo",
+            item_id="42",
+        )
+        draft = {
+            "outcome": "completed",
+            "deliverables": ["Work already completed upstream"],
+            "external_actions": [],
+            "repository_impact": True,
+            "repository_references": [
+                {
+                    "kind": "pull-request",
+                    "url": "https://github.com/example-org/example-repo/pull/42",
+                }
+            ],
+        }
+        state = SimpleNamespace(
+            database_path=self.database, task_id=1, phase=WorkflowPhase.EXECUTE,
+        )
+        with mock.patch(
+            "foxhound.execution_worker._repository_origin", return_value=origin,
+        ):
+            result = _repository_result(state, draft, self.run_directory)
+            self.assertEqual(result["outcome"], "completed")
+
     def test_ineligible_is_accepted_when_the_repository_was_not_changed(self):
         """A genuinely blocked run keeps the outcome by reporting its effect."""
         origin = SimpleNamespace(
@@ -1767,9 +1821,9 @@ class ExecutionWorkerTests(unittest.TestCase):
         )
         origin = SimpleNamespace(kind="review_request")
         _append_repository_receipt(self.run_directory, {
-            "kind": "issue-comment",
+            "kind": "pull-request",
             "repository": "github.com/example-org/example-repo",
-            "url": "https://github.com/example-org/example-repo/issues/42#issuecomment-1",
+            "url": "https://github.com/example-org/example-repo/pull/42",
         })
         with mock.patch(
             "foxhound.execution_worker._repository_origin", return_value=origin,
@@ -1795,6 +1849,27 @@ class ExecutionWorkerTests(unittest.TestCase):
                 self.run_directory,
             )
         self.assertEqual(len(result["deliverables"]), 2)
+
+    def test_github_review_completion_accepts_issue_comment_receipt(self):
+        state = SimpleNamespace(
+            database_path=self.database,
+            task_id=1,
+            phase=WorkflowPhase.EXTERNAL_ACTION,
+        )
+        origin = SimpleNamespace(kind="review_request")
+        _append_repository_receipt(self.run_directory, {
+            "kind": "issue-comment",
+            "repository": "github.com/example-org/example-repo",
+            "url": "https://github.com/example-org/example-repo/issues/42#issuecomment-1",
+        })
+        with mock.patch(
+            "foxhound.execution_worker._repository_origin", return_value=origin,
+        ):
+            result = _repository_result(
+                state, {"outcome": "completed", "deliverables": []},
+                self.run_directory,
+            )
+        self.assertEqual(len(result["deliverables"]), 1)
 
     def test_draft_cli_errors_are_content_free(self):
         private_value = "synthetic-private-outcome-value"
