@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 55
+SCHEMA_VERSION = 56
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -780,6 +780,11 @@ _SCHEMA_V11_COLUMNS = {
 # earlier version is not asked to already have a column that did not exist at
 # that point.
 _SCHEMA_COLUMNS["execution_review_cards"] += ("summary_only",)
+
+# V56 appends the claiming-consumer identity to task review cards (ADR 0036).
+# Added here for the same reason as V54: historical schema maps derived above
+# should not expect it.
+_SCHEMA_COLUMNS["task_review_cards"] += ("claiming_consumer",)
 
 # The versioned maps above are used to validate historical schemas while they
 # migrate.  V45 is additive, so remove its tables and task columns from every
@@ -3046,6 +3051,13 @@ _SCHEMA_V55 = (
 )
 
 
+# ADR 0036 decision 2: record the claiming consumer's identity on a
+# task review card at claim time. Migration adds structure (ADR 0010).
+_SCHEMA_V56 = (
+    "ALTER TABLE task_review_cards ADD COLUMN claiming_consumer TEXT;",
+)
+
+
 # Context exhaustion is a separate terminal condition for one attempt. The
 # workflow table has a closed reason vocabulary, so admitting it requires a
 # table rebuild rather than silently recording it as an ordinary timeout.
@@ -4530,6 +4542,22 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 55
+            if version == 55:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    columns = {
+                        row["name"] for row in connection.execute(
+                            "PRAGMA table_info(task_review_cards)"
+                        )
+                    }
+                    if "claiming_consumer" not in columns:
+                        connection.execute(_SCHEMA_V56[0])
+                    connection.execute("PRAGMA user_version = 56")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 56
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:
@@ -5193,6 +5221,10 @@ class CandidateInbox:
                 and set(columns) == set(expected_columns) | {"steer_digest"}
                 and len(columns) == len(expected_columns) + 1
             ) and not (
+                table == "task_review_cards"
+                and set(columns) == set(expected_columns) | {"claiming_consumer"}
+                and len(columns) == len(expected_columns) + 1
+            ) and not (
                 table == "tasks"
                 and tuple(column for column in columns if column not in {
                     "object", "action", "confidence"
@@ -5206,11 +5238,7 @@ class CandidateInbox:
                 and set(columns) == set(expected_columns)
                 and len(columns) == len(expected_columns)
             ) and not (
-                # SQLite re-adds owner columns at the end when a synthetic
-                # historical-migration rehearsal first drops them. V45 may
-                # already have appended its nullable fields, so the final
-                # shape is equivalent but its harmless column order differs.
-                table == "tasks"
+                table in {"tasks", "task_review_cards"}
                 and set(columns) == set(expected_columns)
                 and len(columns) == len(expected_columns)
             ):
