@@ -40,6 +40,7 @@ from foxhound.execution_worker import (
     _publication_is_the_deliverable,
     _repository_result,
     _repository_receipts,
+    _read_handoff,
     _worker_operations,
 )
 from foxhound.knowledge_client import KnowledgeClientConfig, KnowledgeClientError
@@ -395,7 +396,7 @@ class ExecutionWorkerTests(unittest.TestCase):
         self.assertNotIn(CLAIM_TOKEN, rendered)
         self.assertNotIn(str(self.database), rendered)
         self.assertEqual(context["task"]["text"], "Synthetic task")
-        self.assertEqual(context["schema_version"], 7)
+        self.assertEqual(context["schema_version"], 8)
         self.assertEqual(context["runtime"]["today"], "2030-01-02")
         self.assertEqual(context["runtime"]["today_weekday"], "Wednesday")
         self.assertEqual(
@@ -444,10 +445,42 @@ class ExecutionWorkerTests(unittest.TestCase):
             context["workflow"]["agent_profile_revision"],
             self.claim.agent_profile_revision,
         )
+        self.assertEqual(context["workflow"]["attempt_count"], 1)
+        self.assertIsNone(context["workflow"]["handoff"])
         self.assertEqual(context["operator"]["display_name"], "Person A")
         self.assertEqual(result["layers"][0]["documents"][0]["excerpt"],
                          "Synthetic evidence.")
         self.assertNotIn(CLAIM_TOKEN, repr(load_run_state(self.state_path)))
+
+    def test_handoff_evidence_reading_and_truncation(self):
+        paths = self._enable_archive()
+        worker = self._worker("http://127.0.0.1:9")
+        self.assertIsNone(_read_handoff(None, "execute"))
+        self.assertIsNone(_read_handoff(str(paths.working_directory), "execute"))
+
+        handoff_file = paths.working_directory / "handoff-plan.md"
+        handoff_file.write_text("Small handoff note.", encoding="utf-8")
+        self.assertEqual(
+            _read_handoff(str(paths.working_directory), "plan"),
+            "Small handoff note.",
+        )
+
+        with knowledge_server() as endpoint:
+            worker = self._worker(endpoint)
+            context = worker.context()
+        self.assertEqual(context["workflow"]["handoff"], "Small handoff note.")
+        self.assertEqual(context["workflow"]["attempt_count"], 1)
+
+        # Truncation over 16384 bytes
+        large_content = "A" * 20000
+        handoff_file.write_text(large_content, encoding="utf-8")
+        truncated = _read_handoff(str(paths.working_directory), "plan")
+        self.assertIsNotNone(truncated)
+        self.assertTrue(truncated.endswith("[TRUNCATED: handoff file exceeded 16384 bytes]"))
+        self.assertEqual(
+            len(truncated.encode("utf-8")),
+            16384 + len("\n\n[TRUNCATED: handoff file exceeded 16384 bytes]".encode("utf-8")),
+        )
 
     def test_worker_capabilities_follow_the_phase_gate(self):
         for phase in WorkflowPhase:

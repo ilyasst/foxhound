@@ -72,7 +72,7 @@ RUN_STATE_SCHEMA = "foxhound.execution-run-state"
 RUN_STATE_SCHEMA_VERSION = 6
 INSTRUCTIONS_NAME = "agent-instructions.json"
 WORK_CONTEXT_SCHEMA = "foxhound.execution-work-context"
-WORK_CONTEXT_SCHEMA_VERSION = 7
+WORK_CONTEXT_SCHEMA_VERSION = 8
 WORKER_SEARCH_SCHEMA = "foxhound.execution-worker-search"
 RESULT_DRAFT_SCHEMA = "foxhound.execution-result-draft"
 RESULT_DRAFT_READY_SCHEMA = "foxhound.execution-result-draft-ready"
@@ -114,6 +114,24 @@ _RESULT_INPUTS = (
 def _local_today() -> str:
     """Return the host's authoritative local calendar date."""
     return datetime.now().astimezone().date().isoformat()
+
+
+def _read_handoff(task_work_directory: str | None, phase: str) -> str | None:
+    if not task_work_directory:
+        return None
+    path = Path(task_work_directory) / f"handoff-{phase}.md"
+    if not path.is_file():
+        return None
+    try:
+        raw = path.read_bytes()
+        if not raw:
+            return None
+        if len(raw) > 16384:
+            content = raw[:16384].decode("utf-8", errors="replace")
+            return content + "\n\n[TRUNCATED: handoff file exceeded 16384 bytes]"
+        return raw.decode("utf-8", errors="replace")
+    except Exception:
+        return None
 
 
 def _local_calendar() -> dict[str, object]:
@@ -359,6 +377,11 @@ class ExecutionWorker:
             "workflow": {
                 "version": state.workflow_version,
                 "phase": state.phase.value,
+                "attempt_count": (
+                    service.get(state.task_id).failure_count + 1
+                    if service.get(state.task_id) is not None
+                    else 1
+                ),
                 "agent_profile_id": state.agent_profile_id,
                 "agent_profile_revision": state.agent_profile_revision,
                 "reader_instruction": service.reader_instruction(
@@ -385,6 +408,7 @@ class ExecutionWorker:
                     expected_version=state.workflow_version,
                     claim_token=state.claim_token,
                 )),
+                "handoff": _read_handoff(state.task_work_directory, state.phase.value),
             },
             "operator": {
                 "revision": context.revision,

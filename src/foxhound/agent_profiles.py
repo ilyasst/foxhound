@@ -519,6 +519,19 @@ def _historical_general_profiles() -> tuple[AgentProfile, ...]:
             kill_grace_seconds=30,
             allowed_phases=_PHASES,
         ),
+        AgentProfile(
+            profile_id="general",
+            display_name="General",
+            runtime="hermes",
+            prompt_template=_GENERAL_PROMPT_TEMPLATE_V14,
+            toolsets=("terminal", "file", "web"),
+            max_turns=80,
+            timeout_seconds=2_700,
+            claim_lease_seconds=3_300,
+            heartbeat_seconds=60,
+            kill_grace_seconds=30,
+            allowed_phases=_PHASES,
+        ),
     )
 
 
@@ -1194,17 +1207,22 @@ _GENERAL_PROMPT_TEMPLATE_V14 = _GENERAL_PROMPT_TEMPLATE_V13.replace(
     "Never merge, deploy, publish, message, purchase, or perform another effect unless that exact effect is approved and a bounded Foxhound worker action supports it. If no bounded action exists, report that limitation instead of bypassing the gate. If a terminal command fails and you modify files on disk before retrying, vary the command line (for example by appending a comment like `# retry`) so loop-detection guardrails do not block execution on disk-state changes.",
 )
 
-_GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V14
+_GENERAL_PROMPT_TEMPLATE_V15 = _GENERAL_PROMPT_TEMPLATE_V14.replace(
+    "Prepare the reviewable result early enough that useful work cannot be lost to the turn limit.",
+    "Prepare the reviewable result early enough that useful work cannot be lost to the turn limit.\nIf the work is long, write an owner-only `handoff-<phase>.md` (e.g. `handoff-execute.md`) in `workspace.task_folder` early and update it as work proceeds. It is an unreviewed note to the next attempt if this one is killed by the budget; describe what was established, what was changed and where, and what to do next. It is not a result and does not replace one."
+)
+
+_GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V15
 
 # A built-in profile is a release artifact.  Keep its fingerprints beside the
 # prompt so changing the prompt or policy without publishing a new profile
 # revision fails at every runner and scheduler startup, rather than leaving a
 # stale test in a different file to discover the mismatch later.
 GENERAL_PROFILE_RELEASE_REVISION = (
-    "02a2f7807d3fd05c99d5e807c1153fd3acdd852c940466b58e97a5a9c2f8783e"
+    "f96650db7a90b6fcf84954fdc3698b75e6147949410bcd7d502a25d31636fced"
 )
 GENERAL_PROFILE_RELEASE_PROMPT_SHA256 = (
-    "1c9b8be4784f6aba7174631acea1c8b6f8f59dd6f8927787dbbe31623978f579"
+    "62d2a3d67e5641bea2fa0aa57b30c7f3707583ee54d104d32a20fed8ba452fbe"
 )
 
 
