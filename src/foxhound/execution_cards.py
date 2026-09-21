@@ -2753,7 +2753,22 @@ class ExecutionCardService:
         fuller -- by what is happening in another.
         """
         if bool(row["summary_only"]):
+            # `delivering` only.  A summary settles when it is delivered and
+            # asks nothing afterwards, so a delivered one occupies no part
+            # of this band -- counting it makes the bound cumulative instead
+            # of concurrent, and the band fills permanently after the first
+            # few.  Observed: five delivered summaries against a ceiling of
+            # five, and nineteen queued behind them that could never be
+            # claimed.  The other two bands count `delivered` because a card
+            # awaiting an answer really is still occupying the surface.
             suffix, predicate = "_summary", "summary_only=1"
+            held = connection.execute(
+                "SELECT count(*) FROM execution_review_cards WHERE "
+                "status='delivering' AND consumer_digest=? "
+                "AND summary_only=1",
+                (consumer_digest,),
+            ).fetchone()[0]
+            return consumer_role + suffix, int(held)
         elif row["kind"] == ExecutionCardKind.STEER:
             suffix, predicate = "_steer", "summary_only=0 AND kind='steer'"
         else:
