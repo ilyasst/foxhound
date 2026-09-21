@@ -493,6 +493,9 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertEqual(
             schedule[schedule.index("--skip-planning-for") + 1], "issue"
         )
+        self.assertEqual(
+            schedule[schedule.index("--execute-without-asking") + 1], "issue"
+        )
 
     def test_a_skip_without_execution_authority_names_the_missing_grant(self) -> None:
         document = self._document()
