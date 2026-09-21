@@ -4588,17 +4588,150 @@ class RunSummaryCardTests(ExecutionCardTests):
         body, keyboard = render_execution_review_card(claim.card)
         self.assertIn("Run summary", body)
         self.assertIn("no reply needed", body)
-        self.assertEqual(keyboard, {"inline_keyboard": []})
+        self.assertIn("sends this back to planning", body)
+        self.assertEqual(
+            [b["text"] for row in keyboard["inline_keyboard"] for b in row],
+            ["\U0001f4ac Discuss"],
+        )
 
-    def test_a_summary_offers_the_reader_no_decision(self):
-        """A control here would re-open a choice already made without them."""
+    def test_a_summary_offers_no_decision_but_does_offer_discussion(self):
+        """A decision here would re-open a choice already made without them.
+
+        Disagreeing is not that choice. The granted phase has advanced and
+        nothing is waiting on the reader, but a reader who thinks it went
+        the wrong way still needs somewhere to say so before the next gate
+        arrives with the work already done.
+        """
         self._bind_issue_origin(1)
         self._advance_once(1, "summary-plan-1")
         claim = self.cards.claim_next(consumer_digest=CONSUMER)
         for approvable in (True, False):
             with self.subTest(approvable=approvable):
-                self.assertEqual(
-                    _button_rows(claim.card, approvable=approvable), ())
+                rows = _button_rows(claim.card, approvable=approvable)
+                verbs = {button[1] for row in rows for button in row}
+                self.assertEqual(verbs, {"discuss"})
+                # None of these reopen a settled decision, and none of them
+                # is a new verb the delivering side would refuse.
+                self.assertFalse(verbs & {
+                    "approve", "revise", "start", "done", "drop", "snooze",
+                })
+
+    def test_a_reader_can_discuss_a_summary_back_to_planning(self):
+        """The one reader action a summary carries, end to end."""
+        self._bind_issue_origin(1)
+        self._advance_once(1, "summary-plan-1")
+        claim = self.cards.claim_next(consumer_digest=CONSUMER)
+        delivered = self.cards.complete_delivery(
+            claim.card.id,
+            expected_version=claim.card.version,
+            claim_token=claim.token,
+            transport="synthetic",
+            delivery_ref="synthetic-1",
+        )
+        result = self.cards.submit_input(
+            claim.card.id,
+            expected_version=delivered.card_version,
+            kind="discussion",
+            value="The premise is wrong; check the other component first.",
+        )
+
+        self.assertIs(result.disposition, ExecutionCardDisposition.APPLIED)
+        self.assertEqual(result.workflow_status, WorkflowStatus.QUEUED)
+        self.assertEqual(result.workflow_phase, WorkflowPhase.PLAN)
+
+    def test_discussing_a_summary_regates_from_the_current_version(self):
+        """A summary is not pinned, so its own version is stale by design.
+
+        `_current_card` deliberately lets a summary stay actionable after the
+        workflow moves on. Re-gating from the version recorded on the card
+        would therefore match no row, and every summary discussion would fail
+        as "execution workflow state changed".
+        """
+        self._bind_issue_origin(1)
+        self._advance_once(1, "summary-plan-1")
+        claim = self.cards.claim_next(consumer_digest=CONSUMER)
+        delivered = self.cards.complete_delivery(
+            claim.card.id,
+            expected_version=claim.card.version,
+            claim_token=claim.token,
+            transport="synthetic",
+            delivery_ref="synthetic-1",
+        )
+        # The advanced phase then starts, which is the normal case: a
+        # summary stays actionable while the work it reports on moves on.
+        self._granted().claim_next()
+        with closing(sqlite3.connect(self.database)) as connection:
+            card_version, current_version = connection.execute(
+                "SELECT c.workflow_version,w.version FROM "
+                "execution_review_cards AS c JOIN task_execution_workflows "
+                "AS w ON w.task_id=c.task_id WHERE c.id=?",
+                (claim.card.id,),
+            ).fetchone()
+        self.assertGreater(current_version, card_version)
+
+        result = self.cards.submit_input(
+            claim.card.id,
+            expected_version=delivered.card_version,
+            kind="discussion",
+            value="Send this back.",
+        )
+
+        self.assertIs(result.disposition, ExecutionCardDisposition.APPLIED)
+        self.assertEqual(result.workflow_version, current_version + 1)
+
+    def test_a_summary_note_reaches_the_next_claim(self):
+        """A note nobody reads is the failure this control exists to fix."""
+        self._bind_issue_origin(1)
+        self._advance_once(1, "summary-plan-1")
+        claim = self.cards.claim_next(consumer_digest=CONSUMER)
+        delivered = self.cards.complete_delivery(
+            claim.card.id,
+            expected_version=claim.card.version,
+            claim_token=claim.token,
+            transport="synthetic",
+            delivery_ref="synthetic-1",
+        )
+        note = "Check the resolver before planning this again."
+        self.cards.submit_input(
+            claim.card.id,
+            expected_version=delivered.card_version,
+            kind="discussion",
+            value=note,
+        )
+
+        service = self._granted()
+        run = service.claim_next()
+        self.assertEqual(
+            service.reader_instruction(
+                run.task_id,
+                expected_version=run.workflow_version,
+                claim_token=run.token,
+            ),
+            note,
+        )
+
+    def test_a_summary_refuses_reassignment(self):
+        """Widening the lookup must not widen what a summary can do."""
+        self._bind_issue_origin(1)
+        self._advance_once(1, "summary-plan-1")
+        claim = self.cards.claim_next(consumer_digest=CONSUMER)
+        delivered = self.cards.complete_delivery(
+            claim.card.id,
+            expected_version=claim.card.version,
+            claim_token=claim.token,
+            transport="synthetic",
+            delivery_ref="synthetic-1",
+        )
+
+        result = self.cards.submit_input(
+            claim.card.id,
+            expected_version=delivered.card_version,
+            kind="reassignment",
+            value="Person A",
+        )
+
+        self.assertIs(result.disposition, ExecutionCardDisposition.REFUSED)
+        self.assertIs(result.refusal, ExecutionCardRefusal.INVALID_ACTION)
 
     def test_a_summary_is_always_a_completed_work_card(self):
         """A cross-repository constraint, not a stylistic one.

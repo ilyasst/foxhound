@@ -2104,8 +2104,12 @@ class ExecutionCardService:
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("BEGIN IMMEDIATE")
             try:
+                # Summaries are read here and nowhere else that acts on a
+                # card: a discussion is the one reader action a summary
+                # carries. Reassignment is refused just below, so widening
+                # the lookup does not widen what a summary can do.
                 row = connection.execute(
-                    self._card_select(summaries=False) + " AND c.id=?", (card_id,)
+                    self._card_select(summaries=None) + " AND c.id=?", (card_id,)
                 ).fetchone()
                 refusal = _card_guard(row, expected_version)
                 if (
@@ -2113,6 +2117,12 @@ class ExecutionCardService:
                     and row["status"] != ExecutionCardStatus.DELIVERED
                 ):
                     refusal = ExecutionCardRefusal.INVALID_STATE
+                if (
+                    refusal is None
+                    and bool(row["summary_only"])
+                    and kind != "discussion"
+                ):
+                    refusal = ExecutionCardRefusal.INVALID_ACTION
                 if refusal is None and not _current_card(row):
                     refusal = ExecutionCardRefusal.STALE_VERSION
                 # A gate used to refuse both, on the reasoning that there
@@ -2130,7 +2140,20 @@ class ExecutionCardService:
                     connection.rollback()
                     return _refused_row(card_id, row, refusal)
 
-                target_workflow_version = int(row["workflow_version"]) + 1
+                # Every other card is pinned to the workflow version it was
+                # cut at, and `_current_card` refuses it once that moves. A
+                # summary is deliberately not pinned -- it reports a finished
+                # run, and the workflow advancing afterwards is the normal
+                # case -- so the version on the row is stale by design and
+                # the re-gate has to start from where the workflow is now.
+                # Using the card's version would update no row and surface as
+                # "execution workflow state changed" on every summary.
+                base_workflow_version = (
+                    int(row["workflow_version_current"])
+                    if bool(row["summary_only"])
+                    else int(row["workflow_version"])
+                )
+                target_workflow_version = base_workflow_version + 1
                 connection.execute(
                     "INSERT INTO execution_reader_inputs("
                     "card_id,task_id,card_version,task_version,"
@@ -2141,7 +2164,7 @@ class ExecutionCardService:
                         int(row["task_id"]),
                         expected_version,
                         int(row["task_version"]),
-                        int(row["workflow_version"]),
+                        base_workflow_version,
                         target_workflow_version,
                         kind,
                         value,
@@ -2182,7 +2205,7 @@ class ExecutionCardService:
                             target_workflow_version,
                             now,
                             int(row["task_id"]),
-                            int(row["workflow_version"]),
+                            base_workflow_version,
                         ),
                     )
                 else:
@@ -4301,6 +4324,13 @@ def _summary_card_lines(
         lines.append("\U0001f4dd Run summary \u2014 no reply needed")
         lines.append(f"Outcome: {outcome}")
         lines.append(f"Summary: {card.summary}")
+    # The heading still says no reply is needed, because none is: the phase
+    # advanced under a standing grant and nothing is waiting. That is not the
+    # same as having no way to object, which is what the card used to imply.
+    lines.extend(("", (
+        "Discuss sends this back to planning with your note \u2014 "
+        "say what should change, or what to follow up on."
+    )))
     return lines
 
 
@@ -4949,10 +4979,17 @@ def _button_rows(
     card: ExecutionReviewCard, *, approvable: bool
 ) -> tuple[tuple[tuple[str, str], ...], ...]:
     if card.summary_only:
-        # Nothing to press. A control here would be a decision the workflow
-        # has already taken without the reader, offered back to them as
-        # though it were still open.
-        return ()
+        # No approval control: the decision this reports was taken under a
+        # standing grant, and offering it back would pretend it is still
+        # open. Disagreeing with it is a different thing, and it was the
+        # omission that made the card one-way. A reader who reads a granted
+        # phase and thinks it went the wrong way had nowhere to say so, and
+        # the next gate arrives only once the work is already done.
+        #
+        # `discuss` is the existing verb, carried by every other card kind
+        # and already known to the delivering side, so adding it here is not
+        # a new button verb and does not gate on that side catching up.
+        return ((("\U0001f4ac Discuss", "discuss"),),)
     kind = card.kind
     if kind is ExecutionCardKind.START:
         if (
