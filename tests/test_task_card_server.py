@@ -29,6 +29,7 @@ from foxhound.agent_profiles import (
     parse_profile,
 )
 from foxhound.execution_cards import (
+    ExecutionCardStats,
     ExecutionCardService,
     parse_execution_agent_callback,
     parse_execution_review_callback,
@@ -1047,6 +1048,36 @@ class TaskCardServerTests(unittest.TestCase):
             )
             self.assertEqual(status, 401)
         self.assertEqual((self.cards.count(), self.cards.event_count()), before)
+
+    def test_v1_stats_keeps_its_key_set_when_steer_work_exists(self):
+        """A versioned response may not grow a field on some deployments.
+
+        The client validates this key set exactly.  Adding steer counts
+        only when a steer card happens to exist makes the response valid
+        on quiet deployments and refused on busy ones -- and a refused
+        response stops the sweep, so no execution card reaches the reader
+        at all.  Observed: a steer card entered `delivering`, and
+        sixty-one seconds later delivery stopped entirely.
+        """
+        steer = ExecutionCardStats(
+            pending=0, delivering=0, delivered=0, active=0,
+            steer_pending=2, steer_delivering=1, steer_delivered=3,
+        )
+        with mock.patch.object(
+            ExecutionCardService, "stats", return_value=steer
+        ):
+            with running_server(self.app) as endpoint:
+                status, _, body = request(
+                    endpoint,
+                    "/v1/execution-cards/stats",
+                    request_document(),
+                )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(set(body), {
+            "schema", "schema_version", "ok",
+            "pending", "delivering", "delivered", "active",
+        })
 
     def test_execution_stats_and_missing_adapter_are_content_free(self):
         before = (
