@@ -20,8 +20,8 @@ from .task_ledger import TaskLedgerError
 HEALTH_SCHEMA = "foxhound.delivery-health"
 # 2 adds `superseded_profiles`; 3 adds the count of workflows parked because
 # their measured context did not fit; 4 adds `admission`. Consumers must not
-# infer any of them from a missing aggregate field.
-HEALTH_SCHEMA_VERSION = 5
+# infer any of them from a missing aggregate field. 6 adds `admission.preserved_open`.
+HEALTH_SCHEMA_VERSION = 6
 MAX_THRESHOLD_SECONDS = 7 * 24 * 60 * 60
 MAX_RECENT_FAILURES = 10_000
 
@@ -77,6 +77,7 @@ class AdmissionHealth:
 
     unadmitted: int
     oldest_unadmitted_age_seconds: int | None
+    preserved_open: int
 
 
 @dataclass(frozen=True)
@@ -229,16 +230,25 @@ def _admission_health(connection: object, now: datetime) -> AdmissionHealth:
     hold the alert on forever.
     """
     row = connection.execute(
-        "SELECT COUNT(*) AS unadmitted, MIN(t.created_at) AS oldest "
-        "FROM tasks AS t LEFT JOIN task_execution_workflows AS w "
-        "ON w.task_id=t.id WHERE t.status='open' AND w.task_id IS NULL "
-        "AND NOT EXISTS("
-        " SELECT 1 FROM task_candidate_bindings AS b JOIN "
-        " task_candidate_lifecycle AS l ON l.candidate_id=b.candidate_id "
-        " WHERE b.task_id=t.id AND b.relation='accepted' "
-        " AND l.state='withdrawn' AND l.resolution='preserved_open')"
+        "SELECT "
+        "SUM(CASE WHEN is_preserved = 0 THEN 1 ELSE 0 END) AS unadmitted, "
+        "MIN(CASE WHEN is_preserved = 0 THEN created_at END) AS oldest, "
+        "SUM(CASE WHEN is_preserved = 1 THEN 1 ELSE 0 END) AS preserved "
+        "FROM ("
+        " SELECT t.id, t.created_at, "
+        " CASE WHEN EXISTS("
+        "  SELECT 1 FROM task_candidate_bindings AS b JOIN "
+        "  task_candidate_lifecycle AS l ON l.candidate_id=b.candidate_id "
+        "  WHERE b.task_id=t.id AND b.relation='accepted' "
+        "  AND l.state='withdrawn' AND l.resolution='preserved_open'"
+        " ) THEN 1 ELSE 0 END AS is_preserved "
+        " FROM tasks AS t "
+        " LEFT JOIN task_execution_workflows AS w ON w.task_id=t.id "
+        " WHERE t.status='open' AND w.task_id IS NULL"
+        ")"
     ).fetchone()
     unadmitted = int(row["unadmitted"] or 0)
+    preserved = int(row["preserved"] or 0)
     oldest = row["oldest"]
     return AdmissionHealth(
         unadmitted=unadmitted,
@@ -246,6 +256,7 @@ def _admission_health(connection: object, now: datetime) -> AdmissionHealth:
             None if not unadmitted or oldest is None
             else _age(now, _timestamp(oldest))
         ),
+        preserved_open=preserved,
     )
 
 
