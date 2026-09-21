@@ -1630,7 +1630,8 @@ class TaskExecutionTests(unittest.TestCase):
             1, expected_version=snoozed.version, action="start"
         )
         self.assertEqual(early.refusal, WorkflowRefusal.INVALID_STATE)
-        self.clock.advance(days=1)
+        assert snoozed.wake_at is not None
+        self.clock.value = datetime.fromisoformat(snoozed.wake_at.replace("Z", "+00:00"))
         started = self.service.start_action(
             1, expected_version=snoozed.version, action="start"
         )
