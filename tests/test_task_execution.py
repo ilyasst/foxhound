@@ -410,9 +410,12 @@ class TaskExecutionTests(unittest.TestCase):
             )
             # v54 added the informational-delivery marker and split the one
             # active-card index in two; an older database has one index and
-            # no such column.
+            # no such column. v55 retired run summaries and dropped the
+            # second index again, so it is present only on a database that
+            # stopped between the two.
             connection.execute(
-                "DROP INDEX execution_review_cards_one_active_summary")
+                "DROP INDEX IF EXISTS "
+                "execution_review_cards_one_active_summary")
             connection.execute(
                 "DROP INDEX execution_review_cards_one_active")
             connection.execute(

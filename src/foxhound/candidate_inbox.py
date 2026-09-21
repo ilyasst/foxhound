@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 54
+SCHEMA_VERSION = 55
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -3024,6 +3024,28 @@ _SCHEMA_V54 = (
 )
 
 
+# Run summaries are retired.  Nothing writes one now, so the index that
+# bounded the summary queue has nothing left to bound, and the rows already
+# in the table would otherwise sit `pending` forever -- never claimed,
+# because every read excludes them, and never retired, because the sweep
+# that retires stale cards reads the same population.  Settling them here is
+# what leaves the table saying only what is still true.
+#
+# The column stays.  Dropping it would rewrite a table that the card service
+# reads on every claim, to erase a distinction the history still needs: these
+# rows really were summaries, and a `result_review` row that lost the marker
+# would read as a decision card nobody ever answered.
+_SCHEMA_V55 = (
+    "UPDATE execution_review_cards SET status='cancelled',"
+    "version=version+1,claim_token_digest=NULL,claim_expires_at=NULL,"
+    "consumer_digest=NULL,"
+    "resolved_at=COALESCE(resolved_at,updated_at) "
+    "WHERE summary_only=1 "
+    "AND status IN ('pending','delivering','delivered');",
+    "DROP INDEX IF EXISTS execution_review_cards_one_active_summary;",
+)
+
+
 # Context exhaustion is a separate terminal condition for one attempt. The
 # workflow table has a closed reason vocabulary, so admitting it requires a
 # table rebuild rather than silently recording it as an ordinary timeout.
@@ -4497,6 +4519,17 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 54
+            if version == 54:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V55:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 55")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 55
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:
