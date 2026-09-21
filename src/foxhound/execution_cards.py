@@ -309,6 +309,7 @@ class ExecutionReviewCard:
     #: Informational: this card reports what a run did and asks
     #: nothing.  It carries no controls and settles when it is delivered.
     summary_only: bool = False
+    card_discussion: str | None = field(default=None, repr=False)
     #: Why the last attempt stopped, in the summariser's words. A reason
     #: and an exit code say how the process ended, which cannot tell an
     #: exhausted turn budget from a saturated backend from a refused
@@ -2906,6 +2907,9 @@ class ExecutionCardService:
             "(SELECT i.value FROM execution_reader_inputs AS i "
             " WHERE i.task_id=c.task_id AND i.kind='discussion' "
             " ORDER BY i.sequence DESC LIMIT 1) AS revision_note,"
+            "(SELECT i.value FROM execution_reader_inputs AS i "
+            " WHERE i.card_id=c.id AND i.kind='discussion' "
+            " ORDER BY i.sequence DESC LIMIT 1) AS card_discussion,"
             # Whether this pass actually changed anything. Read from the
             # ledger's own definition of an answer rather than a second one
             # kept here: a card that says "unchanged" while the ledger would
@@ -3416,6 +3420,7 @@ def _card(
                 else ExecutionOutcome(row["result_outcome"])
             ),
             summary_only=bool(row["summary_only"]),
+            card_discussion=str(row["card_discussion"]) if row["card_discussion"] is not None else None,
             revisions=max(0, int(row["revision_count"] or 0)),
             revision_note=str(row["revision_note"] or ""),
             unchanged_from_previous=bool(row["unchanged_from_previous"]),
@@ -4327,10 +4332,16 @@ def _summary_card_lines(
     # The heading still says no reply is needed, because none is: the phase
     # advanced under a standing grant and nothing is waiting. That is not the
     # same as having no way to object, which is what the card used to imply.
-    lines.extend(("", (
-        "Discuss sends this back to planning with your note \u2014 "
-        "say what should change, or what to follow up on."
-    )))
+    if card.card_discussion:
+        if html:
+            lines.extend(("", "<b>Discussed:</b>", _escape(card.card_discussion)))
+        else:
+            lines.extend(("", f"Discussed: {card.card_discussion}"))
+    else:
+        lines.extend(("", (
+            "Discuss sends this back to planning with your note \u2014 "
+            "say what should change, or what to follow up on."
+        )))
     return lines
 
 

@@ -4638,6 +4638,18 @@ class RunSummaryCardTests(ExecutionCardTests):
         self.assertIs(result.disposition, ExecutionCardDisposition.APPLIED)
         self.assertEqual(result.workflow_status, WorkflowStatus.QUEUED)
         self.assertEqual(result.workflow_phase, WorkflowPhase.PLAN)
+        
+        # And the card itself says so.
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                self.cards._card_select(summaries=True) + " AND c.id=?",
+                (claim.card.id,)
+            ).fetchone()
+        re_fetched = self.cards._render_card(row)
+        self.assertEqual(re_fetched.card_discussion, "The premise is wrong; check the other component first.")
+        rendered_body, _ = render_execution_review_card(re_fetched)
+        self.assertIn("Discussed:</b>\nThe premise is wrong; check the other component first.", rendered_body)
 
     def test_discussing_a_summary_regates_from_the_current_version(self):
         """A summary is not pinned, so its own version is stale by design.
