@@ -613,10 +613,16 @@ class TaskCardApplication:
                 "delivered": stats.delivered,
                 "active": stats.active,
             }
-            if stats.steer_pending or stats.steer_delivering or stats.steer_delivered:
-                response.update(steer_pending=stats.steer_pending,
-                                steer_delivering=stats.steer_delivering,
-                                steer_delivered=stats.steer_delivered)
+            # Steer counts are deliberately absent from v1.  This response
+            # is a versioned contract and its client validates the key set
+            # exactly, so a field that appears only when a steer card
+            # happens to exist is not a compatible addition -- it is a
+            # response the client refuses, on exactly the deployments that
+            # have steer work and nowhere else.  Observed: a steer card
+            # entered `delivering`, and sixty-one seconds later the drip
+            # sweep began refusing every response and no execution card
+            # reached the reader at all.  Steer counts belong to v2, which
+            # is where they are.
             return response
         if operation == "execution_stats_scoped":
             _request(payload, required=set())
