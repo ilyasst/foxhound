@@ -168,7 +168,7 @@ _LOCAL_RESEARCH_CLIENTS = {
 }
 
 
-def _local_research_clients() -> dict[str, list[str]]:
+def _local_research_clients(phase: WorkflowPhase) -> dict[str, list[str]]:
     """Approved clients this runner can actually invoke.
 
     Profiles are portable across workers, while local research clients are
@@ -176,11 +176,25 @@ def _local_research_clients() -> dict[str, list[str]]:
     an agent's first useful action into a misleading failure, so this is a
     small runtime fact rather than a profile promise.
     """
-    return {
-        name: list(operations)
-        for name, operations in _LOCAL_RESEARCH_CLIENTS.items()
-        if shutil.which(name) is not None
-    }
+    clients = {}
+    
+    for name, operations in _LOCAL_RESEARCH_CLIENTS.items():
+        if shutil.which(name) is None:
+            continue
+            
+        allowed = list(operations)
+        if name == "outlook":
+            if phase not in (WorkflowPhase.PLAN, WorkflowPhase.EXECUTE):
+                continue
+            if "draft" in allowed and phase is not WorkflowPhase.EXECUTE:
+                allowed.remove("draft")
+        elif name == "moodle":
+            if phase not in (WorkflowPhase.PLAN, WorkflowPhase.EXECUTE):
+                continue
+                
+        clients[name] = allowed
+        
+    return clients
 
 
 class ExecutionWorkerError(RuntimeError):
@@ -297,7 +311,7 @@ class ExecutionWorker:
                 # lack of mail or knowledge access.  Client guidance remains
                 # profile-versioned; this contract names only the approved
                 # read/research surface.
-                "local_research_clients": _local_research_clients(),
+                "local_research_clients": _local_research_clients(state.phase),
                 # Stable symbolic roots supplied by deployment configuration.
                 # They are runtime facts, rather than profile policy, so an
                 # identical reviewed profile works on hosts with different

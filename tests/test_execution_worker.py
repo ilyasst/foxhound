@@ -417,7 +417,6 @@ class ExecutionWorkerTests(unittest.TestCase):
                 "local_research_clients": {
                     "outlook": [
                         "folders", "inbox", "search", "read", "thread",
-                        "draft",
                     ],
                     "moodle": [
                         "renew", "whoami", "courses", "assignments",
