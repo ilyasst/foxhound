@@ -258,3 +258,45 @@ class ExecutionScheduleCommandTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_skip_planning_requires_execution_grants_to_start(self):
+        stdout = StringIO()
+        stderr = StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            self.assertEqual(main([
+                "--database", str(self.database),
+                "--skip-planning-for", "issue",
+                "--plan-without-asking", "issue",
+            ]), 78)
+        self.assertEqual(stderr.getvalue(), "foxhound execution schedule: configuration unavailable\n")
+
+    def test_skip_planning_succeeds_with_execute_grants(self):
+        # We need to insert a candidate for task 1
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "INSERT INTO candidate_inbox(candidate_id, source_kind, "
+                "schema_version, created_at, content) "
+                "VALUES('test1', 'issue', 1, '2030-01-01T12:00:00', '{}')"
+            )
+            connection.execute(
+                "INSERT INTO task_candidate_bindings(task_id, candidate_id, relation) "
+                "VALUES(1, 'test1', 'accepted')"
+            )
+            connection.commit()
+
+        stdout = StringIO()
+        stderr = StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            self.assertEqual(main([
+                "--database", str(self.database),
+                "--skip-planning-for", "issue",
+                "--plan-without-asking", "issue",
+                "--execute-without-asking", "issue",
+                "--limit", "1"
+            ]), 0)
+
+        with closing(sqlite3.connect(self.database)) as connection:
+            phase = connection.execute(
+                "SELECT phase FROM task_execution_workflows WHERE task_id=1"
+            ).fetchone()[0]
+            self.assertEqual(phase, "execute")
