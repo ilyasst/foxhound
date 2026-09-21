@@ -752,7 +752,7 @@ class ExecutionCardService:
             raise TaskLedgerError("execution board limit is invalid")
         with closing(self._connect()) as connection:
             rows = connection.execute(
-                self._card_select() + " WHERE c.status='pending' ORDER BY c.id"
+                self._card_select() + " AND c.status='pending' ORDER BY c.id"
             ).fetchall()
         cards = [self._render_card(row) for row in rows if _current_card(row)]
         totals: dict[str, int] = {
