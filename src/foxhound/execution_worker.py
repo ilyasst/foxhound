@@ -1878,8 +1878,14 @@ def _repository_result(
         and outcome == "awaiting_external"
         and not _has_origin_follow_through_action(actions, origin)
     ):
+        expected = _origin_target_url(origin)
+        target_info = (
+            f": result-external-actions.json must contain an action object with "
+            f"'target': '{expected}' and 'action': '...'"
+            if expected else ""
+        )
         raise ExecutionWorkerDraftError(
-            "repository execution must request an action targeting its origin"
+            f"repository execution must request an action targeting its origin{target_info}"
         )
     if (
         state.phase is WorkflowPhase.EXTERNAL_ACTION
@@ -1925,20 +1931,27 @@ def _repository_result(
     return result
 
 
+def _origin_target_url(origin: object) -> str | None:
+    """Derive the canonical forge target URL for an issue or review request."""
+    record_id = getattr(origin, "record_id", None)
+    item_id = getattr(origin, "item_id", None)
+    kind = getattr(origin, "kind", None)
+    if not all(isinstance(value, str) and value for value in
+               (record_id, item_id, kind)):
+        return None
+    path = "issues" if kind == "issue" else "pull"
+    return f"https://{record_id}/{path}/{item_id.split('/', 1)[0]}"
+
+
 def _has_origin_follow_through_action(
     actions: object, origin: object,
 ) -> bool:
     """Require an approval card to name the exact pending forge update."""
     if not isinstance(actions, list):
         return False
-    record_id = getattr(origin, "record_id", None)
-    item_id = getattr(origin, "item_id", None)
-    kind = getattr(origin, "kind", None)
-    if not all(isinstance(value, str) and value for value in
-               (record_id, item_id, kind)):
+    expected = _origin_target_url(origin)
+    if expected is None:
         return False
-    path = "issues" if kind == "issue" else "pull"
-    expected = f"https://{record_id}/{path}/{item_id.split('/', 1)[0]}"
     return any(
         isinstance(action, dict) and action.get("target") == expected
         for action in actions

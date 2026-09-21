@@ -3893,7 +3893,12 @@ def _structured_collection(
                 supplied, label, MAX_QUESTION_CHARS, single_line=True)
         unknown = set(item) - set(aliases) - set(optional)
         if unknown:
-            raise ValueError(f"execution result {label} are invalid")
+            allowed = sorted(set(aliases) | set(optional))
+            bad_fields = ", ".join(sorted(unknown))
+            raise ValueError(
+                f"execution result {label} contain unsupported fields: "
+                f"{bad_fields}; allowed fields are {', '.join(allowed)}"
+            )
         records.append(record)
     return tuple(records)
 

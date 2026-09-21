@@ -38,6 +38,7 @@ from foxhound.task_execution import (
     TaskExecutionService,
     WorkflowDisposition,
     WorkflowPhase,
+    _structured_collection,
     WorkflowPriority,
     WorkflowRefusal,
     WorkflowStatus,
@@ -2635,6 +2636,20 @@ class PriorFailureEvidenceTests(TaskExecutionTests):
         )
         self.assertEqual(carried, ("Synthetic: a named blocker.",))
         self.assertNotIn("Synthetic", repr(self.service))
+
+    def test_structured_collection_reports_unsupported_fields(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            r"execution result external actions contain unsupported fields: detail; allowed fields are action, channel, requires, target, text, title",
+        ):
+            _structured_collection(
+                [{"action": "Submit review", "detail": "extra"}],
+                "external actions",
+                16000,
+                primary="action",
+                aliases=("action", "title", "text"),
+                optional=("requires", "channel", "target"),
+            )
 
 
 if __name__ == "__main__":

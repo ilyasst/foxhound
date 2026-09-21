@@ -506,6 +506,19 @@ def _historical_general_profiles() -> tuple[AgentProfile, ...]:
             kill_grace_seconds=30,
             allowed_phases=_PHASES,
         ),
+        AgentProfile(
+            profile_id="general",
+            display_name="General",
+            runtime="hermes",
+            prompt_template=_GENERAL_PROMPT_TEMPLATE_V13,
+            toolsets=("terminal", "file", "web"),
+            max_turns=80,
+            timeout_seconds=2_700,
+            claim_lease_seconds=3_300,
+            heartbeat_seconds=60,
+            kill_grace_seconds=30,
+            allowed_phases=_PHASES,
+        ),
     )
 
 
@@ -1173,17 +1186,25 @@ _GENERAL_PROMPT_TEMPLATE_V13 = _GENERAL_PROMPT_TEMPLATE_V12.replace(
 )
 
 
-_GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V13
+_GENERAL_PROMPT_TEMPLATE_V14 = _GENERAL_PROMPT_TEMPLATE_V13.replace(
+    'list posting it in `result-external-actions.json` as a JSON object, for example `{"action":"Post the prepared update","target":"https://github.com/OWNER/REPO/issues/NUMBER"}`. Its `target` must be the exact URL for `task.origin`; a plain-string action description cannot request the follow-through. This lets the reader approve the exact external write.',
+    'list posting it in `result-external-actions.json` as a JSON object, for example `{"action":"Post the prepared update","target":"https://github.com/OWNER/REPO/issues/NUMBER"}` for an issue or `{"action":"Submit review on PR","target":"https://github.com/OWNER/REPO/pull/NUMBER"}` for a pull request. Its `target` must be the exact URL for `task.origin`; allowed action object fields are only `action`, `target`, `channel`, and `requires`; a plain-string action description cannot request the follow-through. This lets the reader approve the exact external write.',
+).replace(
+    "Never merge, deploy, publish, message, purchase, or perform another effect unless that exact effect is approved and a bounded Foxhound worker action supports it. If no bounded action exists, report that limitation instead of bypassing the gate.",
+    "Never merge, deploy, publish, message, purchase, or perform another effect unless that exact effect is approved and a bounded Foxhound worker action supports it. If no bounded action exists, report that limitation instead of bypassing the gate. If a terminal command fails and you modify files on disk before retrying, vary the command line (for example by appending a comment like `# retry`) so loop-detection guardrails do not block execution on disk-state changes.",
+)
+
+_GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V14
 
 # A built-in profile is a release artifact.  Keep its fingerprints beside the
 # prompt so changing the prompt or policy without publishing a new profile
 # revision fails at every runner and scheduler startup, rather than leaving a
 # stale test in a different file to discover the mismatch later.
 GENERAL_PROFILE_RELEASE_REVISION = (
-    "15a5abd4bb06a78046c11004515e487e84b5fed3295f90cd84aed95d2ea603e1"
+    "02a2f7807d3fd05c99d5e807c1153fd3acdd852c940466b58e97a5a9c2f8783e"
 )
 GENERAL_PROFILE_RELEASE_PROMPT_SHA256 = (
-    "2556cb8715a69b9658d93d9d202569cea1766ccf9b9be46f8a1065fdf00da7d3"
+    "1c9b8be4784f6aba7174631acea1c8b6f8f59dd6f8927787dbbe31623978f579"
 )
 
 
