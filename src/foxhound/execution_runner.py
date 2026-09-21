@@ -601,11 +601,14 @@ def _run_claim(
     try:
         directory.mkdir(mode=0o700)
         if config.task_work_root is not None and config.task_kb_root is not None:
-            origin = TaskLedger(config.database_path).origin(claim.task_id)
+            ledger = TaskLedger(config.database_path)
+            origin = ledger.origin(claim.task_id)
             origin_sources = ()
-            if origin and origin.payload:
-                from .card_provenance import stored_origin_sources
-                origin_sources = stored_origin_sources(origin.payload)
+            if origin:
+                payload = ledger.bound_candidate_payload(claim.task_id)
+                if payload:
+                    from .card_provenance import stored_origin_sources
+                    origin_sources = stored_origin_sources(payload)
             archive = prepare_task_archive(
                 working_root=config.task_work_root,
                 kb_root=config.task_kb_root,
