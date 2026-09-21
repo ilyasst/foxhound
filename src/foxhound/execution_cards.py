@@ -246,6 +246,7 @@ class ExecutionReviewCard:
     task_id: int
     task_version: int
     workflow_version: int
+    work_revision_id: int | None
     kind: ExecutionCardKind
     phase: WorkflowPhase
     result_id: str | None
@@ -3292,6 +3293,9 @@ def _card(
             task_id=int(row["task_id"]),
             task_version=int(row["task_version"]),
             workflow_version=int(row["workflow_version"]),
+            work_revision_id=(
+                int(row["work_revision_id"]) if row["work_revision_id"] is not None else None
+            ),
             kind=kind,
             phase=WorkflowPhase(row["phase"]),
             result_id=row["result_id"],
