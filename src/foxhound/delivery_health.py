@@ -160,7 +160,8 @@ def collect_delivery_health(
                 connection, "task_review_cards", "due_at", now
             )
             execution_cards = _card_health(
-                connection, "execution_review_cards", "created_at", now
+                connection, "execution_review_cards", "created_at", now,
+                scope="summary_only=0",
             )
             recent_failures, recent_requeues, last_delivery = _delivery_events(
                 connection, now - timedelta(seconds=policy.failure_window_seconds)
@@ -249,8 +250,21 @@ def _admission_health(connection: object, now: datetime) -> AdmissionHealth:
 
 
 def _card_health(
-    connection: object, table: str, pending_time_column: str, now: datetime
+    connection: object,
+    table: str,
+    pending_time_column: str,
+    now: datetime,
+    *,
+    scope: str = "1=1",
 ) -> DeliveryCardHealth:
+    """How much is waiting on the reader, and how long the oldest has waited.
+
+    `scope` exists because not every row in a card table is a card the reader
+    owes an answer to.  A run summary is delivered when the actionable queue
+    is empty or at its ceiling, so on a busy host it legitimately waits --
+    counting one here reports ordinary prioritisation as a delivery fault, and
+    the watchdog then alerts forever on a system that is working.
+    """
     row = connection.execute(
         "SELECT "
         "SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,"
@@ -258,7 +272,7 @@ def _card_health(
         "SUM(CASE WHEN status='delivered' THEN 1 ELSE 0 END) AS delivered,"
         "SUM(CASE WHEN status IN ('pending','delivering','delivered') THEN 1 ELSE 0 END) AS active,"
         f"MIN(CASE WHEN status='pending' AND {pending_time_column}<=? THEN {pending_time_column} END) AS oldest_pending "
-        f"FROM {table}",
+        f"FROM {table} WHERE {scope}",
         (now.isoformat(timespec="seconds"),),
     ).fetchone()
     oldest = row["oldest_pending"]

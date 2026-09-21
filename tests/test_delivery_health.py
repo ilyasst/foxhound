@@ -342,5 +342,69 @@ class DeliveryHealthTests(unittest.TestCase):
         self.assertNotIn(str(missing), output.getvalue())
 
 
+class RunSummaryHealthTests(DeliveryHealthTests):
+    """A queued run summary is not a delivery fault."""
+
+    def _summary_card(self, *, task_id: int, at: datetime) -> None:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "INSERT INTO task_execution_results("
+                "result_id,task_id,workflow_version,task_version,phase,"
+                "outcome,content_digest,summary,work_markdown,"
+                "questions_json,external_actions_json,deliverables_json,"
+                "repository_references_json,repository_impact,"
+                "agent_profile_id,agent_profile_revision,created_at"
+                ") VALUES(?,?,1,1,'plan','awaiting_plan',?,?,?,"
+                "'[]','[]','[]','[]',0,'general',?,?)",
+                (f"synthetic-{task_id}", task_id, "d" * 64,
+                 "Synthetic summary", "Synthetic work", "e" * 64,
+                 self._time(at)),
+            )
+            connection.execute(
+                "INSERT INTO execution_review_cards("
+                "task_id,task_version,workflow_version,kind,phase,result_id,"
+                "status,version,created_at,updated_at,summary_only"
+                ") VALUES(?,1,1,'result_review','plan',?,'pending',1,?,?,1)",
+                (task_id, f"synthetic-{task_id}",
+                 self._time(at), self._time(at)),
+            )
+
+    def test_a_long_queued_summary_does_not_alert(self):
+        """The regression this class exists for.
+
+        A summary is delivered when the actionable queue is empty or at its
+        ceiling, so on a busy host it waits by design.  Counted as pending
+        work, it drags `oldest_pending` past the threshold and the watchdog
+        alerts forever on a deployment that is delivering perfectly.
+        """
+        long_ago = NOW - timedelta(hours=6)
+        for task_id in range(2, 8):
+            self._summary_card(task_id=task_id, at=long_ago)
+
+        health = collect_delivery_health(self.database, clock=lambda: NOW)
+
+        self.assertEqual(health.execution_cards.pending, 0)
+        self.assertIsNone(health.execution_cards.oldest_pending_age_seconds)
+        self.assertNotIn("pending_age_exceeded", health.alerts)
+
+    def test_an_actionable_card_behind_summaries_still_alerts(self):
+        """Excluding summaries must not mask a real backlog."""
+        long_ago = NOW - timedelta(hours=6)
+        self._summary_card(task_id=2, at=long_ago)
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "INSERT INTO execution_review_cards("
+                "task_id,task_version,workflow_version,kind,phase,status,"
+                "version,created_at,updated_at"
+                ") VALUES(9,1,1,'start','plan','pending',1,?,?)",
+                (self._time(long_ago), self._time(long_ago)),
+            )
+
+        health = collect_delivery_health(self.database, clock=lambda: NOW)
+
+        self.assertEqual(health.execution_cards.pending, 1)
+        self.assertIn("pending_age_exceeded", health.alerts)
+
+
 if __name__ == "__main__":
     unittest.main()
