@@ -2308,7 +2308,7 @@ class ExecutionCardService:
                     ExecutionCardKind.START: "start",
                     ExecutionCardKind.PLAN_REVIEW: "approve",
                     ExecutionCardKind.EXTERNAL_REVIEW: "approve",
-                    ExecutionCardKind.STEER: "steer",
+                    ExecutionCardKind.STEER: "discuss",
                 }.get(kind)
                 if refusal is None and action is None:
                     refusal = ExecutionCardRefusal.INVALID_ACTION
