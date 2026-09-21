@@ -9,8 +9,9 @@ arguments can start the supported commands.
 from __future__ import annotations
 
 import argparse
+import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
@@ -20,7 +21,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .agent_profiles import AgentProfileError, load_registry
-from .execution_runner import ExecutionRunnerConfig
+from .execution_runner import ExecutionRunnerConfig, agent_selection_argv
 from .execution_worker import ExecutionWorkerConfigError, load_knowledge_config
 from .source_policy import (
     action_grants,
@@ -41,7 +42,8 @@ from .task_execution import TaskExecutionService, WorkflowPhase
 
 
 DEPLOYMENT_SCHEMA = "foxhound.deployment-config"
-DEPLOYMENT_SCHEMA_VERSION = 12
+DEPLOYMENT_SCHEMA_VERSION = 15
+_DEPLOYMENT_ROOT_NAME = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 MAX_CONFIG_BYTES = 64 * 1024
 
 
@@ -106,6 +108,7 @@ class WorkflowConfig:
     execution_slot_cap: int
     plan_ready_cap: int
     awaiting_reader_cap: int
+    steer_while_running: tuple[str, ...] = ()
     #: Kinds whose recorded plan runs without a card. Defaults to empty so a
     #: configuration written before this key existed keeps asking.
     execute_without_asking: tuple[str, ...] = ()
@@ -138,6 +141,10 @@ class WorkflowConfig:
             result.extend(("--profile-route", f"{source_kind}={profile_id}"))
         for kind in self.plan_without_asking:
             result.extend(("--plan-without-asking", kind))
+        for kind in self.execute_without_asking:
+            result.extend(("--execute-without-asking", kind))
+        for kind in self.steer_while_running:
+            result.extend(("--steer-while-running", kind))
         for kind in self.skip_planning_for:
             result.extend(("--skip-planning-for", kind))
         for alias in self.reader_aliases:
@@ -153,9 +160,21 @@ class ExecutionRunnerDeploymentConfig:
     gw_alias: str | None = None
     gw_token_file: Path | None = None
     agent_command: str | None = None
+    #: The inference backend this runner's agents use.  Both unset is the
+    #: default and means the agent runtime's own configured backend: nothing
+    #: is added to the command and that runtime's configuration is neither
+    #: read nor written.  Declaring them moves this slot alone, which is what
+    #: makes a mixed deployment -- some slots on one backend, some on another
+    #: -- a configuration edit rather than a machine-wide change.
+    agent_model: str | None = None
+    agent_provider: str | None = None
     worker_command: str | None = None
     runner_slot: str | None = None
     knowledge_root: Path | None = None
+    #: Named machine roots the worker publishes to the agent.  Deployment
+    #: configuration, not profile policy: the same reviewed prompt names the
+    #: root and each host resolves it.
+    deployment_roots: Mapping[str, Path] = field(default_factory=dict)
     task_work_root: Path | None = None
     task_kb_root: Path | None = None
     runtime_session_database: Path | None = None
@@ -193,8 +212,18 @@ class ExecutionRunnerDeploymentConfig:
         ]
         if profile_directory is not None:
             result.extend(("--agent-profile-directory", str(profile_directory)))
+        # Omitted when unset, so a deployment that declares no selection
+        # renders the command it rendered before these fields existed.
+        for option, selection in (
+            ("--agent-model", self.agent_model),
+            ("--agent-provider", self.agent_provider),
+        ):
+            if selection is not None:
+                result.extend((option, selection))
         for source_kind, profile_id in workflow.agent_profile_routes:
             result.extend(("--profile-route", f"{source_kind}={profile_id}"))
+        for name, root in sorted(self.deployment_roots.items()):
+            result.extend(("--deployment-root", f"{name}={root}"))
         for option, path in (
             ("--knowledge-root", self.knowledge_root),
             ("--task-work-root", self.task_work_root),
@@ -225,6 +254,9 @@ class DatabaseConsumersConfig:
     lifecycle_outcome_export: tuple[Path, str, int] | None
     fused_task_titles: str | None
     duplicate_card_schedule: int | None
+    #: How many failed attempts one digest pass explains.  Absent means the
+    #: consumer is disabled, as it does for every other entry here.
+    failure_digest: int | None = None
 
     def argv(self, component: str, database: Path) -> list[str]:
         if component == "candidate-feed-import":
@@ -324,9 +356,46 @@ class DeploymentConfig:
                         self.database, self.agent_profile_directory, self.workflow
                     )
             raise DeploymentConfigError("deployment component is unknown")
+        if component == "failure-digest":
+            return self._failure_digest_argv()
         if self.database_consumers is not None:
             return self.database_consumers.argv(component, self.database)
         raise DeploymentConfigError("deployment component is unknown")
+
+    def _failure_digest_argv(self) -> list[str]:
+        """Explain failed runs from the transcripts this deployment wrote.
+
+        The run root is taken from the runners rather than declared again.
+        This pass reads `run-<id>` directories that the runners created, so
+        a separately configured path is a path that can be wrong -- and its
+        only symptom would be a pass that finds nothing and reports success,
+        which is indistinguishable from a deployment with no failures.
+
+        Every distinct root is passed, because a deployment may give each
+        slot its own and the ledger records which run failed, never which
+        slot ran it. The capability endpoint is not configured here at all:
+        it is resolved exactly as `work_digest` resolves it, from
+        FOXHOUND_DIGEST_ENDPOINT or the loopback default.
+        """
+        roots: list[str] = []
+        for runner in self.execution_runners:
+            if not runner.enabled or runner.run_root is None:
+                continue
+            root = str(runner.run_root)
+            if root not in roots:
+                roots.append(root)
+        if not roots:
+            raise DeploymentConfigError("deployment run root is unavailable")
+        limit = 20
+        if self.database_consumers is not None:
+            configured = self.database_consumers.failure_digest
+            if configured is None:
+                raise DeploymentConfigError("database consumer is disabled")
+            limit = configured
+        argv = ["foxhound-failure-digest", "--database", str(self.database)]
+        for root in roots:
+            argv += ["--run-root", root]
+        return argv + ["--limit", str(limit)]
 
 
 def execute_component(config: DeploymentConfig, component: str) -> None:
@@ -424,7 +493,8 @@ def _parse_document(document: object) -> DeploymentConfig:
     if (
         document.get("schema") != DEPLOYMENT_SCHEMA
         or version not in {
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, DEPLOYMENT_SCHEMA_VERSION
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+            DEPLOYMENT_SCHEMA_VERSION
         }
         or isinstance(version, bool)
     ):
@@ -544,7 +614,11 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
         fields = fields | {"skip_planning_for"}
     if version >= 11:
         fields = fields | {"agent_profile_routes"}
-    document = _object(value, fields)
+    # Announcements are opt-in. Keep a current configuration that predates
+    # this declaration valid and byte-for-byte equivalent to an empty list.
+    # This also makes a controlled schema-version upgrade non-disruptive.
+    optional = {"steer_while_running"} if version >= 15 else set()
+    document = _object(value, fields, optional)
     profile = document["default_agent_profile"]
     grants = document["plan_without_asking"]
     execute_grants = (
@@ -556,6 +630,7 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
     routes = _profile_routes(
         document["agent_profile_routes"] if version >= 11 else []
     )
+    steer = document.get("steer_while_running", []) if version >= 15 else []
     caps = tuple(document[key] for key in (
         "execution_slot_cap", "plan_ready_cap", "awaiting_reader_cap"
     ))
@@ -566,6 +641,7 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
         or not _grant_list(act_grants)
         or not _grant_list(aliases)
         or not _grant_list(skipped)
+        or not _grant_list(steer)
         or any(isinstance(cap, bool) or not isinstance(cap, int) for cap in caps)
     ):
         raise DeploymentConfigError("workflow configuration is invalid")
@@ -574,6 +650,7 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
         routes,
         tuple(grants),
         *caps,
+        steer_while_running=tuple(steer),
         execute_without_asking=tuple(execute_grants),
         act_without_asking=tuple(act_grants),
         reader_aliases=tuple(aliases),
@@ -616,6 +693,29 @@ def _grant_list(value: object) -> bool:
     )
 
 
+def _agent_selection(
+    model: object, provider: object
+) -> tuple[str | None, str | None]:
+    """Validate one runner's declared inference backend.
+
+    Refused here rather than at agent start: a deployment error that only
+    appears when an agent runs costs a claimed workflow to discover, and the
+    claim is what a reader is waiting on.  ``None`` for both is the supported
+    way to say "whatever the agent runtime is configured to use".
+    """
+    if model is not None and not isinstance(model, str):
+        raise DeploymentConfigError("execution runner configuration is invalid")
+    if provider is not None and not isinstance(provider, str):
+        raise DeploymentConfigError("execution runner configuration is invalid")
+    try:
+        agent_selection_argv(model, provider)
+    except ValueError as exc:
+        raise DeploymentConfigError(
+            "execution runner configuration is invalid"
+        ) from exc
+    return model, provider
+
+
 def _parse_execution_runner(
     value: object, *, version: int
 ) -> ExecutionRunnerDeploymentConfig:
@@ -634,12 +734,20 @@ def _parse_execution_runner(
     }
     if version >= 12:
         fields.update({"runtime_session_database", "runtime_log_retention_bytes"})
+    if version >= 13:
+        fields.add("deployment_roots")
+    if version >= 14:
+        fields.update({"agent_model", "agent_provider"})
     document = _object(value, fields)
     strings = tuple(document[key] for key in (
         "gw_endpoint", "gw_alias", "agent_command", "worker_command", "runner_slot"
     ))
     if any(not isinstance(item, str) for item in strings):
         raise DeploymentConfigError("execution runner configuration is invalid")
+    agent_model, agent_provider = (
+        _agent_selection(document["agent_model"], document["agent_provider"])
+        if version >= 14 else (None, None)
+    )
     runtime_database = (
         _optional_absolute_path(document["runtime_session_database"])
         if version >= 12 else None
@@ -666,9 +774,15 @@ def _parse_execution_runner(
         gw_alias=strings[1],
         gw_token_file=_absolute_path(document["gw_token_file"]),
         agent_command=strings[2],
+        agent_model=agent_model,
+        agent_provider=agent_provider,
         worker_command=strings[3],
         runner_slot=strings[4],
         knowledge_root=_optional_absolute_path(document["knowledge_root"]),
+        deployment_roots=(
+            _deployment_roots(document["deployment_roots"])
+            if version >= 13 else {}
+        ),
         task_work_root=_optional_absolute_path(document["task_work_root"]),
         task_kb_root=_optional_absolute_path(document["task_kb_root"]),
         runtime_session_database=runtime_database,
@@ -701,7 +815,12 @@ def _parse_database_consumers(
         fields.add("fused_task_titles")
     if version >= 5:
         fields.add("duplicate_card_schedule")
-    optional_fields = {"task_card_requeue"} if version >= 5 else set()
+    # Optional rather than a schema bump: a deployment that has not enabled
+    # the digest pass is a valid deployment, and every host would otherwise
+    # have to be edited before any of them could run it.
+    optional_fields = (
+        {"task_card_requeue", "failure_digest"} if version >= 5 else set()
+    )
     document = _object(value, fields, optional_fields)
     candidate = _parse_candidate_feed_import(document["candidate_feed_import"])
     intake = _parse_native_intake_run(document["native_intake_run"])
@@ -719,6 +838,10 @@ def _parse_database_consumers(
         _parse_duplicate_card_schedule(document["duplicate_card_schedule"])
         if version >= 5 else None
     )
+    digests = (
+        _parse_failure_digest(document["failure_digest"])
+        if "failure_digest" in document else None
+    )
     return DatabaseConsumersConfig(
         candidate_feed_import=candidate,
         native_intake_run=intake,
@@ -727,6 +850,7 @@ def _parse_database_consumers(
         lifecycle_outcome_export=lifecycle,
         fused_task_titles=titles,
         duplicate_card_schedule=duplicates,
+        failure_digest=digests,
     )
 
 
@@ -820,6 +944,11 @@ def _parse_duplicate_card_schedule(value: object) -> int | None:
     return None if document is None else _positive_int(document["limit"])
 
 
+def _parse_failure_digest(value: object) -> int | None:
+    document = _enabled_document(value, {"limit"})
+    return None if document is None else _positive_int(document["limit"])
+
+
 def _object(value: object, fields: set[str],
             optional: set[str] | None = None) -> Mapping[str, object]:
     """One shape check for every section of the document.
@@ -861,6 +990,23 @@ def _positive_int(value: object) -> int:
 
 def _optional_absolute_path(value: object) -> Path | None:
     return None if value is None else _absolute_path(value)
+
+
+def _deployment_roots(value: object) -> dict[str, Path]:
+    """Symbolic name to absolute root, rejecting a name a profile cannot use."""
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise DeploymentConfigError("execution runner configuration is invalid")
+    roots: dict[str, Path] = {}
+    for name, raw in value.items():
+        if (
+            not isinstance(name, str)
+            or _DEPLOYMENT_ROOT_NAME.fullmatch(name) is None
+        ):
+            raise DeploymentConfigError("execution runner configuration is invalid")
+        roots[name] = _absolute_path(raw)
+    return roots
 
 
 def _role_paths(
@@ -919,6 +1065,10 @@ def _validate_runtime(config: DeploymentConfig) -> None:
         )
     action_grants(config.workflow.act_without_asking)
     source_kind_grants(
+        config.workflow.steer_while_running,
+        label="steer-while-running declarations",
+    )
+    source_kind_grants(
         (source_kind for source_kind, _profile in config.workflow.agent_profile_routes),
         label="workflow agent profile routes",
     )
@@ -928,6 +1078,7 @@ def _validate_runtime(config: DeploymentConfig) -> None:
         profile_registry=registry,
         default_profile_id=config.workflow.default_agent_profile,
         planning_grants=config.workflow.plan_without_asking,
+        steer_while_running=config.workflow.steer_while_running,
         execution_grants=config.workflow.execute_without_asking,
         skip_planning_for=config.workflow.skip_planning_for,
         action_grants=config.workflow.act_without_asking,
@@ -956,6 +1107,8 @@ def _validate_runtime(config: DeploymentConfig) -> None:
                 gw_alias=runner.gw_alias,
                 gw_token_file=runner.gw_token_file,
                 agent_command=runner.agent_command,
+                agent_model=runner.agent_model,
+                agent_provider=runner.agent_provider,
                 profile_registry=registry,
                 default_agent_profile=config.workflow.default_agent_profile,
                 worker_command=runner.worker_command,

@@ -24,13 +24,16 @@ foxhound-scheduler-cutover = "foxhound.scheduler_cutover:main"
 foxhound-agent-profiles = "foxhound.agent_profiles:main"
 foxhound-agent-profile-store = "foxhound.profile_store:main"
 foxhound-delivery-health = "foxhound.delivery_health:main"
+foxhound-profile-adoption = "foxhound.profile_adoption:main"
 foxhound-failure-digest = "foxhound.failure_digest_worker:main"
+foxhound-steer-digest = "foxhound.steer_digest_worker:main"
 foxhound-deployment-config = "foxhound.deployment_config:main"
 foxhound-fused-task-titles = "foxhound.fused_task_titles:main"
 foxhound-task-duplicate-card-schedule = "foxhound.task_duplicate_card_schedule:main"
 foxhound-task-duplicate-quality = "foxhound.task_duplicate_quality:main"
 foxhound-task-structure-status = "foxhound.task_structure_status:main"
 foxhound-task-local-duplicate-eval = "foxhound.task_duplicate_semantic:main"
+foxhound-task-duplicate-queue-diagnostic = "foxhound.task_duplicate_queue_diagnostic:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

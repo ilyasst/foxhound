@@ -190,6 +190,164 @@ class ProfileStoreTests(unittest.TestCase):
                 self.assertNotIn(published[0]["revision"], digests)
                 digests.add(published[0]["revision"])
 
+    def test_validate_and_publish_refuse_absolute_prompt_paths(self):
+        self.write_shared("hermes.md", "Read /srv/example/private-data.\n")
+
+        with self.assertRaisesRegex(ProfileStoreError, "example-scout.*hermes.md"):
+            validate(self.source)
+        with self.assertRaisesRegex(ProfileStoreError, "symbolic deployment root"):
+            publish(self.source, ["example-scout"])
+
+    def test_prompt_guard_allows_a_url_and_catches_a_home_path(self):
+        """A URL path is not a machine path; the guard must tell them apart."""
+        self.write_shared(
+            "hermes.md",
+            SHARED_TEXT + "Cite https://example.com/docs/guide when reporting.\n",
+        )
+        self.assertEqual(validate(self.source)["ok"], True)
+
+        self.write_shared(
+            "hermes.md", SHARED_TEXT + "Read ~/state/example before starting.\n"
+        )
+        with self.assertRaisesRegex(ProfileStoreError, "absolute path"):
+            validate(self.source)
+
+    def test_publish_refuses_a_draft_that_changed_since_it_was_reviewed(self):
+        """The failure this guards: two operators, one store, no lock."""
+        publish(self.source, ["example-scout"])
+        self.write_draft(role=ROLE_TEXT + "First operator's edit.\n")
+        reviewed = validate(self.source)["pending_inputs"]["example-scout"]
+
+        # A second operator replaces the draft before the first publishes.
+        self.write_draft(role=ROLE_TEXT + "Second operator's edit.\n")
+
+        with self.assertRaisesRegex(ProfileStoreError, "example-scout"):
+            publish(
+                self.source, ["example-scout"],
+                expect={"example-scout": reviewed["revision"]},
+            )
+        self.assertEqual(
+            validate(self.source)["pending"], ["example-scout"]
+        )
+
+    def test_publish_proceeds_when_the_draft_is_the_reviewed_one(self):
+        publish(self.source, ["example-scout"])
+        self.write_draft(role=ROLE_TEXT + "Reviewed edit.\n")
+        reviewed = validate(self.source)["pending_inputs"]["example-scout"]
+
+        result = publish(
+            self.source, ["example-scout"],
+            expect={"example-scout": reviewed["revision"]},
+        )
+
+        self.assertEqual(
+            result["published"][0]["revision"], reviewed["revision"]
+        )
+        self.assertEqual(validate(self.source)["pending"], [])
+
+    def test_publish_refuses_an_expectation_it_cannot_check(self):
+        publish(self.source, ["example-scout"])
+        self.write_draft(role=ROLE_TEXT + "Edit.\n")
+        for expect in (
+            {"example-scout": "not-a-revision"},
+            {"example-absent": "0" * 64},
+        ):
+            with self.subTest(expect=expect):
+                with self.assertRaises(ProfileStoreError):
+                    publish(self.source, ["example-scout"], expect=expect)
+
+    def test_two_hosts_run_one_profile_differing_only_by_its_overlay(self):
+        """The point of variants: one reviewed source, a per-host difference."""
+        self.write_overlay("host-b.md", "Host B also reaches the lab bench.\n")
+        self.write_draft(overlays=[], variants={"host-b": ["host-b.md"]})
+        published = publish(self.source, ["example-scout"])["published"][0]
+
+        base = published["revision"]
+        host_b = published["variants"]["host-b"]
+        self.assertNotEqual(base, host_b)
+
+        host_a_target = self.root / "installed-a"
+        host_b_target = self.root / "installed-b"
+        install(self.source, host_a_target)
+        install(self.source, host_b_target, variant="host-b")
+
+        offered = []
+        for target in (host_a_target, host_b_target):
+            catalog = json.loads(
+                (target / CATALOG_NAME).read_text(encoding="utf-8")
+            )
+            offered.append(catalog["profiles"]["example-scout"]["revision"])
+        self.assertEqual(offered, [base, host_b])
+
+        # Each host resolves the other's revision too, so a workflow pinned to
+        # it still runs after the profile is installed somewhere else.
+        for target in (host_a_target, host_b_target):
+            for revision in (base, host_b):
+                self.assertTrue(
+                    (target / REVISIONS_DIRECTORY / "example-scout"
+                     / f"{revision}.json").exists()
+                )
+
+        # Only the overlay differs: the shared and role text are one document.
+        texts = [
+            json.loads(
+                (self.source / REVISIONS_DIRECTORY / "example-scout"
+                 / f"{revision}.json").read_text(encoding="utf-8")
+            )["prompt_template"]
+            for revision in (base, host_b)
+        ]
+        self.assertTrue(texts[1].startswith(texts[0]))
+        self.assertIn("lab bench", texts[1])
+
+    def test_installing_an_unknown_variant_is_refused(self):
+        publish(self.source, ["example-scout"])
+        with self.assertRaises(ProfileStoreError):
+            install(self.source, self.root / "installed-x", variant="absent")
+
+    def test_doctor_compares_two_stores_without_reading_digests_by_hand(self):
+        publish(self.source, ["example-scout"])
+        replica = self.root / "replica"
+        initialize(replica)
+        mirror(self.source, replica)
+
+        same = diagnose(self.source, compare=replica)["compared"]
+        self.assertEqual(same["ok"], True)
+        self.assertEqual(
+            [p["status"] for p in same["profiles"]], ["same"]
+        )
+
+        self.write_draft(role=ROLE_TEXT + "A later edit.\n")
+        publish(self.source, ["example-scout"])
+        ahead = diagnose(self.source, compare=replica)["compared"]
+        entry = ahead["profiles"][0]
+        self.assertEqual((entry["status"], entry["ahead"]), ("source_ahead", 1))
+        self.assertEqual(ahead["ok"], True)
+
+    def test_doctor_reports_two_stores_that_genuinely_diverged(self):
+        publish(self.source, ["example-scout"])
+        replica = self.root / "replica"
+        initialize(replica)
+        mirror(self.source, replica)
+        self.write_draft(role=ROLE_TEXT + "Edited here.\n")
+        publish(self.source, ["example-scout"])
+        # The second operator edits the replica's own draft, which is what
+        # makes the two histories incompatible rather than merely unequal.
+        (replica / DRAFTS_DIRECTORY / "example-scout" / "role.md").write_text(
+            ROLE_TEXT + "Edited there instead.\n", encoding="utf-8"
+        )
+        publish(replica, ["example-scout"])
+
+        compared = diagnose(self.source, compare=replica)["compared"]
+        self.assertEqual(compared["profiles"][0]["status"], "diverged")
+        self.assertEqual(compared["ok"], False)
+
+    def test_a_profile_without_variants_writes_the_catalog_it_always_did(self):
+        publish(self.source, ["example-scout"])
+        catalog = json.loads(
+            (self.source / CATALOG_NAME).read_text(encoding="utf-8")
+        )
+        self.assertNotIn("variants", catalog["profiles"]["example-scout"])
+
     def test_shared_change_republishes_every_active_profile(self):
         self.write_draft("example-clerk", display_name="Example Clerk")
         publish(self.source, ["example-scout", "example-clerk"])
@@ -254,6 +412,18 @@ class ProfileStoreTests(unittest.TestCase):
         )
         self.assertEqual(validate(replica)["pending"], [])
 
+    def test_mirror_preserves_an_unpublished_destination_draft(self):
+        publish(self.source, ["example-scout"])
+        replica = self.root / "replica"
+        initialize(replica)
+        mirror(self.source, replica)
+        role = replica / DRAFTS_DIRECTORY / "example-scout" / "role.md"
+        role.write_text("# Local edit\nKeep this draft.\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(ProfileStoreError, "example-scout.*role.md"):
+            mirror(self.source, replica)
+        self.assertIn("Keep this draft", role.read_text(encoding="utf-8"))
+
     def test_mirror_refuses_a_genuinely_divergent_history(self):
         publish(self.source, ["example-scout"])
         replica = self.root / "replica"
@@ -268,6 +438,20 @@ class ProfileStoreTests(unittest.TestCase):
 
         with self.assertRaises(ProfileStoreError):
             mirror(self.source, replica)
+
+    def test_doctor_reports_per_profile_fast_forward_or_divergence(self):
+        publish(self.source, ["example-scout"])
+        replica = self.root / "replica"
+        initialize(replica)
+        mirror(self.source, replica)
+        self.write_shared("hermes.md", SHARED_TEXT + "Revised.\n")
+        publish(self.source, ["example-scout"])
+
+        report = diagnose(self.source, replica)
+
+        self.assertEqual(report["comparison"], {"profiles": [{
+            "profile_id": "example-scout", "status": "source_ahead", "ahead": 1,
+        }]})
 
     def test_publication_preserves_the_preceding_revision_exactly(self):
         publish(self.source, ["example-scout"])

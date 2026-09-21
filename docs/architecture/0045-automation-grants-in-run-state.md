@@ -44,9 +44,23 @@ not change `last_result_id`. A run that recorded one is reported as
 
 ## Consequences
 
-The grant applies at the moment of recording, so no card is created and
-none has to be retired. Reconciling workflows that were already waiting when
-policy changed is a separate concern, and stays in scheduling.
+The grant applies at the moment of recording, so no *gate* card is created and
+none has to be retired. This ADR once added a bounded, controlless run summary
+card behind each granted advance, reasoning that work needing no approval was
+otherwise entirely silent and that a reader told nothing cannot tell an
+automated phase that advanced from one that never ran.
+
+That premise was wrong, and the summary is retired — see
+[ADR 0053](0053-run-summaries-retired.md). A grant is only ever applied to
+`awaiting_plan` and `awaiting_external`; `completed`, `declined` and
+`ineligible` always raise a card. A granted workflow therefore always reports
+itself in the end, on the card that carries the work and the controls to act
+on it. What the summary added was an unprompted interim notice that a phase
+the reader had already delegated had been delegated, and it outnumbered the
+cards that wanted an answer.
+
+Reconciling workflows that were already waiting when policy changed is a
+separate concern, and stays in scheduling.
 
 The runner and the worker must be the same build. This paragraph once noted
 that `worker_command` was a bare name resolved through `PATH` by the agent,

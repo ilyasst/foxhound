@@ -31,11 +31,11 @@ class PublicDiffGuardTests(unittest.TestCase):
 
     def test_each_mechanical_class_is_caught(self):
         unsafe = "\n".join((
-            "+contact: " + "operator" + "@" + "internal.test",
+            "+contact: " + "operator" + "@" + "company" + ".com",
             "+path: /" + "home" + "/operator/private",
-            "+address: " + "10" + ".20.30.40",
-            "+command: " + "ssh" + " production-node",
-            "+source: https://" + "private.example.invalid" + "/records",
+            "+address: " + "8.8.8" + ".8",
+            "+ $ " + "ssh" + " production-node",
+            "+source: https://" + "private.company" + ".com/records",
         ))
         labels = "\n".join(findings(unsafe))
         self.assertIn("email address", labels)
@@ -61,6 +61,55 @@ class PublicDiffGuardTests(unittest.TestCase):
         ))
         self.assertEqual(findings(diff), [])
 
+    def test_acceptance_criteria_for_reserved_domains_and_networks(self):
+        safe_diff = "\n".join((
+            "+contact: alice@example.invalid",
+            "+docs: https://private.test/docs",
+            "+bind: 0.0.0.0",
+            "+private1: 10.1.2.3",
+            "+private2: 172.16.0.1",
+            "+private3: 192.168.1.100",
+            # The remote command regex was tightened to require start of line or prompt,
+            # so prose like this is no longer flagged.
+            "+prose: Over a non-interactive ssh this reports to the server",
+        ))
+        self.assertEqual(findings(safe_diff), [])
+
+    def test_command_matching_still_works(self):
+        unsafe_diff = "\n".join((
+            "+ssh root@production.test",
+            "+ $ scp file root@198.51.100.1",
+            "+  rsync -avz local/ root@remote-node",
+        ))
+        labels = "\n".join(findings(unsafe_diff))
+        self.assertIn("remote host identifier", labels)
+        self.assertEqual(labels.count("remote host identifier"), 3)
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_systemd_template_units_are_not_email_addresses():
+    """`unit@instance.service` is a systemd instance, not a leaked address.
+
+    The multi-runner documentation on `main` contains `systemctl enable`
+    examples, so this pattern is in the tree: without the exclusion the guard
+    blocks any commit that touches that file. A guard that fires on
+    documentation is one people learn to pass `--no-verify` to.
+    """
+    documentation = "\n".join((
+        "+   systemctl enable --now foxhound-execution-runner@slot-2.service",
+        "+   systemctl enable --now foxhound-execution-runner@slot-3.service",
+        "+   systemctl start backup@daily.timer",
+        "+   systemctl status sshd@0.socket",
+    ))
+    assert findings(documentation) == []
+
+
+def test_a_real_address_is_still_caught_beside_a_unit_name():
+    """The exclusion must be narrow: one line carrying both still reports."""
+    mixed = ("+ systemctl restart worker@slot-1.service  # owner: "
+             + "person" + "@" + "company" + ".com")
+    labels = findings(mixed)
+    assert any("email" in label for label in labels), labels

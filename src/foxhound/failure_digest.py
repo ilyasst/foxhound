@@ -43,6 +43,7 @@ import json
 import os
 import urllib.error
 import urllib.request
+from foxhound.caproute_attribution import request_headers
 
 
 #: A capability, not a model name. Same reasoning as `work_digest`: the
@@ -130,8 +131,7 @@ def digest(transcript: str, *, opener=None) -> str:
     request = urllib.request.Request(
         f"{endpoint()}/v1/chat/completions",
         data=json.dumps(document).encode("utf-8"),
-        headers={"Content-Type": "application/json",
-                 "Accept": "application/json"},
+        headers=request_headers("failure_digest"),
         method="POST",
     )
     open_request = (opener or urllib.request).urlopen

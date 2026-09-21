@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 48
+SCHEMA_VERSION = 56
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -360,6 +360,8 @@ _SCHEMA_COLUMNS = {
         "queue_priority",
         "last_failure_exit_code",
         "last_failure_run_id",
+        "steer_while_running",
+        "current_run_id",
     ),
     "task_execution_results": (
         "result_id",
@@ -435,6 +437,7 @@ _SCHEMA_COLUMNS = {
         # Appended by v39. Declared last because the check below compares the
         # column tuple in order, and ALTER TABLE adds to the end.
         "work_revision_id",
+        "steer_digest",
     ),
     "execution_review_card_events": (
         "sequence",
@@ -445,6 +448,13 @@ _SCHEMA_COLUMNS = {
         "workflow_version",
         "action",
         "occurred_at",
+    ),
+    "execution_card_retractions": (
+        "card_id", "transport", "delivery_ref", "state", "attempts",
+        "claim_token_digest", "claim_expires_at", "created_at", "updated_at",
+    ),
+    "execution_steer_digest_refreshes": (
+        "card_id", "attempts", "last_refreshed_at",
     ),
     "execution_reader_inputs": (
         "sequence",
@@ -558,9 +568,20 @@ _SCHEMA_COLUMNS = {
 #: Semantic assessments arrive at v43, and the delivery record and the result
 #: column that names it both arrive at v42. Every earlier checkpoint excludes
 #: the fields it has not yet introduced.
+_SCHEMA_V48_COLUMNS = {
+    name: tuple(column for column in columns if not (
+        name == "task_execution_workflows"
+        and column in {"steer_while_running", "current_run_id"}
+    ) and not (
+        name == "execution_review_cards" and column == "steer_digest"
+    ))
+    for name, columns in _SCHEMA_COLUMNS.items()
+    if name not in {"execution_card_retractions", "execution_steer_digest_refreshes"}
+}
+
 _SCHEMA_V42_COLUMNS = {
     name: columns
-    for name, columns in _SCHEMA_COLUMNS.items()
+    for name, columns in _SCHEMA_V48_COLUMNS.items()
     if name not in {
         "task_duplicate_assessments",
         "execution_result_artifacts",
@@ -753,6 +774,17 @@ _SCHEMA_V11_COLUMNS = {
     )
     for name, columns in _SCHEMA_V14_COLUMNS.items()
 }
+
+# V54 appends the informational-delivery marker.  It is added after every
+# historical map above has been derived, so that a database migrating from an
+# earlier version is not asked to already have a column that did not exist at
+# that point.
+_SCHEMA_COLUMNS["execution_review_cards"] += ("summary_only",)
+
+# V56 appends the claiming-consumer identity to task review cards (ADR 0036).
+# Added here for the same reason as V54: historical schema maps derived above
+# should not expect it.
+_SCHEMA_COLUMNS["task_review_cards"] += ("claiming_consumer",)
 
 # The versioned maps above are used to validate historical schemas while they
 # migrate.  V45 is additive, so remove its tables and task columns from every
@@ -2850,6 +2882,182 @@ _SCHEMA_V47 = (
 )
 
 
+# An announced run is decided at workflow admission, rather than by the card
+# scheduler reading its own copy of deployment policy.  The run id is nullable
+# because attaching it is deliberately best-effort.  A steer card has no
+# result: it describes work that has not completed yet.  SQLite cannot widen
+# the card-kind and card-shape checks in place, so the card table is rebuilt
+# while retaining all columns added since its original introduction.
+_SCHEMA_V49_CARD_TABLE = (
+    _SCHEMA_V20_CARD_TABLE
+    .replace(
+        "'start','plan_review','external_review','result_review'",
+        "'start','plan_review','external_review','result_review','steer'",
+    )
+    .replace(
+        "        OR (kind = 'result_review' AND result_id IS NOT NULL)\n    ),",
+        "        OR (kind = 'result_review' AND result_id IS NOT NULL)\n"
+        "        OR (kind = 'steer' AND result_id IS NULL)\n    ),",
+    )
+    .replace(
+        "    resolved_at        TEXT,",
+        "    resolved_at        TEXT,\n"
+        "    consumer_digest    TEXT CHECK(consumer_digest IS NULL OR "
+        "length(consumer_digest) = 64),\n"
+        "    superseded_delivery_ref TEXT,\n"
+        "    superseded_transport TEXT,\n"
+        "    work_revision_id   INTEGER REFERENCES work_revisions(id),\n"
+        "    steer_digest       TEXT CHECK(steer_digest IS NULL OR "
+        "length(steer_digest) <= 800),",
+    )
+)
+
+_SCHEMA_V50 = (
+    """CREATE TABLE IF NOT EXISTS execution_card_retractions (
+    card_id INTEGER PRIMARY KEY REFERENCES execution_review_cards(id),
+    transport TEXT NOT NULL CHECK(length(transport) BETWEEN 1 AND 200),
+    delivery_ref TEXT NOT NULL CHECK(length(delivery_ref) BETWEEN 1 AND 2000),
+    state TEXT NOT NULL CHECK(state IN ('pending','delivering','completed','abandoned')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts BETWEEN 0 AND 3),
+    claim_token_digest TEXT,
+    claim_expires_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK((state='delivering') = (claim_token_digest IS NOT NULL AND claim_expires_at IS NOT NULL)),
+    CHECK(state NOT IN ('completed','abandoned') OR claim_token_digest IS NULL)
+);""",
+    "CREATE INDEX IF NOT EXISTS execution_card_retractions_pending ON execution_card_retractions(state,updated_at,card_id);",
+)
+
+# A live run may change meaningfully after its first digest. Refresh it at
+# most twice more, after a bounded interval, so a run that spans hours cannot
+# turn a best-effort model call into a standing load source.
+_SCHEMA_V51 = (
+    """CREATE TABLE IF NOT EXISTS execution_steer_digest_refreshes (
+    card_id INTEGER PRIMARY KEY REFERENCES execution_review_cards(id),
+    attempts INTEGER NOT NULL CHECK(attempts BETWEEN 1 AND 3),
+    last_refreshed_at TEXT NOT NULL
+);""",
+)
+
+# A successful retraction is a separate delivery-lifecycle fact. Keep it in
+# the immutable card-event ledger rather than inferring it from cleared
+# delivery handles, which are deliberately removed after acknowledgement.
+_SCHEMA_V52_CARD_EVENT_TABLE = _SCHEMA_V13_CARD_EVENT_TABLE.replace(
+    "'cancelled','refreshed'",
+    "'cancelled','refreshed','retracted'",
+)
+_SCHEMA_V52 = (
+    "DROP TRIGGER execution_review_card_events_no_update;",
+    "DROP TRIGGER execution_review_card_events_no_delete;",
+    "ALTER TABLE execution_review_card_events "
+    "RENAME TO execution_review_card_events_v51;",
+    _SCHEMA_V52_CARD_EVENT_TABLE,
+    """
+INSERT INTO execution_review_card_events(
+    sequence,card_id,task_id,kind,card_version,workflow_version,action,
+    occurred_at
+)
+SELECT sequence,card_id,task_id,kind,card_version,workflow_version,action,
+       occurred_at
+FROM execution_review_card_events_v51;
+""",
+    "DROP TABLE execution_review_card_events_v51;",
+    _SCHEMA_V9[3],
+    _SCHEMA_V9[4],
+)
+
+
+# Re-presenting an unanswered card is not a delivery failure. `requeue_unanswered`
+# borrowed the `delivery_failed` kind to record it, and `delivery_health` counts
+# every such event in a 15-minute window against a threshold of three -- so an
+# hourly requeue of three or more unanswered cards raised
+# `recent_delivery_failures_exceeded` on a system that was delivering fine.
+#
+# The visible cost was a watchdog that cried wolf. The real cost is that a
+# genuine transport failure became indistinguishable from routine re-presentation,
+# so the check that exists to catch broken delivery could not.
+_SCHEMA_V53_CARD_EVENT_TABLE = _SCHEMA_V52_CARD_EVENT_TABLE.replace(
+    "'cancelled','refreshed','retracted'",
+    "'cancelled','refreshed','retracted','requeued'",
+)
+_SCHEMA_V53 = (
+    "DROP TRIGGER execution_review_card_events_no_update;",
+    "DROP TRIGGER execution_review_card_events_no_delete;",
+    "ALTER TABLE execution_review_card_events "
+    "RENAME TO execution_review_card_events_v52;",
+    _SCHEMA_V53_CARD_EVENT_TABLE,
+    """
+INSERT INTO execution_review_card_events(
+    sequence,card_id,task_id,kind,card_version,workflow_version,action,
+    occurred_at
+)
+SELECT sequence,card_id,task_id,kind,card_version,workflow_version,action,
+       occurred_at
+FROM execution_review_card_events_v52;
+""",
+    "DROP TABLE execution_review_card_events_v52;",
+    _SCHEMA_V9[3],
+    _SCHEMA_V9[4],
+)
+
+
+# A run summary is a delivery record, not a reader gate.  It rides the
+# established private transport as an ordinary execution card row -- the
+# transport validates `kind` against a closed set, so inventing a kind here
+# would refuse the claim, and a refused claim holds the drip's only slot and
+# stops every card reaching the reader.  The distinction is carried by this
+# column instead, and by two separate partial indexes: one active reader-action
+# card per task as before, and independently at most one active summary per
+# task.  The second index is what bounds the summary queue: a newer summary
+# supersedes the one it replaces rather than queueing behind it.
+_SCHEMA_V54 = (
+    "ALTER TABLE execution_review_cards ADD COLUMN summary_only INTEGER "
+    "NOT NULL DEFAULT 0 CHECK(summary_only IN (0,1));",
+    # Replayable, as the additive migrations around it are: a rehearsal may
+    # reset `user_version` while leaving these definitions in place.
+    "DROP INDEX IF EXISTS execution_review_cards_one_active;",
+    "CREATE UNIQUE INDEX execution_review_cards_one_active "
+    "ON execution_review_cards(task_id) "
+    "WHERE status IN ('pending','delivering','delivered') "
+    "AND summary_only=0;",
+    "DROP INDEX IF EXISTS execution_review_cards_one_active_summary;",
+    "CREATE UNIQUE INDEX execution_review_cards_one_active_summary "
+    "ON execution_review_cards(task_id) "
+    "WHERE status IN ('pending','delivering','delivered') "
+    "AND summary_only=1;",
+)
+
+
+# Run summaries are retired.  Nothing writes one now, so the index that
+# bounded the summary queue has nothing left to bound, and the rows already
+# in the table would otherwise sit `pending` forever -- never claimed,
+# because every read excludes them, and never retired, because the sweep
+# that retires stale cards reads the same population.  Settling them here is
+# what leaves the table saying only what is still true.
+#
+# The column stays.  Dropping it would rewrite a table that the card service
+# reads on every claim, to erase a distinction the history still needs: these
+# rows really were summaries, and a `result_review` row that lost the marker
+# would read as a decision card nobody ever answered.
+_SCHEMA_V55 = (
+    "UPDATE execution_review_cards SET status='cancelled',"
+    "version=version+1,claim_token_digest=NULL,claim_expires_at=NULL,"
+    "consumer_digest=NULL,"
+    "resolved_at=COALESCE(resolved_at,updated_at) "
+    "WHERE summary_only=1 "
+    "AND status IN ('pending','delivering','delivered');",
+    "DROP INDEX IF EXISTS execution_review_cards_one_active_summary;",
+)
+
+
+# ADR 0036 decision 2: record the claiming consumer's identity on a
+# task review card at claim time. Migration adds structure (ADR 0010).
+_SCHEMA_V56 = (
+    "ALTER TABLE task_review_cards ADD COLUMN claiming_consumer TEXT;",
+)
+
+
 # Context exhaustion is a separate terminal condition for one attempt. The
 # workflow table has a closed reason vocabulary, so admitting it requires a
 # table rebuild rather than silently recording it as an ordinary timeout.
@@ -4189,6 +4397,167 @@ class CandidateInbox:
                     connection.execute("PRAGMA legacy_alter_table = OFF")
                     connection.execute("PRAGMA foreign_keys = ON")
                 version = 48
+            if version == 48:
+                connection.execute("PRAGMA foreign_keys = OFF")
+                connection.execute("PRAGMA legacy_alter_table = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    workflow_columns = {row["name"] for row in connection.execute(
+                        "PRAGMA table_info(task_execution_workflows)"
+                    )}
+                    if "steer_while_running" not in workflow_columns:
+                        connection.execute(
+                            "ALTER TABLE task_execution_workflows ADD COLUMN "
+                            "steer_while_running INTEGER NOT NULL DEFAULT 0 "
+                            "CHECK(steer_while_running IN (0,1))"
+                        )
+                    if "current_run_id" not in workflow_columns:
+                        connection.execute(
+                            "ALTER TABLE task_execution_workflows ADD COLUMN "
+                            "current_run_id TEXT CHECK(current_run_id IS NULL OR "
+                            "(length(current_run_id)=32 AND "
+                            "current_run_id GLOB '[0-9a-f]*'))"
+                        )
+                    card_columns = {row["name"] for row in connection.execute(
+                        "PRAGMA table_info(execution_review_cards)"
+                    )}
+                    if "steer_digest" not in card_columns:
+                        connection.execute(
+                            "DROP INDEX execution_review_cards_one_active"
+                        )
+                        connection.execute(
+                            "ALTER TABLE execution_review_cards RENAME TO "
+                            "execution_review_cards_v48"
+                        )
+                        connection.execute(_SCHEMA_V49_CARD_TABLE)
+                        connection.execute(
+                            "INSERT INTO execution_review_cards("
+                        "id,task_id,task_version,workflow_version,kind,phase,"
+                        "result_id,status,version,claim_token_digest,"
+                        "claim_expires_at,transport,delivery_ref,delivered_at,"
+                        "resolution,created_at,updated_at,resolved_at,"
+                        "consumer_digest,superseded_delivery_ref,"
+                        "superseded_transport,work_revision_id) "
+                        "SELECT id,task_id,task_version,workflow_version,kind,"
+                        "phase,result_id,status,version,claim_token_digest,"
+                        "claim_expires_at,transport,delivery_ref,delivered_at,"
+                        "resolution,created_at,updated_at,resolved_at,"
+                        "consumer_digest,superseded_delivery_ref,"
+                        "superseded_transport,work_revision_id "
+                            "FROM execution_review_cards_v48"
+                        )
+                        connection.execute("DROP TABLE execution_review_cards_v48")
+                        connection.execute(_SCHEMA_V9[1])
+                    connection.execute("PRAGMA user_version = 49")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                finally:
+                    connection.execute("PRAGMA legacy_alter_table = OFF")
+                    connection.execute("PRAGMA foreign_keys = ON")
+                version = 49
+            if version == 49:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V50:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 50")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 50
+            if version == 50:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    connection.execute(_SCHEMA_V51[0])
+                    connection.execute("PRAGMA user_version = 51")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 51
+            if version == 51:
+                connection.execute("PRAGMA foreign_keys = OFF")
+                connection.execute("PRAGMA legacy_alter_table = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V52:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 52")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                finally:
+                    connection.execute("PRAGMA legacy_alter_table = OFF")
+                    connection.execute("PRAGMA foreign_keys = ON")
+                version = 52
+            if version == 52:
+                connection.execute("PRAGMA foreign_keys = OFF")
+                connection.execute("PRAGMA legacy_alter_table = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V53:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 53")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                finally:
+                    connection.execute("PRAGMA legacy_alter_table = OFF")
+                    connection.execute("PRAGMA foreign_keys = ON")
+                version = 53
+            if version == 53:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    columns = {
+                        row["name"] for row in connection.execute(
+                            "PRAGMA table_info(execution_review_cards)"
+                        )
+                    }
+                    # Migration rehearsals may keep a later additive column
+                    # while resetting user_version, so this upgrade stays
+                    # replayable exactly as its additive predecessors are.
+                    if "summary_only" not in columns:
+                        connection.execute(_SCHEMA_V54[0])
+                    for statement in _SCHEMA_V54[1:]:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 54")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 54
+            if version == 54:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V55:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 55")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 55
+            if version == 55:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    columns = {
+                        row["name"] for row in connection.execute(
+                            "PRAGMA table_info(task_review_cards)"
+                        )
+                    }
+                    if "claiming_consumer" not in columns:
+                        connection.execute(_SCHEMA_V56[0])
+                    connection.execute("PRAGMA user_version = 56")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 56
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:
@@ -4839,16 +5208,37 @@ class CandidateInbox:
                 allow_appended_columns
                 and columns[:len(expected_columns)] == expected_columns
             ) and not (
+                # A synthetic historical-migration rehearsal can begin from
+                # a newer database and remove only the columns it is about to
+                # reintroduce. Steer columns arrived after every checkpoint
+                # below, so tolerate precisely those durable future suffixes.
+                table == "task_execution_workflows"
+                and set(columns) == set(expected_columns) | {
+                    "steer_while_running", "current_run_id"}
+                and len(columns) == len(expected_columns) + 2
+            ) and not (
+                table == "execution_review_cards"
+                and set(columns) == set(expected_columns) | {"steer_digest"}
+                and len(columns) == len(expected_columns) + 1
+            ) and not (
+                table == "task_review_cards"
+                and set(columns) == set(expected_columns) | {"claiming_consumer"}
+                and len(columns) == len(expected_columns) + 1
+            ) and not (
                 table == "tasks"
                 and tuple(column for column in columns if column not in {
                     "object", "action", "confidence"
                 }) == expected_columns
             ) and not (
-                # SQLite re-adds owner columns at the end when a synthetic
-                # historical-migration rehearsal first drops them. V45 may
-                # already have appended its nullable fields, so the final
-                # shape is equivalent but its harmless column order differs.
-                table == "tasks"
+                # ALTER TABLE preserves data but a historical rehearsal that
+                # removes and later restores profile columns can move the
+                # final two steer fields ahead of them. Their names, not
+                # their physical SQLite order, define this row shape.
+                table == "task_execution_workflows"
+                and set(columns) == set(expected_columns)
+                and len(columns) == len(expected_columns)
+            ) and not (
+                table in {"tasks", "task_review_cards"}
                 and set(columns) == set(expected_columns)
                 and len(columns) == len(expected_columns)
             ):

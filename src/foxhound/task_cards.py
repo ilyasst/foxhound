@@ -717,7 +717,7 @@ class TaskCardService:
         but can never apply an action without its delivery record.
         """
         if (not _valid_identity(card_id, expected_version)
-                or action not in {"done", "keep_open", "drop", "snooze"}
+                or action not in TASK_CARD_ACTIONS
                 or not _valid_digest(consumer_digest)):
             return _refused(card_id, CardRefusal.INVALID_ARGUMENT)
         try:

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from foxhound import migrate_database
+from foxhound.task_ledger import MAX_UNPRODUCTIVE_RESURFACES
 
 import copy
 import hashlib
@@ -21,7 +22,11 @@ from foxhound.contracts import candidate_id_for, comparable_task_digest
 from foxhound.native_intake import main
 from review_card_fixture import raise_review_cards
 from foxhound.task_cards import CardRefusal, TaskCardService
-from foxhound.task_execution import TaskExecutionService, WorkflowStatus
+from foxhound.task_execution import (
+    TaskExecutionService,
+    WorkflowRefusal,
+    WorkflowStatus,
+)
 from foxhound.task_ledger import (
     BootstrapDisposition,
     BootstrapRefusal,
@@ -207,6 +212,56 @@ def cumulative_candidate(index: int, kind: str) -> dict:
         "state": "active",
         "generation": 1,
         "changed_at": "2030-02-01T12:00:00Z",
+    }
+    item["source"]["revision"] = hashlib.sha256(
+        json.dumps(item, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return item
+
+
+def review_candidate(
+    head_oid: str,
+    *,
+    title: str = "Review synthetic change",
+    generation: int = 1,
+) -> dict:
+    """A current-shape pull request with GW's explicit head evidence."""
+    item = cumulative_candidate(42, "review_request")
+    item["source"].update({
+        "record_id": "example.com/acme/widget",
+        "item_id": "42",
+    })
+    item["candidate_id"] = candidate_id_for(
+        system="gw",
+        kind="review_request",
+        record_id=item["source"]["record_id"],
+        item_id=item["source"]["item_id"],
+    )
+    item["task"]["text"] = title
+    item["lifecycle"].update({
+        "generation": generation,
+        "changed_at": f"2030-02-{generation:02d}T12:00:00Z",
+    })
+    item["evidence"] = {
+        "document_id": item["source"]["record_id"],
+        "locator": "example.com/acme/widget/pull/42",
+        "sources": [
+            {
+                "name": "pull-request-42.md",
+                "role": "title",
+                "extract": title,
+            },
+            {
+                "name": "pull-request-42.md",
+                "role": "body",
+                "extract": "Synthetic review evidence.",
+            },
+            {
+                "name": "pull-request-42-head.txt",
+                "role": "diff",
+                "extract": head_oid,
+            },
+        ],
     }
     item["source"]["revision"] = hashlib.sha256(
         json.dumps(item, sort_keys=True).encode("utf-8")
@@ -871,6 +926,130 @@ class NativeCandidateIntakeTests(unittest.TestCase):
                 stored = self.inbox.get(enriched["candidate_id"])
                 self.assertEqual(stored.evidence.sources[0].role, role)
 
+    def test_a_finished_review_does_not_re_surface_on_a_metadata_edit(self):
+        """A pull-request edit that leaves the head alone changes no work.
+
+        The revision path deliberately keeps the task version stable for this
+        case. Reopening anyway left the task carrying exactly the content it
+        was completed against, and named a version that was never written.
+        A comment on a pull request is the common shape of this.
+        """
+        self.activate()
+        self.inbox.import_feed(feed(0, review_candidate("a" * 40)))
+        self.intake()
+        closed = self.ledger.get(1)
+        self.assertTrue(
+            self.ledger.transition(
+                1, expected_version=closed.version, action="done"
+            ).accepted
+        )
+
+        # The `done` transition advances the version; that is the baseline
+        # the metadata edit must not move.
+        settled = self.ledger.get(1)
+        self.inbox.import_feed(feed(1, review_candidate(
+            "a" * 40, title="Retitled synthetic change", generation=2
+        )))
+        self.intake()
+
+        task = self.ledger.get(1)
+        self.assertEqual(task.status, TaskStatus.DONE)
+        self.assertEqual(task.version, settled.version)
+        with closing(sqlite3.connect(self.database)) as connection:
+            reopens = connection.execute(
+                "SELECT COUNT(*) FROM task_events WHERE task_id=1 "
+                "AND kind='status_changed' AND from_status='done' "
+                "AND to_status='open'"
+            ).fetchone()[0]
+        self.assertEqual(reopens, 0)
+
+    def test_a_finished_review_re_surfaces_when_the_head_moves(self):
+        """New code is a real change, and must still bring the task back."""
+        self.activate()
+        self.inbox.import_feed(feed(0, review_candidate("a" * 40)))
+        self.intake()
+        closed = self.ledger.get(1)
+        self.assertTrue(
+            self.ledger.transition(
+                1, expected_version=closed.version, action="done"
+            ).accepted
+        )
+
+        self.inbox.import_feed(feed(1, review_candidate(
+            "b" * 40, title="Review synthetic change", generation=2
+        )))
+        self.intake()
+
+        task = self.ledger.get(1)
+        self.assertEqual(task.status, TaskStatus.OPEN)
+        with closing(sqlite3.connect(self.database)) as connection:
+            event_version = connection.execute(
+                "SELECT task_version FROM task_events WHERE task_id=1 "
+                "AND kind='status_changed' AND from_status='done' "
+                "AND to_status='open' ORDER BY sequence DESC LIMIT 1"
+            ).fetchone()[0]
+        # The event must name the version the task actually carries, because
+        # the execution scheduler keys on it.
+        self.assertEqual(event_version, task.version)
+
+    def test_review_metadata_change_preserves_its_current_workflow(self):
+        self.activate()
+        initial = review_candidate("a" * 40, title="Review synthetic change")
+        self.inbox.import_feed(feed(0, initial))
+        self.intake()
+        execution = TaskExecutionService(self.database, clock=lambda: NOW)
+        scheduled = execution.schedule(1, expected_task_version=1)
+
+        edited = review_candidate(
+            "a" * 40, title="Retitled synthetic change", generation=2
+        )
+        self.inbox.import_feed(feed(1, edited))
+        result = self.intake()
+
+        task = self.ledger.get(1)
+        workflow = execution.get(1)
+        self.assertEqual(result.tasks_revised, 1)
+        self.assertEqual(
+            (task.text, task.version), ("Retitled synthetic change", 1)
+        )
+        self.assertEqual(
+            (workflow.task_version, workflow.version),
+            (1, scheduled.version),
+        )
+
+    def test_review_head_updates_coalesce_to_one_latest_workflow(self):
+        self.activate()
+        initial = review_candidate("a" * 40)
+        self.inbox.import_feed(feed(0, initial))
+        self.intake()
+        execution = TaskExecutionService(self.database, clock=lambda: NOW)
+        stale = execution.schedule(1, expected_task_version=1)
+
+        second = review_candidate("b" * 40, generation=2)
+        latest = review_candidate("c" * 40, generation=3)
+        self.inbox.import_feed(feed(1, second, latest))
+        result = self.intake()
+
+        self.assertEqual(result.tasks_revised, 2)
+        self.assertEqual(self.ledger.get(1).version, 3)
+        refreshed = execution.schedule_new()
+        workflow = execution.get(1)
+        self.assertEqual(refreshed.scheduled, 1)
+        self.assertEqual(workflow.task_version, 3)
+        refused = execution.start_action(
+            1, expected_version=stale.version, action="start"
+        )
+        self.assertEqual(refused.refusal, WorkflowRefusal.STALE_WORKFLOW)
+        with closing(sqlite3.connect(self.database)) as connection:
+            workflow_count = connection.execute(
+                "SELECT COUNT(*) FROM task_execution_workflows WHERE task_id=1"
+            ).fetchone()[0]
+            binding = connection.execute(
+                "SELECT source_revision FROM task_candidate_bindings"
+            ).fetchone()[0]
+        self.assertEqual(workflow_count, 1)
+        self.assertEqual(binding, latest["source"]["revision"])
+
     def test_withdrawal_before_binding_advances_without_creating_a_task(self):
         self.activate()
         withdrawn = lifecycle_candidate(1, generation=1, state="withdrawn")
@@ -936,8 +1115,11 @@ class NativeCandidateIntakeTests(unittest.TestCase):
         self.assertEqual(lifecycle, ("withdrawn", "reader_conflict"))
         self.assertEqual(event, "candidate_withdrawal_conflict")
 
-    def test_a_revision_for_a_closed_task_is_recorded_not_applied(self):
-        """The reader closing a task is the end of its life, not a conflict.
+    def test_a_revision_for_a_dropped_task_is_recorded_not_applied(self):
+        """A reader dropping a task is the end of its life, not a conflict.
+
+        ADR 0039 lets a `done` task re-surface, so `dropped` is now the
+        terminal state this protects: the reader rejected the work itself.
 
         A producer that still holds the task open keeps re-emitting it, so
         refusing here did not pause the stream, it stopped it: the cursor
@@ -949,7 +1131,7 @@ class NativeCandidateIntakeTests(unittest.TestCase):
         self.inbox.import_feed(feed(0, candidate(1)))
         self.intake()
         self.assertTrue(
-            self.ledger.transition(1, expected_version=1, action="done").accepted
+            self.ledger.transition(1, expected_version=1, action="drop").accepted
         )
         closed = self.ledger.get(1)
         revised = candidate(
@@ -974,7 +1156,7 @@ class NativeCandidateIntakeTests(unittest.TestCase):
         self.assertEqual(
             (after.text, after.owner, after.due, after.status, after.version),
             (closed.text, closed.owner, closed.due,
-             TaskStatus.DONE, closed.version),
+             TaskStatus.DROPPED, closed.version),
         )
         with closing(sqlite3.connect(self.database)) as connection:
             binding = connection.execute(
@@ -1016,11 +1198,176 @@ class NativeCandidateIntakeTests(unittest.TestCase):
         result = self.intake()
 
         self.assertTrue(result.accepted, result.refusal)
+        # ADR 0039: a `done` task re-surfaces when its source moves, so both
+        # are revised and neither is acknowledged-after-close. The property
+        # this test protects is unchanged -- one settled task does not stop
+        # the candidates behind it.
         self.assertEqual(
-            (result.candidates_after_close, result.tasks_revised), (1, 1))
-        self.assertEqual(self.ledger.get(1).status, TaskStatus.DONE)
+            (result.candidates_after_close, result.tasks_revised), (0, 2))
+        self.assertEqual(self.ledger.get(1).status, TaskStatus.OPEN)
+        self.assertEqual(
+            self.ledger.get(1).text, "Revised after the reader closed it")
         self.assertEqual(
             self.ledger.get(2).text, "Revised while still open")
+
+    def test_a_dropped_task_stays_terminal_when_its_source_moves(self):
+        """A reader who dropped a task rejected the work, not a stale draft."""
+        self.activate()
+        self.inbox.import_feed(feed(0, candidate(1), candidate(2)))
+        self.intake()
+        self.assertTrue(
+            self.ledger.transition(1, expected_version=1, action="drop").accepted
+        )
+        self.inbox.import_feed(feed(
+            2,
+            candidate(1, text="Revised after the reader dropped it"),
+            candidate(2, text="Revised while still open"),
+        ))
+
+        result = self.intake()
+
+        self.assertTrue(result.accepted, result.refusal)
+        self.assertEqual(
+            (result.candidates_after_close, result.tasks_revised), (1, 1))
+        self.assertEqual(self.ledger.get(1).status, TaskStatus.DROPPED)
+        self.assertNotEqual(
+            self.ledger.get(1).text, "Revised after the reader dropped it")
+        self.assertEqual(
+            self.ledger.get(2).text, "Revised while still open")
+
+    def test_a_resurfaced_task_bumps_its_version_and_applies_content(self):
+        """Reopening must apply the revision, not merely change status."""
+        self.activate()
+        self.inbox.import_feed(feed(0, candidate(1)))
+        self.intake()
+        closed = self.ledger.get(1)
+        self.assertTrue(
+            self.ledger.transition(
+                1, expected_version=closed.version, action="done"
+            ).accepted
+        )
+        self.assertEqual(self.ledger.get(1).status, TaskStatus.DONE)
+        self.inbox.import_feed(
+            feed(1, candidate(1, text="Revised after the reader closed it"))
+        )
+
+        self.intake()
+
+        task = self.ledger.get(1)
+        self.assertEqual(task.status, TaskStatus.OPEN)
+        self.assertEqual(task.text, "Revised after the reader closed it")
+        self.assertGreater(task.version, closed.version)
+
+        # The reopen is recorded, at the version the task now carries. The
+        # execution scheduler reads exactly this to tell a re-surfaced task
+        # apart from one whose version moved for another reason, so the two
+        # halves are asserted together rather than separately.
+        with closing(sqlite3.connect(self.database)) as connection:
+            event = connection.execute(
+                "SELECT kind,from_status,to_status,task_version "
+                "FROM task_events WHERE task_id=1 AND kind='status_changed' "
+                "ORDER BY sequence DESC LIMIT 1"
+            ).fetchone()
+            reopened_at, bound = connection.execute(
+                "SELECT e.source_revision,b.source_revision "
+                "FROM task_events e JOIN task_candidate_bindings b "
+                "ON b.task_id=e.task_id "
+                "WHERE e.task_id=1 AND e.kind='status_changed' "
+                "ORDER BY e.sequence DESC LIMIT 1"
+            ).fetchone()
+        self.assertEqual(
+            event, ("status_changed", "done", "open", task.version)
+        )
+        # The event must name the revision that caused the reopen. Every
+        # `status_changed` row used to carry NULL here, so nothing recorded
+        # which source state a task was answered against -- and a re-surfaced
+        # task cannot tell new discussion from the discussion it already read
+        # without it.
+        self.assertIsNotNone(
+            reopened_at, "the reopen must record the revision that caused it"
+        )
+        self.assertEqual(reopened_at, bound)
+
+    def test_closing_a_task_records_the_source_state_it_answered(self):
+        """The baseline: what was this task completed against?
+
+        Re-surfacing is only useful if the ledger can say which source state
+        was already answered -- otherwise a re-surfaced task cannot separate
+        new discussion from the discussion it read before closing. Authorship
+        cannot supply this here: the agents post from the operator's account,
+        so a self-authored revision is indistinguishable from anyone else's.
+
+        Every `status_changed` row carried NULL in these columns before this,
+        so the question had no answer anywhere in the ledger.
+        """
+        self.activate()
+        self.inbox.import_feed(feed(0, candidate(1)))
+        self.intake()
+
+        task = self.ledger.get(1)
+        self.assertTrue(
+            self.ledger.transition(
+                task.id, expected_version=task.version, action="done"
+            ).accepted
+        )
+
+        with closing(sqlite3.connect(self.database)) as connection:
+            recorded, bound = connection.execute(
+                "SELECT e.source_revision,b.source_revision "
+                "FROM task_events e JOIN task_candidate_bindings b "
+                "ON b.task_id=e.task_id "
+                "WHERE e.task_id=? AND e.kind='status_changed' "
+                "AND e.to_status='done' ORDER BY e.sequence DESC LIMIT 1",
+                (task.id,),
+            ).fetchone()
+
+        self.assertIsNotNone(
+            recorded,
+            "closing a task must record the source state it answered",
+        )
+        self.assertEqual(recorded, bound)
+
+    def test_repeated_resurfacing_that_produces_nothing_stops(self):
+        """A runaway must be impossible, not merely unlikely.
+
+        The cycle this bounds is short and real: an agent finishes a task and
+        posts a follow-through comment, the comment moves the source revision,
+        the task re-surfaces, the agent works it and comments again. Authorship
+        cannot break it -- the agents post from the operator's account, so a
+        self-authored revision looks like anyone else's.
+
+        So the ledger counts re-surfaces that folded no work in, and stops.
+        Judgement is still the normal way out; this is the floor under it.
+        """
+        self.activate()
+        self.inbox.import_feed(feed(0, candidate(1)))
+        self.intake()
+
+        reopens = 0
+        for cycle in range(MAX_UNPRODUCTIVE_RESURFACES + 2):
+            task = self.ledger.get(1)
+            if task.status is TaskStatus.OPEN:
+                self.assertTrue(
+                    self.ledger.transition(
+                        1, expected_version=task.version, action="done"
+                    ).accepted
+                )
+            self.inbox.import_feed(
+                feed(cycle + 1, candidate(1, text=f"Source moved {cycle}"))
+            )
+            self.intake()
+            if self.ledger.get(1).status is TaskStatus.OPEN:
+                reopens += 1
+
+        self.assertEqual(
+            reopens,
+            MAX_UNPRODUCTIVE_RESURFACES,
+            "re-surfacing must stop once it has produced nothing "
+            f"{MAX_UNPRODUCTIVE_RESURFACES} times",
+        )
+        # Past the bound the task stays closed and the revision is still
+        # recorded, so nothing is lost -- it is acknowledged, not applied.
+        self.assertEqual(self.ledger.get(1).status, TaskStatus.DONE)
 
     def test_a_revision_whose_task_is_gone_still_refuses(self):
         """A binding pointing at a task that does not exist is corruption,
@@ -1296,7 +1643,7 @@ class NativeCandidateIntakeTests(unittest.TestCase):
         first = candidate(1)
         self.inbox.import_feed(feed(0, first))
         self.intake()
-        self.ledger.transition(1, expected_version=1, action="done")
+        self.ledger.transition(1, expected_version=1, action="drop")
         terminal_revision = candidate(1, text="Revise a closed synthetic task")
         self.inbox.import_feed(feed(1, terminal_revision))
 
@@ -1305,7 +1652,7 @@ class NativeCandidateIntakeTests(unittest.TestCase):
         self.assertTrue(result.accepted, result.refusal)
         self.assertEqual(result.candidates_after_close, 1)
         self.assertEqual(self._intake_cursor(), 2)
-        self.assertEqual(self.ledger.get(1).status, TaskStatus.DONE)
+        self.assertEqual(self.ledger.get(1).status, TaskStatus.DROPPED)
 
     def test_folded_revision_fails_closed(self):
         self.activate()

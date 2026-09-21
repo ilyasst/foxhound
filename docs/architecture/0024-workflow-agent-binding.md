@@ -93,3 +93,63 @@ deliberately not decided here: an automatic adoption is the case closest to
 contradicting this ADR, and the argument should be made against measured
 evidence rather than ahead of it. The reporting exists so that evidence can be
 gathered.
+
+## Amendment: adoption is an operator's act, not a configuration side effect
+
+The amendment above gathered evidence and deferred the decision. The evidence
+arrived. On one deployment, four retired revisions held twenty-eight workflows,
+every one of them queued and none running — a queue entirely composed of work
+held to budgets the operator had already replaced, and entirely safe to move.
+
+So a workflow may now adopt the installed revision of the profile it already
+names. Three properties keep that from contradicting the pin.
+
+**It never changes which profile a workflow names.** Adoption resolves the
+workflow's own `agent_profile_id` and moves only the revision. Choosing a
+different profile remains `select_agent`'s question, a reader's decision, and
+its `awaiting_start` fence is untouched. The two operations answer different
+questions and are deliberately not merged: "which agent should do this?" is a
+choice between alternatives, while "should this keep a budget that no longer
+exists?" has only one sensible answer once an operator has replaced it.
+
+**It never touches a running workflow.** An agent mid-run holds a claim lease
+sized by the revision it started under. Rebinding beneath it would change the
+budget of work already in flight, which is the case this ADR's fence exists to
+prevent, and that protection is unchanged.
+
+**An operator triggers it, and the ledger says so.** This is the part that was
+genuinely undecided, and the alternatives were not equivalent:
+
+- *Automatically, in the scheduler.* Recovers the whole queue with no operator
+  action. It is also the case closest to contradicting this ADR's central
+  claim, because a configuration change alone would alter queued work. The
+  argument that the profile ID is unchanged and the old revision is gone is a
+  reasonable one, but it is exactly the argument this ADR exists to force
+  someone to make deliberately.
+- *A reader control on a card.* Honest, and useless at this scale. A queue of
+  hundreds will not be rebound one card at a time.
+- *An explicit operation.* Chosen. `foxhound-profile-adoption` is a one-shot
+  command, dry run by default, bounded per pass, reporting counts rather than
+  task identities. Every adoption increments the workflow version and emits an
+  `agent_selected` event, so stale cards retire through the existing path and
+  the change is in the ledger rather than inferred from behaviour.
+
+Two rules follow from the same reasoning and are not negotiable in an
+implementation:
+
+**A narrowed budget is reported, never silent.** Adoption is allowed to move a
+workflow to a *smaller* budget — the installed revision is by definition the one
+the operator chose — but a workflow that loses time because its profile was
+narrowed is a decision, and the pass says how many that was. Losing budget by
+accident and losing it on purpose look identical afterwards; only the report
+distinguishes them at the time.
+
+**The pass is bounded and content-free.** Rebinding many workflows retires many
+cards, so a pass has a limit and reports what it left behind. It reports
+magnitudes only: naming the work would put ledger content wherever the output
+is printed.
+
+Automatic adoption remains undecided and is deliberately left so. The explicit
+operation is the conservative half; if the counts it reports turn out to be
+routine rather than exceptional, that is the evidence a future amendment would
+need — and it will have been gathered the same way this one was.

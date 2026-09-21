@@ -32,7 +32,9 @@ from foxhound.execution_runner import (
     ExecutionRunResult,
     _exclusive_lock,
     _runner_lock_path,
+    _transcript_session_id,
     agent_prompt,
+    agent_selection_argv,
     hermes_argv,
     main,
     profile_argv,
@@ -170,6 +172,7 @@ class ExecutionRunnerTests(unittest.TestCase):
 
         def popen(argv, **kwargs):
             launched["kwargs"] = kwargs
+            self.assertEqual(self.service.get(1).current_run_id, "b" * 32)
             handle = kwargs["stdout"]
             handle.write(b"synthetic agent output\n")
             handle.flush()
@@ -579,9 +582,9 @@ class ExecutionRunnerTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            (result.outcome, result.exit_code), ("released", 70)
+            (result.outcome, result.exit_code), ("released", 0)
         )
-        self.assertFalse(result.ok)
+        self.assertTrue(result.ok)
 
     def test_process_exit_and_start_failure_enter_durable_backoff(self):
         self._ready()
@@ -614,6 +617,153 @@ class ExecutionRunnerTests(unittest.TestCase):
         self.assertEqual(
             self.service.get(1).last_failure_reason, "startup_failed"
         )
+
+    def test_unrecorded_session_gets_one_corrective_resume(self):
+        self._ready()
+        launches = []
+
+        def popen(argv, **kwargs):
+            launches.append(tuple(argv))
+            transcript = kwargs["stdout"]
+            if len(launches) == 1:
+                transcript.write(b"session_id: synthetic-session-1\n")
+                transcript.flush()
+                return FakeProcess(exit_code=0)
+
+            state = load_run_state(
+                Path(kwargs["env"]["FOXHOUND_EXECUTION_STATE"])
+            )
+
+            def record():
+                accepted = TaskExecutionService(
+                    state.database_path
+                ).record_result(ExecutionResultEnvelope(
+                    result_id=RESULT_ID,
+                    task_id=state.task_id,
+                    task_version=state.task_version,
+                    workflow_version=state.workflow_version,
+                    phase=state.phase,
+                    claim_token=state.claim_token,
+                    outcome=ExecutionOutcome.AWAITING_PLAN,
+                    summary="Synthetic recovered result",
+                    work_markdown="Synthetic recovered plan",
+                ))
+                self.assertTrue(accepted.accepted)
+
+            return FakeProcess(callback=record)
+
+        result = run_once(
+            self._config(),
+            popen=popen,
+            run_id_factory=lambda: "9" * 32,
+            terminate=self._terminator,
+        )
+
+        self.assertEqual((result.outcome, result.exit_code), ("recorded", 0))
+        self.assertEqual(len(launches), 2)
+        corrective = launches[1]
+        self.assertEqual(
+            corrective[corrective.index("--resume") + 1],
+            "synthetic-session-1",
+        )
+        self.assertIn("--no-restore-cwd", corrective)
+        self.assertEqual(
+            corrective[corrective.index("--max-turns") + 1], "1"
+        )
+        self.assertEqual(
+            corrective[corrective.index("--query") + 1],
+            "The preceding execution turn ended without recording a result. "
+            "Do not do new work. Use exactly one worker operation now: record "
+            "the result already prepared, or release the claim if no result is "
+            "ready.",
+        )
+
+    def test_a_missing_or_malformed_session_id_does_not_retry(self):
+        self._ready()
+        launches = []
+
+        def popen(argv, **kwargs):
+            launches.append(tuple(argv))
+            transcript = kwargs["stdout"]
+            transcript.write(b"session_id: ../not-a-session\n")
+            transcript.flush()
+            return FakeProcess(exit_code=3)
+
+        result = run_once(
+            self._config(),
+            popen=popen,
+            run_id_factory=lambda: "8" * 32,
+            terminate=self._terminator,
+        )
+
+        self.assertEqual((result.outcome, result.exit_code), ("process_exit", 3))
+        self.assertEqual(len(launches), 1)
+
+    def test_a_failed_corrective_resume_is_not_retried(self):
+        self._ready()
+        launches = []
+
+        def popen(argv, **kwargs):
+            launches.append(tuple(argv))
+            transcript = kwargs["stdout"]
+            transcript.write(b"session_id: synthetic-session-2\n")
+            transcript.flush()
+            return FakeProcess(exit_code=3)
+
+        result = run_once(
+            self._config(),
+            popen=popen,
+            run_id_factory=lambda: "7" * 32,
+            terminate=self._terminator,
+        )
+
+        self.assertEqual((result.outcome, result.exit_code), ("process_exit", 3))
+        self.assertEqual(len(launches), 2)
+
+    def test_a_budget_exhausted_session_gets_its_corrective_resume(self):
+        """The closing form a pass prints when it runs out of turns.
+
+        This is the failure the corrective resume exists for: the pass worked
+        to the end of its budget and may have left a result prepared but
+        unrecorded.  It prints a summary block instead of the plain identity
+        line, and a runner that reads only the plain line never resumes it.
+        """
+        self._ready()
+        launches = []
+
+        def popen(argv, **kwargs):
+            launches.append(tuple(argv))
+            transcript = kwargs["stdout"]
+            if len(launches) == 1:
+                transcript.write(
+                    b"\xe2\x9a\xa0 Iteration budget reached (80/80)\n"
+                    b"\nResume this session with:\n"
+                    b"  hermes --resume synthetic-session-3\n"
+                    b"\nSession:        synthetic-session-3\n"
+                    b"Duration:       21m 53s\n"
+                    b"Messages:       180 (2 user, 177 tool calls)\n"
+                )
+                transcript.flush()
+                return FakeProcess(exit_code=0)
+            return FakeProcess(exit_code=3)
+
+        result = run_once(
+            self._config(),
+            popen=popen,
+            run_id_factory=lambda: "6" * 32,
+            terminate=self._terminator,
+        )
+
+        self.assertEqual(len(launches), 2)
+        corrective = launches[1]
+        self.assertEqual(
+            corrective[corrective.index("--resume") + 1],
+            "synthetic-session-3",
+        )
+        self.assertEqual(
+            corrective[corrective.index("--max-turns") + 1], "1"
+        )
+        self.assertEqual(result.outcome, "process_exit")
 
     def test_selected_profile_controls_exact_prompt_tools_turns_and_timing(self):
         specialist = parse_profile({
@@ -1244,6 +1394,182 @@ class ExecutionRunnerTests(unittest.TestCase):
         )
         self.assertIsNotNone(
             run.call_args.args[0].profile_registry.get("specialist")
+        )
+
+    def test_declared_backend_is_selected_before_the_subcommand(self):
+        profile = load_registry().get("general")
+        argv = profile_argv(
+            "synthetic-agent --local",
+            profile,
+            worker_command="synthetic-worker",
+            model="synthetic-model-a",
+            provider="synthetic-provider",
+        )
+
+        self.assertEqual(
+            argv[:6],
+            (
+                "synthetic-agent",
+                "--local",
+                "--model",
+                "synthetic-model-a",
+                "--provider",
+                "synthetic-provider",
+            ),
+        )
+        self.assertEqual(argv[6], "chat")
+
+    def test_an_undeclared_backend_adds_nothing_to_the_invocation(self):
+        profile = load_registry().get("general")
+        selected = profile_argv("synthetic-agent", profile)
+
+        self.assertEqual(selected[0], "synthetic-agent")
+        self.assertEqual(selected[1], "chat")
+        for flag in ("--model", "--provider"):
+            self.assertNotIn(flag, selected)
+            self.assertNotIn(flag, hermes_argv("synthetic-agent", max_turns=2))
+        self.assertEqual(agent_selection_argv(None, None), ())
+
+    def test_an_unusable_backend_selection_is_refused_before_any_claim(self):
+        unusable = (
+            (None, "synthetic-provider"),
+            ("--not-a-model", None),
+            ("synthetic model", None),
+            ("synthetic-model-a", "synthetic provider"),
+            ("synthetic-model-a", "--not-a-provider"),
+            ("", None),
+            ("synthetic-model-a\x00", None),
+        )
+        for model, provider in unusable:
+            with self.subTest(model=model, provider=provider):
+                with self.assertRaises(ValueError):
+                    agent_selection_argv(model, provider)
+                with self.assertRaises(ValueError):
+                    self._config(agent_model=model, agent_provider=provider)
+
+    def test_a_corrective_resume_runs_on_the_backend_the_turn_started_on(self):
+        self._ready()
+        launches = []
+
+        def popen(argv, **kwargs):
+            launches.append(tuple(argv))
+            transcript = kwargs["stdout"]
+            if len(launches) == 1:
+                transcript.write(b"session_id: synthetic-session-1\n")
+                transcript.flush()
+                return FakeProcess(exit_code=0)
+            state = load_run_state(
+                Path(kwargs["env"]["FOXHOUND_EXECUTION_STATE"])
+            )
+
+            def record():
+                TaskExecutionService(state.database_path).record_result(
+                    ExecutionResultEnvelope(
+                        result_id=RESULT_ID,
+                        task_id=state.task_id,
+                        task_version=state.task_version,
+                        workflow_version=state.workflow_version,
+                        phase=state.phase,
+                        claim_token=state.claim_token,
+                        outcome=ExecutionOutcome.AWAITING_PLAN,
+                        summary="Synthetic recovered result",
+                        work_markdown="Synthetic recovered plan",
+                    )
+                )
+
+            return FakeProcess(callback=record)
+
+        run_once(
+            self._config(
+                agent_model="synthetic-model-a",
+                agent_provider="synthetic-provider",
+            ),
+            popen=popen,
+            run_id_factory=lambda: "9" * 32,
+            terminate=self._terminator,
+        )
+
+        self.assertEqual(len(launches), 2)
+        selection = ("--model", "synthetic-model-a",
+                     "--provider", "synthetic-provider")
+        for launch in launches:
+            with self.subTest(launch=launch[0]):
+                index = launch.index("chat")
+                self.assertEqual(launch[index - 4:index], selection)
+        self.assertIn("--resume", launches[1])
+
+
+class TranscriptSessionIdentityTests(unittest.TestCase):
+    """Which closing forms in a private transcript name a resumable session."""
+
+    PLAIN = b"session_id: synthetic-plain\n"
+    SUMMARY = (
+        b"Session:        synthetic-summary\n"
+        b"Duration:       3m 1s\n"
+        b"Messages:       12 (2 user, 9 tool calls)\n"
+    )
+
+    def _identity(self, payload: bytes) -> str | None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "agent-output.log"
+            path.write_bytes(payload)
+            return _transcript_session_id(path, None)
+
+    def test_each_closing_form_alone_names_its_session(self):
+        for label, payload, expected in (
+            ("plain", self.PLAIN, "synthetic-plain"),
+            ("summary", self.SUMMARY, "synthetic-summary"),
+        ):
+            with self.subTest(form=label):
+                self.assertEqual(self._identity(payload), expected)
+
+    def test_the_last_form_written_wins_whichever_it_is(self):
+        self.assertEqual(
+            self._identity(self.PLAIN + self.SUMMARY), "synthetic-summary"
+        )
+        self.assertEqual(
+            self._identity(self.SUMMARY + self.PLAIN), "synthetic-plain"
+        )
+
+    def test_a_transcript_with_neither_form_names_no_session(self):
+        self.assertIsNone(self._identity(b""))
+        self.assertIsNone(
+            self._identity(b"Work finished. Nothing to record.\n")
+        )
+
+    def test_a_malformed_identity_is_rejected_in_either_form(self):
+        for label, payload in (
+            ("plain", b"session_id: ../not-a-session\n"),
+            (
+                "summary",
+                b"Session:        ../not-a-session\nDuration:       1m\n",
+            ),
+        ):
+            with self.subTest(form=label):
+                self.assertIsNone(self._identity(payload))
+
+    def test_quoted_output_is_not_mistaken_for_a_summary_block(self):
+        """Agent output lands in this transcript verbatim.
+
+        A line beginning "Session:" is ordinary prose.  Only the runtime's
+        closing block, whose next line reports the duration, is an identity.
+        """
+        self.assertIsNone(
+            self._identity(b"Session:        notes-from-the-meeting\n")
+        )
+        self.assertIsNone(
+            self._identity(
+                b"Session:        notes\nSummary:        unrelated\n"
+            )
+        )
+
+    def test_a_truncated_closing_block_names_no_session(self):
+        self.assertIsNone(self._identity(b"Session:        synthetic-summary"))
+
+    def test_an_indented_identity_line_is_not_a_closing_form(self):
+        """The resume hint the block prints above itself is not the anchor."""
+        self.assertIsNone(
+            self._identity(b"  hermes --resume synthetic-summary\n")
         )
 
 

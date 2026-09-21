@@ -16,6 +16,7 @@ import stat
 import sys
 import time
 from dataclasses import dataclass
+from datetime import timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -59,7 +60,13 @@ from .task_cards import (
     render_task_review_card,
 )
 from .task_ledger import TaskLedgerError
-from .task_execution import TaskExecutionService, WorkflowOperationResult
+from .task_execution import (
+    WORKFLOW_BOARD_STATUSES,
+    TaskExecutionService,
+    WorkflowBoard,
+    WorkflowBoardDetail,
+    WorkflowOperationResult,
+)
 
 
 log = logging.getLogger("foxhound.task_card_server")
@@ -105,6 +112,8 @@ EXECUTION_AGENT_SELECTION_SCHEMA = (
 )
 EXECUTION_PRIORITY_SCHEMA = "foxhound.execution-workflow-service.priority"
 EXECUTION_PRIORITY_SCHEMA_VERSION = 1
+WORKFLOW_BOARD_SCHEMA = "foxhound.execution-workflow-service.board"
+WORKFLOW_DETAIL_SCHEMA = "foxhound.execution-workflow-service.detail"
 
 # ADR 0036 decision 1: every accepted bearer token is configured with
 # exactly one role from this closed set. A single legacy token with no
@@ -133,6 +142,9 @@ ROUTES = {
     "/v2/execution-cards/stats": "execution_stats_scoped",
     "/v1/execution-cards/schedule": "execution_schedule",
     "/v1/execution-cards/claim": "execution_claim",
+    "/v1/execution-cards/retraction-claim": "execution_retraction_claim",
+    "/v1/execution-cards/retracted": "execution_retracted",
+    "/v1/execution-cards/retraction-failed": "execution_retraction_failed",
     "/v1/execution-cards/delivered": "execution_delivered",
     "/v1/execution-cards/delivery-failed": "execution_delivery_failed",
     "/v1/execution-cards/action": "execution_action",
@@ -149,6 +161,8 @@ ROUTES = {
     "/v1/execution-cards/queue": "execution_queue",
     "/v1/execution-cards/board": "execution_board",
     "/v1/execution-cards/resolve": "execution_resolve",
+    "/v1/execution-workflows/board": "workflow_board",
+    "/v1/execution-workflows/detail": "workflow_detail",
     "/v1/execution-workflows/priority": "execution_priority",
 }
 
@@ -478,9 +492,7 @@ class TaskCardApplication:
                     HTTPStatus.FORBIDDEN,
                 )
             action = request["action"]
-            if not isinstance(action, str) or action not in {
-                "done", "keep_open", "drop", "snooze"
-            }:
+            if not isinstance(action, str) or action not in TASK_CARD_ACTIONS:
                 raise TaskCardServerRequestError(
                     "invalid_request", "task card action is invalid"
                 )
@@ -642,7 +654,7 @@ class TaskCardApplication:
         if operation == "execution_stats":
             _request(payload, required=set())
             stats = self._execution_cards().stats()
-            return {
+            response = {
                 "schema": EXECUTION_STATS_SCHEMA,
                 "schema_version": SERVICE_VERSION,
                 "ok": True,
@@ -651,16 +663,32 @@ class TaskCardApplication:
                 "delivered": stats.delivered,
                 "active": stats.active,
             }
+            # Steer counts are deliberately absent from v1.  This response
+            # is a versioned contract and its client validates the key set
+            # exactly, so a field that appears only when a steer card
+            # happens to exist is not a compatible addition -- it is a
+            # response the client refuses, on exactly the deployments that
+            # have steer work and nowhere else.  Observed: a steer card
+            # entered `delivering`, and sixty-one seconds later the drip
+            # sweep began refusing every response and no execution card
+            # reached the reader at all.  Steer counts belong to v2, which
+            # is where they are.
+            return response
         if operation == "execution_stats_scoped":
             _request(payload, required=set())
             identity = self.resolve_execution_consumer(authorization)
             if identity is None:
                 raise TaskCardServerRequestError("consumer_unresolved", "execution card consumer role is unresolved", HTTPStatus.FORBIDDEN)
             stats = self._execution_cards().stats_scoped(consumer_digest=identity.digest)
-            return {"schema": EXECUTION_STATS_SCHEMA, "schema_version": 2,
+            response = {"schema": EXECUTION_STATS_SCHEMA, "schema_version": 2,
                     "ok": True, "pending": stats.pending,
                     "delivering": stats.delivering, "delivered": stats.delivered,
                     "elsewhere": stats.elsewhere, "active": stats.active}
+            if stats.steer_pending or stats.steer_delivering or stats.steer_delivered:
+                response.update(steer_pending=stats.steer_pending,
+                                steer_delivering=stats.steer_delivering,
+                                steer_delivered=stats.steer_delivered)
+            return response
         if operation == "execution_schedule":
             request = _request(payload, required={"limit"})
             limit = _integer(request["limit"], minimum=1, maximum=1_000)
@@ -773,6 +801,35 @@ class TaskCardApplication:
                     "resolution": None,
                 }
             return _execution_resolve_document(result)
+        if operation == "workflow_board":
+            request = _strict_request(payload, required={"limit"}, optional=set())
+            identity = self.resolve_execution_consumer(authorization)
+            if identity is None or identity.role != QUEUE_VIEW_ROLE:
+                raise TaskCardServerRequestError(
+                    "role_forbidden", "workflow board requires the queue_view role",
+                    HTTPStatus.FORBIDDEN,
+                )
+            return _workflow_board_document(
+                self._execution_workflows().board(
+                    limit=_integer(request["limit"], minimum=1, maximum=100)
+                )
+            )
+        if operation == "workflow_detail":
+            request = _strict_request(
+                payload, required={"task_id", "workflow_version"}, optional=set()
+            )
+            identity = self.resolve_execution_consumer(authorization)
+            if identity is None or identity.role != QUEUE_VIEW_ROLE:
+                raise TaskCardServerRequestError(
+                    "role_forbidden", "workflow detail requires the queue_view role",
+                    HTTPStatus.FORBIDDEN,
+                )
+            return _workflow_detail_document(
+                self._execution_workflows().board_detail(
+                    _integer(request["task_id"], minimum=1),
+                    expected_version=_integer(request["workflow_version"], minimum=1),
+                )
+            )
         if operation == "execution_priority":
             request = _strict_request(
                 payload,
@@ -848,6 +905,34 @@ class TaskCardApplication:
                     "reply_markup": reply_markup,
                 },
             }
+        if operation == "execution_retraction_claim":
+            request = _request(payload, required={"lease_seconds"})
+            identity = self.resolve_execution_consumer(authorization)
+            if identity is None:
+                raise TaskCardServerRequestError("consumer_unresolved", "execution card consumer role is unresolved", HTTPStatus.FORBIDDEN)
+            claim = self._execution_cards().claim_retraction(
+                lease_seconds=_integer(request["lease_seconds"], minimum=5, maximum=300)
+            )
+            return {"schema": EXECUTION_CLAIM_SCHEMA, "schema_version": SERVICE_VERSION,
+                    "ok": True, "status": "empty" if claim is None else "claimed",
+                    "claim": None if claim is None else {
+                        "card_id": claim.card_id, "transport": claim.transport,
+                        "delivery_ref": claim.delivery_ref, "claim_token": claim.token,
+                        "expires_at": claim.expires_at,
+                    }}
+        if operation in {"execution_retracted", "execution_retraction_failed"}:
+            request = _request(payload, required={"card_id", "claim_token"})
+            from .execution_cards import ExecutionCardRetractionClaim
+            claim = ExecutionCardRetractionClaim(
+                _integer(request["card_id"], minimum=1), "", "",
+                _secret(request["claim_token"]), "",
+            )
+            completed = (self._execution_cards().complete_retraction(claim)
+                         if operation == "execution_retracted"
+                         else self._execution_cards().fail_retraction(claim))
+            return {"schema": EXECUTION_OPERATION_SCHEMA,
+                    "schema_version": SERVICE_VERSION, "ok": True,
+                    "status": "applied" if completed else "refused"}
         if operation == "execution_delivered":
             request = _request(
                 payload,
@@ -1811,6 +1896,49 @@ def _execution_detail_document(result: ExecutionCardDetail) -> dict[str, Any]:
     return document
 
 
+def _workflow_board_document(result: WorkflowBoard) -> dict[str, Any]:
+    return {
+        "schema": WORKFLOW_BOARD_SCHEMA,
+        "schema_version": SERVICE_VERSION,
+        "ok": True,
+        "columns": [
+            {"status": status, "total": result.totals[status]}
+            for status in WORKFLOW_BOARD_STATUSES
+        ],
+        "workflows": [
+            {
+                "task_id": entry.task_id,
+                "workflow_version": entry.workflow_version,
+                "board_status": entry.board_status,
+                "phase": entry.phase.value,
+                "task": entry.task,
+                "owner": entry.owner,
+                "agent": entry.agent,
+                "state_since": entry.state_since,
+            }
+            for entry in result.entries
+        ],
+    }
+
+
+def _workflow_detail_document(result: WorkflowBoardDetail) -> dict[str, Any]:
+    document = {
+        "schema": WORKFLOW_DETAIL_SCHEMA,
+        "schema_version": SERVICE_VERSION,
+        "ok": result.accepted,
+        "task_id": result.task_id,
+        "workflow_version": result.workflow_version,
+        "status": None if result.status is None else result.status.value,
+        "phase": None if result.phase is None else result.phase.value,
+        "updated_at": result.updated_at,
+        "summary": result.summary if result.accepted else "",
+        "work_digest": result.work_digest if result.accepted else "",
+        "deliverables": list(result.deliverables) if result.accepted else [],
+        "refusal": None if result.refusal is None else result.refusal.value,
+    }
+    return document
+
+
 def _execution_priority_document(
     result: WorkflowOperationResult,
 ) -> dict[str, Any]:
@@ -2029,6 +2157,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--bind", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8790)
     parser.add_argument("--request-timeout", type=float, default=5.0)
+    parser.add_argument(
+        "--steer-plan-threshold-seconds", type=int, default=20 * 60,
+        help="running-plan age before its Steer card is eligible",
+    )
+    parser.add_argument(
+        "--steer-execute-threshold-seconds", type=int, default=20 * 60,
+        help="running-execute age before its Steer card is eligible",
+    )
     parser.add_argument("--agent-profile-directory", type=Path)
     parser.add_argument(
         "--task-work-root", type=Path,
@@ -2064,6 +2200,10 @@ def main(argv: list[str] | None = None) -> int:
             owner_condition=owner_condition,
             reader_aliases=reader_aliases,
             artifact_root=arguments.task_work_root,
+            steer_plan_threshold=timedelta(
+                seconds=arguments.steer_plan_threshold_seconds),
+            steer_execute_threshold=timedelta(
+                seconds=arguments.steer_execute_threshold_seconds),
         )
         execution_cards.count()
         execution_workflows = TaskExecutionService(

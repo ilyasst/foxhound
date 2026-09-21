@@ -161,6 +161,51 @@ and the failure appears only in the deliverer's log, once per sweep interval.
 Treat a release that adds or renames a button as a two-repository deploy with a
 required order, not as a release.
 
+## Before promoting a release that adds a store validation rule
+
+The private profile store is host state and lives outside this repository, so
+no test here can see its contents.  A release that adds a rule the store must
+satisfy is therefore a change whose failure appears only on the host, and only
+once the symlink has moved.
+
+The rules compound because the store commands share one validation path.  A
+fragment the new release refuses takes down every store operation at once:
+`validate` fails, `publish` refuses, the install unit runs `validate` as its
+first step and aborts before installing anything, and the host mirror validates
+both stores and stops.  The effect is not that one profile cannot be edited; it
+is that no profile can be published or installed on any host running the new
+release.
+
+It is also worse than a stalled install. The card service `Requires` the
+install unit, so an install that exits non-zero takes the card service down
+with it: the service does not start, and `systemctl start` reports only
+`A dependency job for foxhound-task-cards.service failed`, naming neither the
+store nor the fragment. Observed on the first promotion of the absolute-path
+guard. Read the install unit's own status before reading anything into the
+card service's.
+
+So the store is brought into compliance first, and the release is promoted
+after.  Rolling the release back restores the old rule, but a store edited in
+the meantime is not rolled back with it.
+
+The candidate release can answer this before anything is promoted, because
+validation only reads:
+
+```sh
+<release>/venv/bin/foxhound-agent-profile-store --source <store> validate
+```
+
+Run it on every host that has a store, not only the one being promoted first.
+A store that validates under the deployed release and fails under the candidate
+is the whole signal; treat it exactly as the card-verb ordering above, as a
+required order rather than a check to perform afterwards.
+
+The first rule of this kind is the absolute-path prompt guard: a fragment that
+names a machine path is refused, because a profile revision renders identically
+on every host and a path does not.  Replace the path with a symbolic root the
+worker reports in `capabilities.deployment_roots`, publish, install, and then
+promote.
+
 ## Revision reporting
 
 A long-running service reports its deployed revision when it starts.  A process

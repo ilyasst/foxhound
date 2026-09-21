@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from .candidate_inbox import CandidateInbox, InboxError
+from foxhound.caproute_attribution import request_headers
 
 
 CAPABILITY = "thinking_no"
@@ -171,7 +172,7 @@ def generate_title(
             "max_tokens": 100,
             "stream": False,
         }).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        headers=request_headers("fused_task_titles"),
         method="POST",
     )
     open_request = (opener or urllib.request).urlopen

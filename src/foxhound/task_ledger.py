@@ -672,6 +672,96 @@ class TaskLedger:
                         # A binding pointing at a task that does not exist is
                         # corruption, not a race, and must still stop the pass.
                         raise _NativeIntakeConflict
+                    previous = self._bound_candidate(connection, binding)
+                    review_head_changed = _review_head_changed(
+                        previous, candidate
+                    )
+                    desired_owner = (
+                        _row_owner_values(task)
+                        if bool(task["owner_pinned"])
+                        else _candidate_owner_values(candidate)
+                    )
+                    # Does this revision change the task, or only what is known
+                    # about it? Two branches below deliberately keep the task
+                    # version stable -- a pull-request edit that leaves the head
+                    # OID alone, and an evidence-only enrichment -- so that an
+                    # active workflow stays valid. A re-surface must agree with
+                    # them: reopening for a revision that changes nothing leaves
+                    # the task open carrying exactly the content it was
+                    # completed against, and names a version that is never
+                    # written. A pull-request comment is the common case.
+                    advances_version = not (
+                        (
+                            candidate.source.kind == "review_request"
+                            and not review_head_changed
+                        )
+                        or (
+                            task["text"] == candidate.task.text
+                            and task["due"] == candidate.task.due
+                            and _row_owner_values(task) == desired_owner
+                            and _row_structure_values(task)
+                            == _candidate_structure_values(candidate)
+                            and _stored_participants(
+                                connection, int(task["id"])
+                            ) == _candidate_participants(candidate)
+                            and not review_head_changed
+                        )
+                    )
+                    if task["status"] == TaskStatus.DONE and advances_version and (
+                        _unproductive_resurfaces(
+                            connection, int(binding["task_id"])
+                        ) < MAX_UNPRODUCTIVE_RESURFACES
+                    ):
+                        # ADR 0039: a task in `done` re-surfaces when its
+                        # source moves. The work it recorded may never have
+                        # reached the outside world, and refusing to reopen
+                        # made that unreachable forever -- the only remedy was
+                        # to recreate the task outside the ledger.
+                        #
+                        # `dropped` deliberately does not reopen below: a
+                        # reader who dropped a task rejected the work itself,
+                        # and a source edit is not grounds to overrule that.
+                        connection.execute(
+                            "UPDATE tasks SET status=?,closed_at=NULL "
+                            "WHERE id=?",
+                            (TaskStatus.OPEN, int(binding["task_id"])),
+                        )
+                        # Record the reopen the way every other status change
+                        # is recorded. Two things depend on it: the event log
+                        # must not show a task silently changing state, and
+                        # the execution scheduler reads this event to tell a
+                        # re-surfaced task apart from one whose version moved
+                        # for any other reason. The version is the one the
+                        # revision below is about to write, so the event and
+                        # the task agree.
+                        connection.execute(
+                            "INSERT INTO task_events("
+                            "task_id,kind,task_version,candidate_id,"
+                            "source_revision,from_status,to_status,"
+                            "occurred_at) VALUES(?,?,?,?,?,?,?,?)",
+                            (
+                                int(binding["task_id"]),
+                                "status_changed",
+                                int(task["version"]) + 1,
+                                # The revision that caused the reopen, so the
+                                # log says what moved and not merely that
+                                # something did. The revision that was
+                                # answered is on the completion event.
+                                #
+                                # `version + 1` is now sound: the reopen is
+                                # gated on `advances_version`, so the branch
+                                # below writes exactly this.
+                                candidate.candidate_id,
+                                candidate.source.revision,
+                                TaskStatus.DONE,
+                                TaskStatus.OPEN,
+                                now,
+                            ),
+                        )
+                        task = connection.execute(
+                            "SELECT * FROM tasks WHERE id=?",
+                            (int(binding["task_id"]),),
+                        ).fetchone()
                     if task["status"] != TaskStatus.OPEN:
                         # The reader got there first. That is the ordinary end
                         # of a task's life, and a producer that still holds it
@@ -695,11 +785,75 @@ class TaskLedger:
                         )
                         candidates_after_close += 1
                         continue
-                    desired_owner = (
-                        _row_owner_values(task)
-                        if bool(task["owner_pinned"])
-                        else _candidate_owner_values(candidate)
-                    )
+                    if (
+                        candidate.source.kind == "review_request"
+                        and not review_head_changed
+                    ):
+                        # Pull-request title and body edits are source
+                        # metadata, not a request to re-review unchanged
+                        # code.  Keep the durable task current without
+                        # advancing its version, so its sole workflow remains
+                        # valid.  A missing head on a legacy producer is also
+                        # deliberately conservative: it cannot prove a code
+                        # change and therefore cannot restart a review.
+                        connection.execute(
+                            "UPDATE tasks SET text=?,owner=?,due=?,object=?,"
+                            "action=?,confidence=?,updated_at=?,"
+                            "owner_ref_version=?,owner_kind=?,"
+                            "owner_speaker_id=?,owner_canonical_speaker_id=?,"
+                            "owner_speaker_registry_id=?,owner_pinned=?,"
+                            "owner_provisional=? WHERE id=?",
+                            (
+                                candidate.task.text,
+                                desired_owner[0],
+                                candidate.task.due,
+                                *_candidate_structure_values(candidate),
+                                now,
+                                *desired_owner[1:],
+                                int(binding["task_id"]),
+                            ),
+                        )
+                        _replace_participants(
+                            connection, int(binding["task_id"]), candidate
+                        )
+                        connection.execute(
+                            "UPDATE task_candidate_bindings SET "
+                            "source_revision=?,decided_at=? "
+                            "WHERE candidate_id=?",
+                            (
+                                candidate.source.revision,
+                                now,
+                                candidate.candidate_id,
+                            ),
+                        )
+                        connection.execute(
+                            "UPDATE task_candidate_lifecycle SET "
+                            "source_revision=?,changed_at=?,decided_at=? "
+                            "WHERE candidate_id=?",
+                            (
+                                candidate.source.revision,
+                                candidate.lifecycle.changed_at,
+                                now,
+                                candidate.candidate_id,
+                            ),
+                        )
+                        connection.execute(
+                            "INSERT INTO task_events("
+                            "task_id,kind,task_version,candidate_id,"
+                            "source_revision,from_status,to_status,occurred_at) "
+                            "VALUES(?,'candidate_revised',?,?,?,?,?,?)",
+                            (
+                                int(binding["task_id"]),
+                                int(task["version"]),
+                                candidate.candidate_id,
+                                candidate.source.revision,
+                                None,
+                                None,
+                                now,
+                            ),
+                        )
+                        tasks_revised += 1
+                        continue
                     if (
                         task["text"] == candidate.task.text
                         and task["due"] == candidate.task.due
@@ -708,6 +862,7 @@ class TaskLedger:
                         == _candidate_structure_values(candidate)
                         and _stored_participants(connection, int(task["id"]))
                         == _candidate_participants(candidate)
+                        and not review_head_changed
                     ):
                         # A producer may enrich the evidence for an already
                         # accepted task without changing the work itself.
@@ -1368,6 +1523,18 @@ class TaskLedger:
             item_id=str(row["source_item_id"]),
         )
 
+    def bound_candidate_payload(self, task_id: int) -> str | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT h.payload_json "
+                "FROM task_candidate_bindings AS b "
+                "JOIN candidate_revision_history AS h "
+                "ON h.candidate_id=b.candidate_id AND h.source_revision=b.source_revision "
+                "WHERE b.task_id=? AND b.relation='accepted'",
+                (task_id,),
+            ).fetchone()
+        return None if row is None else row["payload_json"]
+
     def source_snapshot_request(
         self, task_id: int,
     ) -> SourceSnapshotRequest | None:
@@ -1611,9 +1778,15 @@ class TaskLedger:
             "AND status NOT IN ('awaiting_start','completed','cancelled')",
             (int(binding["task_id"]),),
         ).fetchone()
+        # A task in `done` re-surfaces: the work it recorded may never have
+        # reached the outside world, and refusing to reopen made that
+        # unreachable forever. `dropped` stays terminal -- a reader who dropped
+        # a task rejected the work itself, and a source edit does not overrule
+        # that. See ADR 0039, which this replaced the refusal in.
+        reopening = task["status"] == TaskStatus.DONE
         reader_conflict = (
             binding["lifecycle_resolution"] == "reader_conflict"
-            or task["status"] != TaskStatus.OPEN
+            or (task["status"] != TaskStatus.OPEN and not reopening)
             or int(task["version"]) != int(binding["task_version"])
             or active_workflow is not None
         )
@@ -1622,6 +1795,11 @@ class TaskLedger:
         resolution = "reader_conflict"
         if not reader_conflict:
             version += 1
+            if reopening:
+                connection.execute(
+                    "UPDATE tasks SET status=?,closed_at=NULL WHERE id=?",
+                    (TaskStatus.OPEN, int(binding["task_id"])),
+                )
             desired_owner = (
                 _row_owner_values(task)
                 if bool(task["owner_pinned"])
@@ -1804,6 +1982,7 @@ class TaskLedger:
 
 
 _USE_CANDIDATE_OWNER = object()
+_REVIEW_HEAD_OID_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 def _candidate_owner_values(
@@ -1937,6 +2116,31 @@ def _valid_native_identity(
     )
 
 
+def _review_head_oid(candidate: TaskCandidate) -> str | None:
+    """Return GW's explicit pull-request head revision when available.
+
+    Candidate ``source.revision`` is a digest of all candidate content, so it
+    changes for a title or body edit too.  The exact 40-hex ``diff`` extract
+    is deliberately narrower: GW emits it only for the current pull-request
+    head.  Old producers lack this item and therefore cannot trigger an
+    automatic re-review merely by changing their general digest.
+    """
+    if candidate.source.kind != "review_request":
+        return None
+    values = [
+        source.extract for source in candidate.evidence.sources
+        if source.role == "diff" and _REVIEW_HEAD_OID_RE.fullmatch(source.extract)
+    ]
+    return values[0] if len(values) == 1 else None
+
+
+def _review_head_changed(before: TaskCandidate, after: TaskCandidate) -> bool:
+    """Whether two revisions prove a pull-request code change."""
+    old = _review_head_oid(before)
+    new = _review_head_oid(after)
+    return old is not None and new is not None and old != new
+
+
 def _valid_effective_owner(value: object) -> bool:
     return (
         isinstance(value, str)
@@ -1955,6 +2159,73 @@ def _valid_timestamp(value: object) -> bool:
     except ValueError:
         return False
     return parsed.tzinfo is not None and parsed.utcoffset() is not None
+
+
+#: How many times a finished task may re-surface without any of those passes
+#: folding work in, before the ledger stops re-surfacing it.
+#:
+#: Re-surfacing is bounded here rather than at the agent, because the agent
+#: cannot be the bound. The obvious structural fence -- ignore revisions the
+#: agent itself caused -- does not exist in this deployment: the agents post
+#: from the operator's account, so a self-authored revision is
+#: indistinguishable from a reader's. Judgement remains the normal way out of
+#: the cycle; this is what makes a runaway impossible rather than unlikely.
+MAX_UNPRODUCTIVE_RESURFACES = 3
+
+
+def _unproductive_resurfaces(
+    connection: sqlite3.Connection, task_id: int
+) -> int:
+    """Re-surfaces since this task last ran its execution to completion.
+
+    The marker has to be work the *agent* did, not work the ledger did. A
+    `work_revisions` row is not it: folding the revision in writes one on every
+    re-surface, so counting those resets the bound on the very event it is
+    meant to bound, and nothing is ever capped.
+
+    A completed execution workflow is the honest signal. A task worked across
+    several source updates completes an execution each time and keeps
+    re-surfacing, which is correct; a task woken repeatedly by activity that
+    never becomes work completes nothing, and stops.
+    """
+    since = connection.execute(
+        "SELECT completed_at FROM task_execution_workflows WHERE task_id=?",
+        (task_id,),
+    ).fetchone()
+    since = since[0] if since is not None else None
+    return connection.execute(
+        "SELECT count(*) FROM task_events WHERE task_id=? "
+        "AND kind='status_changed' AND from_status=? AND to_status=? "
+        "AND (? IS NULL OR occurred_at > ?)",
+        (task_id, TaskStatus.DONE, TaskStatus.OPEN, since, since),
+    ).fetchone()[0]
+
+
+def _bound_source(
+    connection: sqlite3.Connection, task_id: int
+) -> tuple[str | None, str | None]:
+    """The candidate and revision this task is bound to right now.
+
+    Recorded on every status change so the ledger can answer the question the
+    re-surfacing path depends on: *which source state was already answered?*
+    Without it a re-surfaced task cannot tell new discussion from the
+    discussion it read before closing, and nothing downstream can compute a
+    delta. The columns have always existed on `task_events`; they were simply
+    never filled for a status change, so all 269 such rows carried NULL.
+
+    Authorship cannot serve this purpose here -- the agents post from the
+    operator's account, so a self-authored revision is indistinguishable from
+    anyone else's. Remembering the state that was answered is the honest
+    substitute, and it does not depend on who wrote anything.
+    """
+    row = connection.execute(
+        "SELECT candidate_id,source_revision FROM task_candidate_bindings "
+        "WHERE task_id=?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None, None
+    return row["candidate_id"], row["source_revision"]
 
 
 def _apply_task_transition(
@@ -2031,8 +2302,7 @@ def _apply_task_transition(
             task_id,
             "status_changed",
             next_version,
-            None,
-            None,
+            *_bound_source(connection, task_id),
             current_status,
             target,
             now,

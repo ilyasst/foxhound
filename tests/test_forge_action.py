@@ -7,13 +7,19 @@ feature.
 """
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from foxhound import forge_action
-from foxhound.forge_action import ForgeActionError, open_pull_request
+from foxhound.forge_action import (
+    ForgeActionError,
+    MAX_ISSUES_PER_TASK,
+    open_issue,
+    open_pull_request,
+)
 
 
 def _gh(results):
@@ -428,3 +434,117 @@ class AgentGuidance(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _issue_list(items):
+    return (("gh", "issue", "list"), (0, json.dumps(items), ""))
+
+
+OK_ISSUE_CREATE = (
+    ("gh", "issue", "create"),
+    (0, "https://example.com/acme/w/issues/9\n", ""),
+)
+OK_ISSUE_VIEW = (
+    ("gh", "issue", "view"),
+    (0, '{"number": 9, "url": "https://example.com/acme/w/issues/9"}', ""),
+)
+
+
+class OpeningAnIssue(unittest.TestCase):
+    """The only write here that creates work for the system that made it."""
+
+    def test_an_issue_is_opened_on_the_task_repository(self) -> None:
+        runner = _gh([_issue_list([]), OK_ISSUE_CREATE, OK_ISSUE_VIEW])
+        with mock.patch.object(forge_action, "_run", runner):
+            receipt = open_issue(
+                repository="github.com/acme/widget", task_id=4,
+                title="Template example cannot run", body="Body.")
+        self.assertEqual(receipt.repository, "github.com/acme/widget")
+        self.assertEqual(receipt.number, 9)
+        create = next(
+            c for c in runner.calls if c[:3] == ("gh", "issue", "create"))
+        self.assertIn("acme/widget", create)
+
+    def test_the_body_carries_provenance(self) -> None:
+        runner = _gh([_issue_list([]), OK_ISSUE_CREATE, OK_ISSUE_VIEW])
+        with mock.patch.object(forge_action, "_run", runner):
+            open_issue(repository="github.com/acme/widget", task_id=4,
+                       title="T", body="Body.")
+        create = next(
+            c for c in runner.calls if c[:3] == ("gh", "issue", "create"))
+        body = create[create.index("--body") + 1]
+        self.assertIn("Opened by Foxhound for task 4", body)
+        self.assertTrue(body.startswith("Body."))
+
+    def test_a_title_already_open_is_refused_and_names_it(self) -> None:
+        """Re-filing a finding is how a re-surfaced task becomes a loop."""
+        runner = _gh([_issue_list([{
+            "number": 3, "title": "Template  example CANNOT run",
+            "body": "", "url": "https://example.com/acme/w/issues/3",
+        }])])
+        with mock.patch.object(forge_action, "_run", runner):
+            with self.assertRaises(ForgeActionError) as caught:
+                open_issue(
+                    repository="github.com/acme/widget", task_id=4,
+                    title="Template example cannot run", body="Body.")
+        self.assertIn("#3 is already open", str(caught.exception))
+        self.assertNotIn(
+            ("gh", "issue", "create"),
+            [c[:3] for c in runner.calls],
+        )
+
+    def test_a_task_cannot_exceed_its_issue_ceiling(self) -> None:
+        """Counted from the forge: a task outlives any one run directory."""
+        marker = "Opened by Foxhound for task 4,"
+        runner = _gh([_issue_list([
+            {"number": n, "title": f"Earlier finding {n}",
+             "body": f"Something.\n\n---\n_{marker} from work._",
+             "url": f"https://example.com/acme/w/issues/{n}"}
+            for n in range(1, MAX_ISSUES_PER_TASK + 1)
+        ])])
+        with mock.patch.object(forge_action, "_run", runner):
+            with self.assertRaises(ForgeActionError) as caught:
+                open_issue(repository="github.com/acme/widget", task_id=4,
+                           title="One more finding", body="Body.")
+        self.assertIn("which is the limit", str(caught.exception))
+
+    def test_another_tasks_issues_do_not_consume_the_ceiling(self) -> None:
+        runner = _gh([
+            _issue_list([
+                {"number": n, "title": f"Earlier finding {n}",
+                 "body": "---\n_Opened by Foxhound for task 99, from work._",
+                 "url": f"https://example.com/acme/w/issues/{n}"}
+                for n in range(1, MAX_ISSUES_PER_TASK + 2)
+            ]),
+            OK_ISSUE_CREATE, OK_ISSUE_VIEW,
+        ])
+        with mock.patch.object(forge_action, "_run", runner):
+            receipt = open_issue(
+                repository="github.com/acme/widget", task_id=4,
+                title="A new finding", body="Body.")
+        self.assertEqual(receipt.number, 9)
+
+    def test_an_unreadable_list_does_not_forbid_every_issue(self) -> None:
+        """A preflight that cannot see must not become one that refuses."""
+        runner = _gh([
+            (("gh", "issue", "list"), (1, "", "forge unavailable")),
+            OK_ISSUE_CREATE, OK_ISSUE_VIEW,
+        ])
+        with mock.patch.object(forge_action, "_run", runner):
+            receipt = open_issue(repository="github.com/acme/widget",
+                                 task_id=4, title="T", body="Body.")
+        self.assertEqual(receipt.number, 9)
+
+    def test_a_body_is_required(self) -> None:
+        # A title alone is something a reader has to interpret.
+        runner = _gh([])
+        with mock.patch.object(forge_action, "_run", runner):
+            with self.assertRaises(ForgeActionError) as caught:
+                open_issue(repository="github.com/acme/widget", task_id=4,
+                           title="T", body="   ")
+        self.assertIn("body is required", str(caught.exception))
+
+    def test_a_non_github_host_is_refused(self) -> None:
+        with self.assertRaises(ForgeActionError):
+            open_issue(repository="git.example.com/acme/widget", task_id=4,
+                       title="T", body="Body.")
