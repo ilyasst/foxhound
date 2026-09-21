@@ -17,6 +17,7 @@ from foxhound.task_archive import (
     publish_deliverables,
     record_runtime_log,
 )
+from foxhound.card_provenance import CardSourceEvidence
 
 
 class TaskArchiveTests(unittest.TestCase):
@@ -53,6 +54,53 @@ class TaskArchiveTests(unittest.TestCase):
             phase=phase,
             agent_display_name="Agent Example",
         )
+
+    def test_version_4_candidate_produces_archive_header_with_extracts(self):
+        paths = prepare_task_archive(
+            working_root=self.work,
+            kb_root=self.kb,
+            task_id=7,
+            task_text="Review synthetic result",
+            run_id="a" * 32,
+            phase="plan",
+            agent_display_name="Agent Example",
+            origin_kind="meeting",
+            origin_record="1234567890abcdef1234567890abcdef",
+            origin_item="0",
+            origin_sources=(
+                CardSourceEvidence(
+                    name="2024-01-01-sync.md",
+                    role="transcript",
+                    extract="We need to review the synthetic result.",
+                ),
+            )
+        )
+        for path in (paths.working_directory / "README.md", paths.task_file):
+            text = path.read_text(encoding="utf-8")
+            self.assertIn("**Source:** Meeting", text)
+            self.assertIn("- 2024-01-01-sync.md — Transcript", text)
+            self.assertIn("> We need to review the synthetic result.", text)
+            self.assertNotIn("1234567890abcdef", text)  # Opaque record digest absent
+
+    def test_older_candidate_versions_retain_identifier_fallback(self):
+        paths = prepare_task_archive(
+            working_root=self.work,
+            kb_root=self.kb,
+            task_id=7,
+            task_text="Review synthetic result",
+            run_id="a" * 32,
+            phase="plan",
+            agent_display_name="Agent Example",
+            origin_kind="issue",
+            origin_record="github.com/example/project-alpha",
+            origin_item="42",
+            origin_sources=()
+        )
+        for path in (paths.working_directory / "README.md", paths.task_file):
+            text = path.read_text(encoding="utf-8")
+            self.assertIn("**Source:** [Issue #42](https://github.com/example/project-alpha/issues/42)", text)
+            self.assertNotIn("Source files and evidence:", text)
+
 
     def test_repeated_runs_restate_the_task_instead_of_accumulating(self):
         """The document says where the task IS, not how it got there.

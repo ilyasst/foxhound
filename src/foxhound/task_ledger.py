@@ -1523,6 +1523,18 @@ class TaskLedger:
             item_id=str(row["source_item_id"]),
         )
 
+    def bound_candidate_payload(self, task_id: int) -> str | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT h.payload_json "
+                "FROM task_candidate_bindings AS b "
+                "JOIN candidate_revision_history AS h "
+                "ON h.candidate_id=b.candidate_id AND h.source_revision=b.source_revision "
+                "WHERE b.task_id=? AND b.relation='accepted'",
+                (task_id,),
+            ).fetchone()
+        return None if row is None else row["payload_json"]
+
     def source_snapshot_request(
         self, task_id: int,
     ) -> SourceSnapshotRequest | None:
