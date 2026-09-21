@@ -242,6 +242,47 @@ class ExecutionWorkflow:
     priority: WorkflowPriority
 
 
+WORKFLOW_BOARD_STATUSES = (
+    "ready_to_start", "queued", "running", "plan_review",
+    "external_review", "result_review", "snoozed", "parked",
+    "completed", "cancelled",
+)
+
+
+@dataclass(frozen=True)
+class WorkflowBoardEntry:
+    """The bounded, reader-safe face of one current execution workflow."""
+
+    task_id: int
+    workflow_version: int
+    board_status: str
+    phase: WorkflowPhase
+    task: str
+    owner: str
+    agent: str
+    state_since: str
+
+
+@dataclass(frozen=True)
+class WorkflowBoard:
+    entries: tuple[WorkflowBoardEntry, ...]
+    totals: Mapping[str, int]
+
+
+@dataclass(frozen=True)
+class WorkflowBoardDetail:
+    accepted: bool
+    task_id: int
+    workflow_version: int | None = None
+    status: WorkflowStatus | None = None
+    phase: WorkflowPhase | None = None
+    updated_at: str | None = None
+    summary: str = ""
+    work_digest: str = ""
+    deliverables: tuple[Mapping[str, str], ...] = ()
+    refusal: WorkflowRefusal | None = None
+
+
 @dataclass(frozen=True)
 class ExecutionClaim:
     task_id: int
@@ -1787,6 +1828,65 @@ class TaskExecutionService:
             ).fetchone()
         return None if row is None else _workflow(row)
 
+    def board(self, *, limit: int = 100) -> WorkflowBoard:
+        """Return current workflow state without claiming or mutating it."""
+        if (isinstance(limit, bool) or not isinstance(limit, int)
+                or not 1 <= limit <= 100):
+            raise TaskLedgerError("workflow board limit is invalid")
+        where = " WHERE t.status='open' AND w.status NOT IN ('completed','cancelled')"
+        with closing(self._connect()) as connection:
+            grouped = connection.execute(
+                "SELECT w.status,w.phase,COUNT(*) AS total "
+                "FROM task_execution_workflows AS w JOIN tasks AS t ON t.id=w.task_id"
+                + where + " GROUP BY w.status,w.phase"
+            ).fetchall()
+            rows = connection.execute(
+                "SELECT w.task_id,w.version,w.status,w.phase,w.updated_at,"
+                "w.agent_profile_id,t.text,COALESCE(t.owner,'') AS owner "
+                "FROM task_execution_workflows AS w JOIN tasks AS t ON t.id=w.task_id"
+                + where + " ORDER BY CASE w.status "
+                "WHEN 'running' THEN 0 WHEN 'awaiting_review' THEN 1 "
+                "WHEN 'queued' THEN 2 WHEN 'awaiting_start' THEN 3 "
+                "WHEN 'parked' THEN 4 ELSE 5 END,w.updated_at,w.task_id LIMIT ?",
+                (limit,),
+            ).fetchall()
+        totals = {status: 0 for status in WORKFLOW_BOARD_STATUSES}
+        for row in grouped:
+            totals[_workflow_board_status(WorkflowStatus(row["status"]), WorkflowPhase(row["phase"]))] += int(row["total"])
+        entries = tuple(WorkflowBoardEntry(
+            task_id=int(row["task_id"]), workflow_version=int(row["version"]),
+            board_status=_workflow_board_status(WorkflowStatus(row["status"]), WorkflowPhase(row["phase"])),
+            phase=WorkflowPhase(row["phase"]), task=_board_text(row["text"], 500),
+            owner=_board_text(row["owner"], 200), agent=_board_text(row["agent_profile_id"], 64),
+            state_since=str(row["updated_at"]),
+        ) for row in rows)
+        return WorkflowBoard(entries, totals)
+
+    def board_detail(self, task_id: int, *, expected_version: int) -> WorkflowBoardDetail:
+        """Read one current workflow detail through its version fence."""
+        if not _valid_identity(task_id, expected_version):
+            return WorkflowBoardDetail(False, task_id if isinstance(task_id, int) else 0,
+                                       refusal=WorkflowRefusal.INVALID_ARGUMENT)
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT w.task_id,w.version,w.status,w.phase,w.updated_at,"
+                "r.summary,r.work_digest,r.deliverables_json "
+                "FROM task_execution_workflows AS w "
+                "LEFT JOIN task_execution_results AS r ON r.result_id=w.last_result_id "
+                "WHERE w.task_id=?", (task_id,),
+            ).fetchone()
+        if row is None:
+            return WorkflowBoardDetail(False, task_id, refusal=WorkflowRefusal.NOT_FOUND)
+        if int(row["version"]) != expected_version:
+            return WorkflowBoardDetail(False, task_id, refusal=WorkflowRefusal.STALE_WORKFLOW)
+        return WorkflowBoardDetail(
+            True, task_id, workflow_version=int(row["version"]),
+            status=WorkflowStatus(row["status"]), phase=WorkflowPhase(row["phase"]),
+            updated_at=str(row["updated_at"]), summary=_board_text(row["summary"], 1200),
+            work_digest=_board_text(row["work_digest"], 800),
+            deliverables=_board_deliverables(row["deliverables_json"]),
+        )
+
     def reader_instruction(
         self,
         task_id: int,
@@ -3085,6 +3185,54 @@ def _apply_review_action(
         agent_profile_id=row["agent_profile_id"],
         agent_profile_revision=row["agent_profile_revision"],
     )
+
+
+def _workflow_board_status(status: WorkflowStatus, phase: WorkflowPhase) -> str:
+    if status is WorkflowStatus.AWAITING_REVIEW:
+        return {
+            WorkflowPhase.PLAN: "plan_review",
+            WorkflowPhase.EXTERNAL_ACTION: "external_review",
+            WorkflowPhase.EXECUTE: "result_review",
+        }[phase]
+    return {
+        WorkflowStatus.AWAITING_START: "ready_to_start",
+        WorkflowStatus.QUEUED: "queued",
+        WorkflowStatus.RUNNING: "running",
+        WorkflowStatus.SNOOZED: "snoozed",
+        WorkflowStatus.PARKED: "parked",
+    }[status]
+
+
+def _board_text(value: object, maximum: int) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value[:maximum]
+
+
+def _board_deliverables(value: object) -> tuple[Mapping[str, str], ...]:
+    if not isinstance(value, str):
+        return ()
+    try:
+        records = json.loads(value)
+    except (TypeError, ValueError):
+        return ()
+    if not isinstance(records, list) or len(records) > MAX_COLLECTION_ITEMS:
+        return ()
+    projected: list[Mapping[str, str]] = []
+    for record in records:
+        if not isinstance(record, Mapping):
+            return ()
+        text = record.get("body", record.get("text"))
+        if not isinstance(text, str):
+            return ()
+        item = {"text": _board_text(text, 3_000)}
+        for key in ("label", "recipient", "subject"):
+            candidate = record.get(key, "")
+            if not isinstance(candidate, str):
+                return ()
+            item[key] = _board_text(candidate, 300)
+        projected.append(item)
+    return tuple(projected)
 
 
 def _workflow(row: sqlite3.Row) -> ExecutionWorkflow:

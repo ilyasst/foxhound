@@ -787,6 +787,12 @@ prompts, logs, private paths, credentials, profile identifiers, and unbounded
 work-product text are never exposed. This follows ADR 0041's aggregate-scoped
 second-consumer decision and creates no new authority.
 
+For a console that needs actual work rather than reader-card delivery state,
+the same credential may read `POST /v1/execution-workflows/board` and one
+version-fenced `POST /v1/execution-workflows/detail`. These bounded,
+non-mutating routes project current workflow columns and allowlisted result
+detail; they do not expose raw transcripts, paths, or another consumer's card.
+
 The same execution `queue_view` credential may also request bounded priority
 for one exact ready workflow at `POST /v1/execution-workflows/priority` with
 `task_id`, the exact current `workflow_version`, and one action: `raise`,

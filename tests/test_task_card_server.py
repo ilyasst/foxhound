@@ -499,6 +499,53 @@ class TaskCardServerTests(unittest.TestCase):
                 authorization=f"Bearer {queue}",
             )
 
+    def test_workflow_board_is_queue_scoped_bounded_and_non_mutating(self):
+        queue = "q" * 43
+        self.execution.schedule(1, expected_task_version=1)
+        ready = self.execution.start_action(1, expected_version=1, action="start")
+        app = TaskCardApplication(
+            self.cards, {DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: queue},
+            execution_cards=self.execution_cards, execution_workflows=self.execution,
+            execution_tokens={DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: queue},
+        )
+        before = self.execution.event_count()
+        board = app.dispatch(
+            "workflow_board", request_document(limit=10),
+            authorization=f"Bearer {queue}",
+        )
+        self.assertEqual(board["schema"], "foxhound.execution-workflow-service.board")
+        self.assertTrue(board["ok"])
+        self.assertEqual(board["columns"][1], {"status": "queued", "total": 1})
+        self.assertEqual(board["workflows"][0]["workflow_version"], ready.version)
+        self.assertEqual(self.execution.event_count(), before)
+        with running_server(app) as endpoint:
+            status, _, http_board = request(
+                endpoint, "/v1/execution-workflows/board",
+                request_document(limit=10), token=queue,
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(http_board["workflows"], board["workflows"])
+        detail = app.dispatch(
+            "workflow_detail",
+            request_document(task_id=1, workflow_version=ready.version),
+            authorization=f"Bearer {queue}",
+        )
+        self.assertTrue(detail["ok"])
+        self.assertEqual(detail["status"], "queued")
+        self.assertEqual(detail["deliverables"], [])
+        stale = app.dispatch(
+            "workflow_detail",
+            request_document(task_id=1, workflow_version=ready.version + 1),
+            authorization=f"Bearer {queue}",
+        )
+        self.assertFalse(stale["ok"])
+        self.assertEqual(stale["refusal"], "stale_workflow")
+        with self.assertRaises(TaskCardServerRequestError):
+            app.dispatch(
+                "workflow_board", request_document(limit=10),
+                authorization=f"Bearer {TOKEN}",
+            )
+
     def test_execution_queue_resolve_is_strict_and_queue_view_only(self):
         card = self._queue_card()
         queue = "q" * 43
