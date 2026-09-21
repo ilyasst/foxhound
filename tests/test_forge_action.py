@@ -236,7 +236,7 @@ class PreparedWorktree(unittest.TestCase):
 
 class ReviewIsBounded(unittest.TestCase):
     def test_the_review_lands_on_the_task_s_own_pull_request(self):
-        runner = _gh([(("gh", "pr", "comment"), (0, "", "")),
+        runner = _gh([(("gh", "pr", "review"), (0, "", "")),
                       (("gh", "pr", "view"),
                        (0, '{"url": "https://example.com/acme/w/pull/7"}', ""))])
         with mock.patch.object(forge_action, "_run", runner):
@@ -245,7 +245,7 @@ class ReviewIsBounded(unittest.TestCase):
                 task_id=4, body="It looks fine.")
         self.assertEqual(receipt.number, 7)
         comment = next(c for c in runner.calls
-                       if c[:3] == ("gh", "pr", "comment"))
+                       if c[:3] == ("gh", "pr", "review"))
         # The repository comes from the binding; no argument could name
         # another one.
         self.assertIn("acme/widget", comment)
@@ -254,14 +254,14 @@ class ReviewIsBounded(unittest.TestCase):
     def test_the_review_says_an_agent_wrote_it(self):
         # The credential may belong to a person. A reader of the pull
         # request should still be able to tell.
-        runner = _gh([(("gh", "pr", "comment"), (0, "", "")),
+        runner = _gh([(("gh", "pr", "review"), (0, "", "")),
                       (("gh", "pr", "view"), (0, '{"url": "u"}', ""))])
         with mock.patch.object(forge_action, "_run", runner):
             forge_action.post_review(
                 repository="github.com/acme/widget", number="7",
                 task_id=4, body="It looks fine.")
         comment = next(c for c in runner.calls
-                       if c[:3] == ("gh", "pr", "comment"))
+                       if c[:3] == ("gh", "pr", "review"))
         body = comment[comment.index("--body") + 1]
         self.assertTrue(body.startswith("It looks fine."))
         self.assertIn("Foxhound for task 4", body)
@@ -297,7 +297,7 @@ class ReviewIsBounded(unittest.TestCase):
         self.assertEqual(runner.calls, [])
 
     def test_a_refusal_by_the_forge_is_surfaced(self):
-        runner = _gh([(("gh", "pr", "comment"),
+        runner = _gh([(("gh", "pr", "review"),
                        (1, "", "pull request is locked"))])
         with mock.patch.object(forge_action, "_run", runner):
             with self.assertRaises(ForgeActionError) as caught:
@@ -311,7 +311,7 @@ class ReviewIsBounded(unittest.TestCase):
         whether it should merge, and that is the reader's to make. The
         agent's job is to say what it found.
         """
-        runner = _gh([(("gh", "pr", "comment"), (0, "", "")),
+        runner = _gh([(("gh", "pr", "review"), (0, "", "")),
                       (("gh", "pr", "view"), (0, '{"url": "u"}', ""))])
         with mock.patch.object(forge_action, "_run", runner):
             forge_action.post_review(
@@ -548,3 +548,33 @@ class OpeningAnIssue(unittest.TestCase):
         with self.assertRaises(ForgeActionError):
             open_issue(repository="git.example.com/acme/widget", task_id=4,
                        title="T", body="Body.")
+
+    @mock.patch("foxhound.forge_action._run")
+    def test_post_review_with_hold_refuses_approval(self, _run):
+        _run.side_effect = [
+            # The view check
+            (0, '{"reviewDecision": "CHANGES_REQUESTED", "labels": []}', ""),
+        ]
+        with self.assertRaisesRegex(ForgeActionError, "cannot approve a pull request with an outstanding hold"):
+            forge_action.post_review(
+                repository="github.com/owner/repo",
+                number="123",
+                task_id=1,
+                body="Looks good",
+                verdict="approve",
+            )
+
+    @mock.patch("foxhound.forge_action._run")
+    def test_post_review_with_hold_label_refuses_approval(self, _run):
+        _run.side_effect = [
+            # The view check
+            (0, '{"reviewDecision": "REVIEW_REQUIRED", "labels": [{"name": "hold"}]}', ""),
+        ]
+        with self.assertRaisesRegex(ForgeActionError, "cannot approve a pull request with an outstanding hold"):
+            forge_action.post_review(
+                repository="github.com/owner/repo",
+                number="123",
+                task_id=1,
+                body="Looks good",
+                verdict="approve",
+            )

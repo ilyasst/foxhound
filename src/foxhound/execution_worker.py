@@ -470,7 +470,7 @@ class ExecutionWorker:
             "base": base,
         }
 
-    def act_review(self, *, body_file: str,
+    def act_review(self, *, body_file: str, verdict: str = "comment",
                    repository: str | None = None) -> dict[str, Any]:
         """Post one review on the pull request this task is about.
 
@@ -508,6 +508,7 @@ class ExecutionWorker:
                 number=origin.item_id.split("/", 1)[0],
                 task_id=state.task_id,
                 body=body,
+                verdict=verdict,
             )
         except forge_action.ForgeActionError as exc:
             raise ExecutionWorkerClaimError(str(exc)) from exc

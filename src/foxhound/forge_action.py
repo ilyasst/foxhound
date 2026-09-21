@@ -299,15 +299,12 @@ def post_review(
     number: str,
     task_id: int,
     body: str,
+    verdict: str = "comment",
 ) -> ReviewReceipt:
     """Comment one review on a pull request the caller does not choose.
 
     ``repository`` and ``number`` come from the task's binding, so there is
     no parameter that could name another pull request. The body is content.
-
-    Posted as a comment rather than an approval or a rejection. Approving a
-    pull request is a statement about whether it should merge, and that is
-    the reader's to make; an agent's job here is to say what it found.
     """
     if not repository or repository.count("/") != 2:
         raise ForgeActionError(
@@ -323,11 +320,35 @@ def post_review(
         # verdict of nothing.
         raise ForgeActionError("a review body is required")
 
+    if verdict not in ("approve", "request-changes", "comment"):
+        raise ForgeActionError("invalid review verdict")
+
+    if verdict == "approve":
+        rc, out, _err = _run(
+            "gh", "pr", "view", digits, "--repo", name_with_owner,
+            "--json", "reviewDecision,labels")
+        if rc == 0:
+            try:
+                parsed = json.loads(out)
+                decision = parsed.get("reviewDecision")
+                labels = [label.get("name") for label in parsed.get("labels", []) if isinstance(label, dict)]
+                if decision == "CHANGES_REQUESTED" or "hold" in labels:
+                    raise ForgeActionError("cannot approve a pull request with an outstanding hold")
+            except (ValueError, TypeError):
+                pass
+
     body = body.rstrip() + REVIEW_PROVENANCE.format(
         task_id=task_id, repository=repository, number=digits)
+    
+    flag = "--comment"
+    if verdict == "approve":
+        flag = "--approve"
+    elif verdict == "request-changes":
+        flag = "--request-changes"
+
     rc, _out, err = _run(
-        "gh", "pr", "comment", digits, "--repo", name_with_owner,
-        "--body", body)
+        "gh", "pr", "review", digits, "--repo", name_with_owner,
+        flag, "--body", body)
     if rc != 0:
         raise ForgeActionError(
             f"{repository}#{digits}: the forge refused the review "

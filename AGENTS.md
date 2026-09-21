@@ -77,6 +77,10 @@ After the repository bootstrap, all changes follow this workflow:
 7. Confirm the merge, delete the remote branch, remove the worktree, delete the
    local branch, and prune stale worktree references.
 
+## Reviewing
+
+When reviewing a pull request, whether automated or manual, check the thread first. A holding decision must be recorded with a GitHub "Request changes" review or a `hold` label, not as unstructured prose. Approvals are blocked while either marker is present.
+
 The normal repository state is exactly one branch, `main`. Do not maintain
 long-lived development, release, environment, or personal branches. Do not
 commit directly to `main`, force-push it, or bypass the issue and pull-request

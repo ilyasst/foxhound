@@ -1133,9 +1133,10 @@ _GENERAL_PROMPT_TEMPLATE_V10 = _GENERAL_PROMPT_TEMPLATE_V9.replace(
         "Task lifecycle is separate. A completed execution result does not authorize you to close or drop the task.",
         "# Repository follow-through",
         "When `task.origin` identifies a GitHub issue or review request, that exact origin is the repository artifact for this task: an `issue` is updated on its issue, and a `review_request` on its pull request. Never substitute a similarly named repository, issue, or pull request.",
+        "For a `review_request` task, read the thread before composing a verdict. Do not post an approval that leaves an unresolved blocking comment unaddressed. Either demonstrate the hold is satisfied, or report the hold as the outcome.",
         "Repository follow-through is required only when execution changes or advances repository work. Planning, research, and an honest non-repository result remain valid without a forge update; for such a repository-origin execution, write JSON `false` to owner-only `result-repository-impact.json` and explain the bounded result in the deliverables. Omit the file for repository-impacting work: its safe default is `true`.",
         "Before recording repository-impacting work as completed, partial, or blocked, prepare a concise, sanitized update for that artifact. State the outcome, verification performed, any linked pull request, commit, or check, and one clear next step. Do not claim completion while material repository work is unfinished or its truthful follow-through has not been prepared.",
-        f"In `execute`, do not post the update. Put its complete draft in the reviewable result and list posting it as a structured external action with an exact `target` URL for `task.origin`, so the reader can approve the exact external write. In `external_action`, use `{WORKER_COMMAND_TOKEN} act comment --body-file FILE` for an issue update and `{WORKER_COMMAND_TOKEN} act review --body-file FILE` for a pull-request update, but only when that matching operation is listed by `context`; record the receipt link in `result-work.md`. If the run cannot complete it, record the precise blocker and the bounded continuation needed; do not silently release or claim success.",
+        f"In `execute`, do not post the update. Put its complete draft in the reviewable result and list posting it as a structured external action with an exact `target` URL for `task.origin`, so the reader can approve the exact external write. In `external_action`, use `{WORKER_COMMAND_TOKEN} act comment --body-file FILE` for an issue update and `{WORKER_COMMAND_TOKEN} act review --body-file FILE [--verdict approve|request-changes|comment]` for a pull-request update, but only when that matching operation is listed by `context`; record the receipt link in `result-work.md`. If the run cannot complete it, record the precise blocker and the bounded continuation needed; do not silently release or claim success.",
         "When time or turns are becoming insufficient, stop lower-priority exploration, preserve the verified partial result, and record the smallest bounded continuation that can finish it. Do not discard useful work merely because the first pass is incomplete.",
     )),
 )
@@ -1180,10 +1181,10 @@ _GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V13
 # revision fails at every runner and scheduler startup, rather than leaving a
 # stale test in a different file to discover the mismatch later.
 GENERAL_PROFILE_RELEASE_REVISION = (
-    "15a5abd4bb06a78046c11004515e487e84b5fed3295f90cd84aed95d2ea603e1"
+    "fa4a75fd851abfb9acacfda0613f2ac426f07cdf4072b809fa4e9e61d460b960"
 )
 GENERAL_PROFILE_RELEASE_PROMPT_SHA256 = (
-    "2556cb8715a69b9658d93d9d202569cea1766ccf9b9be46f8a1065fdf00da7d3"
+    "13785ab809d0f1f5bc94e56ed0cdabeb5b9254176653d78644ac5b76580abdcc"
 )
 
 
