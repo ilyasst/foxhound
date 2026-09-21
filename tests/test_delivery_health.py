@@ -331,6 +331,7 @@ class DeliveryHealthTests(unittest.TestCase):
         self.assertTrue(health.ok)
         self.assertEqual(health.admission.unadmitted, 0)
         self.assertIsNone(health.admission.oldest_unadmitted_age_seconds)
+        self.assertEqual(health.admission.preserved_open, 1)
 
     def test_unavailable_database_has_content_free_cli_output(self) -> None:
         output = io.StringIO()
