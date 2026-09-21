@@ -1469,7 +1469,7 @@ class ExecutionWorkerTests(unittest.TestCase):
             phase=WorkflowPhase.EXECUTE,
         )
         origin = SimpleNamespace(
-            kind="issue",
+            kind="vulnerability",
             record_id="github.com/example-org/example-repo",
             item_id="42",
         )
@@ -1485,14 +1485,14 @@ class ExecutionWorkerTests(unittest.TestCase):
         self.assertEqual(result["repository_references"], [])
 
     def test_draft_allows_an_analysis_only_repository_result_to_complete(self):
-        """An issue can ask a question, and the answer belongs on the card."""
+        """A vulnerability can ask a question, and the answer belongs on the card."""
         self._write_result_inputs()
         self._write_result_input("result-repository-impact.json", False)
         state = replace(
             load_run_state(self.state_path), phase=WorkflowPhase.EXECUTE,
         )
         origin = SimpleNamespace(
-            kind="issue",
+            kind="vulnerability",
             record_id="github.com/example-org/example-repo",
             item_id="42",
         )

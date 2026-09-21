@@ -1809,6 +1809,7 @@ def _repository_result(
         isinstance(origin_kind, str)
         and _publication_is_the_deliverable(origin_kind)
     )
+    requires_receipts = bool(_required_repository_receipt_kinds(origin_kind)) if origin_kind else False
     if state.phase is WorkflowPhase.EXECUTE and repository_impact:
         if outcome == "completed":
             raise ExecutionWorkerDraftError(
@@ -1818,7 +1819,7 @@ def _repository_result(
             )
     if (
         state.phase in (WorkflowPhase.PLAN, WorkflowPhase.EXECUTE)
-        and publication_is_the_work
+        and requires_receipts
         and not repository_impact
         and outcome == "completed"
         and not references
@@ -1851,7 +1852,7 @@ def _repository_result(
         )
     if (
         state.phase is WorkflowPhase.EXECUTE
-        and (repository_impact or publication_is_the_work)
+        and (repository_impact or publication_is_the_work or requires_receipts)
         and outcome == "awaiting_external"
         and not _has_origin_follow_through_action(actions, origin)
     ):
