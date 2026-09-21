@@ -203,13 +203,13 @@ no cards. Its aggregate stats route lets a gateway cap on-screen delivery
 without listing private tasks or cards. See
 [ADR 0011](docs/architecture/0011-local-task-card-service.md).
 
-A phase that a deployment has granted away advances with no reader gate, and
-would otherwise finish silently. Such a run leaves a bounded run summary
-instead: an informational card with no controls, which settles when it is
-delivered. It is bounded by its own delivery capacity rather than the reader's,
-so it can neither displace a card awaiting an answer nor raise the limit on how
-many of those a reader sees at once, and at most one is active per task. See
-[ADR 0045](docs/architecture/0045-automation-grants-in-run-state.md).
+A phase that a deployment has granted away advances with no reader gate and
+raises no card. It is not thereby silent: a grant only ever covers
+`awaiting_plan` and `awaiting_external`, so the result that ends the work
+still gates, and `phase_granted` is recorded in the ledger against every
+advance. Granted advances briefly left an informational run summary card as
+well; that is retired, and the cards it left are settled on upgrade. See
+[ADR 0053](docs/architecture/0053-run-summaries-retired.md).
 
 Every configured bearer token is paired with exactly one role from a closed
 set: `drip` (the existing chat gateway's pattern) or `queue_view` (reserved
