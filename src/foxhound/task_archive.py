@@ -18,8 +18,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Mapping, Sequence
 
+from .card_provenance import CardSourceEvidence, origin_lines
 
 ARTIFACT_MANIFEST_NAME = "result-artifacts.json"
+
+MAX_LOG_BYTES = 4 * 1024 * 1024
+MAX_HISTORY_RUNS = 8
 TRANSCRIPT_NAME = "agent-output.log"
 RESULT_INPUT_NAMES = (
     "result-summary.txt",
@@ -83,6 +87,7 @@ def prepare_task_archive(
     origin_kind: str | None = None,
     origin_record: str | None = None,
     origin_item: str | None = None,
+    origin_sources: tuple[CardSourceEvidence, ...] = (),
 ) -> TaskArchivePaths:
     """Create the stable task locations and register this run."""
     if isinstance(task_id, bool) or not isinstance(task_id, int) or task_id < 1:
@@ -96,7 +101,23 @@ def prepare_task_archive(
     _make_directory(task_directory)
     _make_directory(task_directory / "runs")
     _make_directory(run_directory)
-    source = _origin_markdown(origin_kind, origin_record, origin_item)
+    source = None
+    if origin_kind and origin_record and origin_item:
+        if origin_sources:
+            lines = origin_lines(
+                kind=origin_kind,
+                record=origin_record,
+                item=origin_item,
+                sources=origin_sources,
+                html_output=False,
+            )
+            if lines and lines[0].startswith("From: "):
+                lines[0] = f"**Source:** {lines[0][6:]}"
+            source = "\n".join(lines)
+        else:
+            source = _origin_markdown(origin_kind, origin_record, origin_item)
+            if source:
+                source = f"**Source:** {source}"
     stamp = datetime.now().astimezone().isoformat(timespec="seconds")
     log = _read_log(task_directory)
     log["task_id"] = task_id
@@ -466,7 +487,7 @@ def _render_task_document(log: Mapping[str, object]) -> str:
         lines.append(f"**Agent:** {agent}")
     source = log.get("source")
     if source:
-        lines.append(f"**Source:** {source}")
+        lines.append(source)
     lines.append(f"**Folder:** `{log.get('working_directory')}`")
     lines.append("")
 
@@ -598,7 +619,7 @@ def _task_header(
         f"**Task:** {task_text}",
     ]
     if source:
-        lines.append(f"**Source:** {source}")
+        lines.append(source)
     lines.extend((f"**Working folder:** `{working_directory}`", ""))
     return "\n".join(lines)
 
