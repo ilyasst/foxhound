@@ -4710,6 +4710,90 @@ class RunSummaryCardTests(ExecutionCardTests):
                 self.assertIsNotNone(claim)
                 self.assertFalse(claim.card.summary_only)
 
+    def _advance_many(self, task_ids) -> int:
+        """Give each of these tasks one recorded, auto-advanced result.
+
+        One task at a time, and each is parked out of the ready queue once
+        it has recorded: a granted workflow is requeued the moment it
+        advances, so left runnable the first task is simply claimed again
+        and the rest never run.
+        """
+        service = self._granted()
+        recorded = 0
+        for task_id in task_ids:
+            self._bind_issue_origin(task_id)
+            scheduled = service.schedule(task_id, expected_task_version=1)
+            service.start_action(
+                task_id, expected_version=scheduled.version, action="start")
+            claim = service.claim_next()
+            self.assertIsNotNone(claim)
+            self.assertEqual(claim.task_id, task_id)
+            outcome = service.record_result(ExecutionResultEnvelope(
+                result_id=f"summary-result-{task_id}",
+                task_id=task_id,
+                task_version=1,
+                workflow_version=claim.workflow_version,
+                phase=claim.phase,
+                claim_token=claim.token,
+                outcome=ExecutionOutcome.AWAITING_PLAN,
+                summary="Synthetic plan recorded",
+                work_markdown="Synthetic plan.",
+            ))
+            self.assertTrue(outcome.accepted, f"refusal={outcome.refusal}")
+            recorded += 1
+            with closing(sqlite3.connect(self.database)) as connection:
+                connection.execute(
+                    "UPDATE task_execution_workflows SET status='snoozed',"
+                    "due_at='2099-01-01T00:00:00+00:00' WHERE task_id=?",
+                    (task_id,),
+                )
+                connection.commit()
+        return recorded
+
+    def test_the_summary_band_drains_as_summaries_are_delivered(self):
+        """The band bounds summaries in flight, not summaries ever sent.
+
+        A summary settles on delivery and asks nothing afterwards, so a
+        delivered one occupies nothing.  Counting it made the bound
+        cumulative: five delivered against a ceiling of five, and every
+        summary raised afterwards queued forever behind cards that were
+        already finished.
+        """
+        ceiling = EXECUTION_CARD_CLAIM_CEILINGS["drip_summary"]
+        self._advance_many(range(1, ceiling + 2))
+
+        delivered = 0
+        for _ in range(ceiling + 1):
+            claim = self.cards.claim_next(consumer_digest=CONSUMER)
+            self.assertIsNotNone(
+                claim, f"band stopped draining after {delivered} deliveries")
+            self.assertTrue(claim.card.summary_only)
+            self.cards.complete_delivery(
+                claim.card.id,
+                expected_version=claim.card.version,
+                claim_token=claim.token,
+                transport="synthetic",
+                delivery_ref=f"summary-delivery-{delivered}",
+            )
+            delivered += 1
+
+        self.assertEqual(delivered, ceiling + 1)
+
+    def test_summaries_in_flight_still_bound_the_band(self):
+        """Draining on delivery must not remove the bound entirely."""
+        ceiling = EXECUTION_CARD_CLAIM_CEILINGS["drip_summary"]
+        self._advance_many(range(1, ceiling + 2))
+
+        # Claim without acknowledging: these stay `delivering`.
+        for _ in range(ceiling):
+            claim = self.cards.claim_next(consumer_digest=CONSUMER)
+            self.assertIsNotNone(claim)
+            self.assertTrue(claim.card.summary_only)
+
+        at_ceiling = self.cards.claim_next(consumer_digest=CONSUMER)
+        self.assertIsInstance(at_ceiling, ClaimAtCeiling)
+        self.assertEqual(at_ceiling.ceiling, ceiling)
+
     # -- the bound ---------------------------------------------------------
 
     def test_a_later_summary_supersedes_the_one_it_replaces(self):
