@@ -1,20 +1,49 @@
-# ADR 0043: Pinned release checkout
+# ADR 0043: Pinned release directory
 
 Status: accepted.
 
-Deployed units import a release of this repository: an export of the tracked
-tree at a named commit, in a directory named for that commit, with its own
-environment.  A symlink selects which one is deployed.  They never import a
-development tree.
+Deployed units run each component from a selected release of this repository: an
+export of the tracked tree at a named commit, in an immutable directory named
+for that commit under the releases root, with its own dedicated virtual
+environment.  A symlink selector names which release is deployed.  They never
+import a development tree or checkout.
 
 A release has no git metadata.  It is not a checkout and cannot be fetched or
 checked out in place; advancing production moves the selector to a different
-release, and building one is the separate procedure below.
+release after preflight succeeds, and building one is the separate procedure
+below.
 
 That held for every unit but one: the worker is run by the agent, not by
 the runner, and was located through the agent's `PATH` rather than from the
 release.  [ADR 0046](0046-worker-resolved-from-the-running-release.md)
 closes that, and is required reading alongside this one.
+
+## Component execution and the selector
+
+Deployed hosts run components via `foxhound-deployment-config exec --component <name>`
+from the selector symlink, as documented in `docs/deployment-configuration.md`.
+For example:
+
+```sh
+/srv/example/releases/current/bin/foxhound-deployment-config \
+  --config /srv/example/private-foxhound-state/deployment.json \
+  exec --component execution-runner:primary
+```
+
+`exec` replaces itself with the matching console script beside
+`foxhound-deployment-config` inside the selected release's own environment; it
+does not use a shell or search `PATH`.
+
+A unit driven by the selector must not also carry a `PYTHONPATH` into the same
+interpreter. The selected-release unit drop-in deliberately unsets `PYTHONPATH`
+(for instance, via `Environment="PYTHONPATH="`) and replaces `ExecStart`.
+Carrying `PYTHONPATH` into the interpreter would allow code from arbitrary
+directories or working checkouts to be imported into the deployed process,
+defeating the isolation of the release environment and creating silent
+contradictions between the deployed release and ambient paths. The two designs
+actively contradict each other on the same unit: deployed execution is
+governed by the selector and the release's virtual environment, never by a
+checkout-and-`PYTHONPATH` arrangement.
 
 ## Why the development tree must not be imported
 
@@ -25,9 +54,9 @@ is a decision to deploy.  The failure is silent in both directions: new code
 can reach production without review, and a service can keep serving code that
 no longer exists anywhere in the tree.
 
-A release checkout makes the moment of deployment explicit.  `main` moving does
-not move production; advancing production is a separate operation that names a
-commit.
+An immutable release directory and selector make the moment of deployment
+explicit.  `main` moving does not move production; advancing production is a
+separate operation that names a commit and moves the selector after preflight.
 
 ## What a deploy is
 
@@ -35,15 +64,20 @@ Advancing and rolling back are one operation with a different commit:
 
 1. Build the release you are advancing to, if it does not already exist, by
    the procedure in "How a release is built".  Nothing running is touched
-   until step 2, so this is safe to do at any time.
-2. Repoint the selector symlink at it, replacing it atomically with a rename
+   until step 3, so this is safe to do at any time.
+2. Run preflight checks against the candidate release before touching
+   production: confirm it answers with the expected revision, run schema
+   inspection (`foxhound-database inspect`), validate store rules
+   (`foxhound-agent-profile-store validate`), and verify card-verb
+   compatibility.
+3. Repoint the selector symlink at it, replacing it atomically with a rename
    rather than deleting and recreating it.  **This is the step that deploys.**
    Everything else restarts processes or confirms the result.
-3. Restart the long-running units.  One-shot units started by a timer pick up
+4. Restart the long-running units.  One-shot units started by a timer pick up
    the new code on their next run and do not need restarting.
-4. Read back the revision each restarted service reports.
+5. Read back the revision each restarted service reports.
 
-Step 4 is part of the deploy, not a check afterwards.  A restart that fails
+Step 5 is part of the deploy, not a check afterwards.  A restart that fails
 leaves the previous process running and serving the previous code, which is
 indistinguishable from a successful deploy unless the revision is read.
 
@@ -133,9 +167,10 @@ itself.
    it, not as an editable install.**  An editable install resolves back to the
    tree it was installed from, which reintroduces precisely the coupling to a
    working tree that a release exists to remove.
-4. **Repoint the symlink last**, once the release answers with the revision
-   expected of it.  Until that point nothing running has been touched, which is
-   what makes the first three steps safe to do at any time.
+4. **Repoint the selector symlink last**, once preflight checks succeed and
+   the release answers with the revision expected of it.  Until that point
+   nothing running has been touched, which is what makes the first three steps
+   safe to do at any time.
 
 None of this is currently scripted.  That is tolerable while promotion is rare
 and deliberate, but it means the procedure is reproduced from memory each time,
@@ -213,13 +248,13 @@ that has outlived several deploys is otherwise identical to a fresh one, and
 the difference has taken a card surface down for hours while every unit
 reported active.
 
-The revision is derived from the release checkout, and a service that cannot
-determine one says so rather than omitting the line: a missing revision is the
-symptom worth seeing.
+The revision is derived from the immutable release directory name (which is
+named for the revision), and a service that cannot determine one says so rather
+than omitting the line: a missing revision is the symptom worth seeing.
 
 ## Relationship to deployed configuration
 
-Configuration is private host state and stays outside the checkout.  The two
-have the same property and need the same discipline: what is deployed should be
-nameable, and a change to it should be an operation rather than an edit whose
-effect is discovered later.
+Configuration is private host state and stays outside any release directory or
+checkout.  The two have the same property and need the same discipline: what is
+deployed should be nameable, and a change to it should be an operation rather
+than an edit whose effect is discovered later.

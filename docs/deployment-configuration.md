@@ -1,16 +1,16 @@
 # Private deployment configuration
 
 Deployed code and deployed configuration are separate concerns with the same
-discipline.  Units import a pinned release checkout, never a development tree;
-see [ADR 0043](architecture/0043-pinned-release-checkout.md) for what a deploy
-consists of and which units must be restarted.  The configuration file below is
-private host state and lives outside any checkout.
+discipline.  Units run from an immutable release directory, never a development
+checkout or working tree; see [ADR 0043](architecture/0043-pinned-release-checkout.md)
+for what a deploy consists of and which units must be restarted.  The configuration
+file below is private host state and lives outside any release directory.
 
 `foxhound-deployment-config` makes the settings that belong to one deployment
-explicit. The JSON file is private host state: keep it outside the checkout,
-make it owner-only (`0600`), and do not commit it, paste it into issues, or
-send its rendered command lines to logs. It contains paths but never token
-values.
+explicit. The JSON file is private host state: keep it outside any release
+directory or repository checkout, make it owner-only (`0600`), and do not
+commit it, paste it into issues, or send its rendered command lines to logs. It
+contains paths but never token values.
 
 Version 15 is current. Eight things about it are worth knowing before an
 upgrade, because none of them announces itself:
@@ -227,6 +227,12 @@ same installed release as the configuration command:
 the release selector and unit definitions private. A promotion changes that
 selector only after preflight succeeds, so every database component starts
 from one selected release with arguments rendered from the same document.
+
+The selected-release unit drop-in deliberately unsets `PYTHONPATH` (for
+example, via `Environment="PYTHONPATH="`) and replaces `ExecStart`. A unit
+driven by the selector must not also carry a `PYTHONPATH` into the same
+interpreter: code must resolve strictly from the installed release
+environment rather than an ambient or development tree.
 
 `worker_command` follows the same principle, and needs to, because the worker
 is run by the agent rather than by the runner: a bare name is resolved to the
