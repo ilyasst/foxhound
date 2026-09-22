@@ -1226,6 +1226,94 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertEqual((refreshed.cancelled, refreshed.created), (1, 1))
         self.assertEqual(self.ledger.get(1).status, TaskStatus.OPEN)
 
+    def _create_result_review(self, task_id: int, result_id: str):
+        # complete the plan phase to create a plan review card
+        self._plan_review(task_id, f"plan-{task_id}")
+        
+        # approve the plan to move to EXECUTE phase
+        approved = self.execution.review_action(
+            task_id,
+            expected_version=self.execution.get(task_id).version,
+            action="approve",
+        )
+        self.assertEqual(approved.phase, WorkflowPhase.EXECUTE)
+        
+        # start EXECUTE phase
+        scheduled = self.execution.get(task_id)
+        assert scheduled is not None
+        self.execution.start_action(
+            task_id, expected_version=scheduled.version, action="start"
+        )
+        
+        self._record(
+            task_id,
+            phase=WorkflowPhase.EXECUTE,
+            outcome=ExecutionOutcome.COMPLETED,
+            result_id=result_id
+        )
+
+    def test_delivery_claim_orders_by_priority_bands_then_age(self):
+        # Arrange: create multiple cards in a mixed pending queue.
+        from datetime import timedelta
+        # Start cards:
+        start_1 = self._schedule_workflow(1)
+        self.clock.advance(timedelta(seconds=1))
+        start_2 = self._schedule_workflow(2)
+        self.clock.advance(timedelta(seconds=1))
+        
+        # Plan and External review cards:
+        plan_1 = self._plan_review(3, "plan_3")
+        self.clock.advance(timedelta(seconds=1))
+        ext_1 = self._external_review(4, "ext_4")
+        self.clock.advance(timedelta(seconds=1))
+        
+        # Result review cards:
+        self._create_result_review(5, "res-5")
+        self.clock.advance(timedelta(seconds=1))
+        self._create_result_review(6, "res-6")
+        
+        # schedule all of them to be pending in execution_review_cards
+        self.cards.schedule(limit=6)
+
+        # Act Assert
+        cards = self.cards
+        
+        # Delivery 1: Result 1
+        claim = cards.claim_next()
+        self.assertEqual(claim.card.task_id, 5)
+        self.assertEqual(claim.card.kind, ExecutionCardKind.RESULT_REVIEW)
+        cards.complete_delivery(claim.card.id, expected_version=claim.card.version, claim_token=claim.token, transport="synthetic", delivery_ref="msg1")
+        
+        # Delivery 2: Result 2
+        claim = cards.claim_next()
+        self.assertEqual(claim.card.task_id, 6)
+        self.assertEqual(claim.card.kind, ExecutionCardKind.RESULT_REVIEW)
+        cards.complete_delivery(claim.card.id, expected_version=claim.card.version, claim_token=claim.token, transport="synthetic", delivery_ref="msg2")
+        
+        # Delivery 3: Plan 1
+        claim = cards.claim_next()
+        self.assertEqual(claim.card.task_id, 3)
+        self.assertEqual(claim.card.kind, ExecutionCardKind.PLAN_REVIEW)
+        cards.complete_delivery(claim.card.id, expected_version=claim.card.version, claim_token=claim.token, transport="synthetic", delivery_ref="msg3")
+        
+        # Delivery 4: External 1
+        claim = cards.claim_next()
+        self.assertEqual(claim.card.task_id, 4)
+        self.assertEqual(claim.card.kind, ExecutionCardKind.EXTERNAL_REVIEW)
+        cards.complete_delivery(claim.card.id, expected_version=claim.card.version, claim_token=claim.token, transport="synthetic", delivery_ref="msg4")
+        
+        # Delivery 5: Start 1
+        claim = cards.claim_next()
+        self.assertEqual(claim.card.task_id, 1)
+        self.assertEqual(claim.card.kind, ExecutionCardKind.START)
+        cards.complete_delivery(claim.card.id, expected_version=claim.card.version, claim_token=claim.token, transport="synthetic", delivery_ref="msg5")
+        
+        # Delivery 6: Start 2
+        claim = cards.claim_next()
+        self.assertEqual(claim.card.task_id, 2)
+        self.assertEqual(claim.card.kind, ExecutionCardKind.START)
+        cards.complete_delivery(claim.card.id, expected_version=claim.card.version, claim_token=claim.token, transport="synthetic", delivery_ref="msg6")
+
     def test_historical_start_card_offers_current_revision_for_reselection(self):
         current = general_profile()
         historical_document = current.document()
