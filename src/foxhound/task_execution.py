@@ -313,6 +313,7 @@ class ExecutionResultEnvelope:
     #: Derived from `work_markdown` by the worker, never by the agent.
     #: Empty is normal and means the card falls back to an excerpt.
     work_digest: str = field(default="", repr=False)
+    voice_summary: str = field(default="", repr=False)
     questions: Sequence[str] = field(default=(), repr=False)
     external_actions: Sequence[object] = field(default=(), repr=False)
     deliverables: Sequence[object] = field(default=(), repr=False)

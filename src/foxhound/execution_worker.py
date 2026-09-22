@@ -26,7 +26,7 @@ from .knowledge_client import (
     KnowledgeSearchResult,
 )
 from .contracts import SourceSnapshotContractError
-from . import work_digest
+from . import work_digest, voice_summary
 from .task_execution import (
     ExecutionResultEnvelope,
     TaskExecutionService,
@@ -843,6 +843,11 @@ class ExecutionWorker:
             # the transaction a card claim is waiting on. Returns "" on
             # any failure; the card then shows an excerpt instead.
             work_digest=work_digest.digest(draft["work_markdown"]),
+            voice_summary=draft.get("voice_summary", "") or voice_summary.generate(
+                draft["work_markdown"],
+                summary=draft["summary"],
+                deliverables=draft["deliverables"],
+            ),
             questions=draft["questions"],
             external_actions=draft["external_actions"],
             deliverables=draft["deliverables"],
@@ -1338,13 +1343,12 @@ def load_result_draft(
     # lived, and already bound to this claim, so preserve it as an empty
     # collection rather than forcing an agent to recreate a correct result.
     supplied = set(document)
-    if supplied == fields:
-        document["repository_references"] = []
-        document["repository_impact"] = True
-    elif supplied == fields | {"repository_references"}:
-        document["repository_impact"] = True
-    elif supplied != fields | {"repository_references", "repository_impact"}:
+    allowed_optionals = {"repository_references", "repository_impact", "voice_summary"}
+    if not (fields <= supplied <= fields | allowed_optionals):
         raise ExecutionWorkerDraftError("execution result draft is invalid")
+    document.setdefault("repository_references", [])
+    document.setdefault("repository_impact", True)
+    document.setdefault("voice_summary", "")
     if (
         document["schema"] != RESULT_DRAFT_SCHEMA
         or document["schema_version"] != WORKER_SCHEMA_VERSION
