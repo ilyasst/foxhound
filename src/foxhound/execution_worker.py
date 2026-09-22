@@ -165,7 +165,7 @@ def _worker_operations(phase: WorkflowPhase) -> list[str]:
     operations.append("act.worktree")
     if phase is WorkflowPhase.EXTERNAL_ACTION:
         operations.append("act.pull-request")
-        operations.extend(("act.comment", "act.issue", "act.review"))
+        operations.extend(("act.comment", "act.issue", "act.review", "act.mail"))
     # Read-only thread access is available in plan and execute, not just
     # external_action: the point is to read review feedback *before* repeating
     # the work, and by external_action the work is already done.
@@ -176,7 +176,7 @@ def _worker_operations(phase: WorkflowPhase) -> list[str]:
 
 _LOCAL_RESEARCH_CLIENTS = {
     "outlook": (
-        "folders", "inbox", "search", "read", "thread", "draft",
+        "folders", "inbox", "search", "read", "thread", "draft", "attachment",
     ),
     "moodle": (
         "renew", "whoami", "courses", "assignments", "submissions",
@@ -558,6 +558,55 @@ class ExecutionWorker:
         _append_repository_receipt(self._state_path.parent, result)
         # Renewed only after the write succeeded, so a lease that lapses
         # mid-post is not extended by the attempt itself.
+        self._renew(service, state)
+        return result
+
+    def act_mail(
+        self, *, to: str, subject: str, body_file: str,
+        attachments: str | None = None,
+    ) -> dict[str, Any]:
+        """Send an approved outbound message."""
+        import subprocess
+        state, service = self._fresh_active("effect")
+        if state.phase is not WorkflowPhase.EXTERNAL_ACTION:
+            raise ExecutionWorkerClaimError(
+                "an external action is only available in the external_action phase"
+            )
+        if not to or "@" not in to:
+            raise ExecutionWorkerClaimError("recipient address is invalid")
+
+        body = _read_private_text(
+            self._state_path.parent / body_file,
+            maximum=60_000, label="message body",
+        )
+
+        cmd = ["outlook", "send", "--to", to, "--subject", subject]
+
+        if attachments:
+            for att in attachments.split(","):
+                path = (self._state_path.parent / att.strip()).resolve()
+                if not path.is_relative_to(self._state_path.parent.resolve()):
+                    raise ExecutionWorkerClaimError(
+                        "attachment must be a result artifact in the task folder"
+                    )
+                if not path.is_file():
+                    raise ExecutionWorkerClaimError(f"attachment missing: {att}")
+                cmd.extend(["--attachment", str(path)])
+
+        try:
+            subprocess.run(
+                cmd, input=body, text=True, capture_output=True, check=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            raise ExecutionWorkerClaimError(
+                f"mail failed: {exc.stderr.strip() or 'unknown error'}"
+            ) from exc
+
+        result = {
+            "kind": "outbound-mail",
+            "to": to,
+            "subject": subject,
+        }
         self._renew(service, state)
         return result
 
@@ -2245,6 +2294,16 @@ def _parser() -> argparse.ArgumentParser:
     comment.add_argument(
         "--body-file", required=True,
         help="file beside the run state holding the status update")
+    mail = act_kinds.add_parser(
+        "mail", help="send an approved outbound message")
+    mail.add_argument("--to", required=True, help="validated recipient address")
+    mail.add_argument("--subject", required=True)
+    mail.add_argument(
+        "--body-file", required=True,
+        help="file beside the run state holding the message text")
+    mail.add_argument(
+        "--attachments",
+        help="comma-separated paths to validated result artifacts")
     thread = subcommands.add_parser(
         "thread", help="read comments and reviews on this task's own thread")
     record = subcommands.add_parser("record")
@@ -2293,6 +2352,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 repository=args.repository)
         elif args.operation == "act" and args.action_kind == "comment":
             result = worker.act_comment(body_file=args.body_file)
+        elif args.operation == "act" and args.action_kind == "mail":
+            result = worker.act_mail(
+                to=args.to, subject=args.subject, body_file=args.body_file,
+                attachments=args.attachments
+            )
         elif args.operation == "act":
             result = worker.act_pull_request(
                 head=args.head, title=args.title, body_file=args.body_file,
