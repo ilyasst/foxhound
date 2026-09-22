@@ -150,7 +150,7 @@ generation. Withdrawal never completes or deletes a Foxhound task: untouched
 open tasks are withheld from cards and execution, while reader-modified or
 already-active tasks are preserved as explicit conflicts. Existing version 1
 and 2 producers retain active generation-zero behavior. See
-[ADR 0023](docs/architecture/0023-candidate-lifecycle.md).
+[ADR 0049](docs/architecture/0049-candidate-lifecycle.md).
 
 Meeting candidate version 4 carries one to three validated source basenames
 with bounded supporting extracts. Cards render those readable sources instead
@@ -202,6 +202,14 @@ logs contain no task/card identifiers or content. Starting the service creates
 no cards. Its aggregate stats route lets a gateway cap on-screen delivery
 without listing private tasks or cards. See
 [ADR 0011](docs/architecture/0011-local-task-card-service.md).
+
+A phase that a deployment has granted away advances with no reader gate and
+raises no card. It is not thereby silent: a grant only ever covers
+`awaiting_plan` and `awaiting_external`, so the result that ends the work
+still gates, and `phase_granted` is recorded in the ledger against every
+advance. Granted advances briefly left an informational run summary card as
+well; that is retired, and the cards it left are settled on upgrade. See
+[ADR 0053](docs/architecture/0053-run-summaries-retired.md).
 
 Every configured bearer token is paired with exactly one role from a closed
 set: `drip` (the existing chat gateway's pattern) or `queue_view` (reserved
@@ -779,6 +787,12 @@ prompts, logs, private paths, credentials, profile identifiers, and unbounded
 work-product text are never exposed. This follows ADR 0041's aggregate-scoped
 second-consumer decision and creates no new authority.
 
+For a console that needs actual work rather than reader-card delivery state,
+the same credential may read `POST /v1/execution-workflows/board` and one
+version-fenced `POST /v1/execution-workflows/detail`. These bounded,
+non-mutating routes project current workflow columns and allowlisted result
+detail; they do not expose raw transcripts, paths, or another consumer's card.
+
 The same execution `queue_view` credential may also request bounded priority
 for one exact ready workflow at `POST /v1/execution-workflows/priority` with
 `task_id`, the exact current `workflow_version`, and one action: `raise`,
@@ -799,6 +813,29 @@ inactive, stale, and already-running workflows are refused unchanged. A
 successful runner claim clears the preference atomically, so it cannot steer a
 later phase. Each successful change is an append-only workflow event; workflow
 capacity and runner-slot ceilings remain unchanged.
+
+### Board projections
+
+The console may read two separate, versioned Kanban projections with its
+existing `queue_view` credential: `POST /v1/task-cards/board` and
+`POST /v1/execution-cards/board`.  Both accept only the ordinary request
+envelope plus a bounded `limit` (1–100), never claim a card, and return a
+closed `columns` vocabulary with true totals, a bounded `cards` page, and a
+content-free `held_elsewhere` count.  Cards held by another consumer are not
+serialized.
+
+Task-board columns are `review` and `snoozed`.  Execution-board columns are
+`ready_to_start`, `queued`, `running`, `plan_review`, `external_review`,
+`result_review`, `snoozed`, `parked`, `completed`, and `cancelled`.  These are
+work-state tokens supplied by Foxhound, not delivery states.  A card carries
+its delivery state only as a small attribute.
+
+The projections expose only a bounded board face: stable card handle and
+version, work-state and delivery tokens, short task/summary text, optional
+owner, source kind, agent display name, and a bounded timestamp.  They never
+expose raw provenance, prompts, transcripts, logs, filesystem paths,
+credentials, or agent profile identifiers.  idroid is the intended consumer;
+it keeps all mutations on the existing version-fenced resolve routes.
 
 The packaged service accepts `--agent-profile-directory`; deployments with
 private profiles must give it the same directory as the execution runner. The

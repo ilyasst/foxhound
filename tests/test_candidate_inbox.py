@@ -85,6 +85,9 @@ class CandidateInboxTests(unittest.TestCase):
                 "ALTER TABLE execution_review_cards DROP COLUMN consumer_digest"
             )
             connection.execute(
+                "ALTER TABLE task_review_cards DROP COLUMN claiming_consumer"
+            )
+            connection.execute(
                 "ALTER TABLE task_review_cards DROP COLUMN source_revision"
             )
             if "repository_references_json" in {
@@ -147,6 +150,9 @@ class CandidateInboxTests(unittest.TestCase):
                 "ALTER TABLE task_review_cards DROP COLUMN consumer_digest"
             )
             connection.execute(
+                "ALTER TABLE task_review_cards DROP COLUMN claiming_consumer"
+            )
+            connection.execute(
                 "ALTER TABLE task_review_cards DROP COLUMN source_revision"
             )
             connection.execute(
@@ -199,6 +205,55 @@ class CandidateInboxTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(version, SCHEMA_VERSION)
         self.assertEqual(columns.count("consumer_digest"), 1)
+        self.assertEqual(row, ("pending", None))
+
+    def _predates_claiming_consumer(self) -> None:
+        """Roll `self.database` back to a v55 fixture with one live card.
+
+        ADR 0036 decision 2: `task_review_cards` gains a nullable
+        `claiming_consumer` column at v56, recording the claiming consumer's
+        identity at claim time. This helper reproduces an installation that
+        predates that migration.
+        """
+        now = NOW.isoformat(timespec="seconds")
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "INSERT INTO tasks(status,text,owner,due,version,created_at,"
+                "updated_at,closed_at) VALUES('open','Synthetic task',"
+                "'Person A',NULL,1,?,?,NULL)",
+                (now, now),
+            )
+            connection.execute(
+                "ALTER TABLE task_review_cards DROP COLUMN claiming_consumer"
+            )
+            connection.execute(
+                "INSERT INTO task_review_cards(task_id,task_version,status,"
+                "version,due_at,created_at,updated_at) "
+                "VALUES(1,1,'pending',1,?,?,?)",
+                (now, now, now),
+            )
+            connection.execute("PRAGMA user_version = 55")
+            connection.commit()
+
+    def test_version_fifty_six_migration_adds_nullable_claiming_consumer(self):
+        self._predates_claiming_consumer()
+
+        migrate_database(self.database)
+
+        with closing(sqlite3.connect(self.database)) as connection:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            columns = [
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(task_review_cards)"
+                )
+            ]
+            row = connection.execute(
+                "SELECT status,claiming_consumer FROM task_review_cards "
+                "WHERE id=1"
+            ).fetchone()
+        self.assertEqual(version, SCHEMA_VERSION)
+        self.assertIn("claiming_consumer", columns)
         self.assertEqual(row, ("pending", None))
 
     def test_fresh_and_migrated_databases_end_up_in_the_same_shape(self):

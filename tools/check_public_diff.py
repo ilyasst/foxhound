@@ -17,6 +17,18 @@ import sys
 
 
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})")
+
+#: A systemd template instance puts an "at" sign between a unit name and an
+#: instance, then a dotted suffix -- the same shape an address has, so
+#: `EMAIL_RE` matches it. The unit suffixes are a closed, narrow set and no
+#: mail domain ends in `.service`, so excluding them costs the real check
+#: nothing. Without this, ordinary `systemctl` documentation is reported as a
+#: leaked address, and a guard that fires on documentation teaches people to
+#: pass --no-verify, which is when it stops protecting anything.
+SYSTEMD_UNIT_SUFFIXES = (
+    ".service", ".socket", ".timer", ".target", ".path", ".mount",
+    ".automount", ".swap", ".slice", ".scope", ".device",
+)
 URL_HOST_RE = re.compile(r"https?://([A-Za-z0-9.-]+)(?::\d+)?(?:[/?#]|$)", re.I)
 HOME_PATH_RE = re.compile(
     r"(?:/home/|/Users/)[A-Za-z0-9._-]+(?:/|\b)|"
@@ -24,7 +36,7 @@ HOME_PATH_RE = re.compile(
 )
 IPV4_RE = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])")
 REMOTE_COMMAND_RE = re.compile(
-    r"\b(?:ssh|scp|rsync)\s+(?:-[A-Za-z]+\s+)*(?:[^\s@]+@)?"
+    r"^\s*(?:\$\s*)?(?:ssh|scp|rsync)\b\s+(?:-[A-Za-z]+\s+)*(?:[^\s@]+@)?"
     r"([A-Za-z0-9][A-Za-z0-9.-]+)"
 )
 
@@ -51,10 +63,16 @@ ALLOWED_URL_DOMAINS = {
 }
 ALLOWED_NETWORKS = tuple(ipaddress.ip_network(value) for value in (
     "127.0.0.0/8",
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "0.0.0.0/32",
     "192.0.2.0/24",
     "198.51.100.0/24",
     "203.0.113.0/24",
 ))
+
+RESERVED_DOMAIN_SUFFIXES = (".invalid", ".test", ".example", ".localhost")
 
 
 PRIVATE_TERMS_ENV = "FOXHOUND_PUBLIC_DIFF_PRIVATE_TERMS"
@@ -77,6 +95,8 @@ def _configured_private_terms(value: str | None = None) -> tuple[str, ...]:
 
 def _allowed_url_host(host: str) -> bool:
     host = host.lower().rstrip(".")
+    if host.endswith(RESERVED_DOMAIN_SUFFIXES):
+        return True
     return any(host == domain or host.endswith("." + domain)
                for domain in ALLOWED_URL_DOMAINS)
 
@@ -97,7 +117,10 @@ def findings(diff_text: str, *, private_terms: tuple[str, ...] | None = None) ->
             found.append(f"added line {added_line}: configured private term")
 
         for match in EMAIL_RE.finditer(line):
-            if match.group(1).lower() not in ALLOWED_EMAIL_DOMAINS:
+            domain = match.group(1).lower()
+            if domain.endswith(SYSTEMD_UNIT_SUFFIXES):
+                continue  # `foxhound-execution-runner@slot-2.service`
+            if domain not in ALLOWED_EMAIL_DOMAINS and not domain.endswith(RESERVED_DOMAIN_SUFFIXES):
                 found.append(f"added line {added_line}: non-example email address")
                 break
 

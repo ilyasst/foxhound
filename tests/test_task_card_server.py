@@ -29,6 +29,7 @@ from foxhound.agent_profiles import (
     parse_profile,
 )
 from foxhound.execution_cards import (
+    ExecutionCardStats,
     ExecutionCardService,
     parse_execution_agent_callback,
     parse_execution_review_callback,
@@ -49,12 +50,14 @@ from foxhound.task_card_server import (
     EXECUTION_OPERATION_SCHEMA,
     EXECUTION_PRIORITY_SCHEMA,
     EXECUTION_QUEUE_SCHEMA,
+    EXECUTION_BOARD_SCHEMA,
     EXECUTION_SCHEDULE_SCHEMA,
     EXECUTION_STATS_SCHEMA,
     HEALTH_SCHEMA,
     OPERATION_SCHEMA,
     QUEUE_SCHEMA,
     QUEUE_SCHEMA_VERSION,
+    BOARD_SCHEMA,
     QUEUE_VIEW_ROLE,
     REQUEST_SCHEMA,
     SCHEDULE_SCHEMA,
@@ -233,6 +236,72 @@ class TaskCardServerTests(unittest.TestCase):
         self.assertIsNone(stale["text"])
         self.assertEqual(stale["refusal"], "stale_version")
 
+    def test_execution_board_is_queue_scoped_bounded_and_non_mutating(self):
+        self.execution.schedule(1, expected_task_version=1)
+        self.execution_cards.schedule()
+        app = TaskCardApplication(
+            self.cards,
+            {DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: QUEUE_VIEW_TOKEN},
+            execution_cards=self.execution_cards,
+            execution_tokens={DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: QUEUE_VIEW_TOKEN},
+        )
+        before = (self.execution_cards.count(), self.execution_cards.event_count())
+        board = app.dispatch(
+            "execution_board", request_document(limit=1),
+            authorization=f"Bearer {QUEUE_VIEW_TOKEN}",
+        )
+        self.assertEqual((board["schema"], board["ok"]),
+                         (EXECUTION_BOARD_SCHEMA, True))
+        self.assertEqual(board["columns"][0],
+                         {"status": "ready_to_start", "total": 1})
+        self.assertEqual(len(board["cards"]), 1)
+        card = board["cards"][0]
+        self.assertEqual(card["board_status"], "ready_to_start")
+        self.assertEqual(set(card), {
+            "id", "version", "handle", "board_status", "delivery_status",
+            "kind", "phase", "task", "owner", "agent", "source",
+            "summary", "state_since",
+        })
+        self.assertNotIn("agent_profile_id", card)
+        with self.assertRaises(TaskCardServerRequestError):
+            app.dispatch(
+                "execution_board", request_document(limit=1, extra=True),
+                authorization=f"Bearer {QUEUE_VIEW_TOKEN}",
+            )
+        with self.assertRaises(TaskCardServerRequestError):
+            app.dispatch(
+                "execution_board", request_document(limit=1),
+                authorization=f"Bearer {TOKEN}",
+            )
+        self.assertEqual(
+            (self.execution_cards.count(), self.execution_cards.event_count()),
+            before,
+        )
+
+    def test_execution_board_http_contract_is_queue_view_only(self):
+        self.execution.schedule(1, expected_task_version=1)
+        self.execution_cards.schedule()
+        app = TaskCardApplication(
+            self.cards,
+            {DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: QUEUE_VIEW_TOKEN},
+            execution_cards=self.execution_cards,
+            execution_tokens={DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: QUEUE_VIEW_TOKEN},
+        )
+        with running_server(app) as endpoint:
+            status, _, board = request(
+                endpoint, "/v1/execution-cards/board",
+                request_document(limit=1), token=QUEUE_VIEW_TOKEN,
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual((board["schema"], board["schema_version"]),
+                             (EXECUTION_BOARD_SCHEMA, 1))
+            status, _, refused = request(
+                endpoint, "/v1/execution-cards/board",
+                request_document(limit=1), token=TOKEN,
+            )
+            self.assertEqual((status, refused["error"]["code"]),
+                             (403, "role_forbidden"))
+
     def test_execution_deliverables_route_is_a_delivered_card_read(self):
         workflow = self.execution.schedule(1, expected_task_version=1)
         self.execution.start_action(
@@ -394,6 +463,44 @@ class TaskCardServerTests(unittest.TestCase):
         card = self.execution_cards.due(limit=1)[0]
         return card
 
+    def test_execution_retraction_routes_acknowledge_a_stale_delivery(self):
+        self.execution.schedule(1, expected_task_version=1)
+        self.execution_cards.schedule()
+        delivery = self.execution_cards.claim_next()
+        self.execution_cards.complete_delivery(
+            delivery.card.id,
+            expected_version=delivery.card.version,
+            claim_token=delivery.token,
+            transport="synthetic",
+            delivery_ref="synthetic-stale-message",
+        )
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "UPDATE task_execution_workflows SET status='queued',"
+                "version=version+1,claim_token_digest=NULL,claimed_at=NULL,"
+                "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
+                "current_run_id=NULL WHERE task_id=1"
+            )
+        self.execution_cards.schedule()
+
+        claimed = self.app.dispatch(
+            "execution_retraction_claim",
+            request_document(lease_seconds=60),
+            authorization=f"Bearer {TOKEN}",
+        )
+        self.assertEqual(claimed["status"], "claimed")
+        self.assertEqual(claimed["claim"]["delivery_ref"],
+                         "synthetic-stale-message")
+        completed = self.app.dispatch(
+            "execution_retracted",
+            request_document(
+                card_id=claimed["claim"]["card_id"],
+                claim_token=claimed["claim"]["claim_token"],
+            ),
+            authorization=f"Bearer {TOKEN}",
+        )
+        self.assertEqual(completed["status"], "applied")
+
     def test_execution_queue_resolve_claims_and_resolves_atomically(self):
         card = self._queue_card()
         queue = "q" * 43
@@ -458,6 +565,53 @@ class TaskCardServerTests(unittest.TestCase):
                     extra="rejected",
                 ),
                 authorization=f"Bearer {queue}",
+            )
+
+    def test_workflow_board_is_queue_scoped_bounded_and_non_mutating(self):
+        queue = "q" * 43
+        self.execution.schedule(1, expected_task_version=1)
+        ready = self.execution.start_action(1, expected_version=1, action="start")
+        app = TaskCardApplication(
+            self.cards, {DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: queue},
+            execution_cards=self.execution_cards, execution_workflows=self.execution,
+            execution_tokens={DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: queue},
+        )
+        before = self.execution.event_count()
+        board = app.dispatch(
+            "workflow_board", request_document(limit=10),
+            authorization=f"Bearer {queue}",
+        )
+        self.assertEqual(board["schema"], "foxhound.execution-workflow-service.board")
+        self.assertTrue(board["ok"])
+        self.assertEqual(board["columns"][1], {"status": "queued", "total": 1})
+        self.assertEqual(board["workflows"][0]["workflow_version"], ready.version)
+        self.assertEqual(self.execution.event_count(), before)
+        with running_server(app) as endpoint:
+            status, _, http_board = request(
+                endpoint, "/v1/execution-workflows/board",
+                request_document(limit=10), token=queue,
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(http_board["workflows"], board["workflows"])
+        detail = app.dispatch(
+            "workflow_detail",
+            request_document(task_id=1, workflow_version=ready.version),
+            authorization=f"Bearer {queue}",
+        )
+        self.assertTrue(detail["ok"])
+        self.assertEqual(detail["status"], "queued")
+        self.assertEqual(detail["deliverables"], [])
+        stale = app.dispatch(
+            "workflow_detail",
+            request_document(task_id=1, workflow_version=ready.version + 1),
+            authorization=f"Bearer {queue}",
+        )
+        self.assertFalse(stale["ok"])
+        self.assertEqual(stale["refusal"], "stale_workflow")
+        with self.assertRaises(TaskCardServerRequestError):
+            app.dispatch(
+                "workflow_board", request_document(limit=10),
+                authorization=f"Bearer {TOKEN}",
             )
 
     def test_execution_queue_resolve_is_strict_and_queue_view_only(self):
@@ -1009,6 +1163,36 @@ class TaskCardServerTests(unittest.TestCase):
             )
             self.assertEqual(status, 401)
         self.assertEqual((self.cards.count(), self.cards.event_count()), before)
+
+    def test_v1_stats_keeps_its_key_set_when_steer_work_exists(self):
+        """A versioned response may not grow a field on some deployments.
+
+        The client validates this key set exactly.  Adding steer counts
+        only when a steer card happens to exist makes the response valid
+        on quiet deployments and refused on busy ones -- and a refused
+        response stops the sweep, so no execution card reaches the reader
+        at all.  Observed: a steer card entered `delivering`, and
+        sixty-one seconds later delivery stopped entirely.
+        """
+        steer = ExecutionCardStats(
+            pending=0, delivering=0, delivered=0, active=0,
+            steer_pending=2, steer_delivering=1, steer_delivered=3,
+        )
+        with mock.patch.object(
+            ExecutionCardService, "stats", return_value=steer
+        ):
+            with running_server(self.app) as endpoint:
+                status, _, body = request(
+                    endpoint,
+                    "/v1/execution-cards/stats",
+                    request_document(),
+                )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(set(body), {
+            "schema", "schema_version", "ok",
+            "pending", "delivering", "delivered", "active",
+        })
 
     def test_execution_stats_and_missing_adapter_are_content_free(self):
         before = (
@@ -1899,6 +2083,58 @@ class TaskCardQueueProjectionTests(unittest.TestCase):
             )
         self.assertEqual(status, 200)
         self.assertNotIn(held_id, {card["id"] for card in body["cards"]})
+
+    def test_board_includes_snoozed_work_and_hides_held_card_content(self):
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "UPDATE task_review_cards SET status='snoozed',"
+                "due_at='2030-03-02T12:00:00+00:00' WHERE task_id=2"
+            )
+        claim = self.cards.claim_next(
+            consumer_digest=hashlib.sha256(TOKEN.encode()).hexdigest(),
+            consumer_role=DRIP_ROLE,
+        )
+        self.assertIsNotNone(claim)
+        before = (self.cards.count(), self.cards.event_count())
+        board = self.app.dispatch(
+            "board", request_document(limit=3),
+            authorization=f"Bearer {QUEUE_VIEW_TOKEN}",
+        )
+        self.assertEqual((board["schema"], board["ok"]), (BOARD_SCHEMA, True))
+        self.assertEqual(board["columns"], [
+            {"status": "review", "total": 1},
+            {"status": "snoozed", "total": 1},
+        ])
+        self.assertEqual(board["held_elsewhere"], 1)
+        self.assertEqual({card["board_status"] for card in board["cards"]},
+                         {"review", "snoozed"})
+        self.assertEqual(
+            set(board["cards"][0]),
+            {"id", "version", "handle", "board_status", "delivery_status",
+             "task", "owner", "source", "state_since"},
+        )
+        self.assertEqual((self.cards.count(), self.cards.event_count()), before)
+        with self.assertRaises(TaskCardServerRequestError):
+            self.app.dispatch(
+                "board", request_document(limit=1, unknown=True),
+                authorization=f"Bearer {QUEUE_VIEW_TOKEN}",
+            )
+
+    def test_board_http_contract_is_queue_view_only(self):
+        with running_server(self.app) as endpoint:
+            status, _, board = request(
+                endpoint, "/v1/task-cards/board", request_document(limit=2),
+                token=QUEUE_VIEW_TOKEN,
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual((board["schema"], board["schema_version"]),
+                             (BOARD_SCHEMA, 1))
+            status, _, refused = request(
+                endpoint, "/v1/task-cards/board", request_document(limit=2),
+                token=TOKEN,
+            )
+            self.assertEqual((status, refused["error"]["code"]),
+                             (403, "role_forbidden"))
 
     def _resolve_request(self, card, action="done"):
         return self.app.dispatch(

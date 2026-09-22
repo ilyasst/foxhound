@@ -14,6 +14,7 @@ import shlex
 import signal
 import stat
 import subprocess
+import shutil
 import sys
 import time
 from dataclasses import dataclass, field
@@ -96,6 +97,17 @@ _CONTEXT_FILTER_REFUSAL = re.compile(
 _CONTEXT_EVIDENCE_BYTES = 256 * 1024
 _SESSION_ID_LINE = re.compile(
     rb"(?m)^session_id:\s*([A-Za-z0-9][A-Za-z0-9._-]{0,127})\s*$"
+)
+#: The same identity, written in the closing block the runtime prints when a
+#: pass stops because it exhausted its turn budget.  That block replaces the
+#: plain ``session_id:`` line rather than accompanying it, so a runner that
+#: reads only the plain form has no identity for exactly the runs most likely
+#: to have left unrecorded work.  The following ``Duration:`` line is required:
+#: it keeps a transcript that merely contains the word "Session:" -- agent
+#: output is quoted into this file verbatim -- from being read as an identity.
+_SESSION_SUMMARY_LINE = re.compile(
+    rb"(?m)^Session:[ \t]+([A-Za-z0-9][A-Za-z0-9._-]{0,127})[ \t]*\r?\n"
+    rb"Duration:[ \t]"
 )
 _SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 #: One inference model or provider name, as the agent runtime names it.  A
@@ -589,7 +601,14 @@ def _run_claim(
     try:
         directory.mkdir(mode=0o700)
         if config.task_work_root is not None and config.task_kb_root is not None:
-            origin = TaskLedger(config.database_path).origin(claim.task_id)
+            ledger = TaskLedger(config.database_path)
+            origin = ledger.origin(claim.task_id)
+            origin_sources = ()
+            if origin:
+                payload = ledger.bound_candidate_payload(claim.task_id)
+                if payload:
+                    from .card_provenance import stored_origin_sources
+                    origin_sources = stored_origin_sources(payload)
             archive = prepare_task_archive(
                 working_root=config.task_work_root,
                 kb_root=config.task_kb_root,
@@ -601,6 +620,7 @@ def _run_claim(
                 origin_kind=None if origin is None else origin.kind,
                 origin_record=None if origin is None else origin.record_id,
                 origin_item=None if origin is None else origin.item_id,
+                origin_sources=origin_sources,
             )
         state_path = directory / "run-state.json"
         instructions_path = directory / INSTRUCTIONS_NAME
@@ -648,6 +668,23 @@ def _run_claim(
         # the line above.
         "NO_COLOR": "1",
         "TERM": "dumb",
+        # Demand attribution for caproute, read by the agent and stamped on
+        # every model call it makes. caproute can already name the process
+        # on the far end of the socket, so it knows these turns are hermes;
+        # what it cannot know is which task they were spent on, and "the
+        # agents used 199 GPU-hours" is not a number anyone can place
+        # models from. One agent is spawned per claim, so the run and the
+        # task are constant for the life of the process and the
+        # environment carries them exactly once.
+        #
+        # Ids only. These become HTTP headers and land in a router's log,
+        # so the task TEXT is deliberately not among them.
+        "CAPROUTE_APP": "foxhound",
+        "CAPROUTE_OPERATION": "execution",
+        "CAPROUTE_JOB": profile.profile_id,
+        "CAPROUTE_RUN_ID": run_id,
+        "CAPROUTE_WORK_ITEM_TYPE": "task",
+        "CAPROUTE_WORK_ITEM_ID": str(claim.task_id),
     })
     process: subprocess.Popen | None = None
     transcript = None
@@ -668,6 +705,16 @@ def _run_claim(
             transcript = _open_transcript(directory)
         except OSError:
             transcript = None
+        if transcript is not None:
+            # The run directory and its transcript now exist together. The
+            # pointer is optional (a database race must not cost the run),
+            # but never record one before there is something safe to read.
+            service.attach_run_id(
+                claim.task_id,
+                expected_version=claim.workflow_version,
+                claim_token=claim.token,
+                run_id=run_id,
+            )
         try:
             process = popen(
                 list(command),
@@ -703,7 +750,9 @@ def _run_claim(
                     sleep=sleep, clock=clock
                 )
                 return ExecutionRunResult(
-                    terminal, 0 if terminal == "recorded" else NO_PROGRESS_EXIT_CODE,
+                    terminal,
+                    0 if terminal in {"recorded", "released"}
+                    else NO_PROGRESS_EXIT_CODE,
                     claim.task_id, forced,
                 )
 
@@ -731,8 +780,10 @@ def _run_claim(
                         process, profile.kill_grace_seconds,
                         sleep=sleep, clock=clock,
                     )
+                    current = service.get(claim.task_id)
+                    terminal = _terminal_result(initial, current, claim.task_id)
                     return ExecutionRunResult(
-                        "claim_lost", NO_PROGRESS_EXIT_CODE,
+                        terminal or "claim_lost", 0 if terminal in {"recorded", "released"} else NO_PROGRESS_EXIT_CODE,
                         claim.task_id, forced,
                     )
                 next_heartbeat = now + profile.heartbeat_seconds
@@ -744,7 +795,8 @@ def _run_claim(
                 if terminal is not None:
                     return ExecutionRunResult(
                         terminal,
-                        0 if terminal == "recorded" else NO_PROGRESS_EXIT_CODE,
+                        0 if terminal in {"recorded", "released"}
+                        else NO_PROGRESS_EXIT_CODE,
                         claim.task_id,
                     )
                 if not corrective_attempted:
@@ -880,6 +932,45 @@ def _run_claim(
             # directory is the record; the folder is what the reader opens.
             with contextlib.suppress(TaskArchiveError):
                 publish_deliverables(archive, directory)
+            cleanup_run_clones(directory)
+
+
+def cleanup_run_clones(run_directory: Path) -> None:
+    """Remove prepared worktrees once their run reaches a terminal state.
+
+    A clone is removed only if it holds no unpushed commits. If it holds
+    work absent from a remote, it is preserved and reported. Removal
+    failures do not fail the run.
+    """
+    try:
+        for entry in run_directory.iterdir():
+            if not entry.is_dir() or not entry.name.startswith("repo-"):
+                continue
+            if not (entry / ".git").exists():
+                continue
+            try:
+                result = subprocess.run(
+                    ["git", "-C", str(entry), "log", "--oneline", "--all", "--not", "--remotes"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            except OSError:
+                continue
+            # A check that could not run has not established anything. Only a
+            # successful, empty answer means "no unpushed work"; a non-zero
+            # exit means git could not tell us, and the clone stays. These
+            # directories are live -- an index.lock, a repo mid-operation or a
+            # permissions hiccup all exit non-zero, and deleting on those
+            # would be deleting precisely when we are least sure.
+            if result.returncode != 0 or result.stdout.strip():
+                continue
+            try:
+                shutil.rmtree(entry)
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 
 def _terminal_result(
@@ -920,8 +1011,9 @@ def _transcript_session_id(path: Path, transcript: object | None) -> str | None:
     """Return the final Hermes session identity from this private transcript.
 
     The runner does not query Hermes state or infer an identity from a path.
-    Hermes writes its own final ``session_id:`` line to the transcript, which
-    makes a missing or malformed line a normal no-resume outcome.
+    Hermes writes its own identity to the transcript in one of two closing
+    forms, and the last one written wins.  A transcript carrying neither is a
+    normal no-resume outcome, as is one whose identity does not parse.
     """
     try:
         if transcript is not None:
@@ -929,11 +1021,18 @@ def _transcript_session_id(path: Path, transcript: object | None) -> str | None:
         data = path.read_bytes()
     except (OSError, AttributeError):
         return None
-    matches = tuple(_SESSION_ID_LINE.finditer(data))
+    matches = [
+        match
+        for pattern in (_SESSION_ID_LINE, _SESSION_SUMMARY_LINE)
+        for match in pattern.finditer(data)
+    ]
     if not matches:
         return None
+    # Position, not pattern order: a pass may print either form, and the one
+    # that closed the transcript is the session this run actually ran in.
+    last = max(matches, key=lambda match: match.start())
     try:
-        return matches[-1].group(1).decode("ascii")
+        return last.group(1).decode("ascii")
     except UnicodeDecodeError:
         return None
 
@@ -1047,7 +1146,8 @@ def _failure_result(
     if terminal in {"recorded", "released"}:
         return ExecutionRunResult(
             terminal,
-            0 if terminal == "recorded" else NO_PROGRESS_EXIT_CODE,
+            0 if terminal in {"recorded", "released"}
+            else NO_PROGRESS_EXIT_CODE,
             claim.task_id,
             forced,
         )

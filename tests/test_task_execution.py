@@ -38,6 +38,7 @@ from foxhound.task_execution import (
     TaskExecutionService,
     WorkflowDisposition,
     WorkflowPhase,
+    _structured_collection,
     WorkflowPriority,
     WorkflowRefusal,
     WorkflowStatus,
@@ -407,6 +408,24 @@ class TaskExecutionTests(unittest.TestCase):
             connection.execute(
                 "ALTER TABLE execution_review_cards DROP COLUMN "
                 "work_revision_id"
+            )
+            # v54 added the informational-delivery marker and split the one
+            # active-card index in two; an older database has one index and
+            # no such column. v55 retired run summaries and dropped the
+            # second index again, so it is present only on a database that
+            # stopped between the two.
+            connection.execute(
+                "DROP INDEX IF EXISTS "
+                "execution_review_cards_one_active_summary")
+            connection.execute(
+                "DROP INDEX execution_review_cards_one_active")
+            connection.execute(
+                "ALTER TABLE execution_review_cards DROP COLUMN summary_only"
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX execution_review_cards_one_active "
+                "ON execution_review_cards(task_id) "
+                "WHERE status IN ('pending','delivering','delivered')"
             )
             connection.execute("PRAGMA user_version = 11")
             connection.commit()
@@ -1615,7 +1634,8 @@ class TaskExecutionTests(unittest.TestCase):
             1, expected_version=snoozed.version, action="start"
         )
         self.assertEqual(early.refusal, WorkflowRefusal.INVALID_STATE)
-        self.clock.advance(days=1)
+        assert snoozed.wake_at is not None
+        self.clock.value = datetime.fromisoformat(snoozed.wake_at.replace("Z", "+00:00"))
         started = self.service.start_action(
             1, expected_version=snoozed.version, action="start"
         )
@@ -1666,6 +1686,46 @@ class TaskExecutionTests(unittest.TestCase):
             claim_token=claim.token,
         )
         self.assertEqual(repeated.refusal, WorkflowRefusal.STALE_WORKFLOW)
+
+    def test_current_run_identity_is_fenced_and_cleared_with_the_claim(self):
+        self._schedule_and_start()
+        claim = self._claim()
+        wrong = self.service.attach_run_id(
+            1,
+            expected_version=claim.workflow_version,
+            claim_token=OTHER_TOKEN,
+            run_id="a" * 32,
+        )
+        self.assertEqual(wrong.refusal, WorkflowRefusal.CLAIM_MISMATCH)
+        self.assertIsNone(self.service.get(1).current_run_id)
+        attached = self.service.attach_run_id(
+            1,
+            expected_version=claim.workflow_version,
+            claim_token=claim.token,
+            run_id="a" * 32,
+        )
+        self.assertEqual(attached.disposition, WorkflowDisposition.APPLIED)
+        self.assertEqual(self.service.get(1).current_run_id, "a" * 32)
+        released = self.service.release(
+            1,
+            expected_version=claim.workflow_version,
+            claim_token=claim.token,
+        )
+        self.assertEqual(released.status, WorkflowStatus.QUEUED)
+        self.assertIsNone(self.service.get(1).current_run_id)
+
+    def test_recording_a_result_clears_the_current_run_identity(self):
+        self._schedule_and_start()
+        claim = self._claim()
+        self.assertTrue(self.service.attach_run_id(
+            1,
+            expected_version=claim.workflow_version,
+            claim_token=claim.token,
+            run_id="b" * 32,
+        ).accepted)
+        recorded = self.service.record_result(self._result(claim))
+        self.assertTrue(recorded.accepted)
+        self.assertIsNone(self.service.get(1).current_run_id)
 
     def test_claim_phase_allowlist_is_atomic_and_leaves_other_work_queued(self):
         self._schedule_and_start()
@@ -1908,6 +1968,59 @@ class TaskExecutionTests(unittest.TestCase):
         stale = self._grant_service("issue").schedule_new()
         self.assertEqual(stale.scheduled, 0)
         self.assertEqual(self.service.get(1).status, WorkflowStatus.CANCELLED)
+
+    def test_a_resurfaced_issue_task_gets_a_fresh_workflow(self):
+        """End to end: the reopen is worthless if no work is ever scheduled.
+
+        Reopening the task and re-scheduling it live in different modules, and
+        each looked correct alone. Before the scheduler gate was relaxed a
+        re-surfaced `issue` task reopened and then sat open forever, because
+        its completed workflow still satisfied the join.
+        """
+        self._bind_origin(1, "issue")
+        self._schedule_and_start()
+        self.service.record_result(self._result(
+            self._claim(), outcome=ExecutionOutcome.COMPLETED
+        ))
+        self.assertEqual(self._grant_service("issue").schedule_new().scheduled, 0)
+
+        # The reader closes it and the source moves. A version advance alone
+        # is NOT the trigger -- that also happens to a task nobody reopened,
+        # and treating it as one broke stale reconciliation.
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "UPDATE task_execution_workflows SET status='completed',"
+                "completed_at=? WHERE task_id=1",
+                (self._now(),),
+            )
+            connection.execute(
+                "UPDATE tasks SET status='open',version=version+1 WHERE id=1"
+            )
+            connection.commit()
+
+        self.assertEqual(
+            self._grant_service("issue").schedule_new().scheduled, 0,
+            "a version advance without a reopen must not re-schedule",
+        )
+
+        # What the ledger actually writes when ADR 0039 re-surfaces a task.
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "INSERT INTO task_events(task_id,kind,task_version,"
+                "candidate_id,source_revision,from_status,to_status,"
+                "occurred_at) VALUES(1,'status_changed',"
+                "(SELECT version FROM tasks WHERE id=1),NULL,NULL,"
+                "'done','open',?)",
+                (self._now(),),
+            )
+            connection.commit()
+
+        resurfaced = self._grant_service("issue").schedule_new()
+
+        self.assertEqual(resurfaced.scheduled, 1)
+        self.assertEqual(
+            self.service.get(1).status, WorkflowStatus.AWAITING_START
+        )
 
     def test_granting_execution_does_not_grant_a_completed_result(self):
         """Only the plan-approval gate is granted; an ending still lands."""
@@ -2357,6 +2470,186 @@ class TaskExecutionTests(unittest.TestCase):
         )
         self.assertNotIn("Synthetic", repr(health))
         self.assertNotIn(TOKEN, repr(health))
+
+
+class PriorFailureEvidenceTests(TaskExecutionTests):
+    """What a run is told about the attempts that failed before it.
+
+    The card showing a reader why the last attempt stopped is the visible
+    half of this.  The next run starting from the task text alone, making
+    the same plan and failing the same way, is the expensive one: two
+    workflows on one deployment took roughly a fifth of all execution
+    capacity over two days doing exactly that.
+    """
+
+    def _running_claim(self):
+        self._schedule_and_start()
+        return self._claim()
+
+    def _digest(self, version: int, text: str, *, phase: str = "plan") -> None:
+        self.assertTrue(self.service.record_failure_digest(
+            1,
+            workflow_version=version,
+            phase=phase,
+            run_id="b" * 32,
+            digest=text,
+        ))
+
+    def test_earlier_failures_reach_the_run_most_recent_first(self):
+        claim = self._running_claim()
+        self._digest(claim.workflow_version - 2, "Synthetic: it ran out of turns.")
+        self._digest(
+            claim.workflow_version - 1,
+            "Synthetic: the request was too large to serve.")
+
+        self.assertEqual(
+            self.service.prior_failures(
+                1,
+                expected_version=claim.workflow_version,
+                claim_token=claim.token,
+            ),
+            (
+                "Synthetic: the request was too large to serve.",
+                "Synthetic: it ran out of turns.",
+            ),
+        )
+
+    def test_the_history_carried_is_bounded(self):
+        """Twenty failure notes are worse than two, not better."""
+        # A workflow with real history behind it: claimed, failed and
+        # requeued several times before this attempt.
+        patient = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: TOKEN,
+            max_attempts=20,
+        )
+        self._schedule_and_start()
+        for _ in range(5):
+            self.clock.advance(hours=1)
+            failing = patient.claim_next()
+            self.assertIsNotNone(failing)
+            patient.fail(
+                1,
+                expected_version=failing.workflow_version,
+                claim_token=failing.token,
+                reason="process_exit",
+            )
+        self.clock.advance(hours=1)
+        claim = patient.claim_next()
+        self.assertIsNotNone(claim)
+        self.assertGreater(
+            claim.workflow_version - 1,
+            TaskExecutionService.PRIOR_FAILURE_LIMIT,
+            "fixture must offer more history than the bound allows",
+        )
+        for version in range(1, claim.workflow_version):
+            self._digest(version, f"Synthetic failure {version}.")
+
+        carried = patient.prior_failures(
+            1,
+            expected_version=claim.workflow_version,
+            claim_token=claim.token,
+        )
+        self.assertEqual(len(carried), TaskExecutionService.PRIOR_FAILURE_LIMIT)
+        self.assertEqual(
+            carried[0], f"Synthetic failure {claim.workflow_version - 1}.")
+
+    def test_only_this_phase_is_carried(self):
+        """An execute failure says nothing about a plan pass that works."""
+        claim = self._running_claim()
+        self.assertEqual(claim.phase, WorkflowPhase.PLAN)
+        self._digest(
+            claim.workflow_version - 1,
+            "Synthetic: execute stopped.", phase="execute")
+
+        self.assertEqual(
+            self.service.prior_failures(
+                1,
+                expected_version=claim.workflow_version,
+                claim_token=claim.token,
+            ),
+            (),
+        )
+
+    def test_the_current_attempt_is_not_its_own_evidence(self):
+        claim = self._running_claim()
+        self._digest(claim.workflow_version, "Synthetic: this very attempt.")
+
+        self.assertEqual(
+            self.service.prior_failures(
+                1,
+                expected_version=claim.workflow_version,
+                claim_token=claim.token,
+            ),
+            (),
+        )
+
+    def test_no_digests_is_an_ordinary_answer(self):
+        """Failing open, everywhere on this path.
+
+        A gateway that is down costs the hint and nothing else -- never the
+        claim, never the run.
+        """
+        claim = self._running_claim()
+        self.assertEqual(
+            self.service.prior_failures(
+                1,
+                expected_version=claim.workflow_version,
+                claim_token=claim.token,
+            ),
+            (),
+        )
+
+    def test_only_the_run_it_belongs_to_may_read_it(self):
+        """Run context, guarded exactly as a reader instruction is."""
+        claim = self._running_claim()
+        self._digest(
+            claim.workflow_version - 1, "Synthetic: it ran out of turns.")
+
+        with self.assertRaises(TaskLedgerError):
+            self.service.prior_failures(
+                1,
+                expected_version=claim.workflow_version,
+                claim_token="execution-token-" + "z" * 32,
+            )
+        with self.assertRaises(TaskLedgerError):
+            self.service.prior_failures(
+                1,
+                expected_version=claim.workflow_version + 5,
+                claim_token=claim.token,
+            )
+
+    def test_the_payload_carries_no_digest_text_into_any_log(self):
+        """The whole point is bounded evidence, not a transcript.
+
+        A digest is already bounded by the pass that wrote it; this asserts
+        the accessor adds nothing of its own and hands back exactly what
+        was recorded.
+        """
+        claim = self._running_claim()
+        self._digest(claim.workflow_version - 1, "Synthetic: a named blocker.")
+        carried = self.service.prior_failures(
+            1,
+            expected_version=claim.workflow_version,
+            claim_token=claim.token,
+        )
+        self.assertEqual(carried, ("Synthetic: a named blocker.",))
+        self.assertNotIn("Synthetic", repr(self.service))
+
+    def test_structured_collection_reports_unsupported_fields(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            r"execution result external actions contain unsupported fields: detail; allowed fields are action, channel, requires, target, text, title",
+        ):
+            _structured_collection(
+                [{"action": "Submit review", "detail": "extra"}],
+                "external actions",
+                16000,
+                primary="action",
+                aliases=("action", "title", "text"),
+                optional=("requires", "channel", "target"),
+            )
 
 
 if __name__ == "__main__":

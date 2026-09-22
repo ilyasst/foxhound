@@ -8,6 +8,7 @@ from foxhound import execution_cards
 
 import json
 import os
+import re
 import sqlite3
 import tempfile
 import time
@@ -42,7 +43,11 @@ from foxhound.execution_cards import (
     ExecutionCardRefusal,
     ExecutionCardService,
     ExecutionCardStatus,
+    ClaimAtCeiling,
+    EXECUTION_CARD_CLAIM_CEILINGS,
     ExecutionReviewCard,
+    _button_rows,
+    _card_lines,
     _markdown_inline,
     parse_execution_agent_callback,
     parse_execution_review_callback,
@@ -2082,7 +2087,11 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertEqual(self.cards.schedule().created, 1)
         body, _keyboard = render_execution_review_card(
             self.cards.claim_next().card)
-        self.assertIn("Stopped after 3 failed attempt", body)
+        # Four claims happened in this phase; the live counter reset to
+        # three when it parked. The card must report what happened.
+        self.assertIn("Stopped after 4 failed attempts in plan", body)
+        self.assertIn("1 result recorded for this phase", body)
+        self.assertIn("from where this phase already got to", body)
 
     def _park_in_execute(self, task_id: int):
         """Plan, get approved, then fail the execute phase until it parks."""
@@ -3929,6 +3938,15 @@ class ExecutionCardTests(unittest.TestCase):
         self._external_review(1, "comment-go-external")
         self._assert_comment_and_go(1, WorkflowPhase.EXTERNAL_ACTION)
 
+    def test_comment_and_go_preempts_steer_card(self):
+        claim = self._announced_running_workflow()
+        self.cards.schedule()
+        delivered = self._claim_and_deliver()
+        result = self.cards.comment_and_go(delivered.card.id, expected_version=delivered.card.version, value="New steering note")
+        self.assertTrue(result.accepted)
+        workflow = self.execution.get(claim.task_id)
+        self.assertEqual(workflow.status, WorkflowStatus.QUEUED)
+
     def test_result_review_omits_comment_and_go(self):
         _body, keyboard = render_execution_review_card(self._plan_card(
             kind=ExecutionCardKind.RESULT_REVIEW,
@@ -4123,6 +4141,665 @@ class ExecutionCardTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM task_events"
             ).fetchone()[0]
         self.assertEqual(after_events, event_count)
+
+    def _announced_running_workflow(self, task_id: int = 1):
+        scheduled = self._schedule_workflow(task_id)
+        self.execution.start_action(
+            task_id, expected_version=scheduled.version, action="start"
+        )
+        claim = self.execution.claim_next()
+        self.assertIsNotNone(claim)
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "UPDATE task_execution_workflows SET steer_while_running=1,"
+                "claimed_at=?,current_run_id=? WHERE task_id=?",
+                ((self.clock() - timedelta(minutes=21)).isoformat(timespec="seconds"),
+                 "a" * 32, task_id),
+            )
+        return claim
+
+    def test_announced_long_run_raises_one_self_retiring_steer_card(self):
+        claim = self._announced_running_workflow()
+        self.assertEqual(self.cards.schedule().created, 1)
+        self.assertEqual(self.cards.schedule().created, 0)
+        card = self.cards.due()[0]
+        self.assertEqual(card.kind, ExecutionCardKind.STEER)
+        rendered, keyboard = render_execution_review_card(card)
+        self.assertIn("Run in progress", rendered)
+        self.assertIn("Running for at least:</b> 21 minutes", rendered)
+        self.assertNotIn("What it is doing", rendered)
+        self.assertIn(
+            "Running for at least: 21 minutes", "\n".join(_card_lines(card))
+        )
+        actions = {
+            parse_execution_review_callback(button["callback_data"])[2]
+            for row in keyboard["inline_keyboard"] for button in row
+        }
+        self.assertEqual(
+            actions, {"discuss", "comment_go", "done", "drop", "brief"}
+        )
+        self.execution.release(
+            claim.task_id, expected_version=claim.workflow_version,
+            claim_token=claim.token,
+        )
+        self.assertEqual(self.cards.schedule().cancelled, 1)
+
+    def test_external_action_run_uses_the_execute_steer_threshold(self):
+        self._announced_running_workflow()
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "UPDATE task_execution_workflows SET phase='external_action' "
+                "WHERE task_id=1"
+            )
+        self.assertEqual(self.cards.schedule().created, 1)
+        self.assertEqual(
+            self.cards.due()[0].phase, WorkflowPhase.EXTERNAL_ACTION
+        )
+
+    def test_steer_capacity_cannot_block_a_start_card(self):
+        self.execution = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: CLAIM_TOKEN,
+            execution_slot_cap=6,
+        )
+        for task_id in range(1, 6):
+            self._announced_running_workflow(task_id)
+        self.assertEqual(self.cards.schedule().created, 5)
+        claims = [self.cards.claim_next(
+            consumer_digest="a" * 64, consumer_role="drip"
+        ) for _ in range(5)]
+        self.assertTrue(all(claim is not None for claim in claims))
+        self.assertEqual(
+            {claim.card.kind for claim in claims}, {ExecutionCardKind.STEER}
+        )
+        self._schedule_workflow(6)
+        self.assertEqual(self.cards.schedule().created, 1)
+        decision = self.cards.claim_next(
+            consumer_digest="a" * 64, consumer_role="drip"
+        )
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.card.kind, ExecutionCardKind.START)
+        stats = self.cards.stats_scoped(consumer_digest="a" * 64)
+        self.assertEqual(stats.steer_delivering, 5)
+        self.assertEqual(stats.delivering, 1)
+
+    def test_steer_note_preempts_without_recording_a_failure(self):
+        claim = self._announced_running_workflow()
+        self.cards.schedule()
+        delivered = self._claim_and_deliver()
+        result = self.cards.submit_input(
+            delivered.card.id, expected_version=delivered.card.version,
+            kind="discussion", value="Use the synthetic fallback.",
+        )
+        self.assertTrue(result.accepted)
+        workflow = self.execution.get(claim.task_id)
+        self.assertEqual((workflow.status, workflow.phase, workflow.failure_count),
+                         (WorkflowStatus.QUEUED, WorkflowPhase.PLAN, 0))
+        self.assertEqual(
+            self.execution.renew(claim.task_id, expected_version=claim.workflow_version,
+                                 claim_token=claim.token).accepted,
+            False,
+        )
+        stale_result = self.execution.record_result(ExecutionResultEnvelope(
+            result_id="synthetic-stale-plan",
+            task_id=claim.task_id,
+            task_version=1,
+            workflow_version=claim.workflow_version,
+            phase=WorkflowPhase.PLAN,
+            claim_token=claim.token,
+            outcome=ExecutionOutcome.AWAITING_PLAN,
+            summary="Synthetic stale plan.",
+            work_markdown="Synthetic stale work.",
+        ))
+        self.assertFalse(stale_result.accepted)
+        with closing(sqlite3.connect(self.database)) as connection:
+            self.assertEqual(connection.execute(
+                "SELECT kind FROM task_execution_events WHERE task_id=? "
+                "ORDER BY sequence DESC LIMIT 1", (claim.task_id,)
+            ).fetchone()[0], "discussion_requested")
+
+    def test_done_from_a_steer_card_finishes_the_live_workflow(self):
+        claim = self._announced_running_workflow()
+        self.cards.schedule()
+        delivered = self._claim_and_deliver()
+        result = self.cards.act(
+            delivered.card.id,
+            expected_version=delivered.card.version,
+            action="done",
+        )
+        self.assertTrue(result.accepted)
+        self.assertEqual(self.ledger.get(claim.task_id).status, TaskStatus.DONE)
+        workflow = self.execution.get(claim.task_id)
+        self.assertEqual(workflow.status, WorkflowStatus.COMPLETED)
+        self.assertIsNone(workflow.current_run_id)
+        self.assertFalse(self.execution.renew(
+            claim.task_id,
+            expected_version=claim.workflow_version,
+            claim_token=claim.token,
+        ).accepted)
+
+    def test_drop_from_a_steer_card_cancels_the_live_workflow(self):
+        claim = self._announced_running_workflow()
+        self.cards.schedule()
+        delivered = self._claim_and_deliver()
+        result = self.cards.act(
+            delivered.card.id,
+            expected_version=delivered.card.version,
+            action="drop",
+        )
+        self.assertTrue(result.accepted)
+        self.assertEqual(self.ledger.get(claim.task_id).status, TaskStatus.DROPPED)
+        workflow = self.execution.get(claim.task_id)
+        self.assertEqual(workflow.status, WorkflowStatus.CANCELLED)
+        self.assertIsNone(workflow.current_run_id)
+        self.assertFalse(self.execution.renew(
+            claim.task_id,
+            expected_version=claim.workflow_version,
+            claim_token=claim.token,
+        ).accepted)
+
+    def test_retraction_is_leased_once_and_clears_its_handle_on_completion(self):
+        self._announced_running_workflow()
+        self.cards.schedule()
+        delivered = self._claim_and_deliver()
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "UPDATE task_execution_workflows SET status='queued',version=version+1,"
+                "claim_token_digest=NULL,claimed_at=NULL,claim_heartbeat_at=NULL,"
+                "claim_expires_at=NULL,current_run_id=NULL WHERE task_id=1"
+            )
+        self.cards.schedule()
+        retraction = self.cards.claim_retraction()
+        self.assertIsNotNone(retraction)
+        self.assertEqual(retraction.card_id, delivered.card.id)
+        self.assertIsNone(self.cards.claim_retraction())
+        self.assertTrue(self.cards.complete_retraction(retraction))
+        with closing(sqlite3.connect(self.database)) as connection:
+            self.assertEqual(connection.execute(
+                "SELECT state FROM execution_card_retractions WHERE card_id=?",
+                (delivered.card.id,),
+            ).fetchone()[0], "completed")
+            self.assertEqual(connection.execute(
+                "SELECT kind FROM execution_review_card_events "
+                "WHERE card_id=? ORDER BY sequence DESC LIMIT 1",
+                (delivered.card.id,),
+            ).fetchone()[0], "retracted")
+
+    def test_retraction_failure_retries_three_times_then_is_abandoned(self):
+        self._announced_running_workflow()
+        self.cards.schedule()
+        delivered = self._claim_and_deliver()
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "UPDATE task_execution_workflows SET status='queued',"
+                "version=version+1,claim_token_digest=NULL,claimed_at=NULL,"
+                "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
+                "current_run_id=NULL WHERE task_id=1"
+            )
+        self.cards.schedule()
+        for attempt in range(1, 4):
+            with self.subTest(attempt=attempt):
+                retraction = self.cards.claim_retraction()
+                self.assertIsNotNone(retraction)
+                self.assertTrue(self.cards.fail_retraction(retraction))
+        self.assertIsNone(self.cards.claim_retraction())
+        with closing(sqlite3.connect(self.database)) as connection:
+            state, attempts = connection.execute(
+                "SELECT state,attempts FROM execution_card_retractions "
+                "WHERE card_id=?", (delivered.card.id,)
+            ).fetchone()
+            self.assertEqual((state, attempts), ("abandoned", 3))
+            self.assertEqual(connection.execute(
+                "SELECT superseded_delivery_ref FROM execution_review_cards "
+                "WHERE id=?", (delivered.card.id,)
+            ).fetchone()[0], f"message-{delivered.card.id}")
+
+    def test_steer_digest_refreshes_twice_then_stops(self):
+        self._announced_running_workflow()
+        self.cards.schedule()
+        for count in range(1, 4):
+            item = self.cards.steer_cards_awaiting_digest()[0]
+            self.assertTrue(self.cards.record_steer_digest(
+                item, f"Synthetic digest {count}."))
+            self.clock.advance(timedelta(minutes=31))
+        self.assertEqual(self.cards.steer_cards_awaiting_digest(), ())
+
+
+CONSUMER = "d" * 64
+
+
+class ParkedAttemptHistoryTests(ExecutionCardTests):
+    """What a parked Start card says about how much has already been spent.
+
+    `claim_next` resets `failure_count` on park, deliberately: a retry that
+    began one slip from parking again would be a retry in name only.  The
+    cost was that nothing carried history across a park, so the card asked
+    the reader to authorise a twentieth attempt while reporting the first.
+    """
+
+    def _burn(self, task_id: int, attempts: int = 3) -> None:
+        """Claim, spend real agent time, fail -- until it parks."""
+        for _ in range(attempts):
+            self.clock.advance(timedelta(minutes=5))
+            claim = self.execution.claim_next()
+            self.assertIsNotNone(claim)
+            # Time passes inside the claim, which is where agent time goes.
+            self.clock.advance(timedelta(minutes=40))
+            self.execution.fail(
+                task_id,
+                expected_version=claim.workflow_version,
+                claim_token=claim.token,
+                reason="process_exit",
+            )
+
+    def _park_in_execute_slowly(self, task_id: int):
+        """As ``_park_in_execute``, but the attempts consume agent time."""
+        self._plan_review(task_id, f"plan-{task_id}")
+        approved = self.execution.review_action(
+            task_id,
+            expected_version=self.execution.get(task_id).version,
+            action="approve",
+        )
+        self.assertEqual(approved.phase, WorkflowPhase.EXECUTE)
+        self._burn(task_id)
+        return self.execution.get(task_id)
+
+    def _park_again(self, task_id: int, *, attempts: int = 3) -> None:
+        """One full turn of the loop: answer Start, reclaim, fail, park."""
+        self.execution.start_action(
+            task_id,
+            expected_version=self.execution.get(task_id).version,
+            action="start",
+        )
+        self._burn(task_id, attempts)
+
+    def _parked_body(self, task_id: int) -> str:
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "UPDATE execution_review_cards SET status='cancelled',"
+                "claim_token_digest=NULL,claim_expires_at=NULL,"
+                "resolved_at='2030-01-01T00:00:00+00:00' "
+                "WHERE task_id=? AND status IN "
+                "('pending','delivering','delivered')", (task_id,))
+            connection.commit()
+        self.cards.schedule()
+        body, _keyboard = render_execution_review_card(
+            self.cards.claim_next().card)
+        return body
+
+    def test_the_reported_count_keeps_rising_across_parks(self):
+        """The loop itself, constructed turn by turn.
+
+        Park, reader answers Start, reclaim, park again.  The live counter
+        returns to three every time; what the card says must not.
+        """
+        task_id = 1
+        self._park_in_execute_slowly(task_id)
+        self.assertEqual(
+            self.execution.get(task_id).status, WorkflowStatus.PARKED)
+
+        seen = []
+        for turn in range(3):
+            body = self._parked_body(task_id)
+            self.assertIn("no result recorded for this phase", body.lower())
+            match = re.search(r"Stopped after (\d+) failed attempt", body)
+            self.assertIsNotNone(match, body)
+            seen.append(int(match.group(1)))
+            with self.subTest(turn=turn):
+                # The live counter is back to three on every turn but the
+                # first; the card must not be.
+                self.assertEqual(
+                    self.execution.get(task_id).failure_count, 3)
+            self._park_again(task_id)
+
+        self.assertEqual(seen, [3, 6, 9])
+
+    def test_a_repeated_park_says_another_identical_attempt_is_unlikely(self):
+        task_id = 1
+        self._park_in_execute_slowly(task_id)
+        first = self._parked_body(task_id)
+        self.assertNotIn("stopped and been restarted", first)
+
+        self._park_again(task_id)
+        second = self._parked_body(task_id)
+        self.assertIn("across 2 parks", second)
+        self.assertIn("stopped and been restarted 2 times", second)
+
+    def test_history_is_scoped_to_the_phase_the_workflow_is_in(self):
+        """A plan that succeeded is not an execute that is stuck.
+
+        Aggregating across phases would report a task as failing many times
+        when only its current phase is, which is a different problem with a
+        different answer.
+        """
+        task_id = 1
+        self._park_in_execute_slowly(task_id)
+        body = self._parked_body(task_id)
+
+        # The planning pass claimed once and recorded a result; the execute
+        # phase has claimed three times and recorded nothing.
+        self.assertIn("Stopped after 3 failed attempts in execute", body)
+        self.assertIn("no result recorded for this phase", body.lower())
+
+    def test_the_card_reports_agent_time_once_it_is_worth_reporting(self):
+        task_id = 1
+        self._park_in_execute_slowly(task_id)
+        body = self._parked_body(task_id)
+        self.assertRegex(body, "\u23f1 \\d+h( \\d+m)? of agent time")
+
+    def test_the_existing_reset_is_unchanged(self):
+        """The reset protects a real behaviour and must stay.
+
+        A retry that began with one attempt left would park again on the
+        first slip. This issue is about not relying on the live counter to
+        carry history, not about removing the reset.
+        """
+        task_id = 1
+        self._park_in_execute_slowly(task_id)
+        self.assertEqual(self.execution.get(task_id).failure_count, 3)
+        self.execution.start_action(
+            task_id,
+            expected_version=self.execution.get(task_id).version,
+            action="start",
+        )
+        self.clock.advance(timedelta(hours=1))
+        claim = self.execution.claim_next()
+        self.assertIsNotNone(claim)
+        self.assertEqual(self.execution.get(task_id).failure_count, 0)
+
+    def test_a_looping_workflow_is_visible_in_readiness(self):
+        """Capacity going into work that never completes, as a number.
+
+        Two such workflows once accounted for about a fifth of all slot
+        time over two days, and nothing anywhere said so.
+        """
+        self.assertEqual(self.execution.readiness().unproductive, 0)
+        self._park_in_execute_slowly(1)
+        # One park is a failure, not yet a loop.
+        self.assertEqual(self.execution.readiness().unproductive, 0)
+        self._park_again(1)
+        self.assertEqual(self.execution.readiness().unproductive, 1)
+
+    def test_a_phase_that_recorded_something_is_not_counted_as_looping(self):
+        task_id = 1
+        self._plan_review(task_id, "recorded-plan")
+        self.execution.review_action(
+            task_id,
+            expected_version=self.execution.get(task_id).version,
+            action="revise")
+        for _ in range(2):
+            self._park_again(task_id)
+        self.assertEqual(
+            self.execution.get(task_id).status, WorkflowStatus.PARKED)
+        self.assertEqual(self.execution.readiness().unproductive, 0)
+
+
+class RetiredRunSummaryTests(ExecutionCardTests):
+    """Run summaries are retired: a granted advance now leaves no card.
+
+    They were informational rows reporting a phase that advanced under a
+    standing grant.  They told a reader nothing the card that gates the
+    finished work does not, and they outnumbered the cards that did want an
+    answer.  The contract is now entirely negative -- nothing writes one,
+    nothing renders one, and a row left behind by an earlier build is inert
+    rather than claimable.
+    """
+
+    def _bind_issue_origin(self, task_id: int) -> None:
+        payload = json.dumps({"synthetic": True})
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "INSERT INTO candidate_inbox(candidate_id,source_system,"
+                "source_kind,source_record_id,source_item_id,source_revision,"
+                "payload_json,created_at,first_imported_at,updated_at) "
+                "VALUES(?,'gw','issue','forge.example/acme/widget',?,"
+                "?,?,'2030-01-01T00:00:00Z','2030-01-01T00:00:00Z',"
+                "'2030-01-01T00:00:00Z')",
+                (f"origin-{task_id}", str(task_id), "b" * 64, payload),
+            )
+            connection.execute(
+                "INSERT INTO task_candidate_bindings(candidate_id,"
+                "source_revision,task_id,relation,decided_at) "
+                "VALUES(?,?,?,'accepted','2030-01-01T00:00:00Z')",
+                (f"origin-{task_id}", "b" * 64, task_id),
+            )
+            connection.commit()
+
+    def _granted(self) -> TaskExecutionService:
+        return TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: CLAIM_TOKEN,
+            execution_grants=["issue"],
+            action_grants=["issue"],
+        )
+
+    def _advance_once(self, task_id: int, result_id: str) -> None:
+        """Drive one granted task through a recorded, auto-advanced result."""
+        service = self._granted()
+        scheduled = service.schedule(task_id, expected_task_version=1)
+        service.start_action(
+            task_id, expected_version=scheduled.version, action="start")
+        claim = service.claim_next()
+        recorded = service.record_result(ExecutionResultEnvelope(
+            result_id=result_id,
+            task_id=task_id,
+            task_version=1,
+            workflow_version=claim.workflow_version,
+            phase=claim.phase,
+            claim_token=claim.token,
+            outcome=ExecutionOutcome.AWAITING_PLAN,
+            summary="Synthetic plan recorded",
+            work_markdown="Synthetic plan.",
+        ))
+        self.assertTrue(recorded.accepted)
+
+    def _summary_rows(self, task_id: int | None = None) -> list[tuple]:
+        where = "" if task_id is None else f" AND task_id={int(task_id)}"
+        with closing(sqlite3.connect(self.database)) as connection:
+            return connection.execute(
+                "SELECT id,task_id,status,result_id FROM "
+                "execution_review_cards WHERE summary_only=1" + where
+                + " ORDER BY id"
+            ).fetchall()
+
+    def _summary_rows(self, task_id: int | None = None) -> list[tuple]:
+        where = "" if task_id is None else f" AND task_id={int(task_id)}"
+        with closing(sqlite3.connect(self.database)) as connection:
+            return connection.execute(
+                "SELECT id,task_id,status,result_id FROM "
+                "execution_review_cards WHERE summary_only=1" + where
+                + " ORDER BY id"
+            ).fetchall()
+
+    def _insert_legacy_summary(self, task_id: int, result_id: str) -> int:
+        """A row exactly as the retired code wrote one.
+
+        A release is promoted while runs are in flight, so a build that still
+        emitted summaries can insert one moments before this build starts
+        reading the table.
+        """
+        with closing(sqlite3.connect(self.database)) as connection:
+            cursor = connection.execute(
+                "INSERT INTO execution_review_cards(task_id,task_version,"
+                "workflow_version,kind,phase,result_id,status,version,"
+                "created_at,updated_at,summary_only) "
+                "VALUES(?,1,2,'result_review','plan',?,'pending',1,?,?,1)",
+                (task_id, result_id, self.clock().isoformat(),
+                 self.clock().isoformat()),
+            )
+            connection.commit()
+            return int(cursor.lastrowid)
+
+    # -- nothing is written ------------------------------------------------
+
+    def test_an_auto_advanced_result_leaves_no_card(self):
+        """The reason this was retired: one card per phase passed through."""
+        self._bind_issue_origin(1)
+        self._advance_once(1, "summary-plan-1")
+
+        self.assertEqual(self._summary_rows(), [])
+        with closing(sqlite3.connect(self.database)) as connection:
+            total = connection.execute(
+                "SELECT count(*) FROM execution_review_cards WHERE task_id=1"
+            ).fetchone()[0]
+        self.assertEqual(total, 0)
+        self.assertIsNone(self.cards.claim_next(consumer_digest=CONSUMER))
+
+    def test_a_granted_advance_still_advances_the_workflow(self):
+        """Retiring the report must not retire the thing it reported on."""
+        self._bind_issue_origin(1)
+        self._advance_once(1, "summary-plan-1")
+        with closing(sqlite3.connect(self.database)) as connection:
+            status, phase = connection.execute(
+                "SELECT status,phase FROM task_execution_workflows "
+                "WHERE task_id=1"
+            ).fetchone()
+        self.assertEqual((status, phase), ("queued", "execute"))
+
+    def test_a_terminal_result_still_raises_a_card(self):
+        """No grant covers `completed`, so nothing is hidden by this change.
+
+        A reader who no longer sees the phases a task passed through still
+        sees where it ended up, and that card is the one carrying the work.
+        """
+        self._bind_issue_origin(1)
+        service = self._granted()
+        scheduled = service.schedule(1, expected_task_version=1)
+        service.start_action(
+            1, expected_version=scheduled.version, action="start")
+        claim = service.claim_next()
+        self.assertTrue(service.record_result(ExecutionResultEnvelope(
+            result_id="terminal-1",
+            task_id=1,
+            task_version=1,
+            workflow_version=claim.workflow_version,
+            phase=claim.phase,
+            claim_token=claim.token,
+            outcome=ExecutionOutcome.COMPLETED,
+            summary="Synthetic completed result",
+            work_markdown="Synthetic work.",
+        )).accepted)
+        self.assertEqual(self.cards.schedule().created, 1)
+        card = self.cards.claim_next(consumer_digest=CONSUMER)
+        self.assertIsNotNone(card)
+        self.assertEqual(card.card.kind, ExecutionCardKind.RESULT_REVIEW)
+
+    # -- a row left behind is inert ----------------------------------------
+
+    def test_a_legacy_summary_row_is_never_claimed(self):
+        """It carries `kind='result_review'`, so admitting it would render a
+        decision card for a phase the workflow has already moved past."""
+        self._bind_issue_origin(1)
+        self._schedule_workflow(1)
+        self._insert_legacy_summary(1, "legacy-summary-1")
+        self.assertEqual(len(self._summary_rows()), 1)
+        self.assertIsNone(self.cards.claim_next(consumer_digest=CONSUMER))
+
+    def test_a_legacy_summary_takes_no_capacity_and_no_backlog(self):
+        """A delivered one counted in a band nothing can ever free."""
+        self._bind_issue_origin(1)
+        self._schedule_workflow(1)
+        card_id = self._insert_legacy_summary(1, "legacy-summary-1")
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "UPDATE execution_review_cards SET status='delivered',"
+                "consumer_digest=? WHERE id=?",
+                (CONSUMER, card_id),
+            )
+            connection.commit()
+        stats = self.cards.stats()
+        self.assertEqual(stats.delivered, 0)
+        self.assertEqual(stats.active, 0)
+        scoped = self.cards.stats_scoped(consumer_digest=CONSUMER)
+        self.assertEqual(scoped.delivered, 0)
+        self.assertEqual(scoped.active, 0)
+
+    def test_the_upgrade_settles_the_summaries_already_in_the_table(self):
+        """Left alone they sit `pending` for good.
+
+        Every read excludes them, so no reader is ever offered one, and the
+        sweep that retires stale cards reads the same population -- so
+        nothing would ever take them off the table either.
+        """
+        self._bind_issue_origin(1)
+        self._schedule_workflow(1)
+        pending = self._insert_legacy_summary(1, "legacy-pending")
+        self._bind_issue_origin(2)
+        self._schedule_workflow(2)
+        delivered = self._insert_legacy_summary(2, "legacy-delivered")
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "UPDATE execution_review_cards SET status='delivered',"
+                "consumer_digest=? WHERE id=?",
+                (CONSUMER, delivered),
+            )
+            connection.execute("PRAGMA user_version = 54")
+            connection.commit()
+
+        migrate_database(self.database)
+
+        with closing(sqlite3.connect(self.database)) as connection:
+            statuses = dict(connection.execute(
+                "SELECT id,status FROM execution_review_cards "
+                "WHERE summary_only=1"
+            ))
+            held = connection.execute(
+                "SELECT count(*) FROM execution_review_cards "
+                "WHERE summary_only=1 AND consumer_digest IS NOT NULL"
+            ).fetchone()[0]
+            index = connection.execute(
+                "SELECT count(*) FROM sqlite_master WHERE type='index' "
+                "AND name='execution_review_cards_one_active_summary'"
+            ).fetchone()[0]
+        self.assertEqual(statuses[pending], "cancelled")
+        self.assertEqual(statuses[delivered], "cancelled")
+        self.assertEqual(held, 0)
+        self.assertEqual(index, 0)
+
+    def test_a_legacy_summary_holds_no_part_of_the_capacity_band(self):
+        """The band that fills permanently and can never be freed.
+
+        A summary settled on delivery and stayed `delivered` forever.  A band
+        that counted one would lose that slot for good, and the console's is
+        two wide: two leftover rows and no card reaches a reader again.
+        """
+        ceiling = EXECUTION_CARD_CLAIM_CEILINGS["queue_view"]
+        self._bind_issue_origin(1)
+        for task_id in range(2, 2 + ceiling):
+            self._schedule_workflow(task_id)
+        self.assertEqual(self.cards.schedule().created, ceiling)
+        for task_id in range(2, 2 + ceiling):
+            card_id = self._insert_legacy_summary(task_id, f"legacy-{task_id}")
+            with closing(sqlite3.connect(self.database)) as connection:
+                connection.execute(
+                    "UPDATE execution_review_cards SET status='delivered',"
+                    "consumer_digest=? WHERE id=?",
+                    (CONSUMER, card_id),
+                )
+                connection.commit()
+
+        claim = self.cards.claim_next(
+            consumer_digest=CONSUMER, consumer_role="queue_view")
+        self.assertNotIsInstance(claim, ClaimAtCeiling)
+        self.assertIsNotNone(claim)
+        self.assertEqual(claim.card.kind, ExecutionCardKind.START)
+
+    def test_a_legacy_summary_is_not_requeued_as_unanswered(self):
+        """Re-presenting it would ask for an answer it never wanted."""
+        self._bind_issue_origin(1)
+        self._schedule_workflow(1)
+        card_id = self._insert_legacy_summary(1, "legacy-summary-1")
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "UPDATE execution_review_cards SET status='delivered',"
+                "consumer_digest=?,delivered_at=? WHERE id=?",
+                (CONSUMER, self.clock().isoformat(), card_id),
+            )
+            connection.commit()
+        self.clock.advance(timedelta(days=2))
+        self.assertEqual(self.cards.requeue_unanswered().requeued, 0)
 
 
 if __name__ == "__main__":

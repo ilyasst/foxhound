@@ -35,6 +35,7 @@ from . import task_duplicate_assessments as assessments
 from . import task_duplicate_detection as lexical
 from . import task_duplicate_proposals as proposals
 from .candidate_inbox import CandidateInbox, InboxError
+from foxhound.caproute_attribution import request_headers
 
 
 DETECTOR = "local-semantic-v1"
@@ -440,7 +441,7 @@ def _classify(
                 document, separators=(",", ":"), ensure_ascii=False)),
             separators=(",", ":"),
         ).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        headers=request_headers("task_duplicate_semantic"),
         method="POST",
     )
     open_request = (opener or _OPENER).open

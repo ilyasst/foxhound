@@ -120,7 +120,8 @@ class AgentProfile:
             or not is_worker_command(worker_command)
         ):
             raise AgentProfileError("agent worker command is invalid")
-        return self.prompt_template.replace(WORKER_COMMAND_TOKEN, worker_command)
+        return PHASE_CONTRACT_PRECEDENCE + self.prompt_template.replace(
+            WORKER_COMMAND_TOKEN, worker_command)
 
     def public_summary(self, *, include_policy: bool = False) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -260,6 +261,50 @@ class AgentProfileRegistry:
         ):
             raise AgentProfileError("agent profile revision is unavailable")
         return profile
+
+
+#: Prepended to every rendered profile prompt, whoever authored the profile.
+#:
+#: A profile prompt is supplied to the runtime as the caller's system message,
+#: and the runtime puts its own guidance ahead of it. That guidance is written
+#: for an assistant answering a person directly, and it tells the model to keep
+#: working until an artifact exists and never to end a turn with a plan. This
+#: system is built the other way around: a phase ends by handing something to a
+#: reader, and `awaiting_plan` and `awaiting_external` are its finished states.
+#: The two readings of "stopped with a plan" are indistinguishable from inside
+#: the model, and the phase contract is the one that loses by default, because
+#: the other text came first and sounds like diligence.
+#:
+#: It lives here rather than in a prompt template because profile content is
+#: deployment-owned: a template can be authored anywhere, and this has to hold
+#: for all of them. Rendering is also the last point the code controls before
+#: the text becomes the run's authority, and the bootstrap has already told the
+#: agent that what `context` returns is exactly that.
+#:
+#: Deliberately not quoting the runtime's current wording. It is upstream, it
+#: changes, and a rule that only fires on a remembered sentence would go quiet
+#: without anyone noticing.
+PHASE_CONTRACT_PRECEDENCE = (
+    "# Precedence\n"
+    "These instructions are the authority for this run. Guidance that reached "
+    "you before them -- about finishing the job, not stopping at a plan, and "
+    "not ending a turn without completing the work -- is written for an "
+    "assistant answering a person directly. Where it differs from what "
+    "follows, what follows wins.\n"
+    "The difference is concrete, and it decides how a run ends. Work here is "
+    "split into phases, and a phase finishes by handing something to a reader: "
+    "a plan to approve, or validated local work plus the exact outside effect "
+    "it still needs. Recording `awaiting_plan` or `awaiting_external` with the "
+    "complete draft attached is a finished deliverable. It is not a "
+    "description of work you have yet to do, and it is not stopping early -- "
+    "it is how the work gets done here, because the next phase cannot begin "
+    "until a person has seen it.\n"
+    "So when the phase you are in cannot perform an outside effect, the "
+    "absence of that effect is not unfinished work. Record the phase-valid "
+    "outcome with everything the reader needs to approve the next step. "
+    "Continuing past that point, or recording a terminal outcome to avoid "
+    "handing over, both lose the work.\n\n"
+)
 
 
 def render_bootstrap(worker_command: str = "foxhound-task-worker") -> str:
@@ -461,6 +506,32 @@ def _historical_general_profiles() -> tuple[AgentProfile, ...]:
             kill_grace_seconds=30,
             allowed_phases=_PHASES,
         ),
+        AgentProfile(
+            profile_id="general",
+            display_name="General",
+            runtime="hermes",
+            prompt_template=_GENERAL_PROMPT_TEMPLATE_V13,
+            toolsets=("terminal", "file", "web"),
+            max_turns=80,
+            timeout_seconds=2_700,
+            claim_lease_seconds=3_300,
+            heartbeat_seconds=60,
+            kill_grace_seconds=30,
+            allowed_phases=_PHASES,
+        ),
+        AgentProfile(
+            profile_id="general",
+            display_name="General",
+            runtime="hermes",
+            prompt_template=_GENERAL_PROMPT_TEMPLATE_V14,
+            toolsets=("terminal", "file", "web"),
+            max_turns=80,
+            timeout_seconds=2_700,
+            claim_lease_seconds=3_300,
+            heartbeat_seconds=60,
+            kill_grace_seconds=30,
+            allowed_phases=_PHASES,
+        ),
     )
 
 
@@ -543,8 +614,8 @@ def _validate_profile(profile: AgentProfile) -> None:
         raise AgentProfileError("agent profile phases are invalid")
     for value, minimum, maximum, label in (
         (profile.max_turns, 1, 200, "turn limit"),
-        (profile.timeout_seconds, 30, 3_300, "timeout"),
-        (profile.claim_lease_seconds, 300, 3_600, "claim lease"),
+        (profile.timeout_seconds, 30, 7_200, "timeout"),
+        (profile.claim_lease_seconds, 300, 10_800, "claim lease"),
         (profile.heartbeat_seconds, 5, 600, "heartbeat"),
         (profile.kill_grace_seconds, 1, 120, "shutdown grace"),
     ):
@@ -1112,6 +1183,12 @@ _GENERAL_PROMPT_TEMPLATE_V12 = _GENERAL_PROMPT_TEMPLATE_V11.replace(
 
 
 _GENERAL_PROMPT_TEMPLATE_V13 = _GENERAL_PROMPT_TEMPLATE_V12.replace(
+    "Repository follow-through is required only when execution changes or advances repository work. Planning, research, and an honest non-repository result remain valid without a forge update; for such a repository-origin execution, write JSON `false` to owner-only `result-repository-impact.json` and explain the bounded result in the deliverables. Omit the file for repository-impacting work: its safe default is `true`.",
+    "Repository follow-through is required only when execution changes or advances repository work. Planning, research, and an honest non-repository result remain valid without a forge update; for such a repository-origin execution, write JSON `false` to owner-only `result-repository-impact.json` before `draft --outcome completed`, and explain the bounded result in the deliverables. Omit the file for repository-impacting work: its safe default is `true`; without the explicit `false`, `completed` is correctly refused pending follow-through.",
+).replace(
+    "In `execute`, do not post the update. Put its complete draft in the reviewable result and list posting it as a structured external action with an exact `target` URL for `task.origin`, so the reader can approve the exact external write.",
+    "In `execute`, do not post the update. Put its complete draft in the reviewable result and list posting it in `result-external-actions.json` as a JSON object, for example `{\"action\":\"Post the prepared update\",\"target\":\"https://github.com/OWNER/REPO/issues/NUMBER\"}`. Its `target` must be the exact URL for `task.origin`; a plain-string action description cannot request the follow-through. This lets the reader approve the exact external write.",
+).replace(
     f"Call `{WORKER_COMMAND_TOKEN} act worktree [--repository LOCATOR]` only when `context` lists `act.worktree`. A task may legitimately span several repositories.",
     "\n".join((
         f"Call `{WORKER_COMMAND_TOKEN} act worktree [--repository LOCATOR]` only when `context` lists `act.worktree`. A task may legitimately span several repositories.",
@@ -1122,17 +1199,30 @@ _GENERAL_PROMPT_TEMPLATE_V13 = _GENERAL_PROMPT_TEMPLATE_V12.replace(
 )
 
 
-_GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V13
+_GENERAL_PROMPT_TEMPLATE_V14 = _GENERAL_PROMPT_TEMPLATE_V13.replace(
+    'list posting it in `result-external-actions.json` as a JSON object, for example `{"action":"Post the prepared update","target":"https://github.com/OWNER/REPO/issues/NUMBER"}`. Its `target` must be the exact URL for `task.origin`; a plain-string action description cannot request the follow-through. This lets the reader approve the exact external write.',
+    'list posting it in `result-external-actions.json` as a JSON object, for example `{"action":"Post the prepared update","target":"https://github.com/OWNER/REPO/issues/NUMBER"}` for an issue or `{"action":"Submit review on PR","target":"https://github.com/OWNER/REPO/pull/NUMBER"}` for a pull request. Its `target` must be the exact URL for `task.origin`; allowed action object fields are only `action`, `target`, `channel`, and `requires`; a plain-string action description cannot request the follow-through. This lets the reader approve the exact external write.',
+).replace(
+    "Never merge, deploy, publish, message, purchase, or perform another effect unless that exact effect is approved and a bounded Foxhound worker action supports it. If no bounded action exists, report that limitation instead of bypassing the gate.",
+    "Never merge, deploy, publish, message, purchase, or perform another effect unless that exact effect is approved and a bounded Foxhound worker action supports it. If no bounded action exists, report that limitation instead of bypassing the gate. If a terminal command fails and you modify files on disk before retrying, vary the command line (for example by appending a comment like `# retry`) so loop-detection guardrails do not block execution on disk-state changes.",
+)
+
+_GENERAL_PROMPT_TEMPLATE_V15 = _GENERAL_PROMPT_TEMPLATE_V14.replace(
+    "Prepare the reviewable result early enough that useful work cannot be lost to the turn limit.",
+    "Prepare the reviewable result early enough that useful work cannot be lost to the turn limit.\nIf the work is long, write an owner-only `handoff-<phase>.md` (e.g. `handoff-execute.md`) in `workspace.task_folder` early and update it as work proceeds. It is an unreviewed note to the next attempt if this one is killed by the budget; describe what was established, what was changed and where, and what to do next. It is not a result and does not replace one."
+)
+
+_GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V15
 
 # A built-in profile is a release artifact.  Keep its fingerprints beside the
 # prompt so changing the prompt or policy without publishing a new profile
 # revision fails at every runner and scheduler startup, rather than leaving a
 # stale test in a different file to discover the mismatch later.
 GENERAL_PROFILE_RELEASE_REVISION = (
-    "aebb138882a0c6c66be45a8c05d7c4aac726f88954f9f8217a2e37ff776e77c9"
+    "f96650db7a90b6fcf84954fdc3698b75e6147949410bcd7d502a25d31636fced"
 )
 GENERAL_PROFILE_RELEASE_PROMPT_SHA256 = (
-    "a28cf00e1baa76eaa618aa55440519cdb2fa8ab1a441d5b87c66bfdaed4aa758"
+    "62d2a3d67e5641bea2fa0aa57b30c7f3707583ee54d104d32a20fed8ba452fbe"
 )
 
 

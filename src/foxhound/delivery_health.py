@@ -20,8 +20,8 @@ from .task_ledger import TaskLedgerError
 HEALTH_SCHEMA = "foxhound.delivery-health"
 # 2 adds `superseded_profiles`; 3 adds the count of workflows parked because
 # their measured context did not fit; 4 adds `admission`. Consumers must not
-# infer any of them from a missing aggregate field.
-HEALTH_SCHEMA_VERSION = 4
+# infer any of them from a missing aggregate field. 6 adds `admission.preserved_open`.
+HEALTH_SCHEMA_VERSION = 6
 MAX_THRESHOLD_SECONDS = 7 * 24 * 60 * 60
 MAX_RECENT_FAILURES = 10_000
 
@@ -77,6 +77,7 @@ class AdmissionHealth:
 
     unadmitted: int
     oldest_unadmitted_age_seconds: int | None
+    preserved_open: int
 
 
 @dataclass(frozen=True)
@@ -111,6 +112,7 @@ class DeliveryHealth:
     task_cards: DeliveryCardHealth
     execution_cards: DeliveryCardHealth
     recent_failures: int
+    recent_requeues: int
     failure_window_seconds: int
     last_successful_delivery_age_seconds: int | None
     workflows: ExecutionReadiness
@@ -132,6 +134,7 @@ class DeliveryHealth:
             "execution_cards": asdict(self.execution_cards),
             "delivery": {
                 "recent_failures": self.recent_failures,
+                "recent_requeues": self.recent_requeues,
                 "failure_window_seconds": self.failure_window_seconds,
                 "last_successful_delivery_age_seconds": self.last_successful_delivery_age_seconds,
             },
@@ -158,9 +161,10 @@ def collect_delivery_health(
                 connection, "task_review_cards", "due_at", now
             )
             execution_cards = _card_health(
-                connection, "execution_review_cards", "created_at", now
+                connection, "execution_review_cards", "created_at", now,
+                scope="summary_only=0",
             )
-            recent_failures, last_delivery = _delivery_events(
+            recent_failures, recent_requeues, last_delivery = _delivery_events(
                 connection, now - timedelta(seconds=policy.failure_window_seconds)
             )
             admission = _admission_health(connection, now)
@@ -200,6 +204,7 @@ def collect_delivery_health(
         task_cards=task_cards,
         execution_cards=execution_cards,
         recent_failures=recent_failures,
+        recent_requeues=recent_requeues,
         failure_window_seconds=policy.failure_window_seconds,
         last_successful_delivery_age_seconds=last_age,
         workflows=workflows,
@@ -225,16 +230,25 @@ def _admission_health(connection: object, now: datetime) -> AdmissionHealth:
     hold the alert on forever.
     """
     row = connection.execute(
-        "SELECT COUNT(*) AS unadmitted, MIN(t.created_at) AS oldest "
-        "FROM tasks AS t LEFT JOIN task_execution_workflows AS w "
-        "ON w.task_id=t.id WHERE t.status='open' AND w.task_id IS NULL "
-        "AND NOT EXISTS("
-        " SELECT 1 FROM task_candidate_bindings AS b JOIN "
-        " task_candidate_lifecycle AS l ON l.candidate_id=b.candidate_id "
-        " WHERE b.task_id=t.id AND b.relation='accepted' "
-        " AND l.state='withdrawn' AND l.resolution='preserved_open')"
+        "SELECT "
+        "SUM(CASE WHEN is_preserved = 0 THEN 1 ELSE 0 END) AS unadmitted, "
+        "MIN(CASE WHEN is_preserved = 0 THEN created_at END) AS oldest, "
+        "SUM(CASE WHEN is_preserved = 1 THEN 1 ELSE 0 END) AS preserved "
+        "FROM ("
+        " SELECT t.id, t.created_at, "
+        " CASE WHEN EXISTS("
+        "  SELECT 1 FROM task_candidate_bindings AS b JOIN "
+        "  task_candidate_lifecycle AS l ON l.candidate_id=b.candidate_id "
+        "  WHERE b.task_id=t.id AND b.relation='accepted' "
+        "  AND l.state='withdrawn' AND l.resolution='preserved_open'"
+        " ) THEN 1 ELSE 0 END AS is_preserved "
+        " FROM tasks AS t "
+        " LEFT JOIN task_execution_workflows AS w ON w.task_id=t.id "
+        " WHERE t.status='open' AND w.task_id IS NULL"
+        ")"
     ).fetchone()
     unadmitted = int(row["unadmitted"] or 0)
+    preserved = int(row["preserved"] or 0)
     oldest = row["oldest"]
     return AdmissionHealth(
         unadmitted=unadmitted,
@@ -242,12 +256,26 @@ def _admission_health(connection: object, now: datetime) -> AdmissionHealth:
             None if not unadmitted or oldest is None
             else _age(now, _timestamp(oldest))
         ),
+        preserved_open=preserved,
     )
 
 
 def _card_health(
-    connection: object, table: str, pending_time_column: str, now: datetime
+    connection: object,
+    table: str,
+    pending_time_column: str,
+    now: datetime,
+    *,
+    scope: str = "1=1",
 ) -> DeliveryCardHealth:
+    """How much is waiting on the reader, and how long the oldest has waited.
+
+    `scope` exists because not every row in a card table is a card the reader
+    owes an answer to.  A run summary is delivered when the actionable queue
+    is empty or at its ceiling, so on a busy host it legitimately waits --
+    counting one here reports ordinary prioritisation as a delivery fault, and
+    the watchdog then alerts forever on a system that is working.
+    """
     row = connection.execute(
         "SELECT "
         "SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,"
@@ -255,7 +283,7 @@ def _card_health(
         "SUM(CASE WHEN status='delivered' THEN 1 ELSE 0 END) AS delivered,"
         "SUM(CASE WHEN status IN ('pending','delivering','delivered') THEN 1 ELSE 0 END) AS active,"
         f"MIN(CASE WHEN status='pending' AND {pending_time_column}<=? THEN {pending_time_column} END) AS oldest_pending "
-        f"FROM {table}",
+        f"FROM {table} WHERE {scope}",
         (now.isoformat(timespec="seconds"),),
     ).fetchone()
     oldest = row["oldest_pending"]
@@ -270,21 +298,34 @@ def _card_health(
     )
 
 
-def _delivery_events(connection: object, since: datetime) -> tuple[int, datetime | None]:
+def _delivery_events(
+    connection: object, since: datetime
+) -> tuple[int, int, datetime | None]:
+    """Failures and requeues counted apart, because they mean opposite things.
+
+    A `delivery_failed` says the transport could not present a card. A
+    `requeued` says a card was re-presented because nobody answered it for an
+    hour -- routine, and a fact about the reader rather than the system. Only
+    the first belongs in the alert; the second is still worth reporting, and
+    was the thing actually happening every time this alarm fired.
+    """
     row = connection.execute(
         "SELECT "
         "SUM(CASE WHEN kind='delivery_failed' AND occurred_at>=? THEN 1 ELSE 0 END) AS recent_failures,"
+        "SUM(CASE WHEN kind='requeued' AND occurred_at>=? THEN 1 ELSE 0 END) AS recent_requeues,"
         "MAX(CASE WHEN kind='delivered' THEN occurred_at END) AS last_delivery "
         "FROM ("
         "SELECT kind,occurred_at FROM task_review_card_events "
         "UNION ALL "
         "SELECT kind,occurred_at FROM execution_review_card_events"
         ")",
-        (since.isoformat(timespec="seconds"),),
+        (since.isoformat(timespec="seconds"),) * 2,
     ).fetchone()
     last = row["last_delivery"]
-    return int(row["recent_failures"] or 0), (
-        None if last is None else _timestamp(str(last))
+    return (
+        int(row["recent_failures"] or 0),
+        int(row["recent_requeues"] or 0),
+        None if last is None else _timestamp(str(last)),
     )
 
 

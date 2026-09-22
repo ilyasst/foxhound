@@ -32,9 +32,26 @@ reader leave at most one current card; no reader receives a card per source
 change.
 
 An open snooze is superseded by a newer source revision. The reader deferred
-the earlier source state, not an unknown later one. Terminal tasks are never
-reopened or re-surfaced; the ledger records their newer bound revision as a
-reader conflict without applying task content.
+the earlier source state, not an unknown later one.
+
+A task in `done` re-surfaces when its bound revision moves: the ledger reopens
+it and applies the candidate content. A task that reached `done` without its
+work reaching the outside world would otherwise be unreachable forever, and the
+only remedy would be to recreate it outside the ledger. A task in `dropped`
+stays terminal, because a reader who dropped it rejected the work itself and a
+source edit is not grounds to overrule that. A task with a workflow still in
+flight also keeps recording a conflict rather than reopening underneath a run.
+
+Re-surfacing a terminal task reintroduces the loop this ADR originally closed
+by refusing it: the agent's own follow-through comment enters issue provenance,
+so a comment can move the revision that re-surfaces the task the comment was
+reporting on. **That loop is now bounded at the agent rather than at the
+ledger.** An agent that finds its follow-through already published records
+completion against the existing receipt instead of repeating the work. This is
+a weaker guarantee than the structural refusal it replaces: it costs one run per
+cycle to decide to do nothing, and it holds only while the agent applies the
+rule. Making it structural again would mean carrying comment authorship into
+provenance so that a self-authored revision could be ignored.
 
 Forge issue provenance may contain title, body, and one bounded comment
 extract. The comment is labelled as source evidence, not a claimed semantic
