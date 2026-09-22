@@ -1223,6 +1223,9 @@ class TaskCardService:
                 task_relations.withdraw(
                     connection, relation_id, withdrawn_by="reader"
                 )
+                self._reopen_task(
+                    connection, task_id=relation.subject_id, now=now,
+                )
                 if not duplicates.reopen_confirmed(
                     connection, proposal_id=int(proposal["id"]),
                     actor="reader", now=now,
@@ -1459,16 +1462,25 @@ class TaskCardService:
         current_right = "(SELECT version FROM tasks WHERE id=right_task_id)"
         open_left = "(SELECT status FROM tasks WHERE id=left_task_id)='open'"
         open_right = "(SELECT status FROM tasks WHERE id=right_task_id)='open'"
+        relation_left = (
+            "(SELECT count(1) FROM task_relations WHERE subject_id=left_task_id "
+            "AND kind='duplicate_of' AND withdrawn_at IS NULL)>0"
+        )
+        relation_right = (
+            "(SELECT count(1) FROM task_relations WHERE subject_id=right_task_id "
+            "AND kind='duplicate_of' AND withdrawn_at IS NULL)>0"
+        )
         updated = connection.execute(
             "UPDATE task_duplicate_proposals SET state='superseded',"
             "settled_at=?,updated_at=? "
             "WHERE state='proposed' AND card_id IS NULL "
             # Either the comparison has moved, or there is no open task left
-            # to consolidate into. Both are permanent; a merely busy task is
-            # neither and keeps its place in the queue.
+            # to consolidate into, or an active duplicate_of relation makes
+            # delivery permanently impossible.
             f"AND (left_task_version<>{current_left} "
             f"OR right_task_version<>{current_right} "
-            f"OR (NOT {open_left} AND NOT {open_right}))",
+            f"OR (NOT {open_left} AND NOT {open_right}) "
+            f"OR {relation_left} OR {relation_right})",
             (now, now),
         )
         return int(updated.rowcount)
@@ -1620,6 +1632,20 @@ class TaskCardService:
             # This is durable local bookkeeping only. The remote call happens
             # after this reader action commits.
             fused_task_titles.enqueue(connection, task_id=object_id, now=now)
+            subject_version = (
+                int(proposal["right_task_version"])
+                if subject_id == int(proposal["right_task_id"])
+                else int(proposal["left_task_version"])
+            )
+            transition = _apply_task_transition(
+                connection,
+                task_id=subject_id,
+                expected_version=subject_version,
+                action="drop",
+                now=now,
+            )
+            if not transition.accepted:
+                return None
             decision = duplicates.Decision.CONFIRMED
             self._cancel_duplicate_task_cards(
                 connection, task_id=subject_id, now=now,
@@ -1644,10 +1670,28 @@ class TaskCardService:
             kind="cancelled", card_version=next_version,
             task_version=int(row["task_version"]), now=now,
         )
+        subject_status = (
+            TaskStatus.DROPPED if action == "duplicate_confirm" else TaskStatus.OPEN
+        )
         return CardOperationResult(
             CardDisposition.APPLIED, card_id=int(row["id"]),
             version=next_version, status=CardStatus.CANCELLED,
-            task_version=int(row["task_version"]), task_status=TaskStatus.OPEN,
+            task_version=int(row["task_version"]), task_status=subject_status,
+        )
+
+    @staticmethod
+    def _reopen_task(
+        connection: sqlite3.Connection, *, task_id: int, now: str,
+    ) -> None:
+        """Reopen a task that was dropped by a confirmed duplicate.
+
+        Idempotent: if the task is already open it writes nothing.
+        """
+        connection.execute(
+            "UPDATE tasks SET status='open',version=version+1,"
+            "updated_at=?,closed_at=NULL "
+            "WHERE id=? AND status='dropped'",
+            (now, task_id),
         )
 
     def _cancel_duplicate_task_cards(

@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 56
+SCHEMA_VERSION = 57
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -3058,6 +3058,17 @@ _SCHEMA_V56 = (
 )
 
 
+# Settle duplicate proposals stuck in 'proposed' for tasks that already carry an
+# active duplicate_of relation (Issue #571).
+_SCHEMA_V57 = (
+    "UPDATE task_duplicate_proposals "
+    "SET state='superseded', settled_at=COALESCE(settled_at, updated_at), updated_at=datetime('now') "
+    "WHERE state='proposed' AND card_id IS NULL AND ("
+    "EXISTS (SELECT 1 FROM task_relations WHERE subject_id=left_task_id AND kind='duplicate_of' AND withdrawn_at IS NULL) "
+    "OR EXISTS (SELECT 1 FROM task_relations WHERE subject_id=right_task_id AND kind='duplicate_of' AND withdrawn_at IS NULL));",
+)
+
+
 # Context exhaustion is a separate terminal condition for one attempt. The
 # workflow table has a closed reason vocabulary, so admitting it requires a
 # table rebuild rather than silently recording it as an ordinary timeout.
@@ -4558,6 +4569,17 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 56
+            if version == 56:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V57:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 57")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 57
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:
