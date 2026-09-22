@@ -218,6 +218,13 @@ class DuplicateReviewCardTests(unittest.TestCase):
             "SELECT kind,asserted_by FROM task_relations"
         ).fetchone()
         self.assertEqual(tuple(relation), ("duplicate_of", "reader"))
+        task_statuses = self.connection.execute(
+            "SELECT id,status,closed_at FROM tasks ORDER BY id"
+        ).fetchall()
+        self.assertEqual(len(task_statuses), 2)
+        self.assertEqual(task_statuses[0]["status"], "open")
+        self.assertEqual(task_statuses[1]["status"], "dropped")
+        self.assertIsNotNone(task_statuses[1]["closed_at"])
         job = self.connection.execute(
             "SELECT state,title FROM task_fused_title_jobs WHERE task_id=1"
         ).fetchone()
@@ -306,6 +313,46 @@ class DuplicateReviewCardTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(tuple(relation), (2, 1))
 
+    def test_confirming_does_not_loop_cards_after_subject_is_closed(self):
+        """A confirmed duplicate that closes its subject cannot re-card."""
+        claim = self._deliver()
+        self.cards.act(
+            claim.card.id, expected_version=claim.card.version,
+            action="duplicate_confirm",
+        )
+        created_total = 0
+        cancelled_total = 0
+        for _ in range(5):
+            sched = self.cards.schedule_duplicate_proposals()
+            created_total += sched.created
+            cancelled_total += sched.cancelled
+            sched = self.cards.schedule()
+            created_total += sched.created
+            cancelled_total += sched.cancelled
+
+        self.assertEqual(created_total, 0)
+        self.assertEqual(cancelled_total, 0)
+        self.assertEqual(self._live_cards(), [])
+
+    def test_stale_relation_supersedes_proposal(self):
+        """A task carrying an un-withdrawn duplicate_of is permanently unaskable."""
+        self.connection.execute(
+            "INSERT INTO task_relations(subject_id,object_id,kind,"
+            "basis,asserted_by,actor,created_at) "
+            "VALUES(2,1,'duplicate_of','test','reader','reader',?)",
+            (NOW.isoformat(),),
+        )
+        self.connection.commit()
+
+        self.cards.schedule_duplicate_proposals()
+
+        proposal_state = self.connection.execute(
+            "SELECT state FROM task_duplicate_proposals WHERE id=?",
+            (self.proposal.proposal_id,),
+        ).fetchone()[0]
+        self.assertEqual(proposal_state, "superseded")
+        self.assertEqual(self._live_cards(), [])
+
     def test_stale_right_task_refuses_confirmation(self) -> None:
         claim = self._deliver()
         self.connection.execute("UPDATE tasks SET version=2 WHERE id=2")
@@ -366,6 +413,12 @@ class DuplicateReviewCardTests(unittest.TestCase):
             ).fetchone()[0],
             "proposed",
         )
+        # Reversing reopens the subject task that was dropped by confirmation.
+        subject_status = self.connection.execute(
+            "SELECT status,closed_at FROM tasks WHERE id=2"
+        ).fetchone()
+        self.assertEqual(subject_status["status"], "open")
+        self.assertIsNone(subject_status["closed_at"])
         self.assertEqual(
             tuple(self.connection.execute(
                 "SELECT state,title FROM task_fused_title_jobs WHERE task_id=1"

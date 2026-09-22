@@ -256,6 +256,40 @@ class CandidateInboxTests(unittest.TestCase):
         self.assertIn("claiming_consumer", columns)
         self.assertEqual(row, ("pending", None))
 
+    def test_version_fifty_seven_migration_settles_stuck_proposals(self):
+        migrate_database(self.database)
+        now = NOW.isoformat(timespec="seconds")
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "INSERT INTO tasks(id,status,text,owner,due,version,created_at,updated_at) "
+                "VALUES(101,'open','T1','Person A',NULL,1,?,?),"
+                "(102,'open','T2','Person A',NULL,1,?,?)",
+                (now, now, now, now),
+            )
+            connection.execute(
+                "INSERT INTO task_relations(subject_id,object_id,kind,basis,asserted_by,actor,created_at) "
+                "VALUES(102,101,'duplicate_of','test','reader','reader',?)",
+                (now,),
+            )
+            connection.execute(
+                "INSERT INTO task_duplicate_proposals(id,left_task_id,left_task_version,"
+                "right_task_id,right_task_version,basis,detector,state,created_at,updated_at) "
+                "VALUES(500,101,1,102,1,'test','test','proposed',?,?)",
+                (now, now),
+            )
+            connection.execute("PRAGMA user_version = 56")
+            connection.commit()
+
+        migrate_database(self.database)
+
+        with closing(sqlite3.connect(self.database)) as connection:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            state = connection.execute(
+                "SELECT state FROM task_duplicate_proposals WHERE id=500"
+            ).fetchone()[0]
+        self.assertEqual(version, 57)
+        self.assertEqual(state, "superseded")
+
     def test_fresh_and_migrated_databases_end_up_in_the_same_shape(self):
         fresh_database = Path(self.temporary.name) / "fresh.sqlite3"
         migrate_database(fresh_database)
