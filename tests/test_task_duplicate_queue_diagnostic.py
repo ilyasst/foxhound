@@ -194,6 +194,30 @@ class DuplicateQueueDiagnosticTests(unittest.TestCase):
         self.assertIn("right_version_stale", codes)
         self.assertEqual(result.permanently_blocked, 1)
 
+    def test_duplicate_relation_is_permanent(self) -> None:
+        db = _DbFixture()
+        try:
+            db.insert_task(1, "Task one")
+            db.insert_task(2, "Task two")
+            db.propose(1, 2)
+            db.connection.execute(
+                "INSERT INTO task_relations(subject_id,object_id,kind,"
+                "basis,asserted_by,actor,created_at) "
+                "VALUES(2,1,'duplicate_of','test','reader','reader',?)",
+                (NOW,),
+            )
+            db.commit()
+            result = diagnose_duplicate_queue(database_path=db.database)
+        finally:
+            db.close()
+
+        proposal = result.proposals[0]
+        codes = [r.code for r in proposal.reasons]
+        self.assertIn("duplicate_relation", codes)
+        reason = next(r for r in proposal.reasons if r.code == "duplicate_relation")
+        self.assertTrue(reason.permanent)
+        self.assertEqual(result.permanently_blocked, 1)
+
     # -----------------------------------------------------------------------
     # Permanent: both tasks closed
     # -----------------------------------------------------------------------
