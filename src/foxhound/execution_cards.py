@@ -333,6 +333,10 @@ class ExecutionReviewCard:
         default=(), repr=False
     )
     outcome: ExecutionOutcome | None = None
+    proposed_execution_agent: str | None = field(default=None, repr=False)
+    proposed_execution_agent_rationale: str | None = field(
+        default=None, repr=False
+    )
 
 
 @dataclass(frozen=True)
@@ -4034,12 +4038,6 @@ def _start_card_lines(
         )
     lines.extend(_origin_lines(card, html=html))
     lines.extend(_continues_lines(card, html=html))
-    # Which agent would run this, before it runs. A reader who cannot see
-    # it cannot tell that a pull request is about to be reviewed by a
-    # compatibility profile, which is how one review was lost.
-    agent = (_escape(card.agent_display_name) if html
-             else card.agent_display_name)
-    lines.append(f"🤖 <b>Agent:</b> {agent}" if html else f"🤖 Agent: {agent}")
     if card.workflow_status is WorkflowStatus.PARKED:
         # A reader who is never told has no way to distinguish a task
         # nobody has reached from one the agent abandoned.
@@ -4428,6 +4426,13 @@ def _card_lines(card: ExecutionReviewCard) -> list[str]:
             card.deliverables, heading="Deliverables", html=False,
             render=_drafted))
     lines.extend(_work_lines(card, label="Plan", html=False))
+    if card.proposed_execution_agent:
+        lines.extend((
+            "",
+            f"Proposed agent: {card.proposed_execution_agent}"
+        ))
+        if card.proposed_execution_agent_rationale:
+            lines.append(card.proposed_execution_agent_rationale)
     return lines
 
 
@@ -5028,7 +5033,7 @@ def _button_rows(
             )
             if approvable:
                 rows = ((("✅ Done", "done"),),) + rows
-            return rows + ((("📋 Task brief", "brief"),),)
+            return rows
         rows: tuple[tuple[tuple[str, str], ...], ...] = (
             (("✅ Done", "done"), ("▶️ Continue", "start")),
             (("🗑 Drop", "drop"), ("✏️ Update", "discuss")),
@@ -5040,11 +5045,6 @@ def _button_rows(
             rows += ((
                 (_owner_hold_button_label(card.owner), OWNER_HOLD_ACTION),
             ),)
-        if card.workflow_status is WorkflowStatus.AWAITING_START:
-            # Only before it starts: once a workflow is running, changing
-            # the agent underneath it would rebind work already in flight.
-            rows += ((("🤖 Agent", "agent"),),)
-        rows += ((("📋 Task brief", "brief"),),)
         return rows if approvable else rows[1:]
     if kind is ExecutionCardKind.STEER:
         rows = (
