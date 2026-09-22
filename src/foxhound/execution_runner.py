@@ -422,7 +422,7 @@ def profile_argv(
     ):
         raise ValueError("execution agent profile is invalid")
     base = _agent_command_argv(command)
-    return (
+    argv = (
         *base,
         *agent_selection_argv(model, provider),
         "chat",
@@ -436,6 +436,9 @@ def profile_argv(
         "--toolsets",
         ",".join(profile.toolsets),
     )
+    if profile.skills:
+        argv = argv + ("--skills", ",".join(profile.skills))
+    return argv
 
 
 def corrective_argv(
@@ -463,7 +466,7 @@ def corrective_argv(
         or "\0" in source
     ):
         raise ValueError("execution corrective resume is invalid")
-    return (
+    argv = (
         *_agent_command_argv(command),
         # The same backend the lost turn ran on.  This turn resumes that
         # session to close it out; finishing it somewhere else would hand the
@@ -484,6 +487,9 @@ def corrective_argv(
         session_id,
         "--no-restore-cwd",
     )
+    if profile.skills:
+        argv = argv + ("--skills", ",".join(profile.skills))
+    return argv
 
 
 def _agent_command_argv(command: object) -> tuple[str, ...]:

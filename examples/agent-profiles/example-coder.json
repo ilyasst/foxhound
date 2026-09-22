@@ -20,5 +20,8 @@
     "plan",
     "execute",
     "external_action"
+  ],
+  "skills": [
+    "fictional-repo-reader"
   ]
 }
