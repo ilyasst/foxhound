@@ -22,6 +22,7 @@ from foxhound.task_cards import (
     CardDisposition,
     CardRefusal,
     CardStatus,
+    TaskStatus,
     TaskCardService,
     TASK_CARD_READS,
     _affordable_sources as affordable_sources,
@@ -352,6 +353,65 @@ class DuplicateReviewCardTests(unittest.TestCase):
         ).fetchone()[0]
         self.assertEqual(proposal_state, "superseded")
         self.assertEqual(self._live_cards(), [])
+
+    def test_show_full_cards_delivers_both_members_with_action_buttons(self):
+        """Selecting Show full cards summons both members with normal action buttons."""
+        claim = self._deliver()
+        card_id = claim.card.id
+        version = claim.card.version
+
+        # Before: 1 live card (the duplicate review card)
+        self.assertEqual(len(self._live_cards()), 1)
+
+        result = self.cards.show_full_cards(card_id, expected_version=version)
+        self.assertTrue(result.accepted)
+        self.assertEqual(len(result.cards), 2)
+
+        # Both members are delivered
+        self.assertEqual({c.task_id for c in result.cards}, {1, 2})
+        for card in result.cards:
+            self.assertEqual(card.status, CardStatus.DELIVERED)
+            self.assertIsNone(card.duplicate)
+            # Each delivered card is the standard full card and retains its action buttons
+            text, keyboard = render_task_review_card(card)
+            self.assertIn("Task done?", text)
+            action_buttons = [
+                b["callback_data"].rsplit("|", 1)[1]
+                for row in keyboard["inline_keyboard"]
+                for b in row
+            ]
+            self.assertIn("done", action_buttons)
+            self.assertIn("keep_open", action_buttons)
+            self.assertIn("drop", action_buttons)
+            self.assertIn("snooze", action_buttons)
+
+        # Each card can be acted on independently
+        card_1 = next(c for c in result.cards if c.task_id == 1)
+        action_res = self.cards.act(card_1.id, expected_version=card_1.version, action="done")
+        self.assertTrue(action_res.accepted)
+        self.assertEqual(action_res.task_status, TaskStatus.DONE)
+
+    def test_show_full_cards_fails_safely_if_task_cannot_be_retrieved(self):
+        """The control fails visibly and safely if either task can no longer be retrieved."""
+        claim = self._deliver()
+        card_id = claim.card.id
+        version = claim.card.version
+
+        # Delete task 2
+        self.connection.execute("DELETE FROM tasks WHERE id=2")
+        self.connection.commit()
+
+        result = self.cards.show_full_cards(card_id, expected_version=version)
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.refusal, CardRefusal.NOT_FOUND)
+
+        # The duplicate card remains unchanged, no partial cards created
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT status FROM task_review_cards WHERE id=?", (card_id,)
+            ).fetchone()[0],
+            "delivered",
+        )
 
     def test_stale_right_task_refuses_confirmation(self) -> None:
         claim = self._deliver()
