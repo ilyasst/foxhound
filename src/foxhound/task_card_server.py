@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 from dataclasses import asdict
 import hashlib
 import hmac
@@ -883,27 +884,40 @@ class TaskCardApplication:
                     "claim": None,
                 }
             body, reply_markup = render_execution_review_card(claim.card)
+            claim_payload = {
+                "card_id": claim.card.id,
+                "card_version": claim.card.version,
+                "kind": claim.card.kind.value,
+                "phase": claim.card.phase.value,
+                "claim_token": claim.token,
+                "expires_at": claim.expires_at,
+                "delivery_key": (
+                    f"foxhound-execution-card-{claim.card.id}-"
+                    f"v{claim.card.version}"
+                ),
+                "superseded_delivery_ref": claim.superseded_delivery_ref,
+                "superseded_transport": claim.superseded_transport,
+                "body": body,
+                "reply_markup": reply_markup,
+            }
+            if claim.card.result_id:
+                try:
+                    with closing(self._execution_cards()._connect()) as db:
+                        row = db.execute(
+                            "SELECT 1 FROM execution_result_artifacts "
+                            "WHERE result_id=? AND name='voice_summary.wav'",
+                            (claim.card.result_id,),
+                        ).fetchone()
+                        if row is not None:
+                            claim_payload["voice_artifact_name"] = "voice_summary.wav"
+                except Exception:
+                    pass
             return {
                 "schema": EXECUTION_CLAIM_SCHEMA,
                 "schema_version": SERVICE_VERSION,
                 "ok": True,
                 "status": "claimed",
-                "claim": {
-                    "card_id": claim.card.id,
-                    "card_version": claim.card.version,
-                    "kind": claim.card.kind.value,
-                    "phase": claim.card.phase.value,
-                    "claim_token": claim.token,
-                    "expires_at": claim.expires_at,
-                    "delivery_key": (
-                        f"foxhound-execution-card-{claim.card.id}-"
-                        f"v{claim.card.version}"
-                    ),
-                    "superseded_delivery_ref": claim.superseded_delivery_ref,
-                    "superseded_transport": claim.superseded_transport,
-                    "body": body,
-                    "reply_markup": reply_markup,
-                },
+                "claim": claim_payload,
             }
         if operation == "execution_retraction_claim":
             request = _request(payload, required={"lease_seconds"})

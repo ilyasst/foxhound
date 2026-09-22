@@ -26,7 +26,7 @@ from .knowledge_client import (
     KnowledgeSearchResult,
 )
 from .contracts import SourceSnapshotContractError
-from . import work_digest, voice_summary
+from . import work_digest, voice_summary, tts_client
 from .task_execution import (
     ExecutionResultEnvelope,
     TaskExecutionService,
@@ -863,6 +863,34 @@ class ExecutionWorker:
                     state.task_id, expected_version=state.workflow_version)),
         )
         if state.task_run_directory is not None:
+            if envelope.voice_summary:
+                try:
+                    audio = tts_client.synthesize(envelope.voice_summary)
+                    if audio:
+                        audio_path = self._state_path.parent / "voice_summary.wav"
+                        tmp_audio = self._state_path.parent / "voice_summary.wav.tmp"
+                        tmp_audio.write_bytes(audio)
+                        os.chmod(tmp_audio, 0o600)
+                        tmp_audio.replace(audio_path)
+                        manifest_path = (
+                            self._state_path.parent / ARTIFACT_MANIFEST_NAME
+                        )
+                        manifest = []
+                        if manifest_path.exists():
+                            try:
+                                manifest = json.loads(
+                                    manifest_path.read_text(encoding="utf-8"))
+                            except Exception:
+                                manifest = []
+                        if "voice_summary.wav" not in manifest:
+                            manifest.append("voice_summary.wav")
+                            tmp_m = manifest_path.with_suffix(".tmp")
+                            tmp_m.write_text(
+                                json.dumps(manifest), encoding="utf-8")
+                            os.chmod(tmp_m, 0o600)
+                            tmp_m.replace(manifest_path)
+                except Exception:
+                    pass
             ledger = TaskLedger(state.database_path)
             task = ledger.get(state.task_id)
             origin = ledger.origin(state.task_id)

@@ -1537,6 +1537,64 @@ class TaskCardServerTests(unittest.TestCase):
                 ("queued", "execute"),
             )
 
+    def test_execution_claim_includes_voice_artifact_name_when_present(self):
+        self.execution.schedule(1, expected_task_version=1)
+        with running_server(self.app) as endpoint:
+            request(endpoint, "/v1/execution-cards/schedule", request_document(limit=2))
+            _, _, claimed = request(
+                endpoint,
+                "/v1/execution-cards/claim",
+                request_document(lease_seconds=60),
+            )
+            start_claim = claimed["claim"]
+            delivery = request_document(
+                card_id=start_claim["card_id"],
+                card_version=start_claim["card_version"],
+                claim_token=start_claim["claim_token"],
+                transport="synthetic",
+                delivery_ref="execution-message-voice-test",
+            )
+            request(endpoint, "/v1/execution-cards/delivered", delivery)
+            request(
+                endpoint,
+                "/v1/execution-cards/action",
+                request_document(
+                    card_id=start_claim["card_id"],
+                    card_version=start_claim["card_version"],
+                    action="start",
+                ),
+            )
+            execution_claim = self.execution.claim_next()
+            run_dir = Path(tempfile.mkdtemp())
+            (run_dir / "voice_summary.wav").write_bytes(b"RIFF1234WAVEfmt ")
+            recorded = self.execution.record_result(ExecutionResultEnvelope(
+                result_id="synthetic-voice-result",
+                task_id=1,
+                task_version=1,
+                workflow_version=execution_claim.workflow_version,
+                phase="plan",
+                claim_token=execution_claim.token,
+                outcome=ExecutionOutcome.AWAITING_PLAN,
+                summary="Synthetic plan summary",
+                work_markdown="Synthetic plan body",
+                artifacts=[{
+                    "relative_path": "voice_summary.wav",
+                    "name": "voice_summary.wav",
+                    "size_bytes": 16,
+                    "content_digest": "0" * 64,
+                    "run_directory": str(run_dir),
+                }],
+            ))
+            self.assertTrue(recorded.accepted)
+            request(endpoint, "/v1/execution-cards/schedule", request_document(limit=2))
+            _, _, claimed = request(
+                endpoint,
+                "/v1/execution-cards/claim",
+                request_document(lease_seconds=60),
+            )
+            claim = claimed["claim"]
+            self.assertEqual(claim.get("voice_artifact_name"), "voice_summary.wav")
+
     def test_execution_routes_reject_invalid_request_shapes(self):
         with running_server(self.app) as endpoint:
             status, _, body = request(
