@@ -147,6 +147,14 @@ _REASON_TASK_STATUS_INVALID = DisqualificationReason(
     description="Task status pair does not match reviewable pattern",
 )
 
+#: Relation condition: a task carrying an un-withdrawn duplicate_of relation
+#: is permanently unaskable (Issue #571).
+_REASON_DUPLICATE_RELATION = DisqualificationReason(
+    code="duplicate_relation",
+    permanent=True,
+    description="Task carries an un-withdrawn duplicate_of relation",
+)
+
 #: Active card conflict: the chosen task already has an active card
 #: (pending/delivering/delivered/snoozed) that is not PENDING, or its
 #: pending card already asks a different comparison.
@@ -291,6 +299,13 @@ def _diagnose(connection: sqlite3.Connection) -> QueueDiagnostic:
         if existing is not None:
             cards_with_proposals.add(cid)
 
+    duplicate_relations = {
+        int(row[0]) for row in connection.execute(
+            "SELECT subject_id FROM task_relations "
+            "WHERE kind='duplicate_of' AND withdrawn_at IS NULL"
+        ).fetchall()
+    }
+
     diagnostics: list[ProposalDiagnostic] = []
     total_proposed = 0
     carded = 0
@@ -383,7 +398,11 @@ def _diagnose(connection: sqlite3.Connection) -> QueueDiagnostic:
             else:
                 reasons.append(_REASON_TASK_STATUS_INVALID)
 
-        # 6. Card conflict (only when no permanent reason already exists)
+        # 6. Un-withdrawn duplicate_of relation (permanent)
+        if left_id in duplicate_relations or right_id in duplicate_relations:
+            reasons.append(_REASON_DUPLICATE_RELATION)
+
+        # 7. Card conflict (only when no permanent reason already exists)
         if not any(r.permanent for r in reasons):
             # Determine which task would be carded (the open one)
             if left_status == "open":
