@@ -40,6 +40,9 @@ EXECUTION_CONTEXT_SCHEMA_VERSION = 1
 OWNER_MEETING_REQUEST_SCHEMA = "gw.owner-upcoming-meeting-request"
 OWNER_MEETING_RESPONSE_SCHEMA = "gw.owner-upcoming-meeting"
 OWNER_MEETING_SCHEMA_VERSION = 1
+WORKING_GROUPS_REQUEST_SCHEMA = "gw.working-groups-request"
+WORKING_GROUPS_RESPONSE_SCHEMA = "gw.working-groups"
+WORKING_GROUPS_SCHEMA_VERSION = 1
 LAYER_ORDER = ("kb", "secondary", "emails")
 
 _ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -234,6 +237,31 @@ class GwKnowledgeClient:
             "/v1/owner-upcoming-meeting", request
         )
         return _parse_owner_meeting_response(document)
+
+    def working_groups(
+        self,
+        *,
+        query: str | None = None,
+        person_name: str | None = None,
+        attendees: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
+        """Query active organic working groups from GW."""
+        request: dict[str, Any] = {
+            "schema": WORKING_GROUPS_REQUEST_SCHEMA,
+            "schema_version": WORKING_GROUPS_SCHEMA_VERSION,
+            "alias": self._config.alias,
+        }
+        if query is not None:
+            request["query"] = query[:500]
+        if person_name is not None:
+            request["person_name"] = person_name[:200]
+        if attendees is not None:
+            request["attendees"] = list(attendees)[:50]
+
+        document = self._request_json("/v1/working-groups", request)
+        if not isinstance(document, dict) or document.get("schema") != WORKING_GROUPS_RESPONSE_SCHEMA:
+            raise KnowledgeResponseError("GW working groups response is invalid")
+        return document
 
     def refresh_source(
         self, request: SourceSnapshotRequest,

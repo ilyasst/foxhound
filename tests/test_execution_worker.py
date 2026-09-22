@@ -100,6 +100,34 @@ def knowledge_server() -> Iterator[str]:
                         "lifecycle": "active", "actionability": "actionable",
                     },
                 }
+            elif self.path == "/v1/working-groups":
+                response = {
+                    "schema": "gw.working-groups",
+                    "schema_version": 1,
+                    "ok": True,
+                    "alias": request["alias"],
+                    "total_groups": 1,
+                    "working_groups": [
+                        {
+                            "cluster_id": 0,
+                            "name": "Person A, Person B · Composite, Testing",
+                            "dominant_people": ["Person A", "Person B"],
+                            "keywords": ["composite", "testing"],
+                            "member_count": 2,
+                            "members": ["Person A", "Person B"],
+                            "recent_artifacts": [],
+                        }
+                    ],
+                    "matched_group": {
+                        "cluster_id": 0,
+                        "name": "Person A, Person B · Composite, Testing",
+                        "dominant_people": ["Person A", "Person B"],
+                        "keywords": ["composite", "testing"],
+                        "member_count": 2,
+                        "members": ["Person A", "Person B"],
+                        "recent_artifacts": [],
+                    },
+                }
             else:
                 response = {
                     "schema": "gw.search",
@@ -396,6 +424,14 @@ class ExecutionWorkerTests(unittest.TestCase):
         self.assertNotIn(CLAIM_TOKEN, rendered)
         self.assertNotIn(str(self.database), rendered)
         self.assertEqual(context["task"]["text"], "Synthetic task")
+        self.assertEqual(
+            context["task"]["working_group"],
+            {
+                "name": "Person A, Person B · Composite, Testing",
+                "dominant_people": ["Person A", "Person B"],
+                "keywords": ["composite", "testing"],
+            },
+        )
         self.assertEqual(context["schema_version"], 8)
         self.assertEqual(context["runtime"]["today"], "2030-01-02")
         self.assertEqual(context["runtime"]["today_weekday"], "Wednesday")
