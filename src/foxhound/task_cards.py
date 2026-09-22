@@ -1052,23 +1052,24 @@ class TaskCardService:
     def stats(self, *, consumer_digest: str) -> CardStats:
         if not _valid_digest(consumer_digest):
             raise TaskLedgerError("task card consumer digest is invalid")
+        now = self._clock_value().isoformat(timespec="seconds")
         with closing(self._connect()) as connection:
             row = connection.execute(
                 "SELECT "
-                "SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,"
-                "SUM(CASE WHEN status='delivering' AND consumer_digest=? "
+                "SUM(CASE WHEN status='pending' OR (status='delivering' AND claim_expires_at<=?) THEN 1 ELSE 0 END) AS pending,"
+                "SUM(CASE WHEN status='delivering' AND claim_expires_at>? AND consumer_digest=? "
                 "THEN 1 ELSE 0 END) AS delivering,"
                 "SUM(CASE WHEN status='delivered' AND consumer_digest=? "
                 "THEN 1 ELSE 0 END) AS delivered,"
                 "SUM(CASE WHEN status='snoozed' THEN 1 ELSE 0 END) AS snoozed,"
-                "SUM(CASE WHEN status IN ('delivering','delivered') "
+                "SUM(CASE WHEN (status='delivered' OR (status='delivering' AND claim_expires_at>?)) "
                 "AND consumer_digest IS NOT NULL AND consumer_digest<>? "
                 "THEN 1 ELSE 0 END) AS elsewhere,"
                 "SUM(CASE WHEN status IN "
                 "('pending','delivering','delivered','snoozed') "
                 "THEN 1 ELSE 0 END) AS active "
                 "FROM task_review_cards",
-                (consumer_digest, consumer_digest, consumer_digest),
+                (now, now, consumer_digest, consumer_digest, now, consumer_digest),
             ).fetchone()
         return CardStats(*(
             int(row[name] or 0)
@@ -1080,17 +1081,19 @@ class TaskCardService:
 
     def stats_global(self) -> CardStats:
         """Return the legacy unscoped queue snapshot for v1 clients."""
+        now = self._clock_value().isoformat(timespec="seconds")
         with closing(self._connect()) as connection:
             row = connection.execute(
                 "SELECT "
-                "SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,"
-                "SUM(CASE WHEN status='delivering' THEN 1 ELSE 0 END) AS delivering,"
+                "SUM(CASE WHEN status='pending' OR (status='delivering' AND claim_expires_at<=?) THEN 1 ELSE 0 END) AS pending,"
+                "SUM(CASE WHEN status='delivering' AND claim_expires_at>? THEN 1 ELSE 0 END) AS delivering,"
                 "SUM(CASE WHEN status='delivered' THEN 1 ELSE 0 END) AS delivered,"
                 "SUM(CASE WHEN status='snoozed' THEN 1 ELSE 0 END) AS snoozed,"
                 "SUM(CASE WHEN status IN "
                 "('pending','delivering','delivered','snoozed') "
                 "THEN 1 ELSE 0 END) AS active "
-                "FROM task_review_cards"
+                "FROM task_review_cards",
+                (now, now)
             ).fetchone()
         return CardStats(
             pending=int(row["pending"] or 0),
