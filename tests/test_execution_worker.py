@@ -418,6 +418,7 @@ class ExecutionWorkerTests(unittest.TestCase):
                 "local_research_clients": {
                     "outlook": [
                         "folders", "inbox", "search", "read", "thread",
+                        "attachment",
                     ],
                     "moodle": [
                         "renew", "whoami", "courses", "assignments",
@@ -491,6 +492,7 @@ class ExecutionWorkerTests(unittest.TestCase):
         self.assertIn("act.comment", external)
         self.assertIn("act.issue", external)
         self.assertIn("act.review", external)
+        self.assertIn("act.mail", external)
 
     def test_a_working_tree_does_not_unlock_any_external_effect(self):
         """The gate is the effect, not the edit.
@@ -2053,6 +2055,53 @@ class ExecutionWorkerTests(unittest.TestCase):
                 code = main(["context"])
         self.assertEqual(code, 70)
         self.assertNotIn(private_value, output.getvalue() + errors.getvalue())
+
+    @mock.patch("subprocess.run")
+    def test_act_mail_validates_arguments_and_fencing(self, run_mock):
+        run_mock.return_value = mock.Mock(stdout="sent", stderr="")
+        with knowledge_server() as endpoint:
+            # Plan phase -> not allowed
+            worker = self._worker(endpoint)
+            with self.assertRaisesRegex(ExecutionWorkerClaimError, "external_action phase"):
+                worker.act_mail(to="user@example.com", subject="S", body_file="b", attachments=None)
+
+            # External action phase -> allowed
+            state = replace(
+                load_run_state(self.state_path),
+                phase=WorkflowPhase.EXTERNAL_ACTION,
+            )
+            with mock.patch.object(worker, "_active", return_value=(state, SimpleNamespace())), mock.patch.object(worker, "_renew"):
+                # Invalid recipient
+                with self.assertRaisesRegex(ExecutionWorkerClaimError, "recipient address is invalid"):
+                    worker.act_mail(to="invalid", subject="S", body_file="b", attachments=None)
+
+                # Missing body
+                with self.assertRaisesRegex(ExecutionWorkerConfigError, "message body is unavailable"):
+                    worker.act_mail(to="user@example.com", subject="S", body_file="missing.md", attachments=None)
+
+                # Success path
+                body_path = worker._state_path.parent / "body.md"
+                body_path.write_text("mail content")
+                body_path.chmod(0o600)
+                result = worker.act_mail(to="user@example.com", subject="Success", body_file="body.md", attachments=None)
+                self.assertEqual(result["kind"], "outbound-mail")
+                self.assertEqual(result["to"], "user@example.com")
+                run_mock.assert_called_once()
+                args = run_mock.call_args[0][0]
+                self.assertEqual(args[:6], ["outlook", "send", "--to", "user@example.com", "--subject", "Success"])
+
+                # Attachment bounds validation
+                run_mock.reset_mock()
+                with self.assertRaisesRegex(ExecutionWorkerClaimError, "attachment must be a result artifact in the task folder"):
+                    worker.act_mail(to="user@example.com", subject="S", body_file="body.md", attachments="../../secret.txt")
+
+                att_path = worker._state_path.parent / "att.txt"
+                att_path.write_text("data")
+                att_path.chmod(0o600)
+                worker.act_mail(to="user@example.com", subject="S", body_file="body.md", attachments="att.txt")
+                args = run_mock.call_args[0][0]
+                self.assertIn("--attachment", args)
+                self.assertIn(str(att_path.resolve()), args)
 
 
 class ResultLocationTests(unittest.TestCase):
