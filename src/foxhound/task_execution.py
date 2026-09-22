@@ -638,7 +638,8 @@ class TaskExecutionService:
             or not 1 <= limit <= 1_000
         ):
             raise ValueError("execution schedule limit is invalid")
-        now = self._now()
+        now_dt = self._clock_value()
+        now = now_dt.isoformat(timespec="seconds")
         with closing(self._connect()) as connection:
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("BEGIN IMMEDIATE")
@@ -777,7 +778,10 @@ class TaskExecutionService:
                     " JOIN candidate_inbox AS o "
                     " ON o.candidate_id=b.candidate_id "
                     " WHERE b.task_id=t.id AND b.relation='accepted'"
-                    ") AS origin_kind FROM tasks AS t "
+                    ") AS origin_kind, "
+                    "(EXISTS(SELECT 1 FROM task_review_cards AS rc "
+                    " WHERE rc.task_id=t.id AND rc.status IN ('delivered','snoozed','resolved'))) AS review_delivered "
+                    "FROM tasks AS t "
                     "LEFT JOIN task_execution_workflows AS w "
                     "ON w.task_id=t.id WHERE t.status='open' "
                     "AND (w.task_id IS NULL OR (w.task_version!=t.version "
@@ -843,6 +847,10 @@ class TaskExecutionService:
                                 capped += 1
                                 continue
                             waiting_room -= 1
+                    due_at = None
+                    if status is WorkflowStatus.SNOOZED:
+                        due_at = (now_dt + timedelta(days=21)).isoformat(timespec="seconds")
+
                     profile = self._profile_for(row["origin_kind"])
                     if row["workflow_task_id"] is None:
                         version = 1
@@ -851,10 +859,10 @@ class TaskExecutionService:
                             "task_id,task_version,status,phase,version,due_at,"
                             "failure_count,created_at,updated_at,agent_profile_id,"
                             "agent_profile_revision,steer_while_running) "
-                            "VALUES(?,?,?,?,?,NULL,0,?,?,?,?,?)",
+                            "VALUES(?,?,?,?,?,?,0,?,?,?,?,?)",
                             (
                                 task_id, task_version, status.value, phase.value,
-                                version, now, now,
+                                version, due_at, now, now,
                                 profile.profile_id,
                                 profile.revision,
                                 int(row["origin_kind"] in self._steer_while_running),
@@ -864,7 +872,7 @@ class TaskExecutionService:
                         version = int(row["workflow_version"]) + 1
                         connection.execute(
                             "UPDATE task_execution_workflows SET task_version=?,"
-                            "status=?,phase=?,version=?,due_at=NULL,"
+                            "status=?,phase=?,version=?,due_at=?,"
                             "claim_token_digest=NULL,claimed_at=NULL,"
                             "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
                             "current_run_id=NULL,"
@@ -877,11 +885,35 @@ class TaskExecutionService:
                             "WHERE task_id=?",
                             (
                                 task_version, status.value, phase.value, version,
-                                now, profile.profile_id, profile.revision,
+                                due_at, now, profile.profile_id, profile.revision,
                                 int(row["origin_kind"] in self._steer_while_running),
                                 task_id,
                             ),
                         )
+                    if status is WorkflowStatus.SNOOZED:
+                        cursor = connection.execute(
+                            "INSERT INTO task_execution_owner_holds("
+                            "task_id,task_version,workflow_version,status,owner_display,"
+                            "owner_ref_version,owner_kind,owner_speaker_id,"
+                            "owner_canonical_speaker_id,owner_speaker_registry_id,owner_pinned,"
+                            "owner_provisional,backstop_at,created_at) "
+                            "VALUES(?,?,?,'active',?,?,?,?,?,?,?,?,?,?)",
+                            (
+                                task_id, task_version, version,
+                                canonical_owner_display(row["owner"], row["owner_kind"]),
+                                int(row["owner_ref_version"]), row["owner_kind"], row["owner_speaker_id"],
+                                row["owner_canonical_speaker_id"], row["owner_speaker_registry_id"],
+                                int(row["owner_pinned"]), int(row["owner_provisional"]),
+                                due_at, now,
+                            )
+                        )
+                        connection.execute(
+                            "INSERT INTO task_execution_owner_hold_events("
+                            "hold_id,task_id,kind,matched,evidence_revision,occurred_at) "
+                            "VALUES(?,?,?,?,?,?)",
+                            (int(cursor.lastrowid), task_id, "created", None, None, now)
+                        )
+                        
                     self._event(
                         connection,
                         task_id,
@@ -3755,8 +3787,12 @@ def _cancel_superseded_start_cards(
 #: Owner columns every selection feeding `_initial_status` must carry.
 _OWNER_COLUMNS = (
     "t.owner,t.owner_kind,t.owner_ref_version,t.owner_provisional,"
+    "t.owner_speaker_id,t.owner_canonical_speaker_id,t.owner_speaker_registry_id,"
+    "t.owner_pinned,"
 )
 
+
+from .task_owner import canonical_owner_display, normalized_owner
 
 def _initial_status(
     origin_kind: object,
@@ -3764,27 +3800,20 @@ def _initial_status(
     row: Mapping[str, object] | None = None,
     reader_aliases: frozenset[str] = frozenset(),
 ) -> WorkflowStatus:
-    """Whether this task must be asked about before it is planned.
-
-    A gate exists so no agent time is spent on a task the reader never
-    wanted. For some sources that question is already answered: enrolling
-    a repository is the permission for its issues, and the gate then asks
-    again about every one of them, using a card that can only show a title
-    because nothing has looked at the issue yet.
-
-    Which sources those are is a judgement about this machine and the
-    operator's appetite for it, not a fact about the source. It is
-    declared per machine and defaults to empty, so a machine that says
-    nothing is asked about everything.
-
-    Planning is read-only and produces no external effect, so granting it
-    costs one agent pass and yields a card that can actually be judged.
-    Everything after the plan is still gated.
-    """
+    """Whether this task must be asked about before it is planned."""
     if isinstance(origin_kind, str) and origin_kind in granted:
         return WorkflowStatus.QUEUED
     if row is not None and reader_owned(row, reader_aliases):
         return WorkflowStatus.QUEUED
+    if row is not None and origin_kind == "meeting" and "review_delivered" in row.keys() and bool(row["review_delivered"]):
+        owner_display = canonical_owner_display(row["owner"], row["owner_kind"])
+        if owner_display and owner_display != "(unassigned)":
+            n_owner = normalized_owner(owner_display)
+            if n_owner not in reader_aliases:
+                if row["owner_kind"] == "person":
+                    if row["owner_ref_version"] == 1 and not row["owner_provisional"]:
+                        if row["owner_speaker_id"] or row["owner_canonical_speaker_id"] or row["owner_speaker_registry_id"]:
+                            return WorkflowStatus.SNOOZED
     return WorkflowStatus.AWAITING_START
 
 

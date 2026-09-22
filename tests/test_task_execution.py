@@ -257,6 +257,55 @@ class TaskExecutionTests(unittest.TestCase):
             deliverables=("Synthetic deliverable",),
         )
 
+    def test_meeting_task_with_other_owner_is_auto_held(self):
+        """A meeting-sourced task with a validated other owner skips the start card and holds."""
+        def bind(task_id, record):
+            with closing(sqlite3.connect(self.database)) as connection:
+                now = self._now()
+                connection.execute(
+                    "INSERT INTO tasks(id,status,text,owner,owner_kind,owner_ref_version,"
+                    "owner_provisional,owner_speaker_id,owner_canonical_speaker_id,"
+                    "owner_speaker_registry_id,owner_pinned,due,version,created_at,updated_at,closed_at) "
+                    "VALUES(?,'open',?,'Person B','person',1,0,'speaker-b','speaker-b','reg-b',1,NULL,1,?,?,NULL)",
+                    (task_id, f"Synthetic meeting task {task_id}", now, now)
+                )
+                connection.execute(
+                    "INSERT INTO candidate_inbox(candidate_id,source_system,"
+                    "source_kind,source_record_id,source_item_id,"
+                    "source_revision,payload_json,created_at,"
+                    "first_imported_at,updated_at) "
+                    "VALUES(?,'gw','meeting',?,?,'rev','{}',?,?,?)",
+                    (f"cand-{task_id}", record, f"item-{task_id}", now, now, now)
+                )
+                connection.execute(
+                    "INSERT INTO task_candidate_bindings(candidate_id,"
+                    "source_revision,task_id,relation,decided_at) "
+                    "VALUES(?,?,?,'accepted',?)",
+                    (f"cand-{task_id}", "rev", task_id, now)
+                )
+                # simulate a delivered post-source review card
+                connection.execute(
+                    "INSERT INTO task_review_cards(task_id,task_version,status,version,due_at,created_at,updated_at) "
+                    "VALUES(?,1,'delivered',1,?,?,?)",
+                    (task_id, now, now, now)
+                )
+                connection.commit()
+
+        bind(100, "record_synthetic")
+        self.service.schedule_new(limit=10)
+        
+        with closing(sqlite3.connect(self.database)) as connection:
+            workflow = connection.execute(
+                "SELECT status, phase, due_at FROM task_execution_workflows WHERE task_id=100"
+            ).fetchone()
+            self.assertEqual(workflow[0], "snoozed")
+            
+            hold = connection.execute(
+                "SELECT status, owner_display FROM task_execution_owner_holds WHERE task_id=100"
+            ).fetchone()
+            self.assertEqual(hold[0], "active")
+            self.assertEqual(hold[1], "Person B")
+
     def test_repository_references_are_validated_and_persisted(self):
         scheduled = self.service.schedule(1, expected_task_version=1)
         self.service.start_action(
