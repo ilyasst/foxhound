@@ -739,7 +739,7 @@ class ExecutionRunnerTests(unittest.TestCase):
         rendered = json.dumps(argv)
         instructions = general_profile().render_prompt("foxhound-task-worker")
         self.assertIn("foxhound-task-worker context", bootstrap)
-        self.assertIn("--ignore-rules", argv)
+        self.assertIn("--safe-mode", argv)
         # The bootstrap says how to ask for the instructions. It is not a
         # short copy of them: process arguments are readable outside the run.
         self.assertLess(len(bootstrap), len(instructions) // 2)
@@ -785,7 +785,7 @@ class ExecutionRunnerTests(unittest.TestCase):
                 "50",
                 "--source",
                 "tool",
-                "--ignore-rules",
+                "--safe-mode",
                 "--toolsets",
                 "terminal,file,web,vision",
             ),

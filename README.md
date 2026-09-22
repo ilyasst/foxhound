@@ -306,9 +306,10 @@ or result draft, and no instructions in its arguments either. Its command line
 carries only a public bootstrap requiring the first `foxhound-task-worker
 context` call; that call returns the instructions of the revision the claim is
 pinned to, from an owner-only file the runner writes into the run directory and
-removes when supervision ends. Hermes is launched with `--ignore-rules`, so
-ambient rule, memory, and skill injection cannot change what a recorded
-revision means, and the agent is told to read each checkout's own contributor
+removes when supervision ends. Hermes is launched with `--safe-mode`, so
+ambient rule, memory, skill, user-configuration, plugin, and MCP-server
+injection cannot change what a recorded revision means, and the agent is told
+to read each checkout's own contributor
 instructions after a worktree is prepared. It can obtain only the current
 private work context, bounded GW search, durable result recording, and claim
 release through the narrow `foxhound-task-worker` command. See

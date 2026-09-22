@@ -151,7 +151,7 @@ class FencedInstructionDeliveryTests(unittest.TestCase):
 
         arguments = json.dumps(launched["argv"])
         self.assertIn(agent_prompt(), launched["argv"])
-        self.assertIn("--ignore-rules", launched["argv"])
+        self.assertIn("--safe-mode", launched["argv"])
         # Authority comes from the profile, not from anything the agent reads.
         for text in (agent_prompt(), instructions):
             with self.subTest(text=text[:24]):

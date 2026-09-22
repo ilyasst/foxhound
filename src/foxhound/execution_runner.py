@@ -212,7 +212,7 @@ def hermes_argv(
         str(max_turns),
         "--source",
         "tool",
-        "--ignore-rules",
+        "--safe-mode",
     ]
     if toolsets:
         if not isinstance(toolsets, str) or "\0" in toolsets:
@@ -232,8 +232,9 @@ def profile_argv(
     The profile's own instructions are not passed here. Process arguments are
     readable outside this run, so they carry only the public bootstrap; the
     instructions reach the agent through the fenced worker instead.
-    `--ignore-rules` keeps ambient rule, memory, and skill injection from
-    changing behavior behind an already recorded revision.
+    ``--safe-mode`` keeps ambient rule, memory, skill, user-configuration,
+    plugin, and MCP-server injection from changing what a recorded revision
+    means.
     """
     if not isinstance(profile, AgentProfile) or profile.runtime != "hermes":
         raise ValueError("execution agent profile is invalid")
@@ -248,7 +249,7 @@ def profile_argv(
         str(profile.max_turns),
         "--source",
         "tool",
-        "--ignore-rules",
+        "--safe-mode",
         "--toolsets",
         ",".join(profile.toolsets),
     )
