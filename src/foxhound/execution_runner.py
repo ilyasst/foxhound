@@ -973,6 +973,83 @@ def cleanup_run_clones(run_directory: Path) -> None:
         pass
 
 
+def cleanup_runs(
+    run_root: Path,
+    *,
+    keep_minimum: int = 10,
+    dry_run: bool = False,
+) -> dict[str, int]:
+    """Remove completed per-run directories, keeping the newest *keep_minimum*.
+
+    A run is eligible for removal when its ``run-state.json`` contains a
+    finished receipt, or when the directory is empty (failed startup).
+    Active runs (full state with no ``"finished"`` key) and directories with
+    unparseable state are kept.
+
+    Returns ``{"removed": N, "kept": M, "bytes_freed": B, "errors": E}``.
+    """
+    if not run_root.is_dir():
+        raise ExecutionRunnerError("execution run root is not a directory")
+
+    removed = 0
+    kept = 0
+    bytes_freed = 0
+    errors = 0
+    completed_runs: list[tuple[float, Path]] = []  # (mtime, path)
+
+    for entry in run_root.iterdir():
+        if not entry.is_dir() or not entry.name.startswith("run-"):
+            continue
+        suffix = entry.name[len("run-"):]
+        if not _RUN_ID_RE.fullmatch(suffix):
+            continue
+
+        state_path = entry / "run-state.json"
+        if not state_path.exists():
+            # Empty directory — failed startup, safe to remove
+            completed_runs.append((entry.stat().st_mtime, entry))
+            continue
+
+        try:
+            data = json.loads(state_path.read_bytes())
+            if data.get("schema") == "foxhound.execution-run-receipt" and data.get(
+                "finished"
+            ):
+                completed_runs.append((entry.stat().st_mtime, entry))
+            else:
+                # Active run — keep it
+                kept += 1
+        except (OSError, json.JSONDecodeError, KeyError):
+            # Corrupted state — keep it for inspection
+            kept += 1
+
+    # Sort by mtime descending, keep newest keep_minimum
+    completed_runs.sort(key=lambda x: x[0], reverse=True)
+    to_remove = completed_runs[keep_minimum:]
+
+    for _, run_dir in to_remove:
+        try:
+            dir_size = sum(
+                f.stat().st_size for f in run_dir.rglob("*") if f.is_file()
+            )
+            if dry_run:
+                bytes_freed += dir_size
+                removed += 1
+            else:
+                shutil.rmtree(run_dir)
+                removed += 1
+                bytes_freed += dir_size
+        except OSError:
+            errors += 1
+
+    return {
+        "removed": removed,
+        "kept": kept + len(completed_runs[:keep_minimum]),
+        "bytes_freed": bytes_freed,
+        "errors": errors,
+    }
+
+
 def _terminal_result(
     initial: ExecutionWorkflow,
     current: ExecutionWorkflow | None,
@@ -1522,6 +1599,23 @@ def _parser() -> argparse.ArgumentParser:
             "default."
         ),
     )
+    parser.add_argument(
+        "--cleanup",
+        action="store_true",
+        help=(
+            "remove completed per-run directories, keeping the most recent "
+            "ones (use with --cleanup-keep to adjust the minimum)"
+        ),
+    )
+    parser.add_argument(
+        "--cleanup-keep",
+        type=int,
+        default=10,
+        help=(
+            "minimum number of completed runs to retain during cleanup "
+            "(default: 10)"
+        ),
+    )
     return parser
 
 
@@ -1571,7 +1665,39 @@ def _deployment_roots(values: Sequence[str] | None) -> dict[str, Path]:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    raw_args: list[str] = list(argv) if argv is not None else sys.argv[1:]
+    is_cleanup = "--cleanup" in raw_args
+    parser = _parser()
+    if is_cleanup:
+        # When --cleanup is used, the database/gw arguments are not needed.
+        # Make them optional so argparse does not reject the call.
+        for action in parser._actions:
+            if action.dest in (
+                "database",
+                "gw_endpoint",
+                "gw_alias",
+                "gw_token_file",
+            ):
+                action.required = False
+    args = parser.parse_args(raw_args)
+    # Standalone cleanup mode: does not claim, does not need a database.
+    if args.cleanup:
+        try:
+            _private_run_root(args.run_root)
+            result = cleanup_runs(
+                args.run_root,
+                keep_minimum=args.cleanup_keep,
+                dry_run=False,
+            )
+            print(json.dumps(result))
+            return 0
+        except (ExecutionRunnerError, TypeError) as exc:
+            print(
+                "foxhound execution runner: cleanup failed: "
+                + _diagnosis(exc),
+                file=sys.stderr,
+            )
+            return 70
     try:
         config = ExecutionRunnerConfig(
             database_path=args.database,

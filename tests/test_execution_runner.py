@@ -6,6 +6,7 @@ from __future__ import annotations
 from foxhound import migrate_database
 
 import json
+import os
 import sqlite3
 import stat
 import subprocess
@@ -35,6 +36,7 @@ from foxhound.execution_runner import (
     _transcript_session_id,
     agent_prompt,
     agent_selection_argv,
+    cleanup_runs,
     hermes_argv,
     main,
     profile_argv,
@@ -1571,6 +1573,140 @@ class TranscriptSessionIdentityTests(unittest.TestCase):
         self.assertIsNone(
             self._identity(b"  hermes --resume synthetic-summary\n")
         )
+
+
+class CleanupRunsTests(unittest.TestCase):
+    """Tests for the per-run directory cleanup function."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.root.chmod(0o700)
+
+    def _completed_run(self, index: int) -> Path:
+        """Create one completed run directory with a finished receipt."""
+        run_dir = self.root / f"run-{index:032x}"
+        run_dir.mkdir(mode=0o700)
+        state = {
+            "schema": "foxhound.execution-run-receipt",
+            "schema_version": 1,
+            "run_id": f"{index:032x}",
+            "task_id": 1,
+            "finished": True,
+        }
+        (run_dir / "run-state.json").write_text(json.dumps(state) + "\n")
+        os.utime(run_dir, (1000 + index, 1000 + index))
+        return run_dir
+
+    def _active_run(self, index: int) -> Path:
+        """Create one active run directory with full state (not finished)."""
+        run_dir = self.root / f"run-{index:032x}"
+        run_dir.mkdir(mode=0o700)
+        state = {
+            "schema": "foxhound.execution-run-state",
+            "schema_version": 1,
+            "run_id": f"{index:032x}",
+            "task_id": 1,
+            "claim_token": "abc",
+        }
+        (run_dir / "run-state.json").write_text(json.dumps(state) + "\n")
+        return run_dir
+
+    def test_cleanup_runs_empty(self):
+        result = cleanup_runs(self.root)
+        self.assertEqual(result["removed"], 0)
+        self.assertEqual(result["kept"], 0)
+        self.assertEqual(result["bytes_freed"], 0)
+        self.assertEqual(result["errors"], 0)
+
+    def test_cleanup_runs_all_completed(self):
+        for i in range(15):
+            self._completed_run(i)
+        result = cleanup_runs(self.root, keep_minimum=5)
+        self.assertEqual(result["removed"], 10)
+        self.assertEqual(result["kept"], 5)
+        remaining = [d for d in self.root.iterdir() if d.is_dir()]
+        self.assertEqual(len(remaining), 5)
+
+    def test_cleanup_runs_mixed(self):
+        # 3 active, 5 completed
+        for i in range(3):
+            self._active_run(i)
+        for i in range(3, 8):
+            self._completed_run(i)
+        result = cleanup_runs(self.root, keep_minimum=2)
+        self.assertEqual(result["removed"], 3)
+        self.assertEqual(result["kept"], 5)  # 3 active + 2 kept completed
+        remaining = [d for d in self.root.iterdir() if d.is_dir()]
+        self.assertEqual(len(remaining), 5)
+
+    def test_cleanup_runs_preserves_active(self):
+        self._active_run(0)
+        self._completed_run(1)
+        result = cleanup_runs(self.root, keep_minimum=0)
+        self.assertEqual(result["removed"], 1)
+        self.assertEqual(result["kept"], 1)
+        remaining = [d for d in self.root.iterdir() if d.is_dir()]
+        self.assertEqual(len(remaining), 1)
+        self.assertTrue(remaining[0].name.startswith("run-0"))
+
+    def test_cleanup_runs_empty_dirs(self):
+        """Empty directories from failed startups are cleaned up."""
+        for i in range(5):
+            run_dir = self.root / f"run-{i:032x}"
+            run_dir.mkdir(mode=0o700)
+            os.utime(run_dir, (1000 + i, 1000 + i))
+        result = cleanup_runs(self.root, keep_minimum=2)
+        self.assertEqual(result["removed"], 3)
+        self.assertEqual(result["kept"], 2)
+
+    def test_cleanup_runs_corrupted_state(self):
+        """Corrupted state files are kept, not deleted."""
+        run_dir = self.root / f"run-{0:032x}"
+        run_dir.mkdir(mode=0o700)
+        (run_dir / "run-state.json").write_text("not valid json")
+        result = cleanup_runs(self.root, keep_minimum=0)
+        self.assertEqual(result["removed"], 0)
+        self.assertEqual(result["kept"], 1)
+
+    def test_cleanup_runs_keep_minimum(self):
+        """Exactly keep_minimum newest completed runs are retained."""
+        for i in range(10):
+            self._completed_run(i)
+        result = cleanup_runs(self.root, keep_minimum=3)
+        self.assertEqual(result["removed"], 7)
+        self.assertEqual(result["kept"], 3)
+        remaining = sorted(
+            [d for d in self.root.iterdir() if d.is_dir()],
+            key=lambda d: d.name,
+        )
+        # Newest 3 (indices 7, 8, 9) should remain
+        self.assertEqual(len(remaining), 3)
+
+    def test_cleanup_runs_invalid_root(self):
+        try:
+            cleanup_runs(self.root / "does_not_exist")
+            self.fail("Should have raised")
+        except ExecutionRunnerError:
+            pass
+
+    def test_cleanup_runs_skips_invalid_names(self):
+        (self.root / "not-a-run").mkdir()
+        (self.root / "run-invalid").mkdir()
+        (self.root / "run-xyz").mkdir()
+        result = cleanup_runs(self.root)
+        self.assertEqual(result["removed"], 0)
+        self.assertEqual(result["kept"], 0)
+
+    def test_cleanup_runs_dry_run(self):
+        for i in range(5):
+            self._completed_run(i)
+        result = cleanup_runs(self.root, keep_minimum=2, dry_run=True)
+        self.assertEqual(result["removed"], 3)
+        # Dry run: nothing actually removed
+        remaining = [d for d in self.root.iterdir() if d.is_dir()]
+        self.assertEqual(len(remaining), 5)
 
 
 if __name__ == "__main__":
