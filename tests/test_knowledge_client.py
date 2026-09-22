@@ -122,6 +122,37 @@ def source_snapshot_response(request: dict) -> dict:
     }
 
 
+def working_groups_response(request: dict) -> dict:
+    matched = {
+        "cluster_id": 0,
+        "name": "Person A, Person B · Composite, Testing",
+        "dominant_people": ["Person A", "Person B"],
+        "keywords": ["composite", "testing"],
+        "member_count": 2,
+        "members": ["Person A", "Person B"],
+        "recent_artifacts": [],
+    } if (request.get("query") or request.get("person_name")) else None
+    return {
+        "schema": "gw.working-groups",
+        "schema_version": 1,
+        "ok": True,
+        "alias": request.get("alias", "primary"),
+        "total_groups": 1,
+        "working_groups": [
+            {
+                "cluster_id": 0,
+                "name": "Person A, Person B · Composite, Testing",
+                "dominant_people": ["Person A", "Person B"],
+                "keywords": ["composite", "testing"],
+                "member_count": 2,
+                "members": ["Person A", "Person B"],
+                "recent_artifacts": [],
+            }
+        ],
+        "matched_group": matched,
+    }
+
+
 @contextmanager
 def server(
     *,
@@ -159,6 +190,8 @@ def server(
                 response = owner_meeting_response(request)
             elif self.path == "/v1/source-snapshot":
                 response = source_snapshot_response(request)
+            elif self.path == "/v1/working-groups":
+                response = working_groups_response(request)
             else:
                 response = search_response(request)
             if transform is not None:
@@ -583,10 +616,12 @@ class KnowledgeClientTests(unittest.TestCase):
                     {
                         "execution_context", "owner_upcoming_meeting",
                         "refresh_source", "resolve_task_owner", "search",
+                        "working_groups",
                     },
                 )
                 instance.search("synthetic query")
                 instance.execution_context()
+                instance.working_groups(query="synthetic")
                 instance.owner_upcoming_meeting(
                     owner="Person B",
                     owner_ref={

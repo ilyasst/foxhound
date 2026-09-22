@@ -302,6 +302,23 @@ class ExecutionWorker:
         ):
             raise ExecutionWorkerClaimError("execution claim is unavailable")
         origin = TaskLedger(state.database_path).origin(state.task_id)
+
+        working_group_context = None
+        try:
+            wg_doc = GwKnowledgeClient(self._knowledge_config).working_groups(
+                query=task.text,
+                person_name=task.owner,
+            )
+            matched = wg_doc.get("matched_group")
+            if matched:
+                working_group_context = {
+                    "name": matched.get("name"),
+                    "dominant_people": matched.get("dominant_people", []),
+                    "keywords": matched.get("keywords", []),
+                }
+        except Exception:
+            working_group_context = None
+
         return {
             "schema": WORK_CONTEXT_SCHEMA,
             "schema_version": WORK_CONTEXT_SCHEMA_VERSION,
@@ -346,6 +363,7 @@ class ExecutionWorker:
                 "text": task.text,
                 "owner": task.owner,
                 "due": task.due,
+                "working_group": working_group_context,
                 # The agent is told to take its repository and issue identity
                 # from here and to infer nothing from the task text. Leaving
                 # it out did not make the agent careful, it made it blind: it
