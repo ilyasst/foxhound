@@ -58,6 +58,7 @@ TASK_CARD_ACTIONS = frozenset({
     "snooze",
     "duplicate_confirm",
     "duplicate_reject",
+    "show_full_cards",
 })
 
 #: Wire tokens for the controls that read a card instead of answering it.
@@ -374,6 +375,21 @@ class CardPresentation:
         return self.disposition is not CardDisposition.REFUSED
 
 
+@dataclass(frozen=True)
+class FullCardsResult:
+    """The two standard full cards delivered for a duplicate pair."""
+
+    disposition: CardDisposition
+    card_id: int
+    card_version: int | None = None
+    cards: tuple[TaskReviewCard, ...] = ()
+    refusal: CardRefusal | None = None
+
+    @property
+    def accepted(self) -> bool:
+        return self.disposition is not CardDisposition.REFUSED
+
+
 class TaskCardService:
     """Durable scheduling and actions for Foxhound task review cards."""
 
@@ -530,6 +546,143 @@ class TaskCardService:
             card=card,
             expanded=expanded,
         )
+
+    def show_full_cards(
+        self, card_id: int, *, expected_version: int
+    ) -> FullCardsResult:
+        """Deliver the standard full cards for both members of a duplicate pair."""
+        if not _valid_identity(card_id, expected_version):
+            return FullCardsResult(
+                CardDisposition.REFUSED,
+                card_id if isinstance(card_id, int) and not isinstance(card_id, bool) else 0,
+                refusal=CardRefusal.INVALID_ARGUMENT,
+            )
+        now_dt = self._clock_value()
+        now = now_dt.isoformat(timespec="seconds")
+        with closing(self._connect()) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    self._card_select() + " WHERE c.id=?", (card_id,)
+                ).fetchone()
+                refusal = _card_guard(row, expected_version)
+                if refusal is not None:
+                    connection.rollback()
+                    return FullCardsResult(
+                        CardDisposition.REFUSED, card_id,
+                        card_version=None if row is None else int(row["version"]),
+                        refusal=refusal,
+                    )
+                if row["status"] != CardStatus.DELIVERED:
+                    connection.rollback()
+                    return FullCardsResult(
+                        CardDisposition.REFUSED, card_id,
+                        card_version=int(row["version"]),
+                        refusal=CardRefusal.INVALID_STATE,
+                    )
+                if not _card_is_current(connection, row):
+                    connection.rollback()
+                    return FullCardsResult(
+                        CardDisposition.REFUSED, card_id,
+                        card_version=int(row["version"]),
+                        refusal=CardRefusal.STALE_VERSION,
+                    )
+                card = _card(row)
+                if card.duplicate is None:
+                    connection.rollback()
+                    return FullCardsResult(
+                        CardDisposition.REFUSED, card_id,
+                        card_version=int(row["version"]),
+                        refusal=CardRefusal.INVALID_STATE,
+                    )
+
+                task_id_a = card.task_id
+                task_id_b = card.duplicate.other_task_id
+
+                # Both tasks must be retrievable
+                task_a = connection.execute(
+                    "SELECT id, status, version FROM tasks WHERE id=?",
+                    (task_id_a,),
+                ).fetchone()
+                task_b = connection.execute(
+                    "SELECT id, status, version FROM tasks WHERE id=?",
+                    (task_id_b,),
+                ).fetchone()
+                if task_a is None or task_b is None:
+                    connection.rollback()
+                    return FullCardsResult(
+                        CardDisposition.REFUSED, card_id,
+                        card_version=int(row["version"]),
+                        refusal=CardRefusal.NOT_FOUND,
+                    )
+
+                # Cancel the comparison card
+                next_version = expected_version + 1
+                connection.execute(
+                    "UPDATE task_review_cards SET status='cancelled',version=?,"
+                    "claim_token_digest=NULL,claim_expires_at=NULL,consumer_digest=NULL,"
+                    "resolved_at=?,updated_at=? WHERE id=? AND version=?",
+                    (next_version, now, now, card_id, expected_version),
+                )
+                self._event(
+                    connection, card_id=card_id, task_id=task_id_a,
+                    kind="cancelled", card_version=next_version,
+                    task_version=int(row["task_version"]), now=now,
+                )
+
+                # Deliver standard cards for both tasks
+                delivered_cards: list[TaskReviewCard] = []
+                for task in (task_a, task_b):
+                    tid = int(task["id"])
+                    tver = int(task["version"])
+                    rev = connection.execute(
+                        "SELECT b.source_revision FROM task_candidate_bindings AS b "
+                        "WHERE b.task_id=? AND b.relation='accepted'",
+                        (tid,),
+                    ).fetchone()
+                    source_rev = rev[0] if rev else None
+
+                    transport = row["transport"] or "synthetic"
+                    delivery_ref = f"{row['delivery_ref'] or 'card'}-t{tid}"
+                    consumer = row["consumer_digest"]
+
+                    cursor = connection.execute(
+                        "INSERT INTO task_review_cards("
+                        "task_id,task_version,source_revision,status,version,"
+                        "due_at,transport,delivery_ref,delivered_at,consumer_digest,"
+                        "created_at,updated_at) VALUES(?,?,?,'delivered',1,?,?,?,?,?,?,?)",
+                        (
+                            tid, tver, source_rev, now, transport,
+                            delivery_ref, now, consumer, now, now,
+                        ),
+                    )
+                    new_card_id = int(cursor.lastrowid)
+                    self._event(
+                        connection, card_id=new_card_id, task_id=tid,
+                        kind="scheduled", card_version=1,
+                        task_version=tver, now=now,
+                    )
+                    self._event(
+                        connection, card_id=new_card_id, task_id=tid,
+                        kind="delivered", card_version=1,
+                        task_version=tver, now=now,
+                    )
+                    new_row = connection.execute(
+                        self._card_select() + " WHERE c.id=?",
+                        (new_card_id,),
+                    ).fetchone()
+                    delivered_cards.append(_card(new_row))
+
+                connection.commit()
+                return FullCardsResult(
+                    CardDisposition.APPLIED, card_id=card_id,
+                    card_version=next_version,
+                    cards=tuple(delivered_cards),
+                )
+            except Exception:
+                connection.rollback()
+                raise
 
     def due(self, *, limit: int = 20) -> tuple[TaskReviewCard, ...]:
         if not _valid_limit(limit):
@@ -1099,6 +1252,25 @@ class TaskCardService:
                         return _refused_row(card_id, row, CardRefusal.STALE_VERSION)
                     connection.commit()
                     return result
+
+                if action == "show_full_cards":
+                    connection.rollback()
+                    full_res = self.show_full_cards(
+                        card_id, expected_version=expected_version
+                    )
+                    if not full_res.accepted:
+                        return _refused_row(
+                            card_id, row,
+                            full_res.refusal or CardRefusal.INVALID_STATE,
+                        )
+                    return CardOperationResult(
+                        CardDisposition.APPLIED,
+                        card_id=card_id,
+                        version=expected_version + 1,
+                        status=CardStatus.CANCELLED,
+                        task_version=int(row["task_version"]),
+                        task_status=TaskStatus.OPEN,
+                    )
 
                 task_version = int(row["task_version"])
                 task_status = TaskStatus.OPEN
@@ -1788,7 +1960,7 @@ class TaskCardService:
     def _card_select() -> str:
         return (
             "SELECT c.id,c.task_id,c.task_version,c.status,c.version,c.due_at,"
-            "c.source_revision,"
+            "c.source_revision,c.transport,c.delivery_ref,c.consumer_digest,"
             "COALESCE((SELECT job.title FROM task_fused_title_jobs AS job "
             "WHERE job.task_id=c.task_id AND job.state='ready'),t.text) AS text,"
             "t.owner,t.owner_kind,t.due,t.confidence,t.created_at AS task_created,"
@@ -1941,7 +2113,7 @@ def render_task_review_card(card: TaskReviewCard) -> tuple[str, dict]:
     ('pending','delivering','delivered','snoozed') AND duplicate/completion
     are both absent` -- this branch and its buttons can go.
     """
-    if card.status is not CardStatus.DELIVERING:
+    if card.status not in (CardStatus.DELIVERING, CardStatus.DELIVERED):
         raise ValueError("task review card is not claimed for delivery")
     text = html.escape(card.text, quote=False)
     if card.duplicate is not None:
@@ -2162,22 +2334,27 @@ def _render_duplicate_check(
             raise ValueError("task review callback exceeds transport limit")
         return value
 
-    keyboard = {"inline_keyboard": [[
-        {
-            "text": "✅ Already completed" if recent_closed else "✅ Same task",
-            "callback_data": callback("duplicate_confirm"),
-        },
-        {"text": "↔️ Keep separate", "callback_data": callback("duplicate_reject")},
-        # A read, never an answer. It rides the same card id and version as
-        # the two answers beside it, so opening the comparison and then
-        # answering it is one decision on one card rather than two.
-        {
-            "text": "↩️ Less" if expanded else "🔍 Show both in full",
-            "callback_data": callback(
-                DUPLICATE_COLLAPSE if expanded else DUPLICATE_EXPAND
-            ),
-        },
-    ]]}
+    keyboard = {"inline_keyboard": [
+        [
+            {
+                "text": "✅ Already completed" if recent_closed else "✅ Same task",
+                "callback_data": callback("duplicate_confirm"),
+            },
+            {"text": "↔️ Keep separate", "callback_data": callback("duplicate_reject")},
+            {
+                "text": "↩️ Less" if expanded else "🔍 Show both in full",
+                "callback_data": callback(
+                    DUPLICATE_COLLAPSE if expanded else DUPLICATE_EXPAND
+                ),
+            },
+        ],
+        [
+            {
+                "text": "📋 Show full cards",
+                "callback_data": callback("show_full_cards"),
+            },
+        ],
+    ]}
     return "\n".join(lines), keyboard
 
 
