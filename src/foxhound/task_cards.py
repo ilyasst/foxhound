@@ -114,6 +114,16 @@ def _execution_holds(task_id: str) -> str:
 
 _EXECUTION_HOLDS = _execution_holds("t.id")
 
+
+def _preserved_open_withdrawal(task_id: str) -> str:
+    """SQL predicate: the task outlived an accepted withdrawn candidate."""
+    return (
+        "EXISTS(SELECT 1 FROM task_candidate_bindings AS b JOIN "
+        " task_candidate_lifecycle AS l ON l.candidate_id=b.candidate_id "
+        f" WHERE b.task_id={task_id} AND b.relation='accepted' "
+        " AND l.state='withdrawn' AND l.resolution='preserved_open')"
+    )
+
 #: A workflow that exists but is not in flight. A snooze defers work with no
 #: deadline, so treating it as a hold kept a duplicate question unaskable for
 #: as long as the snooze lasted -- while it still counted as unsettled, which
@@ -1549,12 +1559,7 @@ class TaskCardService:
             # workflow underneath it. While execution holds the task, that
             # question is not this surface's to ask.
             "AND NOT " + _EXECUTION_HOLDS + " "
-            "AND NOT EXISTS("
-            " SELECT 1 FROM task_candidate_bindings AS b JOIN "
-            " task_candidate_lifecycle AS l ON l.candidate_id=b.candidate_id "
-            " WHERE b.task_id=t.id AND b.relation='accepted' "
-            " AND l.state='withdrawn' AND l.resolution='preserved_open'"
-            ") "
+            "AND NOT " + _preserved_open_withdrawal("t.id") + " "
             "ORDER BY e.id LIMIT ?",
             (limit,),
         ).fetchall()
@@ -1642,17 +1647,23 @@ class TaskCardService:
             "(SELECT count(1) FROM task_relations WHERE subject_id=right_task_id "
             "AND kind='duplicate_of' AND withdrawn_at IS NULL)>0"
         )
+        carded_task = (
+            f"CASE WHEN {open_left} THEN left_task_id ELSE right_task_id END"
+        )
         updated = connection.execute(
             "UPDATE task_duplicate_proposals SET state='superseded',"
             "settled_at=?,updated_at=? "
             "WHERE state='proposed' AND card_id IS NULL "
             # Either the comparison has moved, or there is no open task left
-            # to consolidate into, or an active duplicate_of relation makes
-            # delivery permanently impossible.
+            # to consolidate into, an active duplicate_of relation makes
+            # delivery permanently impossible, or the chosen open task was
+            # deliberately preserved after its accepted source disappeared.
             f"AND (left_task_version<>{current_left} "
             f"OR right_task_version<>{current_right} "
             f"OR (NOT {open_left} AND NOT {open_right}) "
-            f"OR {relation_left} OR {relation_right})",
+            f"OR {relation_left} OR {relation_right} OR "
+            + _preserved_open_withdrawal(carded_task)
+            + ")",
             (now, now),
         )
         return int(updated.rowcount)
@@ -1697,6 +1708,13 @@ class TaskCardService:
             # the reader was sent every one of them.
             "AND NOT " + _duplicate_execution_holds("left_task.id") + " "
             "AND NOT " + _duplicate_execution_holds("right_task.id") + " "
+            # `_cancel_stale` retracts every card for a task preserved after
+            # its accepted source was withdrawn. Selecting that task again
+            # would release and re-bind the proposal on every scheduler pass.
+            "AND NOT " + _preserved_open_withdrawal(
+                "CASE WHEN left_task.status='open' THEN left_task.id "
+                "ELSE right_task.id END"
+            ) + " "
             "AND left_task.version=d.left_task_version "
             "AND right_task.version=d.right_task_version "
             "AND ((left_task.status='open' AND right_task.status "
@@ -1904,12 +1922,9 @@ class TaskCardService:
             + _bound_source_revision("t.id") + ",'') OR EXISTS("
             " SELECT 1 FROM task_relations AS relation "
             " WHERE relation.subject_id=t.id AND relation.kind='duplicate_of' "
-            " AND relation.withdrawn_at IS NULL) OR EXISTS("
-            " SELECT 1 FROM task_candidate_bindings AS b JOIN "
-            " task_candidate_lifecycle AS l ON l.candidate_id=b.candidate_id "
-            " WHERE b.task_id=t.id AND b.relation='accepted' "
-            " AND l.state='withdrawn' AND l.resolution='preserved_open'"
-            ")) ORDER BY c.id"
+            " AND relation.withdrawn_at IS NULL) OR "
+            + _preserved_open_withdrawal("t.id")
+            + ") ORDER BY c.id"
         ).fetchall()
         for row in rows:
             next_version = int(row["version"]) + 1
