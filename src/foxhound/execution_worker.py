@@ -555,9 +555,11 @@ class ExecutionWorker:
             raise ExecutionWorkerClaimError(
                 "this task is not about a pull request awaiting review"
             )
-        body = _read_private_text(
-            self._state_path.parent / body_file,
-            maximum=60_000, label="review body")
+        search_dirs = _body_search_path(state, self._state_path.parent)
+        target_path = _locate_body_file(search_dirs, body_file)
+        body = _read_body_text(
+            target_path, maximum=60_000, label="review body",
+        )
         try:
             receipt = forge_action.post_review(
                 repository=repository or origin.record_id,
@@ -593,9 +595,10 @@ class ExecutionWorker:
         if not to or "@" not in to:
             raise ExecutionWorkerClaimError("recipient address is invalid")
 
-        body = _read_private_text(
-            self._state_path.parent / body_file,
-            maximum=60_000, label="message body",
+        search_dirs = _body_search_path(state, self._state_path.parent)
+        target_path = _locate_body_file(search_dirs, body_file)
+        body = _read_body_text(
+            target_path, maximum=60_000, label="message body",
         )
 
         cmd = ["outlook", "send", "--to", to, "--subject", subject]
@@ -657,9 +660,11 @@ class ExecutionWorker:
             raise ExecutionWorkerClaimError(
                 "this task has no origin, so it names no repository to file on"
             )
-        body = _read_private_text(
-            self._state_path.parent / body_file,
-            maximum=60_000, label="issue body")
+        search_dirs = _body_search_path(state, self._state_path.parent)
+        target_path = _locate_body_file(search_dirs, body_file)
+        body = _read_body_text(
+            target_path, maximum=60_000, label="issue body",
+        )
         try:
             receipt = forge_action.open_issue(
                 repository=repository or origin.record_id,
@@ -699,9 +704,11 @@ class ExecutionWorker:
             raise ExecutionWorkerClaimError(
                 "this task is not about an issue that can receive a comment"
             )
-        body = _read_private_text(
-            self._state_path.parent / body_file,
-            maximum=60_000, label="issue comment body")
+        search_dirs = _body_search_path(state, self._state_path.parent)
+        target_path = _locate_body_file(search_dirs, body_file)
+        body = _read_body_text(
+            target_path, maximum=60_000, label="issue comment body",
+        )
         try:
             receipt = forge_action.post_issue_comment(
                 repository=origin.record_id, number=origin.item_id,
@@ -741,9 +748,12 @@ class ExecutionWorker:
             )
         body = ""
         if body_file:
-            body = _read_private_text(
-                self._state_path.parent / body_file,
-                maximum=60_000, label="pull request body")
+            search_dirs = _body_search_path(state, self._state_path.parent)
+            target_path = _locate_body_file(search_dirs, body_file)
+            body = _read_body_text(
+                target_path, maximum=60_000, label="pull request body",
+                require_non_empty=False,
+            )
         target = repository or origin.record_id
         worktree = (self._state_path.parent
                     / f"repo-{target.rsplit('/', 1)[-1]}-{origin.item_id}")
@@ -1651,6 +1661,77 @@ def _read_result_text(path: Path, *, label: str) -> str:
     return value
 
 
+def _body_search_path(
+    state: ExecutionRunState, run_directory: Path
+) -> tuple[Path, ...]:
+    """Where an authored action body file may legitimately live.
+
+    Checked in order: the private run directory, the synchronised task run
+    directory, the synchronised task work directory, and the process working
+    directory if distinct.
+    """
+    directories: list[Path] = [run_directory]
+    for attr in ("task_run_directory", "task_work_directory"):
+        value = getattr(state, attr, None)
+        if value:
+            candidate = Path(value)
+            if candidate.is_absolute() and candidate not in directories:
+                directories.append(candidate)
+    try:
+        cwd = Path.cwd().resolve()
+        if cwd.is_absolute() and cwd not in directories:
+            directories.append(cwd)
+    except OSError:
+        pass
+    return tuple(directories)
+
+
+def _locate_body_file(
+    directories: tuple[Path, ...],
+    name: str,
+) -> Path:
+    """The first directory holding the body file, or the primary expected path."""
+    if not isinstance(name, str) or not name.strip():
+        raise ExecutionWorkerDraftError("action body file path is required")
+    supplied = Path(name)
+    if supplied.is_absolute():
+        try:
+            return supplied.resolve(strict=True)
+        except OSError:
+            return supplied
+    for directory in directories:
+        candidate = directory / supplied
+        try:
+            if candidate.is_file():
+                return candidate.resolve(strict=True)
+        except OSError:
+            continue
+    fallback = directories[0] / supplied
+    try:
+        return fallback.resolve()
+    except OSError:
+        return fallback
+
+
+def _read_body_text(
+    path: Path,
+    *,
+    maximum: int = 60_000,
+    label: str,
+    require_non_empty: bool = True,
+) -> str:
+    """Read one authored action body file, reporting precise failure reasons."""
+    try:
+        value = _read_private_text(path, maximum=maximum, label=label)
+    except ExecutionWorkerConfigError as exc:
+        raise ExecutionWorkerDraftError(
+            f"{label}: {_result_read_failure(path, exc)}"
+        ) from exc
+    if require_non_empty and not value.strip():
+        raise ExecutionWorkerDraftError(f"{label} is empty")
+    return value
+
+
 def _read_optional_string_array(
     path: Path, *, label: str
 ) -> list[object]:
@@ -2323,12 +2404,12 @@ def _parser() -> argparse.ArgumentParser:
         "--repository", help="canonical locator; defaults to the task origin")
     pull_request.add_argument(
         "--body-file",
-        help="file beside the run state holding the pull request body")
+        help="file holding the pull request body")
     review = act_kinds.add_parser(
         "review", help="post a review on the pull request this task is about")
     review.add_argument(
         "--body-file", required=True,
-        help="file beside the run state holding the review")
+        help="file holding the review")
     review.add_argument(
         "--repository", help="canonical locator; defaults to the task origin")
     issue = act_kinds.add_parser(
@@ -2336,21 +2417,21 @@ def _parser() -> argparse.ArgumentParser:
     issue.add_argument("--title", required=True)
     issue.add_argument(
         "--body-file", required=True,
-        help="file beside the run state holding the issue body")
+        help="file holding the issue body")
     issue.add_argument(
         "--repository", help="canonical locator; defaults to the task origin")
     comment = act_kinds.add_parser(
         "comment", help="post an approved status update on the origin issue")
     comment.add_argument(
         "--body-file", required=True,
-        help="file beside the run state holding the status update")
+        help="file holding the status update")
     mail = act_kinds.add_parser(
         "mail", help="send an approved outbound message")
     mail.add_argument("--to", required=True, help="validated recipient address")
     mail.add_argument("--subject", required=True)
     mail.add_argument(
         "--body-file", required=True,
-        help="file beside the run state holding the message text")
+        help="file holding the message text")
     mail.add_argument(
         "--attachments",
         help="comma-separated paths to validated result artifacts")
