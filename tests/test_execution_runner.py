@@ -1356,6 +1356,35 @@ class ExecutionRunnerTests(unittest.TestCase):
         run.assert_not_called()
         self.assertIn("refusing to claim", errors.getvalue())
 
+    def test_cli_refuses_to_claim_when_the_package_is_outside_the_release(self):
+        # An editable install replaces the release's package while every path
+        # and symlink still reads correctly. The worker check cannot catch
+        # this class because both sides import the same drifted package.
+        # This check catches it by resolving where the package lives on disk.
+        from foxhound.worker_resolution import PackageOutsideRelease
+        output = StringIO()
+        errors = StringIO()
+        arguments = [
+            "--database", str(self.database),
+            "--run-root", str(self.run_root),
+            "--gw-endpoint", "http://127.0.0.1:8787",
+            "--gw-alias", "primary",
+            "--gw-token-file", str(self.token_file),
+        ]
+        with redirect_stdout(output), redirect_stderr(errors), mock.patch(
+            "foxhound.execution_runner.verify_worker",
+        ), mock.patch(
+            "foxhound.execution_runner.verify_release_integrity",
+            side_effect=PackageOutsideRelease(
+                "running package is not inside the selected release"
+            ),
+        ), mock.patch("foxhound.execution_runner.run_once") as run:
+            code = main(arguments)
+        self.assertEqual(code, 78)
+        run.assert_not_called()
+        self.assertIn("refusing to claim", errors.getvalue())
+        self.assertIn("running package", errors.getvalue())
+
     def test_cli_passes_an_explicit_phase_allowlist(self):
         output = StringIO()
         profiles = self.root / "profiles"

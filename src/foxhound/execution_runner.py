@@ -73,9 +73,11 @@ from .source_policy import action_grants as _action_grants
 from .source_policy import execution_grants as _execution_grants
 from .source_policy import planning_grants as _planning_grants
 from .worker_resolution import (
+    PackageOutsideRelease,
     WorkerMismatch,
     is_worker_command,
     resolve_worker_command,
+    verify_release_integrity,
     verify_worker,
 )
 
@@ -1739,7 +1741,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             _worker_command(config),
             run_state_schema_version=RUN_STATE_SCHEMA_VERSION,
         )
+        # An editable install pointed at a development checkout replaces the
+        # release's own package while paths and symlinks still read correctly.
+        # The worker check cannot catch this class: both sides import the same
+        # drifted package and agree.  This check resolves where the running
+        # package lives on disk and refuses when it sits outside the release.
+        verify_release_integrity()
         result = run_once(config)
+    except PackageOutsideRelease as exc:
+        print(
+            "foxhound execution runner: refusing to claim: " + str(exc),
+            file=sys.stderr,
+        )
+        return 78
     except WorkerMismatch as exc:
         print(
             "foxhound execution runner: refusing to claim: " + str(exc),
