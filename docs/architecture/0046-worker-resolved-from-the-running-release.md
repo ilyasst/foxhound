@@ -6,9 +6,9 @@ Accepted.
 
 ## Context
 
-[ADR 0043](0043-pinned-release-checkout.md) says deployed units import a
-release checkout and never a development tree. That holds for the execution
-runner. It did not hold for the worker.
+[ADR 0043](0043-pinned-release-checkout.md) says deployed units run from an
+immutable release directory and never a development tree. That holds for the
+execution runner. It did not hold for the worker.
 
 The runner does not spawn the worker. It spawns an agent, hands it a prompt
 naming `foxhound-task-worker`, and the agent runs that name in its own shell.
