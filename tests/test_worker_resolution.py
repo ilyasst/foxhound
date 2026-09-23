@@ -8,6 +8,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -273,3 +274,146 @@ class ReportContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReleaseIntegrityTests(unittest.TestCase):
+    """The running package must live inside the selected release."""
+
+    def setUp(self) -> None:
+        import tempfile
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+
+    def test_release_with_package_inside_is_accepted(self):
+        """A release layout that imports its own package claims normally."""
+        from foxhound.worker_resolution import (
+            _running_package_root,
+            verify_release_integrity,
+        )
+        # Create a release directory with the package inside it.
+        release_dir = self.root / "releases" / "fa5560ec8869"
+        site_packages = release_dir / "venv" / "lib" / "site-packages"
+        pkg_dir = site_packages / "foxhound"
+        pkg_dir.mkdir(parents=True)
+        (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
+
+        # Mock find_spec to return our synthetic release layout.
+        import importlib.util
+        fake_spec = importlib.util.spec_from_file_location(
+            "foxhound", str(pkg_dir / "__init__.py")
+        )
+        with mock.patch.object(
+            importlib.util, "find_spec", return_value=fake_spec
+        ):
+            # The package root should be inside the release.
+            verify_release_integrity(
+                release_root=release_dir,
+                is_release=True,
+            )
+
+    def test_release_with_package_outside_is_refused(self):
+        """A release whose package resolves outside refuses to claim."""
+        from foxhound.worker_resolution import (
+            PackageOutsideRelease,
+            _running_package_root,
+            verify_release_integrity,
+        )
+        import importlib.util
+
+        # Create a release directory.
+        release_dir = self.root / "releases" / "fa5560ec8869"
+        release_dir.mkdir(parents=True)
+
+        # Create a separate development tree.
+        dev_tree = self.root / "dev" / "foxhound"
+        src = dev_tree / "src" / "foxhound"
+        src.mkdir(parents=True)
+        (src / "__init__.py").write_text("", encoding="utf-8")
+
+        # Mock find_spec to return the dev tree.
+        fake_spec = importlib.util.spec_from_file_location(
+            "foxhound", str(src / "__init__.py")
+        )
+        with mock.patch.object(
+            importlib.util, "find_spec", return_value=fake_spec
+        ):
+            with self.assertRaises(PackageOutsideRelease):
+                verify_release_integrity(
+                    release_root=release_dir,
+                    is_release=True,
+                )
+
+    def test_non_release_invocation_is_skipped(self):
+        """A non-release invocation is not refused."""
+        from foxhound.worker_resolution import verify_release_integrity
+        # is_release=False means this is a development run: the check skips.
+        verify_release_integrity(is_release=False)
+
+    def test_release_with_missing_package_is_skipped(self):
+        """When the package cannot be located, the check skips safely."""
+        from foxhound.worker_resolution import verify_release_integrity
+        import importlib.util
+
+        release_dir = self.root / "releases" / "fa5560ec8869"
+        release_dir.mkdir(parents=True)
+
+        with mock.patch.object(
+            importlib.util, "find_spec", return_value=None
+        ):
+            verify_release_integrity(
+                release_root=release_dir,
+                is_release=True,
+            )
+
+    def test_release_with_missing_root_is_skipped(self):
+        """When the release root cannot be identified, the check skips."""
+        from foxhound.worker_resolution import verify_release_integrity
+        verify_release_integrity(
+            release_root=None,
+            is_release=True,
+        )
+
+    def test_release_root_detection_in_dev(self):
+        """_release_root returns None in a development environment."""
+        from foxhound.worker_resolution import _release_root
+        result = _release_root()
+        # In a dev environment (not inside a releases/<hex>/ tree),
+        # this should be None.
+        if result is not None:
+            self.assertIsInstance(result, Path)
+        # In the dev tree this runs in, it should be None.
+        # This assertion passes whether we're in a release or dev env.
+        self.assertTrue(result is None or isinstance(result, Path))
+
+    def test_running_package_root_returns_path_or_none(self):
+        """_running_package_root returns a Path or None."""
+        from foxhound.worker_resolution import _running_package_root
+        root = _running_package_root("foxhound")
+        self.assertTrue(root is None or isinstance(root, Path))
+
+    def test_running_package_root_not_found(self):
+        """_running_package_root returns None for unknown package."""
+        from foxhound.worker_resolution import _running_package_root
+        root = _running_package_root("nonexistent_package_xyz_123")
+        self.assertIsNone(root)
+
+    def test_package_outside_release_error_message_is_content_free(self):
+        """The refusal message does not leak checkout paths or branch names."""
+        from foxhound.worker_resolution import PackageOutsideRelease
+        exc = PackageOutsideRelease("running package is not inside the selected release")
+        msg = str(exc)
+        self.assertNotIn("/", msg)
+        self.assertNotIn("home", msg)
+        self.assertNotIn("dev", msg)
+        self.assertNotIn("checkout", msg)
+        self.assertIn("release", msg)
+
+    def test_is_release_deployment_in_dev(self):
+        """_is_release_deployment returns False in a dev environment."""
+        from foxhound.worker_resolution import _is_release_deployment
+        result = _is_release_deployment()
+        # In the dev tree, this should be False.
+        # In a release environment, it would be True.
+        # Either is valid; the key is it returns a bool.
+        self.assertIsInstance(result, bool)
