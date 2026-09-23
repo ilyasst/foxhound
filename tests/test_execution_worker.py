@@ -2112,7 +2112,7 @@ class ExecutionWorkerTests(unittest.TestCase):
                     worker.act_mail(to="invalid", subject="S", body_file="b", attachments=None)
 
                 # Missing body
-                with self.assertRaisesRegex(ExecutionWorkerConfigError, "message body is unavailable"):
+                with self.assertRaisesRegex(ExecutionWorkerDraftError, "message body: not found at"):
                     worker.act_mail(to="user@example.com", subject="S", body_file="missing.md", attachments=None)
 
                 # Success path
@@ -2138,6 +2138,67 @@ class ExecutionWorkerTests(unittest.TestCase):
                 args = run_mock.call_args[0][0]
                 self.assertIn("--attachment", args)
                 self.assertIn(str(att_path.resolve()), args)
+
+    def test_act_comment_finds_body_file_in_task_work_directory(self):
+        with knowledge_server() as endpoint:
+            worker, active = self._effect_worker(
+                endpoint, task_id=1, kind="issue", item_id="42",
+            )
+            task_dir = Path(self.temporary.name) / "task-sync"
+            task_dir.mkdir(mode=0o700)
+            body_file = task_dir / "status_update.txt"
+            body_file.write_text("Work completed successfully.\n", encoding="utf-8")
+            body_file.chmod(0o600)
+            with active, mock.patch.object(worker, "_renew"), mock.patch.object(
+                execution_worker.GwKnowledgeClient, "refresh_source",
+                return_value=SimpleNamespace(status="current", usable=True),
+            ), mock.patch.object(
+                execution_worker.forge_action, "post_issue_comment",
+                return_value=SimpleNamespace(
+                    repository="github.com/example-org/example-repo",
+                    number=42,
+                    url="https://github.com/example-org/example-repo/issues/42",
+                ),
+            ) as post_comment:
+                state = replace(
+                    load_run_state(self.state_path),
+                    task_id=1,
+                    phase=WorkflowPhase.EXTERNAL_ACTION,
+                    task_work_directory=str(task_dir),
+                )
+                with mock.patch.object(worker, "_active", return_value=(state, SimpleNamespace())):
+                    result = worker.act_comment(body_file="status_update.txt")
+                self.assertEqual(result["kind"], "issue-comment")
+                post_comment.assert_called_once()
+                self.assertEqual(post_comment.call_args.kwargs["body"], "Work completed successfully.\n")
+
+    def test_act_comment_cli_missing_body_file_exits_with_code_65(self):
+        output = StringIO()
+        errors = StringIO()
+        token_file = self.run_directory / "token.txt"
+        token_file.write_text(TOKEN, encoding="utf-8")
+        token_file.chmod(0o600)
+        with knowledge_server() as endpoint:
+            state = replace(
+                load_run_state(self.state_path),
+                phase=WorkflowPhase.EXTERNAL_ACTION,
+            )
+            self._bind_fresh_origin(1, kind="issue", item_id="42")
+            with redirect_stdout(output), redirect_stderr(errors):
+                with mock.patch.dict(os.environ, {
+                    "FOXHOUND_EXECUTION_STATE": str(self.state_path),
+                    "FOXHOUND_GW_ENDPOINT": endpoint,
+                    "FOXHOUND_GW_ALIAS": "primary",
+                    "FOXHOUND_GW_TOKEN_FILE": str(token_file),
+                }, clear=True), mock.patch(
+                    "foxhound.execution_worker.load_run_state",
+                    return_value=state,
+                ):
+                    code = main(["act", "comment", "--body-file", "missing-body.txt"])
+            self.assertEqual(code, 65)
+            err = errors.getvalue()
+            self.assertIn("issue comment body: not found at", err)
+            self.assertNotIn("configuration unavailable", err)
 
 
 class ResultLocationTests(unittest.TestCase):
@@ -2257,6 +2318,89 @@ class ResultLocationTests(unittest.TestCase):
             execution_worker._locate_result(order, "result-summary.txt"),
             self.task / "result-summary.txt",
         )
+
+
+class BodyFileLocationTests(unittest.TestCase):
+    """An action body file can be authored in the run folder or the task folders."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        root = Path(self.temporary.name)
+        self.task_work = root / "task-work"
+        self.task_run = root / "task-run"
+        self.run = root / "run-scratch"
+        for directory in (self.task_work, self.task_run, self.run):
+            directory.mkdir(mode=0o700)
+        self.addCleanup(self.temporary.cleanup)
+
+    @staticmethod
+    def _state(task_work_directory=None, task_run_directory=None):
+        return types.SimpleNamespace(
+            task_work_directory=task_work_directory,
+            task_run_directory=task_run_directory,
+        )
+
+    def _write(self, directory, name, text="Synthetic body text.\n"):
+        path = directory / name
+        path.write_text(text, encoding="utf-8")
+        path.chmod(0o600)
+        return path
+
+    def test_search_path_includes_run_scratch_and_task_directories(self):
+        state = self._state(str(self.task_work), str(self.task_run))
+        order = execution_worker._body_search_path(state, self.run)
+        self.assertIn(self.run, order)
+        self.assertIn(self.task_run, order)
+        self.assertIn(self.task_work, order)
+
+    def test_locates_body_file_in_run_scratch_directory(self):
+        expected = self._write(self.run, "comment.md")
+        state = self._state(str(self.task_work), str(self.task_run))
+        order = execution_worker._body_search_path(state, self.run)
+        self.assertEqual(execution_worker._locate_body_file(order, "comment.md"), expected)
+
+    def test_locates_body_file_in_task_run_directory(self):
+        expected = self._write(self.task_run, "comment.md")
+        state = self._state(str(self.task_work), str(self.task_run))
+        order = execution_worker._body_search_path(state, self.run)
+        self.assertEqual(execution_worker._locate_body_file(order, "comment.md"), expected)
+
+    def test_locates_body_file_in_task_work_directory(self):
+        expected = self._write(self.task_work, "comment.md")
+        state = self._state(str(self.task_work), str(self.task_run))
+        order = execution_worker._body_search_path(state, self.run)
+        self.assertEqual(execution_worker._locate_body_file(order, "comment.md"), expected)
+
+    def test_locates_body_file_with_absolute_path(self):
+        other = Path(self.temporary.name) / "other"
+        other.mkdir(mode=0o700)
+        expected = self._write(other, "comment.md")
+        state = self._state(str(self.task_work), str(self.task_run))
+        order = execution_worker._body_search_path(state, self.run)
+        self.assertEqual(execution_worker._locate_body_file(order, str(expected)), expected)
+
+    def test_missing_body_file_returns_primary_expected_path(self):
+        state = self._state(str(self.task_work), str(self.task_run))
+        order = execution_worker._body_search_path(state, self.run)
+        located = execution_worker._locate_body_file(order, "missing.md")
+        self.assertEqual(located, self.run / "missing.md")
+
+    def test_read_body_text_reads_and_validates_content(self):
+        path = self._write(self.run, "comment.md", "Approved action body.\n")
+        content = execution_worker._read_body_text(path, label="issue comment body")
+        self.assertEqual(content, "Approved action body.\n")
+
+    def test_read_body_text_refuses_empty_when_required(self):
+        path = self._write(self.run, "empty.md", "   \n")
+        with self.assertRaisesRegex(ExecutionWorkerDraftError, "issue comment body is empty"):
+            execution_worker._read_body_text(path, label="issue comment body")
+
+    def test_read_body_text_reports_not_found_with_informative_draft_error(self):
+        missing = self.run / "nonexistent.md"
+        with self.assertRaises(ExecutionWorkerDraftError) as cm:
+            execution_worker._read_body_text(missing, label="issue comment body")
+        self.assertIn("issue comment body: not found at", str(cm.exception))
+        self.assertIn("nonexistent.md", str(cm.exception))
 
 
 class ThreadReadTests(unittest.TestCase):
