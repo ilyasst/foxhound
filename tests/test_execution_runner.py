@@ -1299,6 +1299,8 @@ class ExecutionRunnerTests(unittest.TestCase):
                 "--ignore-rules",
                 "--toolsets",
                 "terminal,file,web,vision",
+                "--skills",
+                "fictional-repo-reader",
             ),
         )
         self.assertNotIn(

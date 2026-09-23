@@ -335,6 +335,7 @@ class AgentProfileTests(unittest.TestCase):
                 profile.timeout_seconds,
                 profile.claim_lease_seconds,
                 profile.allowed_phases,
+                profile.skills,
             ),
             (
                 ("terminal", "file", "web", "vision"),
@@ -342,6 +343,7 @@ class AgentProfileTests(unittest.TestCase):
                 1_800,
                 2_700,
                 ("plan", "execute", "external_action"),
+                ("fictional-repo-reader",),
             ),
         )
         prompt = profile.render_prompt("synthetic-worker")
@@ -456,6 +458,11 @@ class AgentProfileTests(unittest.TestCase):
             ("allowed_phases", ["execute", "execute"]),
             ("allowed_phases", ["admin"]),
             ("allowed_phases", "execute"),
+            ("skills", ["Upper"]),
+            ("skills", ["a" * 33]),
+            ("skills", ["fictional-skill", "fictional-skill"]),
+            ("skills", ["fictional-skill"] * 33),
+            ("skills", "fictional-skill"),
         ]
         for field, value in variants:
             document = dict(base)

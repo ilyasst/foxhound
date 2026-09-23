@@ -54,6 +54,7 @@ _FIELDS = frozenset({
     "prompt_template", "toolsets", "max_turns", "timeout_seconds",
     "claim_lease_seconds", "heartbeat_seconds", "kill_grace_seconds",
     "allowed_phases",
+    "skills",
 })
 _CATALOG_FIELDS = frozenset({"schema", "schema_version", "profiles"})
 _CATALOG_ENTRY_FIELDS = frozenset({"state", "revision", "history"})
@@ -62,6 +63,7 @@ _CATALOG_ENTRY_FIELDS = frozenset({"state", "revision", "history"})
 #: that uses no variants is byte-identical to one written before they existed.
 _CATALOG_ENTRY_VARIANT_FIELDS = _CATALOG_ENTRY_FIELDS | {"variants"}
 _VARIANT_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+_SKILL_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 _CATALOG_STATES = frozenset({"active", "disabled"})
 
 
@@ -88,6 +90,7 @@ class AgentProfile:
     heartbeat_seconds: int
     kill_grace_seconds: int
     allowed_phases: tuple[str, ...]
+    skills: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _validate_profile(self)
@@ -113,6 +116,9 @@ class AgentProfile:
             "kill_grace_seconds": self.kill_grace_seconds,
             "allowed_phases": list(self.allowed_phases),
         }
+        if self.skills:
+            doc["skills"] = list(self.skills)
+        return doc
 
     def render_prompt(self, worker_command: str) -> str:
         if (
@@ -140,6 +146,8 @@ class AgentProfile:
                 "kill_grace_seconds": self.kill_grace_seconds,
                 "allowed_phases": list(self.allowed_phases),
             }
+            if self.skills:
+                result["policy"]["skills"] = list(self.skills)
         return result
 
 
@@ -546,7 +554,12 @@ def load_registry(private_directory: Path | None = None) -> AgentProfileRegistry
 
 
 def parse_profile(document: object) -> AgentProfile:
-    if not isinstance(document, dict) or set(document) != _FIELDS:
+    if not isinstance(document, dict):
+        raise AgentProfileError("agent profile manifest shape is invalid")
+    keys = set(document)
+    # "skills" is optional in the manifest shape for backwards compatibility,
+    # but handled explicitly below.
+    if keys != _FIELDS and keys != (_FIELDS - {"skills"}):
         raise AgentProfileError("agent profile manifest shape is invalid")
     if (
         document.get("schema") != PROFILE_SCHEMA
@@ -569,6 +582,7 @@ def parse_profile(document: object) -> AgentProfile:
             allowed_phases=_string_tuple(
                 document["allowed_phases"], "allowed phases"
             ),
+            skills=_optional_string_tuple(document.get("skills"), "skills"),
         )
     except AgentProfileError:
         raise
@@ -612,6 +626,13 @@ def _validate_profile(profile: AgentProfile) -> None:
         or any(phase not in _PHASES for phase in profile.allowed_phases)
     ):
         raise AgentProfileError("agent profile phases are invalid")
+    if (
+        not isinstance(profile.skills, tuple)
+        or len(profile.skills) > 32
+        or len(set(profile.skills)) != len(profile.skills)
+        or any(not isinstance(skill, str) or not _SKILL_NAME_RE.fullmatch(skill) for skill in profile.skills)
+    ):
+        raise AgentProfileError("agent profile skills are invalid")
     for value, minimum, maximum, label in (
         (profile.max_turns, 1, 200, "turn limit"),
         (profile.timeout_seconds, 30, 7_200, "timeout"),
@@ -644,6 +665,15 @@ def _string_tuple(value: object, label: str) -> tuple[str, ...]:
         raise AgentProfileError(f"agent profile {label} are invalid")
     return tuple(value)
 
+def _optional_string_tuple(value: object, label: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if (
+        not isinstance(value, list)
+        or any(not isinstance(item, str) for item in value)
+    ):
+        raise AgentProfileError(f"agent profile {label} are invalid")
+    return tuple(value)
 
 def _load_private_profiles(
     directory: Path,
