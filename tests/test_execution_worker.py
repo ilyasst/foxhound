@@ -1885,6 +1885,105 @@ class ExecutionWorkerTests(unittest.TestCase):
             )
         self.assertEqual(len(result["deliverables"]), 2)
 
+    def test_github_issue_completion_accepts_referenced_pull_request_with_comment_receipt(self):
+        state = SimpleNamespace(
+            database_path=self.database,
+            task_id=1,
+            phase=WorkflowPhase.EXTERNAL_ACTION,
+        )
+        origin = SimpleNamespace(
+            kind="issue",
+            record_id="github.com/example-org/example-repo",
+            item_id="42",
+        )
+        _append_repository_receipt(self.run_directory, {
+            "kind": "issue-comment",
+            "repository": "github.com/example-org/example-repo",
+            "url": "https://github.com/example-org/example-repo/issues/42#issuecomment-1",
+        })
+        with mock.patch(
+            "foxhound.execution_worker._repository_origin", return_value=origin,
+        ):
+            result = _repository_result(
+                state,
+                {
+                    "outcome": "completed",
+                    "deliverables": [],
+                    "repository_references": [{
+                        "kind": "pull-request",
+                        "url": "https://github.com/example-org/example-repo/pull/43",
+                    }],
+                },
+                self.run_directory,
+            )
+        self.assertEqual(result["outcome"], "completed")
+        self.assertEqual(len(result["deliverables"]), 2)
+        urls = [r["url"] for r in result["repository_references"]]
+        self.assertIn("https://github.com/example-org/example-repo/pull/43", urls)
+
+    def test_github_issue_completion_accepts_both_referenced_pull_request_and_issue(self):
+        state = SimpleNamespace(
+            database_path=self.database,
+            task_id=1,
+            phase=WorkflowPhase.EXTERNAL_ACTION,
+        )
+        origin = SimpleNamespace(
+            kind="issue",
+            record_id="github.com/example-org/example-repo",
+            item_id="42",
+        )
+        with mock.patch(
+            "foxhound.execution_worker._repository_origin", return_value=origin,
+        ):
+            result = _repository_result(
+                state,
+                {
+                    "outcome": "completed",
+                    "deliverables": ["PR merged externally"],
+                    "repository_references": [
+                        {
+                            "kind": "pull-request",
+                            "url": "https://github.com/example-org/example-repo/pull/43",
+                        },
+                        {
+                            "kind": "issue",
+                            "url": "https://github.com/example-org/example-repo/issues/42",
+                        },
+                    ],
+                },
+                self.run_directory,
+            )
+        self.assertEqual(result["outcome"], "completed")
+        self.assertEqual(len(result["deliverables"]), 3)
+
+    def test_github_review_completion_accepts_referenced_review(self):
+        state = SimpleNamespace(
+            database_path=self.database,
+            task_id=1,
+            phase=WorkflowPhase.EXTERNAL_ACTION,
+        )
+        origin = SimpleNamespace(
+            kind="review_request",
+            record_id="github.com/example-org/example-repo",
+            item_id="42",
+        )
+        with mock.patch(
+            "foxhound.execution_worker._repository_origin", return_value=origin,
+        ):
+            result = _repository_result(
+                state,
+                {
+                    "outcome": "completed",
+                    "deliverables": ["Review already posted externally"],
+                    "repository_references": [{
+                        "kind": "review",
+                        "url": "https://github.com/example-org/example-repo/pull/42#pullrequestreview-1",
+                    }],
+                },
+                self.run_directory,
+            )
+        self.assertEqual(result["outcome"], "completed")
+
     def test_github_review_completion_needs_review_receipt(self):
         state = SimpleNamespace(
             database_path=self.database,

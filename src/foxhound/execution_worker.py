@@ -2096,33 +2096,60 @@ def _repository_result(
         and outcome == "completed"
     ):
         receipts = _repository_receipts(run_directory)
-        if not receipts:
+        ref_kinds = {
+            reference.get("kind")
+            for reference in references
+            if isinstance(reference, dict)
+            and isinstance(reference.get("kind"), str)
+        }
+        if "issue" in ref_kinds:
+            ref_kinds = ref_kinds | {"issue-comment"}
+        received = {receipt["kind"] for receipt in receipts}
+        if origin_kind == "review_request" and (
+            "issue-comment" in received or "issue-comment" in ref_kinds
+        ):
+            received = received | {"review"}
+        all_provided = received | ref_kinds
+        if not all_provided:
             raise ExecutionWorkerDraftError(
                 "repository completion requires a worker action receipt"
             )
-        required = _required_repository_receipt_kinds(origin.kind)
-        received = {receipt["kind"] for receipt in receipts}
-        if origin.kind == "review_request" and "issue-comment" in received:
-            received = received | {"review"}
-        missing = required - received
+        required = _required_repository_receipt_kinds(origin_kind)
+        missing = required - all_provided
         if missing:
             names = " and ".join(sorted(missing))
             raise ExecutionWorkerDraftError(
-                f"repository {origin.kind} completion requires {names} receipt"
+                f"repository {origin_kind} completion requires {names} receipt"
             )
-        result["deliverables"] = [
-            *list(result.get("deliverables") or ()),
-            *[
-                "Repository follow-through: "
-                f"[{receipt['kind']}]({receipt['url']})"
-                for receipt in receipts
-            ],
-        ]
-        references.extend(
-            {"kind": "pull-request", "url": receipt["url"]}
+        existing_deliverables = list(result.get("deliverables") or ())
+        receipt_urls = {receipt.get("url") for receipt in receipts}
+        follow_through_deliverables = [
+            f"Repository follow-through: [{receipt['kind']}]({receipt['url']})"
             for receipt in receipts
-            if receipt["kind"] == "pull-request"
-        )
+        ]
+        for ref in references:
+            if (
+                isinstance(ref, dict)
+                and isinstance(ref.get("url"), str)
+                and ref.get("url") not in receipt_urls
+            ):
+                kind = ref.get("kind", "reference")
+                label = f"Repository follow-through: [{kind}]({ref['url']})"
+                if (
+                    label not in existing_deliverables
+                    and label not in follow_through_deliverables
+                ):
+                    follow_through_deliverables.append(label)
+        result["deliverables"] = [*existing_deliverables, *follow_through_deliverables]
+        existing_ref_urls = {
+            ref.get("url") for ref in references if isinstance(ref, dict)
+        }
+        for receipt in receipts:
+            if (
+                receipt.get("kind") == "pull-request"
+                and receipt.get("url") not in existing_ref_urls
+            ):
+                references.append({"kind": "pull-request", "url": receipt["url"]})
     origin_record = getattr(origin, "record_id", None)
     if isinstance(origin_record, str):
         for reference in references:
