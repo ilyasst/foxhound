@@ -395,10 +395,18 @@ class ExecutionWorker:
             "workflow": {
                 "version": state.workflow_version,
                 "phase": state.phase.value,
-                "attempt_count": (
-                    service.get(state.task_id).failure_count + 1
-                    if service.get(state.task_id) is not None
-                    else 1
+                # The count across every park, not the count since the
+                # last one.  `failure_count` resets when `claim_next`
+                # reclaims a parked workflow -- deliberately, so a retry
+                # does not begin one slip from parking again -- so reading
+                # it here told an agent on its twentieth attempt that it
+                # was on its first, which is the single fact most likely
+                # to make it repeat what has already failed.  #498 made
+                # the durable per-phase count available; this uses it.
+                "attempt_count": service.phase_attempts(
+                    state.task_id,
+                    expected_version=state.workflow_version,
+                    claim_token=state.claim_token,
                 ),
                 "agent_profile_id": state.agent_profile_id,
                 "agent_profile_revision": state.agent_profile_revision,
