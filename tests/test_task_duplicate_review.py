@@ -181,6 +181,34 @@ class DuplicateReviewCardTests(unittest.TestCase):
         ).fetchone()[0]
         self.assertEqual(cancelled, 0)
 
+    def test_a_preserved_open_withdrawal_does_not_loop_across_passes(self):
+        """A question retracted for a withdrawn source stays retracted."""
+        self.connection.execute(
+            "INSERT INTO task_candidate_lifecycle("
+            "candidate_id,source_revision,task_version,state,resolution,"
+            "changed_at,decided_at) "
+            "VALUES('candidate-1',?,1,'withdrawn','preserved_open',?,?)",
+            (f"{1:064x}", NOW.isoformat(), NOW.isoformat()),
+        )
+        self.connection.commit()
+
+        created = cancelled = 0
+        for _ in range(5):
+            result = self.cards.schedule_duplicate_proposals()
+            created += result.created
+            cancelled += result.cancelled
+            result = self.cards.schedule()
+            created += result.created
+            cancelled += result.cancelled
+
+        self.assertEqual((created, cancelled), (0, 0))
+        self.assertEqual(self._live_cards(), [])
+        proposal = self.connection.execute(
+            "SELECT state,card_id FROM task_duplicate_proposals WHERE id=?",
+            (self.proposal.proposal_id,),
+        ).fetchone()
+        self.assertEqual(tuple(proposal), ("superseded", None))
+
     def test_a_card_on_screen_is_retracted_once_a_workflow_takes_the_task(self):
         """A live card must go when execution picks the task up."""
         self.assertEqual(self.cards.schedule_duplicate_proposals().asked, 1)
