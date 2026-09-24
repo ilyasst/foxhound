@@ -1075,6 +1075,34 @@ class ExecutionWorkerTests(unittest.TestCase):
 
         self.assertEqual(state.deployment_roots, {"shared_state": str(shared)})
 
+    def test_context_includes_configured_deployment_roots(self):
+        drive = self.root / "drive"
+        drive.mkdir()
+        self._write_state(
+            schema_version=6,
+            deployment_roots={"sync_drive": str(drive)},
+        )
+
+        with (
+            mock.patch(
+                "foxhound.execution_worker._local_today",
+                return_value="2030-01-02",
+            ),
+            mock.patch(
+                "foxhound.execution_worker.shutil.which",
+                return_value="/usr/bin/synthetic-client",
+            ),
+            knowledge_server() as endpoint,
+        ):
+            worker = self._worker(endpoint)
+            context = worker.context()
+
+        self.assertIn("deployment_roots", context["capabilities"])
+        self.assertEqual(
+            context["capabilities"]["deployment_roots"],
+            {"sync_drive": str(drive)},
+        )
+
     def test_result_path_is_confined_to_the_immediate_run_directory(self):
         draft = self._write_draft()
         path, document = load_result_draft(self.run_directory, str(draft))
