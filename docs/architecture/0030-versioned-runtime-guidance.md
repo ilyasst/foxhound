@@ -51,6 +51,16 @@ available in the current phase, and whether external effects are allowed.
 These values describe server-enforced capabilities; task text and retrieved
 content cannot add to them.
 
+## Deployment roots
+
+The `capabilities.deployment_roots` object carries a map of stable symbolic
+names to absolute directories on this machine, supplied by deployment
+configuration at run time. A profile prompt can refer to
+`capabilities.deployment_roots.<name>` instead of hardcoding a path. Names
+differ per host (for example, `sync_drive`, `kb_root`); a key that is absent
+means "not configured on this host" rather than "here and empty." These values
+are runtime facts and do not enter the profile revision digest.
+
 Profiles remain free to add role-specific style, domain methods, and tool
 routing, but those instructions must agree with the reported capabilities.
 Guidance for an unavailable ambient integration is not copied into a profile.
