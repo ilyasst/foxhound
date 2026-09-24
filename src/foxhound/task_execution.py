@@ -352,6 +352,14 @@ class WorkflowOperationResult:
 
 
 @dataclass(frozen=True)
+class ReaderInstruction:
+    """What the reader asked for, and when they asked."""
+
+    text: str
+    received_at: str
+
+
+@dataclass(frozen=True)
 class ExecutionReadiness:
     awaiting_start: int
     snoozed: int
@@ -1895,7 +1903,34 @@ class TaskExecutionService:
         expected_version: int,
         claim_token: str,
     ) -> str | None:
-        """Return only the discussion bound to this supervised run."""
+        """The discussion bound to this run, without its arrival time."""
+        found = self.reader_instruction_with_time(
+            task_id,
+            expected_version=expected_version,
+            claim_token=claim_token,
+        )
+        return None if found is None else found.text
+
+    def reader_instruction_with_time(
+        self,
+        task_id: int,
+        *,
+        expected_version: int,
+        claim_token: str,
+    ) -> ReaderInstruction | None:
+        """Return only the discussion bound to this supervised run.
+
+        The arrival time comes back with the text because the agent is
+        given both the reader's request and any note an earlier attempt
+        left, and is asked to decide between them when they disagree.  It
+        cannot do that without knowing which came last: a reader may
+        redirect work that is then attempted again, and the note from that
+        attempt is the newer of the two.
+
+        Reading the time separately would mean querying twice, recording a
+        second delivery, and risking two answers about two different
+        instructions.
+        """
         if (
             not _valid_identity(task_id, expected_version)
             or not _valid_secret(claim_token)
@@ -1915,7 +1950,8 @@ class TaskExecutionService:
             if refusal is not None:
                 raise TaskLedgerError("execution claim is unavailable")
             value = connection.execute(
-                "SELECT i.sequence,i.value FROM execution_reader_inputs AS i "
+                "SELECT i.sequence,i.value,i.occurred_at "
+                "FROM execution_reader_inputs AS i "
                 "WHERE i.task_id=? AND i.kind='discussion' "
                 "AND i.target_workflow_version<=? AND NOT EXISTS("
                 " SELECT 1 FROM task_execution_results AS r "
@@ -1937,7 +1973,10 @@ class TaskExecutionService:
                 return None
             self._record_instruction_delivery(
                 connection, row, expected_version, int(value["sequence"]), now)
-        return str(value["value"])
+        return ReaderInstruction(
+            text=str(value["value"]),
+            received_at=str(value["occurred_at"]),
+        )
 
     @staticmethod
     def _record_instruction_delivery(

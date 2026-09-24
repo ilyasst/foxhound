@@ -489,6 +489,34 @@ class ExecutionWorkerTests(unittest.TestCase):
                          "Synthetic evidence.")
         self.assertNotIn(CLAIM_TOKEN, repr(load_run_state(self.state_path)))
 
+    def test_both_sources_arrive_with_the_time_they_arrived(self):
+        """The reader decided the agent should weigh these, not a rule.
+
+        That only works if it can tell them apart and tell which came
+        last: a reader can redirect work that is then attempted again, so
+        the note from that attempt is the newer of the two, and the rule
+        "the note is always stale" would be wrong exactly then.
+        """
+        paths = self._enable_archive()
+        (paths.working_directory / "handoff-plan.md").write_text(
+            "Synthetic note from an earlier pass.", encoding="utf-8")
+
+        with knowledge_server() as endpoint:
+            workflow = self._worker(endpoint).context()["workflow"]
+
+        self.assertEqual(
+            workflow["handoff"], "Synthetic note from an earlier pass.")
+        self.assertIsNotNone(workflow["handoff_written_at"])
+        # Both keys are always present, so an agent never has to infer
+        # absence from a missing field.
+        self.assertIn("reader_instruction_received_at", workflow)
+
+    def test_no_note_still_reports_no_time(self):
+        with knowledge_server() as endpoint:
+            workflow = self._worker(endpoint).context()["workflow"]
+        self.assertIsNone(workflow["handoff"])
+        self.assertIsNone(workflow["handoff_written_at"])
+
     def test_handoff_evidence_reading_and_truncation(self):
         paths = self._enable_archive()
         worker = self._worker("http://127.0.0.1:9")

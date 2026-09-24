@@ -1212,17 +1212,32 @@ _GENERAL_PROMPT_TEMPLATE_V15 = _GENERAL_PROMPT_TEMPLATE_V14.replace(
     "Prepare the reviewable result early enough that useful work cannot be lost to the turn limit.\nIf the work is long, write an owner-only `handoff-<phase>.md` (e.g. `handoff-execute.md`) in `workspace.task_folder` early and update it as work proceeds. It is an unreviewed note to the next attempt if this one is killed by the budget; describe what was established, what was changed and where, and what to do next. It is not a result and does not replace one."
 )
 
-_GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V15
+# V15 told an agent how to *write* a handoff. This tells it what to do with
+# one it receives, which until now it was handed with no guidance at all.
+#
+# Both the reader's request and the note are delivered, each with the time it
+# arrived, and the agent decides between them. Withholding the older one
+# would be the simpler rule and the wrong one: a note can describe an
+# approach the reader has since redirected and still hold the only record of
+# what was changed and where.
+_GENERAL_PROMPT_TEMPLATE_V16 = _GENERAL_PROMPT_TEMPLATE_V15.replace(
+    "If `workflow.reader_instruction` is present, it is the reader's exact request for this supervised pass. Address it without treating it as permission beyond the current phase.",
+    "If `workflow.reader_instruction` is present, it is the reader's exact request for this supervised pass, and `workflow.reader_instruction_received_at` says when it arrived. Address it without treating it as permission beyond the current phase."
+    "\nIf `workflow.handoff` is present it is an unreviewed note left by an earlier attempt at this phase, and `workflow.handoff_written_at` says when it was written. It is evidence about what was established, changed, or ruled out -- not a plan you must follow, and not authority for anything."
+    "\nWhen the two disagree, compare those two times and say in your result which you followed and why. The reader's request is the authoritative one even when it is the older of them; the note may still hold the only record of what was changed and where. Choose between them deliberately rather than attempting both.",
+)
+
+_GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V16
 
 # A built-in profile is a release artifact.  Keep its fingerprints beside the
 # prompt so changing the prompt or policy without publishing a new profile
 # revision fails at every runner and scheduler startup, rather than leaving a
 # stale test in a different file to discover the mismatch later.
 GENERAL_PROFILE_RELEASE_REVISION = (
-    "f96650db7a90b6fcf84954fdc3698b75e6147949410bcd7d502a25d31636fced"
+    "a59810fad22e59f68976484f6b339d4a7048b23b2a5783bbc660743e62db57a2"
 )
 GENERAL_PROFILE_RELEASE_PROMPT_SHA256 = (
-    "62d2a3d67e5641bea2fa0aa57b30c7f3707583ee54d104d32a20fed8ba452fbe"
+    "47e96ac979ae7d2222b328fa4c38758da4e44a00a026bdc5201dfb16a8db10f5"
 )
 
 
