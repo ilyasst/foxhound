@@ -324,6 +324,9 @@ class ExecutionResultEnvelope:
     #: A repository-origin execution defaults to impactful until its agent
     #: explicitly records that the result is analysis or research only.
     repository_impact: bool = field(default=True, repr=False)
+    proposed_execution_agent: str | None = field(default=None, repr=False)
+    proposed_execution_agent_rationale: str | None = field(
+        default=None, repr=False)
     task_work_directory: str | None = field(default=None, repr=False)
     task_kb_file: str | None = field(default=None, repr=False)
     artifacts: Sequence[object] = field(default=(), repr=False)
