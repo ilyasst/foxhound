@@ -71,6 +71,38 @@ class FailureDigestTextTests(unittest.TestCase):
         self.assertLessEqual(len(extract), failure_digest.MAX_INPUT_CHARS)
         self.assertIn("the thing that stopped it", extract)
 
+    def test_a_reply_that_recites_the_brief_is_not_a_digest(self):
+        """Observed in production, on about one digest in ten.
+
+        A capability whose thinking channel is suppressed emits its
+        reasoning as content, and that reasoning opens by restating the
+        task it was given.  The result filled the length cap with our own
+        instruction and never reached the run at all -- then went onto the
+        reader's card as "why it stopped", and into the next run's payload
+        as evidence about what had already been tried.
+        """
+        recited = (
+            "Thinking Process: 1. **Analyze the Request:** **Task:** "
+            "Explain why one automated agent run stopped early. **Input:** "
+            "A verbatim extract from the end of that run's output. "
+            "**Format:** 2 to 4 short sentences, plain prose. "
+            "**Output:** Write nothing else. 2. **Analyze the Input Data:**"
+        )
+        self.assertEqual(failure_digest.clean(recited), "")
+
+    def test_a_digest_that_mentions_a_phrase_in_passing_is_kept(self):
+        """Rejecting a recital must not reject a description of one.
+
+        A run really can stop while writing about short sentences, and a
+        digest that says so is doing its job.
+        """
+        honest = (
+            "The run was rewriting a style guide so that its examples used "
+            "2 to 4 short sentences. It stopped when the editor process "
+            "exited without writing the file back."
+        )
+        self.assertEqual(failure_digest.clean(honest), honest)
+
     def test_a_short_transcript_is_used_whole(self):
         self.assertEqual(
             failure_digest.tail("  stopped at the turn limit\n"),
