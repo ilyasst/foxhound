@@ -77,16 +77,35 @@ ledgers under an exclusive local lock and appends an immutable aggregate
 success receipt only after both imports complete:
 
 ```sh
-python -m foxhound.shadow_cycle \
+foxhound-shadow-cycle \
   --candidate-outbox /srv/example/private-candidate-outbox \
   --observation-outbox /srv/example/private-observation-outbox \
   --database /srv/example/private-foxhound-state/foxhound.sqlite3 \
   --stream-id example-shadow
 ```
 
+This is the command scheduled by the host to consume the producer's
+candidate feed. It is the mechanism that reads enrolled-repository issue
+candidates, meeting candidates, email candidates, and any other source kind
+the producer publishes. Without a scheduled invocation of this command,
+candidates sit in the producer outbox and nobody imports them.
+
+On first run after enrolling a forge repository, the producer writes its
+issue candidates to the candidate outbox on the next cycle. The shadow
+cycle then imports them alongside any meeting or email candidates already
+in the feed. The command is idempotent: an empty candidate outbox (no new
+pages since the last cursor) is a successful run with an `unchanged`
+disposition and exit code 0.
+
 A failure between the two imports leaves no false success receipt; the next
 cycle replays the committed candidate prefix and resumes safely. This command
 still does not bootstrap tasks, schedule itself, create cards, or run agents.
+
+An outbox that has not been created yet is reported as absent (distinct
+error on stderr, exit 1). An outbox that exists but cannot be read
+(permission or I/O error) is reported as unreadable (distinct error on
+stderr, exit 1). Both are distinct from other validation failures, which
+report a generic failure message.
 
 After a comparison ledger is complete, an application may explicitly invoke
 the task ledger's shadow bootstrap. Imports never invoke it. Only current,
