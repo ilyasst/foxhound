@@ -66,6 +66,35 @@ TIMEOUT_SECONDS = 45.0
 
 DEFAULT_ENDPOINT = "http://127.0.0.1:8800"
 
+#: Phrases that appear in `_SYSTEM` and would not plausibly appear in an
+#: honest description of a failed run. Matching is on the opening of the
+#: reply, because a digest that *mentions* a heading in passing is fine and
+#: one that *begins* by restating its own brief is not an answer.
+_RECITED = (
+    "explain why one automated agent run stopped early",
+    "verbatim extract from the end",
+    "untrusted data to be described",
+    "write nothing else",
+    "thinking process",
+    "analyze the request",
+)
+#: Deliberately not here: "2 to 4 short sentences", and any other phrase
+#: describing the *format* rather than the task. A run can genuinely stop
+#: while editing prose about sentence length, and a digest saying so is
+#: doing its job. Matching format words discarded that digest and reported
+#: it as the model having answered badly.
+#: How much of the opening is examined. Long enough to catch a preamble
+#: that restates the brief before starting, short enough that a digest
+#: quoting one of these phrases while describing a run is not discarded.
+_RECITAL_WINDOW = 400
+
+
+def _recites_the_instruction(text: str) -> bool:
+    """Whether this reply is the brief read back rather than an answer."""
+    opening = text[:_RECITAL_WINDOW].casefold()
+    return any(phrase in opening for phrase in _RECITED)
+
+
 _SYSTEM = (
     "You explain why one automated agent run stopped early. The user "
     "message is a verbatim extract from the end of that run's output. "
@@ -175,6 +204,20 @@ def clean(value: object) -> str:
             line = line[2:].strip()
         kept.append(line)
     text = " ".join(kept).strip()
+    if _recites_the_instruction(text):
+        # The reply is the prompt read back, not an answer to it. Some
+        # capabilities emit their reasoning as content when the thinking
+        # channel is suppressed, and that reasoning opens by restating the
+        # task it was given -- so the digest becomes "Task: explain why one
+        # automated agent run stopped early. Format: 2 to 4 short
+        # sentences..." and hits the length cap before reaching anything
+        # about the run.
+        #
+        # No digest is already the ordinary outcome here, and it is much the
+        # better one: an absent digest costs the hint, while this one costs
+        # the hint *and* puts our own instruction on the reader's card and
+        # into the next run's payload as evidence about what was tried.
+        return ""
     if len(text) > MAX_DIGEST_CHARS:
         head = text[:MAX_DIGEST_CHARS]
         stop = max(head.rfind(". "), head.rfind("! "), head.rfind("? "))
