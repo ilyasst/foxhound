@@ -2307,14 +2307,18 @@ class ResultLocationTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         root = Path(self.temporary.name)
         self.task = root / "task-folder"
+        self.task_run = root / "task-run"
         self.run = root / "run-folder"
-        for directory in (self.task, self.run):
+        for directory in (self.task, self.task_run, self.run):
             directory.mkdir(mode=0o700)
         self.addCleanup(self.temporary.cleanup)
 
     @staticmethod
-    def _state(task_folder):
-        return types.SimpleNamespace(task_work_directory=task_folder)
+    def _state(task_folder, task_run_folder=None):
+        return types.SimpleNamespace(
+            task_work_directory=task_folder,
+            task_run_directory=task_run_folder,
+        )
 
     def _write(self, directory, name, text="Synthetic result."):
         path = directory / name
@@ -2326,6 +2330,24 @@ class ResultLocationTests(unittest.TestCase):
         order = execution_worker._result_search_path(
             self._state(str(self.task)), self.run)
         self.assertEqual(order, (self.task, self.run))
+
+    def test_the_task_run_directory_is_searched_before_task_folder(self):
+        order = execution_worker._result_search_path(
+            self._state(str(self.task), str(self.task_run)), self.run)
+        self.assertEqual(order, (self.task_run, self.task, self.run))
+
+    def test_a_result_in_the_task_run_directory_is_found(self):
+        expected = self._write(self.task_run, "result-summary.txt")
+        order = execution_worker._result_search_path(
+            self._state(str(self.task), str(self.task_run)), self.run)
+
+        self.assertEqual(
+            execution_worker._locate_result(
+                order, "result-summary.txt",
+                task_folder_not_before=expected.stat().st_mtime_ns - 1,
+            ),
+            expected,
+        )
 
     def test_a_result_in_the_task_folder_is_found(self):
         expected = self._write(self.task, "result-summary.txt")
