@@ -8,10 +8,12 @@ manifest.
 
 from __future__ import annotations
 
-import json
+import contextlib
 import hashlib
+import json
 import os
 import re
+import shutil
 import stat
 from dataclasses import dataclass
 from datetime import datetime
@@ -88,6 +90,7 @@ def prepare_task_archive(
     origin_record: str | None = None,
     origin_item: str | None = None,
     origin_sources: tuple[CardSourceEvidence, ...] = (),
+    max_runs: int | None = None,
 ) -> TaskArchivePaths:
     """Create the stable task locations and register this run."""
     if isinstance(task_id, bool) or not isinstance(task_id, int) or task_id < 1:
@@ -135,6 +138,11 @@ def prepare_task_archive(
     })
     paths = TaskArchivePaths(task_directory, task_file, run_directory)
     _publish_log(paths, log)
+    # Prune older run directories so the task folder does not grow without
+    # bound. The current run was just registered, so it is never removed.
+    if max_runs is not None and max_runs >= 1:
+        with contextlib.suppress(TaskArchiveError, OSError):
+            prune_old_runs(task_directory / "runs", max_runs=max_runs)
     return paths
 
 
@@ -315,6 +323,98 @@ def publish_deliverables(
             continue
         copied.append(name)
     return tuple(copied)
+
+
+def prune_old_runs(
+    runs_directory: Path,
+    *,
+    max_runs: int,
+    dry_run: bool = False,
+) -> dict[str, int]:
+    """Remove older run directories from a task folder, keeping *max_runs*.
+
+    Only terminal runs are eligible for removal: a run is terminal when
+    its directory name starts with ``plan-`` or ``act-`` and the task log
+    records a non-None ``outcome`` for that run.  Active runs and runs
+    whose state cannot be determined are always kept.
+
+    Among eligible runs, the oldest (by directory modification time) are
+    removed first.  A single removal failure does not abort the sweep.
+
+    Returns ``{"removed": N, "kept": M, "bytes_freed": B, "errors": E}``.
+    """
+    if max_runs < 1:
+        raise TaskArchiveError("task run retention is invalid")
+    if not runs_directory.is_dir():
+        raise TaskArchiveError("task run directory is not a directory")
+
+    # Load the task log to know which runs have an outcome
+    log = _read_log(runs_directory.parent)
+    outcomes: dict[str, object] = {}
+    for entry in log.get("runs", []):
+        if isinstance(entry, dict):
+            run_name = entry.get("run")
+            if isinstance(run_name, str):
+                outcomes[run_name] = entry.get("outcome")
+
+    removed = 0
+    kept = 0
+    bytes_freed = 0
+    errors = 0
+    eligible: list[tuple[float, Path]] = []  # (mtime, path)
+
+    for entry in runs_directory.iterdir():
+        if not entry.is_dir():
+            continue
+        if entry.name.startswith("."):
+            continue
+        # A run directory is ``<phase>-<id>``
+        if "-" not in entry.name:
+            kept += 1
+            continue
+
+        phase_part = entry.name.split("-", 1)[0]
+        is_terminal_phase = phase_part in {"plan", "execute", "act"}
+
+        if not is_terminal_phase:
+            kept += 1
+            continue
+
+        outcome = outcomes.get(entry.name)
+        if outcome is None:
+            # No recorded outcome — still active or incomplete
+            kept += 1
+            continue
+
+        eligible.append((entry.stat().st_mtime, entry))
+
+    # Sort oldest first
+    eligible.sort(key=lambda x: x[0])
+    to_remove = eligible[: len(eligible) - max_runs] if len(eligible) > max_runs else []
+
+    for _, run_dir in to_remove:
+        try:
+            dir_size = sum(
+                f.stat().st_size
+                for f in run_dir.rglob("*")
+                if f.is_file()
+            )
+            if dry_run:
+                bytes_freed += dir_size
+            else:
+                shutil.rmtree(run_dir)
+                bytes_freed += dir_size
+            removed += 1
+        except OSError:
+            errors += 1
+
+    kept += len(eligible) - len(to_remove)
+    return {
+        "removed": removed,
+        "kept": kept,
+        "bytes_freed": bytes_freed,
+        "errors": errors,
+    }
 
 
 def recorded_artifacts(run_directory: Path) -> tuple[dict[str, object], ...]:

@@ -169,6 +169,8 @@ class ExecutionRunnerConfig:
     #: own tagged structured session record after a run finishes.
     runtime_session_database: Path | None = field(default=None, repr=False)
     runtime_log_retention_bytes: int = DEFAULT_RUNTIME_LOG_RETENTION_BYTES
+    #: Maximum run directories kept per task folder; ``None`` means no cap.
+    task_run_retention: int | None = None
     allowed_phases: tuple[WorkflowPhase, ...] = tuple(WorkflowPhase)
     planning_grants: tuple[str, ...] = ()
     execution_grants: tuple[str, ...] = ()
@@ -293,6 +295,13 @@ class ExecutionRunnerConfig:
             raise ValueError("runtime log retention is invalid")
         if self.runtime_session_database is not None and self.task_work_root is None:
             raise ValueError("runtime session logs require task archive roots")
+        if (
+            self.task_run_retention is not None
+            and (isinstance(self.task_run_retention, bool)
+                  or not isinstance(self.task_run_retention, int)
+                  or self.task_run_retention < 1)
+        ):
+            raise ValueError("task run retention is invalid")
 
 
 @dataclass(frozen=True)
@@ -621,6 +630,7 @@ def _run_claim(
                 origin_record=None if origin is None else origin.record_id,
                 origin_item=None if origin is None else origin.item_id,
                 origin_sources=origin_sources,
+                max_runs=config.task_run_retention,
             )
         state_path = directory / "run-state.json"
         instructions_path = directory / INSTRUCTIONS_NAME
@@ -1600,6 +1610,16 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--task-run-retention",
+        type=int,
+        default=None,
+        help=(
+            "maximum run directories kept per task folder; omitted means "
+            "no cap. Set to 20 as a conservative default for long-running "
+            "deployments."
+        ),
+    )
+    parser.add_argument(
         "--cleanup",
         action="store_true",
         help=(
@@ -1723,6 +1743,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             task_kb_root=args.task_kb_root,
             runtime_session_database=args.runtime_session_database,
             runtime_log_retention_bytes=args.runtime_log_retention_bytes,
+            task_run_retention=args.task_run_retention,
             allowed_phases=(
                 tuple(WorkflowPhase(value) for value in args.allowed_phases)
                 if args.allowed_phases

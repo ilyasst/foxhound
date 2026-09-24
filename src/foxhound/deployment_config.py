@@ -42,7 +42,7 @@ from .task_execution import TaskExecutionService, WorkflowPhase
 
 
 DEPLOYMENT_SCHEMA = "foxhound.deployment-config"
-DEPLOYMENT_SCHEMA_VERSION = 15
+DEPLOYMENT_SCHEMA_VERSION = 16
 _DEPLOYMENT_ROOT_NAME = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 MAX_CONFIG_BYTES = 64 * 1024
 
@@ -179,6 +179,7 @@ class ExecutionRunnerDeploymentConfig:
     task_kb_root: Path | None = None
     runtime_session_database: Path | None = None
     runtime_log_retention_bytes: int | None = None
+    task_run_retention: int | None = None
 
     def argv(
         self,
@@ -234,6 +235,8 @@ class ExecutionRunnerDeploymentConfig:
                 result.extend((option, str(path)))
         if self.runtime_log_retention_bytes is not None:
             result.extend(("--runtime-log-retention-bytes", str(self.runtime_log_retention_bytes)))
+        if self.task_run_retention is not None:
+            result.extend(("--task-run-retention", str(self.task_run_retention)))
         for kind in workflow.plan_without_asking:
             result.extend(("--plan-without-asking", kind))
         for kind in workflow.execute_without_asking:
@@ -493,7 +496,7 @@ def _parse_document(document: object) -> DeploymentConfig:
     if (
         document.get("schema") != DEPLOYMENT_SCHEMA
         or version not in {
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
             DEPLOYMENT_SCHEMA_VERSION
         }
         or isinstance(version, bool)
@@ -738,6 +741,8 @@ def _parse_execution_runner(
         fields.add("deployment_roots")
     if version >= 14:
         fields.update({"agent_model", "agent_provider"})
+    if version >= 16:
+        fields.add("task_run_retention")
     document = _object(value, fields)
     strings = tuple(document[key] for key in (
         "gw_endpoint", "gw_alias", "agent_command", "worker_command", "runner_slot"
@@ -757,6 +762,15 @@ def _parse_execution_runner(
     )
     if retention is not None and (
         isinstance(retention, bool) or not isinstance(retention, int) or retention < 1
+    ):
+        raise DeploymentConfigError("execution runner configuration is invalid")
+    task_run_retention = (
+        document["task_run_retention"] if version >= 16 else None
+    )
+    if task_run_retention is not None and (
+        isinstance(task_run_retention, bool)
+        or not isinstance(task_run_retention, int)
+        or task_run_retention < 1
     ):
         raise DeploymentConfigError("execution runner configuration is invalid")
     if (document["task_work_root"] is None) != (document["task_kb_root"] is None):
@@ -787,6 +801,7 @@ def _parse_execution_runner(
         task_kb_root=_optional_absolute_path(document["task_kb_root"]),
         runtime_session_database=runtime_database,
         runtime_log_retention_bytes=retention,
+        task_run_retention=task_run_retention,
     )
 
 
