@@ -1510,9 +1510,11 @@ def _read_private_json(
 def _result_search_path(state, run_directory: Path) -> tuple[Path, ...]:
     """Where an authored result may legitimately live, in preference order.
 
-    The task folder first: it is the synchronised directory the owner reviews
+    The task run directory first (when present): it is the dedicated folder
+    for this claim where the agent is instructed to work.
+    The task folder second: it is the synchronised directory the owner reviews
     from, so a result written there is a result the reader can actually open.
-    The run directory second, because results authored in the agent's own
+    The run directory last, because results authored in the agent's own
     working directory were the only ones accepted before this and must keep
     recording unchanged.
 
@@ -1520,12 +1522,18 @@ def _result_search_path(state, run_directory: Path) -> tuple[Path, ...]:
     without one falls back to the run directory alone rather than guessing.
     """
     directories: list[Path] = []
+    task_run_folder = getattr(state, "task_run_directory", None)
+    if task_run_folder:
+        candidate = Path(task_run_folder)
+        if candidate.is_absolute():
+            directories.append(candidate)
     task_folder = getattr(state, "task_work_directory", None)
     if task_folder:
         candidate = Path(task_folder)
-        if candidate.is_absolute():
+        if candidate.is_absolute() and candidate not in directories:
             directories.append(candidate)
-    directories.append(run_directory)
+    if run_directory not in directories:
+        directories.append(run_directory)
     return tuple(directories)
 
 
@@ -1552,11 +1560,12 @@ def _fenced_out(
 ) -> bool:
     """Whether a shared task-folder file predates this claim.
 
-    Only the task folder is fenced, and only when a private run directory
-    exists to fall back to.  A claim that cannot read its own anchor fences
-    everything shared, because harvesting a prior claim is the worse failure.
+    Only directories outside the private run directory are fenced, and only
+    when a private run directory exists to fall back to.  A claim that cannot
+    read its own anchor fences everything shared, because harvesting a prior
+    claim is the worse failure.
     """
-    if index != 0 or len(directories) <= 1:
+    if index == len(directories) - 1 or len(directories) <= 1:
         return False
     if task_folder_not_before is None:
         return True
