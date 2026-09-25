@@ -50,6 +50,8 @@ from foxhound.task_card_server import (
     EXECUTION_CLAIM_SCHEMA,
     EXECUTION_CLAIM_SCHEMA_VERSION,
     EXECUTION_DETAIL_SCHEMA,
+    EXECUTION_DETAIL_SCHEMA_VERSION,
+    WORKFLOW_DETAIL_SCHEMA_VERSION,
     EXECUTION_OPERATION_SCHEMA,
     EXECUTION_PRIORITY_SCHEMA,
     EXECUTION_QUEUE_SCHEMA,
@@ -83,6 +85,7 @@ from foxhound.task_card_server import (
 from review_card_fixture import raise_review_cards
 from foxhound.task_cards import TASK_CARD_READS, TaskCardService
 from foxhound.task_execution import (
+    WORK_BODY_PROJECTION_MAX,
     ExecutionOutcome,
     ExecutionResultEnvelope,
     TaskExecutionService,
@@ -608,7 +611,10 @@ class TaskCardServerTests(unittest.TestCase):
             authorization=f"Bearer {queue}",
         )
         self.assertTrue(detail["ok"])
+        self.assertEqual(
+            detail["schema_version"], WORKFLOW_DETAIL_SCHEMA_VERSION)
         self.assertEqual(detail["status"], "queued")
+        self.assertEqual(detail["work_markdown"], "")
         self.assertEqual(detail["deliverables"], [])
         stale = app.dispatch(
             "workflow_detail",
@@ -617,6 +623,7 @@ class TaskCardServerTests(unittest.TestCase):
         )
         self.assertFalse(stale["ok"])
         self.assertEqual(stale["refusal"], "stale_workflow")
+        self.assertEqual(stale["work_markdown"], "")
         with self.assertRaises(TaskCardServerRequestError):
             app.dispatch(
                 "workflow_board", request_document(limit=10),
@@ -773,7 +780,7 @@ class TaskCardServerTests(unittest.TestCase):
             authorization=f"Bearer {queue}",
         )
         self.assertEqual(detail["schema"], EXECUTION_DETAIL_SCHEMA)
-        self.assertEqual(detail["schema_version"], 2)
+        self.assertEqual(detail["schema_version"], EXECUTION_DETAIL_SCHEMA_VERSION)
         self.assertTrue(detail["ok"])
         self.assertEqual(detail["status"], "awaiting_start")
         self.assertEqual(detail["phase"], "plan")
@@ -781,7 +788,10 @@ class TaskCardServerTests(unittest.TestCase):
         self.assertIsNone(detail["failure_reason"])
         self.assertIsNone(detail["failure_exit_code"])
         self.assertIsNone(detail["failure_run_id"])
-        self.assertNotIn("work_markdown", detail)
+        # A gate carries no result, so there is no body to show yet. What stays
+        # out of this projection is private provenance -- paths, prompts,
+        # profile revisions -- not the account of the run itself.
+        self.assertEqual(detail["work_markdown"], "")
         self.assertNotIn("task_work_directory", detail)
         self.assertEqual((self.execution_cards.count(), self.execution_cards.event_count()), before)
         with self.assertRaises(TaskCardServerRequestError):
@@ -809,6 +819,99 @@ class TaskCardServerTests(unittest.TestCase):
         self.assertFalse(held["ok"])
         self.assertIsNone(held["summary"])
 
+    def test_detail_routes_carry_the_recorded_work_body(self):
+        """The account of a run reaches a reader, bounded, on both routes.
+
+        `summary` and `work_digest` are short derivations with no structure.
+        A reader asked to approve or accept work needs what was actually
+        written, and neither detail route used to project it, so a console
+        could only show a paragraph of a report that had sections and lists.
+        """
+        body = (
+            "## What ran\n\n- Read the form\n- Filled section A\n\n"
+            "1. First\n2. Second"
+        )
+        self.execution.schedule(1, expected_task_version=1)
+        self.execution.start_action(1, expected_version=1, action="start")
+        claim = self.execution.claim_next()
+        self.assertIsNotNone(claim)
+        recorded = self.execution.record_result(ExecutionResultEnvelope(
+            result_id="d" * 32,
+            task_id=claim.task_id,
+            task_version=claim.task_version,
+            workflow_version=claim.workflow_version,
+            phase=claim.phase,
+            claim_token=claim.token,
+            outcome=ExecutionOutcome.AWAITING_PLAN,
+            summary="Synthetic summary",
+            work_markdown=body,
+            work_digest="Synthetic digest",
+        ))
+        self.execution_cards.schedule()
+        card = self.execution_cards.due(limit=1)[0]
+        queue = "q" * 43
+        app = TaskCardApplication(
+            self.cards, {DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: queue},
+            execution_cards=self.execution_cards,
+            execution_workflows=self.execution,
+            execution_tokens={DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: queue},
+        )
+        detail = app.dispatch(
+            "execution_detail",
+            request_document(card_id=card.id, card_version=card.version),
+            authorization=f"Bearer {queue}",
+        )
+        self.assertTrue(detail["ok"])
+        self.assertEqual(detail["work_markdown"], body)
+        self.assertNotIn("task_work_directory", detail)
+        workflow = app.dispatch(
+            "workflow_detail",
+            request_document(task_id=1, workflow_version=recorded.version),
+            authorization=f"Bearer {queue}",
+        )
+        self.assertTrue(workflow["ok"])
+        self.assertEqual(workflow["work_markdown"], body)
+
+    def test_detail_routes_bound_the_recorded_work_body(self):
+        oversized = "x" * (WORK_BODY_PROJECTION_MAX + 500)
+        self.execution.schedule(1, expected_task_version=1)
+        self.execution.start_action(1, expected_version=1, action="start")
+        claim = self.execution.claim_next()
+        recorded = self.execution.record_result(ExecutionResultEnvelope(
+            result_id="e" * 32,
+            task_id=claim.task_id,
+            task_version=claim.task_version,
+            workflow_version=claim.workflow_version,
+            phase=claim.phase,
+            claim_token=claim.token,
+            outcome=ExecutionOutcome.AWAITING_PLAN,
+            summary="Synthetic summary",
+            work_markdown=oversized,
+        ))
+        self.execution_cards.schedule()
+        card = self.execution_cards.due(limit=1)[0]
+        queue = "q" * 43
+        app = TaskCardApplication(
+            self.cards, {DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: queue},
+            execution_cards=self.execution_cards,
+            execution_workflows=self.execution,
+            execution_tokens={DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: queue},
+        )
+        detail = app.dispatch(
+            "execution_detail",
+            request_document(card_id=card.id, card_version=card.version),
+            authorization=f"Bearer {queue}",
+        )
+        workflow = app.dispatch(
+            "workflow_detail",
+            request_document(task_id=1, workflow_version=recorded.version),
+            authorization=f"Bearer {queue}",
+        )
+        self.assertEqual(
+            len(detail["work_markdown"]), WORK_BODY_PROJECTION_MAX)
+        self.assertEqual(
+            len(workflow["work_markdown"]), WORK_BODY_PROJECTION_MAX)
+
     def test_execution_detail_stale_refusal_is_content_free_and_versioned(self):
         card = self._queue_card()
         queue = "q" * 43
@@ -824,11 +927,12 @@ class TaskCardServerTests(unittest.TestCase):
         )
         self.assertEqual(
             (response["schema"], response["schema_version"], response["ok"]),
-            (EXECUTION_DETAIL_SCHEMA, 2, False),
+            (EXECUTION_DETAIL_SCHEMA, EXECUTION_DETAIL_SCHEMA_VERSION, False),
         )
         self.assertEqual(response["refusal"], "stale_version")
         self.assertIsNone(response["summary"])
         self.assertIsNone(response["work_digest"])
+        self.assertIsNone(response["work_markdown"])
         self.assertEqual(response["deliverables"], [])
         self.assertIsNone(response["failure_reason"])
         self.assertIsNone(response["failure_exit_code"])

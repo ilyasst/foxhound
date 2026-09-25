@@ -469,6 +469,10 @@ class ExecutionCardDetail:
     outcome: ExecutionOutcome | None = None
     summary: str = field(default="", repr=False)
     work_digest: str = field(default="", repr=False)
+    #: The recorded account of the run. The two fields above are short
+    #: derivations of it; this is the one a reader can be shown the work
+    #: through. Bounded where it is serialized, as they are.
+    work_markdown: str = field(default="", repr=False)
     deliverables: tuple[CardRecord, ...] = field(default=(), repr=False)
     failure_reason: str | None = None
     failure_exit_code: int | None = None
@@ -2120,6 +2124,7 @@ class ExecutionCardService:
                 outcome=None if outcome is None else ExecutionOutcome(outcome),
                 summary="" if row["summary"] is None else str(row["summary"]),
                 work_digest="" if row["work_digest"] is None else str(row["work_digest"]),
+                work_markdown="" if row["work_markdown"] is None else str(row["work_markdown"]),
                 deliverables=_stored_collection(row["deliverables_json"]),
                 failure_reason=row["workflow_failure_reason"],
                 failure_exit_code=row["workflow_failure_exit_code"],

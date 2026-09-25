@@ -279,6 +279,10 @@ class WorkflowBoardDetail:
     updated_at: str | None = None
     summary: str = ""
     work_digest: str = ""
+    #: The recorded account of the run, as the agent wrote it. `summary` and
+    #: `work_digest` are short derivations of this and carry no structure, so
+    #: this is the only field a reader can be shown the actual work through.
+    work_markdown: str = ""
     deliverables: tuple[Mapping[str, str], ...] = ()
     refusal: WorkflowRefusal | None = None
 
@@ -1871,7 +1875,7 @@ class TaskExecutionService:
         with closing(self._connect()) as connection:
             row = connection.execute(
                 "SELECT w.task_id,w.version,w.status,w.phase,w.updated_at,"
-                "r.summary,r.work_digest,r.deliverables_json "
+                "r.summary,r.work_digest,r.work_markdown,r.deliverables_json "
                 "FROM task_execution_workflows AS w "
                 "LEFT JOIN task_execution_results AS r ON r.result_id=w.last_result_id "
                 "WHERE w.task_id=?", (task_id,),
@@ -1885,6 +1889,7 @@ class TaskExecutionService:
             status=WorkflowStatus(row["status"]), phase=WorkflowPhase(row["phase"]),
             updated_at=str(row["updated_at"]), summary=_board_text(row["summary"], 1200),
             work_digest=_board_text(row["work_digest"], 800),
+            work_markdown=_board_text(row["work_markdown"], WORK_BODY_PROJECTION_MAX),
             deliverables=_board_deliverables(row["deliverables_json"]),
         )
 
@@ -3202,6 +3207,13 @@ def _workflow_board_status(status: WorkflowStatus, phase: WorkflowPhase) -> str:
         WorkflowStatus.SNOOZED: "snoozed",
         WorkflowStatus.PARKED: "parked",
     }[status]
+
+
+#: Bound for the recorded run body where it is projected to a reader. Larger
+#: than the derived fields beside it because it is the whole account of a run
+#: rather than a sentence about one, and small enough that a detail read stays
+#: one bounded response.
+WORK_BODY_PROJECTION_MAX = 16_000
 
 
 def _board_text(value: object, maximum: int) -> str:
