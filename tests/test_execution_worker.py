@@ -432,7 +432,7 @@ class ExecutionWorkerTests(unittest.TestCase):
                 "keywords": ["composite", "testing"],
             },
         )
-        self.assertEqual(context["schema_version"], 8)
+        self.assertEqual(context["schema_version"], 9)
         self.assertEqual(context["runtime"]["today"], "2030-01-02")
         self.assertEqual(context["runtime"]["today_weekday"], "Wednesday")
         self.assertEqual(
