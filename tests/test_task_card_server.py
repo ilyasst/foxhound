@@ -36,7 +36,9 @@ from foxhound.execution_cards import (
 )
 from foxhound.knowledge_client import OwnerUpcomingMeeting
 from foxhound.task_card_server import (
+    BOUNDED_SOURCE_KINDS,
     CLAIM_SCHEMA,
+    CLAIM_SCHEMA_VERSION,
     DRIP_ROLE,
     ERROR_SCHEMA,
     EXECUTION_AGENT_OPTIONS_SCHEMA,
@@ -46,6 +48,7 @@ from foxhound.task_card_server import (
     EXECUTION_ARTIFACTS_SCHEMA,
     EXECUTION_VIEW_SCHEMA,
     EXECUTION_CLAIM_SCHEMA,
+    EXECUTION_CLAIM_SCHEMA_VERSION,
     EXECUTION_DETAIL_SCHEMA,
     EXECUTION_OPERATION_SCHEMA,
     EXECUTION_PRIORITY_SCHEMA,
@@ -2769,9 +2772,10 @@ class TaskCardClaimConsumerIdentityTests(unittest.TestCase):
             status, _, claimed = request(
                 endpoint,
                 "/v1/task-cards/claim",
-                request_document(lease_seconds=60),
+                request_document(lease_seconds=60, claim_version=1),
             )
             self.assertEqual(status, 200)
+            self.assertEqual(claimed["schema_version"], 1)
             self.assertEqual(
                 set(claimed),
                 {"schema", "schema_version", "ok", "status", "claim"},
@@ -2867,6 +2871,314 @@ class TaskCardClaimConsumerIdentityTests(unittest.TestCase):
             )
         self.assertEqual(status, 200)
         self.assertEqual(claimed["status"], "claimed")
+
+
+class SourceRoutingClaimTests(unittest.TestCase):
+    """Source routing metadata exposed on task and execution card claims (Issue #688)."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.database = Path(self.temporary.name) / "foxhound.sqlite3"
+        self.artifact_root = Path(self.temporary.name) / "task-work"
+        self.artifact_root.mkdir(mode=0o700)
+        self.clock = Clock()
+        migrate_database(self.database)
+        self.cards = TaskCardService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: CLAIM_TOKEN,
+        )
+        self.execution = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: WORKFLOW_TOKEN,
+        )
+        self.execution_cards = ExecutionCardService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: EXECUTION_DELIVERY_TOKEN,
+            artifact_root=self.artifact_root,
+        )
+        self.app = TaskCardApplication(
+            self.cards,
+            TOKEN,
+            execution_cards=self.execution_cards,
+        )
+
+    def _insert_task(self, task_id: int, text: str = "Synthetic task"):
+        with closing(sqlite3.connect(self.database)) as conn, conn:
+            conn.execute(
+                "INSERT INTO tasks(id, status, text, owner, due, version, created_at, updated_at) "
+                "VALUES (?, 'open', ?, 'Person A', NULL, 1, ?, ?)",
+                (task_id, text, NOW.isoformat(), NOW.isoformat()),
+            )
+
+    def _bind_origin(
+        self,
+        task_id: int,
+        kind: str,
+        record_id: str = "forge.example/acme/project-alpha",
+        item_id: str = "42",
+        revision: str = "a" * 64,
+    ):
+        candidate_id = f"cand-{task_id}-{kind}"
+        with closing(sqlite3.connect(self.database)) as conn, conn:
+            conn.execute(
+                "INSERT INTO candidate_inbox("
+                "candidate_id, source_system, source_kind, source_record_id, source_item_id, source_revision,"
+                "payload_json, created_at, first_imported_at, updated_at) "
+                "VALUES (?, 'gw', ?, ?, ?, ?, '{}', ?, ?, ?)",
+                (candidate_id, kind, record_id, item_id, revision, NOW.isoformat(), NOW.isoformat(), NOW.isoformat()),
+            )
+            conn.execute(
+                "INSERT INTO candidate_revision_history("
+                "candidate_id, source_revision, payload_json, created_at, imported_at) "
+                "VALUES (?, ?, '{}', ?, ?)",
+                (candidate_id, revision, NOW.isoformat(), NOW.isoformat()),
+            )
+            conn.execute(
+                "INSERT INTO task_candidate_bindings("
+                "candidate_id, source_revision, task_id, relation, decided_at) "
+                "VALUES (?, ?, ?, 'accepted', ?)",
+                (candidate_id, revision, task_id, NOW.isoformat()),
+            )
+
+    def test_task_card_claims_v1_and_v2_exact_field_sets(self):
+        self._insert_task(1, "Task for field verification")
+        self._bind_origin(1, "issue", record_id="forge.example/project-alpha", item_id="101")
+        raise_review_cards(self.database, self.clock(), limit=1)
+
+        with running_server(self.app) as endpoint:
+            # Version 1 exact field set
+            status, _, v1 = request(
+                endpoint,
+                "/v1/task-cards/claim",
+                request_document(lease_seconds=60, claim_version=1),
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(v1["schema_version"], 1)
+            self.assertEqual(
+                set(v1["claim"]),
+                {
+                    "card_id", "card_version", "claim_token", "expires_at",
+                    "delivery_key", "body", "reply_markup",
+                },
+            )
+            self.assertNotIn("source_kind", v1["claim"])
+
+            # End lease by failing delivery so it can be reclaimed
+            request(
+                endpoint,
+                "/v1/task-cards/delivery-failed",
+                request_document(
+                    card_id=v1["claim"]["card_id"],
+                    card_version=v1["claim"]["card_version"],
+                    claim_token=v1["claim"]["claim_token"],
+                ),
+            )
+
+            # Version 2 exact field set (explicit claim_version=2)
+            status, _, v2 = request(
+                endpoint,
+                "/v1/task-cards/claim",
+                request_document(lease_seconds=60, claim_version=2),
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(v2["schema_version"], 2)
+            self.assertEqual(
+                set(v2["claim"]),
+                {
+                    "card_id", "card_version", "claim_token", "expires_at",
+                    "delivery_key", "body", "reply_markup", "source_kind",
+                },
+            )
+            self.assertEqual(v2["claim"]["source_kind"], "issue")
+
+            # End lease again
+            request(
+                endpoint,
+                "/v1/task-cards/delivery-failed",
+                request_document(
+                    card_id=v2["claim"]["card_id"],
+                    card_version=v2["claim"]["card_version"],
+                    claim_token=v2["claim"]["claim_token"],
+                ),
+            )
+
+            # Version 2 by default when claim_version is omitted
+            status, _, default_claim = request(
+                endpoint,
+                "/v1/task-cards/claim",
+                request_document(lease_seconds=60),
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(default_claim["schema_version"], 2)
+            self.assertEqual(default_claim["claim"]["source_kind"], "issue")
+
+    def test_execution_card_claims_v1_and_v2_exact_field_sets(self):
+        self._insert_task(1, "Task for execution claim")
+        self._bind_origin(1, "review_request", record_id="forge.example/project-alpha", item_id="202")
+        self.execution.schedule(1, expected_task_version=1)
+        self.execution_cards.schedule()
+
+        with running_server(self.app) as endpoint:
+            # Version 1 exact field set
+            status, _, v1 = request(
+                endpoint,
+                "/v1/execution-cards/claim",
+                request_document(lease_seconds=60, claim_version=1),
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(v1["schema_version"], 1)
+            self.assertEqual(
+                set(v1["claim"]),
+                {
+                    "card_id", "card_version", "kind", "phase", "claim_token",
+                    "expires_at", "delivery_key", "superseded_delivery_ref",
+                    "superseded_transport", "body", "reply_markup",
+                },
+            )
+            self.assertNotIn("source_kind", v1["claim"])
+
+            # Release failure
+            request(
+                endpoint,
+                "/v1/execution-cards/delivery-failed",
+                request_document(
+                    card_id=v1["claim"]["card_id"],
+                    card_version=v1["claim"]["card_version"],
+                    claim_token=v1["claim"]["claim_token"],
+                ),
+            )
+
+            # Version 2 exact field set
+            status, _, v2 = request(
+                endpoint,
+                "/v1/execution-cards/claim",
+                request_document(lease_seconds=60, claim_version=2),
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(v2["schema_version"], 2)
+            self.assertEqual(
+                set(v2["claim"]),
+                {
+                    "card_id", "card_version", "kind", "phase", "claim_token",
+                    "expires_at", "delivery_key", "superseded_delivery_ref",
+                    "superseded_transport", "body", "reply_markup", "source_kind",
+                },
+            )
+            self.assertEqual(v2["claim"]["source_kind"], "review_request")
+
+    def test_task_card_origin_kinds_routed_and_bounded(self):
+        # 1. Issue origin
+        self._insert_task(1, "Issue task")
+        self._bind_origin(1, "issue", record_id="forge.example/org/repo-1", item_id="11")
+        # 2. Meeting origin
+        self._insert_task(2, "Meeting task")
+        self._bind_origin(2, "meeting", record_id="meeting-2026-09-01", item_id="action-1")
+        # 3. No origin
+        self._insert_task(3, "Task without origin")
+        # 4. Out of vocabulary origin
+        self._insert_task(4, "Task with unknown origin")
+        self._bind_origin(4, "unrecognized_source_kind", record_id="other/rec", item_id="99")
+
+        raise_review_cards(self.database, self.clock(), limit=10)
+
+        with running_server(self.app) as endpoint:
+            # Claim task 1 (issue)
+            _, _, c1 = request(endpoint, "/v1/task-cards/claim", request_document(lease_seconds=60))
+            self.assertEqual(c1["claim"]["source_kind"], "issue")
+            self.assertNotIn("repo-1", c1["claim"]["source_kind"])
+
+            # Claim task 2 (meeting)
+            _, _, c2 = request(endpoint, "/v1/task-cards/claim", request_document(lease_seconds=60))
+            self.assertEqual(c2["claim"]["source_kind"], "meeting")
+
+            # Claim task 3 (no origin)
+            _, _, c3 = request(endpoint, "/v1/task-cards/claim", request_document(lease_seconds=60))
+            self.assertIsNone(c3["claim"]["source_kind"])
+
+            # Claim task 4 (unrecognized origin kind)
+            _, _, c4 = request(endpoint, "/v1/task-cards/claim", request_document(lease_seconds=60))
+            self.assertIsNone(c4["claim"]["source_kind"])
+
+    def test_execution_card_origin_kinds_routed_and_bounded(self):
+        # 1. Review request execution card
+        self._insert_task(1, "Review request workflow")
+        self._bind_origin(1, "review_request", record_id="forge.example/org/repo-2", item_id="77")
+        self.execution.schedule(1, expected_task_version=1)
+
+        # 2. Meeting execution card
+        self._insert_task(2, "Meeting workflow")
+        self._bind_origin(2, "meeting", record_id="meeting-2026-09-02", item_id="action-2")
+        self.execution.schedule(2, expected_task_version=1)
+
+        # 3. No origin execution card
+        self._insert_task(3, "Execution without origin")
+        self.execution.schedule(3, expected_task_version=1)
+
+        self.execution_cards.schedule(limit=10)
+
+        with running_server(self.app) as endpoint:
+            _, _, c1 = request(endpoint, "/v1/execution-cards/claim", request_document(lease_seconds=60))
+            self.assertEqual(c1["claim"]["source_kind"], "review_request")
+            self.assertNotIn("repo-2", c1["claim"]["source_kind"])
+
+            _, _, c2 = request(endpoint, "/v1/execution-cards/claim", request_document(lease_seconds=60))
+            self.assertEqual(c2["claim"]["source_kind"], "meeting")
+
+            _, _, c3 = request(endpoint, "/v1/execution-cards/claim", request_document(lease_seconds=60))
+            self.assertIsNone(c3["claim"]["source_kind"])
+
+    def test_delivery_success_and_failure_behavior_unchanged_on_v2(self):
+        self._insert_task(1, "Delivery lifecycle task")
+        self._bind_origin(1, "issue")
+        raise_review_cards(self.database, self.clock(), limit=1)
+
+        with running_server(self.app) as endpoint:
+            _, _, claimed = request(
+                endpoint,
+                "/v1/task-cards/claim",
+                request_document(lease_seconds=60),
+            )
+            claim = claimed["claim"]
+            self.assertEqual(claim["source_kind"], "issue")
+
+            # delivery-failed frees the card for claiming again
+            _, _, failed = request(
+                endpoint,
+                "/v1/task-cards/delivery-failed",
+                request_document(
+                    card_id=claim["card_id"],
+                    card_version=claim["card_version"],
+                    claim_token=claim["claim_token"],
+                ),
+            )
+            self.assertEqual(failed["disposition"], "applied")
+
+            # Re-claim succeeds
+            _, _, reclaimed = request(
+                endpoint,
+                "/v1/task-cards/claim",
+                request_document(lease_seconds=60),
+            )
+            self.assertEqual(reclaimed["claim"]["card_id"], claim["card_id"])
+
+            # Delivery completes normally
+            delivery = request_document(
+                card_id=reclaimed["claim"]["card_id"],
+                card_version=reclaimed["claim"]["card_version"],
+                claim_token=reclaimed["claim"]["claim_token"],
+                transport="synthetic",
+                delivery_ref="message-v2-1",
+            )
+            _, _, delivered = request(
+                endpoint,
+                "/v1/task-cards/delivered",
+                delivery,
+            )
+            self.assertEqual(delivered["card_status"], "delivered")
 
 
 if __name__ == "__main__":
