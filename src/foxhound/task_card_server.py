@@ -62,6 +62,7 @@ from .task_cards import (
 )
 from .task_ledger import TaskLedgerError
 from .task_execution import (
+    WORK_BODY_PROJECTION_MAX,
     WORKFLOW_BOARD_STATUSES,
     TaskExecutionService,
     WorkflowBoard,
@@ -100,7 +101,7 @@ EXECUTION_DELIVERABLES_SCHEMA = "foxhound.execution-card-service.deliverables"
 EXECUTION_ARTIFACTS_SCHEMA = "foxhound.execution-card-service.artifacts"
 EXECUTION_VIEW_SCHEMA = "foxhound.execution-card-service.view"
 EXECUTION_DETAIL_SCHEMA = "foxhound.execution-card-service.detail"
-EXECUTION_DETAIL_SCHEMA_VERSION = 2
+EXECUTION_DETAIL_SCHEMA_VERSION = 3
 EXECUTION_QUEUE_SCHEMA = "foxhound.execution-card-service.queue"
 EXECUTION_QUEUE_SCHEMA_VERSION = 1
 EXECUTION_BOARD_SCHEMA = "foxhound.execution-card-service.board"
@@ -117,6 +118,10 @@ EXECUTION_PRIORITY_SCHEMA = "foxhound.execution-workflow-service.priority"
 EXECUTION_PRIORITY_SCHEMA_VERSION = 1
 WORKFLOW_BOARD_SCHEMA = "foxhound.execution-workflow-service.board"
 WORKFLOW_DETAIL_SCHEMA = "foxhound.execution-workflow-service.detail"
+# Version 1 of this document rode SERVICE_VERSION, which pins every route that
+# has never changed shape. Version 2 adds the recorded run body, so it carries
+# its own constant: a consumer has to be able to tell these two apart.
+WORKFLOW_DETAIL_SCHEMA_VERSION = 2
 
 # ADR 0036 decision 1: every accepted bearer token is configured with
 # exactly one role from this closed set. A single legacy token with no
@@ -1977,6 +1982,8 @@ def _execution_detail_document(result: ExecutionCardDetail) -> dict[str, Any]:
         "outcome": None if result.outcome is None else result.outcome.value,
         "summary": _queue_projection_text(result.summary, 1_200),
         "work_digest": _queue_projection_text(result.work_digest, 800),
+        "work_markdown": _queue_projection_text(
+            result.work_markdown, WORK_BODY_PROJECTION_MAX),
         "deliverables": _queue_projection_records(result.deliverables),
         "failure_reason": result.failure_reason,
         "failure_exit_code": result.failure_exit_code,
@@ -1986,8 +1993,8 @@ def _execution_detail_document(result: ExecutionCardDetail) -> dict[str, Any]:
     if not result.accepted:
         for key in ("workflow_version", "status", "phase", "updated_at",
                     "due_at", "completed_at", "outcome", "summary",
-                    "work_digest", "deliverables", "failure_reason",
-                    "failure_exit_code", "failure_run_id"):
+                    "work_digest", "work_markdown", "deliverables",
+                    "failure_reason", "failure_exit_code", "failure_run_id"):
             document[key] = None if key != "deliverables" else []
     return document
 
@@ -2020,7 +2027,7 @@ def _workflow_board_document(result: WorkflowBoard) -> dict[str, Any]:
 def _workflow_detail_document(result: WorkflowBoardDetail) -> dict[str, Any]:
     document = {
         "schema": WORKFLOW_DETAIL_SCHEMA,
-        "schema_version": SERVICE_VERSION,
+        "schema_version": WORKFLOW_DETAIL_SCHEMA_VERSION,
         "ok": result.accepted,
         "task_id": result.task_id,
         "workflow_version": result.workflow_version,
@@ -2029,6 +2036,7 @@ def _workflow_detail_document(result: WorkflowBoardDetail) -> dict[str, Any]:
         "updated_at": result.updated_at,
         "summary": result.summary if result.accepted else "",
         "work_digest": result.work_digest if result.accepted else "",
+        "work_markdown": result.work_markdown if result.accepted else "",
         "deliverables": list(result.deliverables) if result.accepted else [],
         "refusal": None if result.refusal is None else result.refusal.value,
     }
