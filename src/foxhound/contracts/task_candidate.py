@@ -205,9 +205,13 @@ def task_candidate_document(candidate: TaskCandidate) -> dict[str, Any]:
             "pinned": owner_ref.pinned,
             "provisional": owner_ref.provisional,
         }
-    if candidate.schema_version in {
-        STRUCTURED_TASK_SCHEMA_VERSION, SOURCE_HISTORY_SCHEMA_VERSION,
-    }:
+    if (
+        candidate.schema_version == STRUCTURED_TASK_SCHEMA_VERSION
+        or (
+            candidate.schema_version == SOURCE_HISTORY_SCHEMA_VERSION
+            and candidate.task.object is not None
+        )
+    ):
         task.update({
             "object": candidate.task.object,
             "action": candidate.task.action,
@@ -388,9 +392,25 @@ def parse_task_candidate(document: object) -> TaskCandidate:
 
     task_doc = _object(root["task"], "candidate.task")
     base_task_fields = {"text", "owner", "due"}
-    if version in {
-        STRUCTURED_TASK_SCHEMA_VERSION, SOURCE_HISTORY_SCHEMA_VERSION,
-    }:
+    structured_task = version == STRUCTURED_TASK_SCHEMA_VERSION
+    if version == SOURCE_HISTORY_SCHEMA_VERSION:
+        structured_fields = {"object", "action", "confidence"}
+        present_structured_fields = structured_fields & set(task_doc)
+        if present_structured_fields and present_structured_fields != structured_fields:
+            raise ContractError("candidate.task structure is incomplete")
+        if "participants" in task_doc and not present_structured_fields:
+            raise ContractError(
+                "candidate.task.participants requires a structure"
+            )
+        structured_task = bool(present_structured_fields)
+        _required_and_allowed_fields(
+            task_doc,
+            "candidate.task",
+            {"text", "owner", "owner_ref", "due"},
+            {"text", "owner", "owner_ref", "due", "project", "object",
+             "action", "participants", "confidence"},
+        )
+    elif version == STRUCTURED_TASK_SCHEMA_VERSION:
         _required_and_allowed_fields(
             task_doc,
             "candidate.task",
@@ -464,28 +484,19 @@ def parse_task_candidate(document: object) -> TaskCandidate:
         owner_ref=owner_ref,
         object=(
             _bounded_text(task_doc["object"], "candidate.task.object", 1, 200)
-            if version in {
-                STRUCTURED_TASK_SCHEMA_VERSION, SOURCE_HISTORY_SCHEMA_VERSION,
-            } else None
+            if structured_task else None
         ),
         action=(
             _choice(task_doc["action"], "candidate.task.action", TASK_ACTIONS)
-            if version in {
-                STRUCTURED_TASK_SCHEMA_VERSION, SOURCE_HISTORY_SCHEMA_VERSION,
-            } else None
+            if structured_task else None
         ),
         participants=(
             _participant_refs(task_doc["participants"])
-            if version in {
-                STRUCTURED_TASK_SCHEMA_VERSION, SOURCE_HISTORY_SCHEMA_VERSION,
-            }
-            and "participants" in task_doc else ()
+            if structured_task and "participants" in task_doc else ()
         ),
         confidence=(
             _confidence(task_doc["confidence"])
-            if version in {
-                STRUCTURED_TASK_SCHEMA_VERSION, SOURCE_HISTORY_SCHEMA_VERSION,
-            } else None
+            if structured_task else None
         ),
     )
 

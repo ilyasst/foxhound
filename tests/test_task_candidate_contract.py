@@ -666,6 +666,36 @@ class TaskCandidateContractTests(unittest.TestCase):
         self.assertEqual(schema["properties"]["schema_version"]["const"], 9)
         self.assertIn("history", schema["properties"]["source"]["required"])
 
+    def test_version_9_does_not_require_structured_task_fields(self):
+        document = fixture("meeting-candidate-v2.json")
+        document["schema_version"] = 9
+        document["source"]["history"] = {
+            "source": "meeting",
+            "stream_id": "primary",
+            "item_id": document["candidate_id"],
+            "position": 1,
+            "revision": "e" * 64,
+        }
+        document["task"]["owner_ref"] = {
+            "kind": "person", "speaker_id": None,
+            "canonical_speaker_id": None, "speaker_registry_id": None,
+            "pinned": False, "provisional": True,
+        }
+        document["lifecycle"] = {
+            "state": "active", "generation": 1,
+            "changed_at": "2030-01-01T00:00:00Z",
+        }
+
+        candidate = parse_task_candidate(document)
+
+        self.assertIsNone(candidate.task.object)
+        self.assertEqual(task_candidate_document(candidate), document)
+
+        invalid = copy.deepcopy(document)
+        invalid["task"]["object"] = "synthetic sample"
+        with self.assertRaises(ContractError):
+            parse_task_candidate(invalid)
+
 
 if __name__ == "__main__":
     unittest.main()
