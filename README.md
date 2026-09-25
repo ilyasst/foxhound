@@ -297,6 +297,28 @@ The default alert thresholds are 15 minutes for pending work and delivery
 freshness, and three failures within 15 minutes. Supply the explicit bounded
 threshold options when a deployment needs a different policy.
 
+### Review backpressure vs. delivery health
+
+When an active consumer's review surface is full, execution cards remain pending
+and unacknowledged claims are relinquished with a bounded `surface_full` release.
+`foxhound-delivery-health` distinguishes this reader backpressure from a broken
+delivery path:
+
+- While actionable execution cards are pending, at least one execution card is
+  delivered, and a `surface_full` release occurred within the delivery freshness
+  window (default 15 minutes), the execution cards report `review_backpressure: true`.
+- Under review backpressure, the execution backlog does not emit false `delivery_stale`
+  or execution-driven `pending_age_exceeded` alerts, as the sender is active and
+  gated only by an unanswered review card.
+- Pending count and oldest pending age remain visible in the report so the review
+  backlog remains observable.
+- Real `delivery_failed` events continue to trigger `recent_delivery_failures_exceeded`
+  even during backpressure.
+- When the surface-full release ages out beyond the freshness window, ordinary
+  staleness and age alerts resume.
+- In multi-consumer deployments, backpressure is evaluated per consumer: one
+  consumer's full review surface cannot mask another consumer's delivery failure.
+
 ## Local semantic duplicate evaluation
 
 Duplicate-proposal quality is measured only from reader decisions. Before a

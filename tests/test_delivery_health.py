@@ -126,6 +126,49 @@ class DeliveryHealthTests(unittest.TestCase):
                 (candidate, "a" * 64, self._time(NOW), self._time(NOW)),
             )
 
+    def _insert_execution_card(
+        self,
+        *,
+        task_id: int,
+        status: str,
+        created: datetime,
+        consumer_digest: str | None = None,
+        delivered_at: datetime | None = None,
+    ) -> int:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            card = connection.execute(
+                "INSERT INTO execution_review_cards("
+                "task_id,task_version,workflow_version,kind,phase,status,version,"
+                "consumer_digest,delivered_at,created_at,updated_at"
+                ") VALUES(?,1,1,'start','plan',?,1,?,?,?,?)",
+                (
+                    task_id,
+                    status,
+                    consumer_digest,
+                    None if delivered_at is None else self._time(delivered_at),
+                    self._time(created),
+                    self._time(created),
+                ),
+            )
+            return int(card.lastrowid)
+
+    def _execution_card_event(
+        self,
+        card_id: int,
+        *,
+        task_id: int,
+        kind: str,
+        at: datetime,
+        action: str | None = None,
+    ) -> None:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "INSERT INTO execution_review_card_events("
+                "card_id,task_id,kind,card_version,workflow_version,action,occurred_at"
+                ") VALUES(?,?,?,1,1,?,?)",
+                (card_id, task_id, kind, action, self._time(at)),
+            )
+
     @staticmethod
     def _time(value: datetime) -> str:
         return value.isoformat(timespec="seconds")
@@ -332,6 +375,168 @@ class DeliveryHealthTests(unittest.TestCase):
         self.assertEqual(health.admission.unadmitted, 0)
         self.assertIsNone(health.admission.oldest_unadmitted_age_seconds)
         self.assertEqual(health.admission.preserved_open, 1)
+
+    def test_review_backpressure_suppresses_delivery_stale_and_pending_age_exceeded(self) -> None:
+        consumer = "a" * 64
+        self._open_task(1, created=NOW - timedelta(minutes=30), workflow=True)
+        self._open_task(2, created=NOW - timedelta(minutes=25), workflow=True)
+
+        # 1 delivered card for consumer A (delivered 25 mins ago)
+        card1 = self._insert_execution_card(
+            task_id=1, status="delivered", created=NOW - timedelta(minutes=25),
+            consumer_digest=consumer, delivered_at=NOW - timedelta(minutes=25),
+        )
+        # 1 pending card for consumer A (created 20 mins ago)
+        card2 = self._insert_execution_card(
+            task_id=2, status="pending", created=NOW - timedelta(minutes=20),
+            consumer_digest=consumer,
+        )
+        # surface_full release on card 2 within freshness window (2 minutes ago)
+        self._execution_card_event(
+            card2, task_id=2, kind="claim_released", at=NOW - timedelta(minutes=2),
+            action="surface_full",
+        )
+
+        health = collect_delivery_health(self.database, clock=lambda: NOW)
+
+        self.assertTrue(health.ok)
+        self.assertEqual(health.alerts, ())
+        self.assertTrue(health.execution_cards.review_backpressure)
+        self.assertEqual(health.execution_cards.pending, 1)
+        self.assertEqual(health.execution_cards.delivered, 1)
+        self.assertEqual(health.execution_cards.oldest_pending_age_seconds, 1200)
+        self.assertEqual(health.recent_surface_full_releases, 1)
+
+        doc = health.document()
+        self.assertEqual(doc["schema_version"], 7)
+        self.assertTrue(doc["execution_cards"]["review_backpressure"])
+        self.assertEqual(doc["delivery"]["recent_surface_full_releases"], 1)
+        self.assertEqual(doc["delivery"]["surface_full"], 1)
+
+    def test_review_backpressure_becomes_stale_when_surface_full_ages_out(self) -> None:
+        consumer = "a" * 64
+        self._open_task(1, created=NOW - timedelta(minutes=30), workflow=True)
+        self._open_task(2, created=NOW - timedelta(minutes=25), workflow=True)
+
+        card1 = self._insert_execution_card(
+            task_id=1, status="delivered", created=NOW - timedelta(minutes=25),
+            consumer_digest=consumer, delivered_at=NOW - timedelta(minutes=25),
+        )
+        card2 = self._insert_execution_card(
+            task_id=2, status="pending", created=NOW - timedelta(minutes=20),
+            consumer_digest=consumer,
+        )
+        # surface_full release is aged out (20 minutes ago, beyond 15-minute freshness window)
+        self._execution_card_event(
+            card2, task_id=2, kind="claim_released", at=NOW - timedelta(minutes=20),
+            action="surface_full",
+        )
+
+        health = collect_delivery_health(self.database, clock=lambda: NOW)
+
+        self.assertFalse(health.ok)
+        self.assertFalse(health.execution_cards.review_backpressure)
+        self.assertIn("delivery_stale", health.alerts)
+        self.assertIn("pending_age_exceeded", health.alerts)
+        self.assertEqual(health.execution_cards.pending, 1)
+        self.assertEqual(health.execution_cards.oldest_pending_age_seconds, 1200)
+
+    def test_genuine_delivery_failure_still_alarms_during_backpressure(self) -> None:
+        consumer = "a" * 64
+        self._open_task(1, created=NOW - timedelta(minutes=30), workflow=True)
+        self._open_task(2, created=NOW - timedelta(minutes=25), workflow=True)
+
+        card1 = self._insert_execution_card(
+            task_id=1, status="delivered", created=NOW - timedelta(minutes=25),
+            consumer_digest=consumer, delivered_at=NOW - timedelta(minutes=25),
+        )
+        card2 = self._insert_execution_card(
+            task_id=2, status="pending", created=NOW - timedelta(minutes=20),
+            consumer_digest=consumer,
+        )
+        self._execution_card_event(
+            card2, task_id=2, kind="claim_released", at=NOW - timedelta(minutes=2),
+            action="surface_full",
+        )
+        # 3 transport failures in the window
+        for i in range(3):
+            self._execution_card_event(
+                card2, task_id=2, kind="delivery_failed", at=NOW - timedelta(seconds=10 + i),
+            )
+
+        health = collect_delivery_health(
+            self.database,
+            policy=DeliveryHealthPolicy(max_recent_failures=3),
+            clock=lambda: NOW,
+        )
+
+        self.assertFalse(health.ok)
+        self.assertTrue(health.execution_cards.review_backpressure)
+        self.assertIn("recent_delivery_failures_exceeded", health.alerts)
+        self.assertNotIn("delivery_stale", health.alerts)
+        self.assertNotIn("pending_age_exceeded", health.alerts)
+
+    def test_old_pending_task_cards_still_alarm_beside_execution_backpressure(self) -> None:
+        consumer = "a" * 64
+        self._open_task(1, created=NOW - timedelta(minutes=30), workflow=True)
+        self._open_task(2, created=NOW - timedelta(minutes=25), workflow=True)
+
+        card1 = self._insert_execution_card(
+            task_id=1, status="delivered", created=NOW - timedelta(minutes=25),
+            consumer_digest=consumer, delivered_at=NOW - timedelta(minutes=25),
+        )
+        card2 = self._insert_execution_card(
+            task_id=2, status="pending", created=NOW - timedelta(minutes=20),
+            consumer_digest=consumer,
+        )
+        self._execution_card_event(
+            card2, task_id=2, kind="claim_released", at=NOW - timedelta(minutes=2),
+            action="surface_full",
+        )
+
+        # An old pending task card
+        self._insert_task_card(due=NOW - timedelta(minutes=20))
+
+        health = collect_delivery_health(self.database, clock=lambda: NOW)
+
+        self.assertFalse(health.ok)
+        self.assertTrue(health.execution_cards.review_backpressure)
+        self.assertIn("pending_age_exceeded", health.alerts)
+        self.assertIn("delivery_stale", health.alerts)
+
+    def test_multi_consumer_backpressure_does_not_mask_another_consumers_failure(self) -> None:
+        consumer_a = "a" * 64
+        consumer_b = "b" * 64
+        self._open_task(1, created=NOW - timedelta(minutes=30), workflow=True)
+        self._open_task(2, created=NOW - timedelta(minutes=25), workflow=True)
+        self._open_task(3, created=NOW - timedelta(minutes=20), workflow=True)
+
+        # Consumer A is under backpressure
+        card1 = self._insert_execution_card(
+            task_id=1, status="delivered", created=NOW - timedelta(minutes=25),
+            consumer_digest=consumer_a, delivered_at=NOW - timedelta(minutes=25),
+        )
+        card2 = self._insert_execution_card(
+            task_id=2, status="pending", created=NOW - timedelta(minutes=20),
+            consumer_digest=consumer_a,
+        )
+        self._execution_card_event(
+            card2, task_id=2, kind="claim_released", at=NOW - timedelta(minutes=2),
+            action="surface_full",
+        )
+
+        # Consumer B has an old pending card, 0 delivered cards, and no releases
+        card3 = self._insert_execution_card(
+            task_id=3, status="pending", created=NOW - timedelta(minutes=20),
+            consumer_digest=consumer_b,
+        )
+
+        health = collect_delivery_health(self.database, clock=lambda: NOW)
+
+        self.assertFalse(health.ok)
+        self.assertTrue(health.execution_cards.review_backpressure)
+        self.assertIn("pending_age_exceeded", health.alerts)
+        self.assertIn("delivery_stale", health.alerts)
 
     def test_unavailable_database_has_content_free_cli_output(self) -> None:
         output = io.StringIO()

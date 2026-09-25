@@ -21,7 +21,8 @@ HEALTH_SCHEMA = "foxhound.delivery-health"
 # 2 adds `superseded_profiles`; 3 adds the count of workflows parked because
 # their measured context did not fit; 4 adds `admission`. Consumers must not
 # infer any of them from a missing aggregate field. 6 adds `admission.preserved_open`.
-HEALTH_SCHEMA_VERSION = 6
+# 7 adds `execution_cards.review_backpressure` and `delivery.recent_surface_full_releases`.
+HEALTH_SCHEMA_VERSION = 7
 MAX_THRESHOLD_SECONDS = 7 * 24 * 60 * 60
 MAX_RECENT_FAILURES = 10_000
 
@@ -60,6 +61,11 @@ class DeliveryCardHealth:
     delivered: int
     active: int
     oldest_pending_age_seconds: int | None
+
+
+@dataclass(frozen=True)
+class ExecutionDeliveryCardHealth(DeliveryCardHealth):
+    review_backpressure: bool = False
 
 
 @dataclass(frozen=True)
@@ -110,9 +116,10 @@ class DeliveryHealthPolicy:
 @dataclass(frozen=True)
 class DeliveryHealth:
     task_cards: DeliveryCardHealth
-    execution_cards: DeliveryCardHealth
+    execution_cards: ExecutionDeliveryCardHealth
     recent_failures: int
     recent_requeues: int
+    recent_surface_full_releases: int
     failure_window_seconds: int
     last_successful_delivery_age_seconds: int | None
     workflows: ExecutionReadiness
@@ -135,6 +142,8 @@ class DeliveryHealth:
             "delivery": {
                 "recent_failures": self.recent_failures,
                 "recent_requeues": self.recent_requeues,
+                "recent_surface_full_releases": self.recent_surface_full_releases,
+                "surface_full": self.recent_surface_full_releases,
                 "failure_window_seconds": self.failure_window_seconds,
                 "last_successful_delivery_age_seconds": self.last_successful_delivery_age_seconds,
             },
@@ -160,12 +169,26 @@ def collect_delivery_health(
             task_cards = _card_health(
                 connection, "task_review_cards", "due_at", now
             )
-            execution_cards = _card_health(
+            execution_cards_base = _card_health(
                 connection, "execution_review_cards", "created_at", now,
                 scope="summary_only=0",
             )
-            recent_failures, recent_requeues, last_delivery = _delivery_events(
+            (
+                recent_failures,
+                recent_requeues,
+                recent_surface_full,
+                last_delivery,
+                last_task_delivery,
+                last_execution_delivery,
+            ) = _delivery_events(
                 connection, now - timedelta(seconds=policy.failure_window_seconds)
+            )
+            (
+                review_backpressure,
+                unbackpressured_age_exceeded,
+                unbackpressured_delivery_stale,
+            ) = _execution_backpressure_and_status(
+                connection, now, policy
             )
             admission = _admission_health(connection, now)
         execution = TaskExecutionService(database, clock=lambda: now)
@@ -174,25 +197,35 @@ def collect_delivery_health(
     except (TaskBootstrapConfigError, TaskLedgerError, OSError, ValueError) as exc:
         raise DeliveryHealthError("delivery health is unavailable") from exc
 
-    last_age = None if last_delivery is None else _age(now, last_delivery)
-    pending_or_stuck = (
-        task_cards.pending + task_cards.delivering
-        + execution_cards.pending + execution_cards.delivering
+    execution_cards = ExecutionDeliveryCardHealth(
+        pending=execution_cards_base.pending,
+        delivering=execution_cards_base.delivering,
+        delivered=execution_cards_base.delivered,
+        active=execution_cards_base.active,
+        oldest_pending_age_seconds=execution_cards_base.oldest_pending_age_seconds,
+        review_backpressure=review_backpressure,
     )
+
+    last_age = None if last_delivery is None else _age(now, last_delivery)
     alerts: list[str] = []
-    oldest = max((
-        age for age in (
-            task_cards.oldest_pending_age_seconds,
-            execution_cards.oldest_pending_age_seconds,
-        ) if age is not None
-    ), default=None)
-    if oldest is not None and oldest > policy.max_pending_age_seconds:
+
+    task_age_exceeded = (
+        task_cards.oldest_pending_age_seconds is not None
+        and task_cards.oldest_pending_age_seconds > policy.max_pending_age_seconds
+    )
+    if task_age_exceeded or unbackpressured_age_exceeded:
         alerts.append("pending_age_exceeded")
     if recent_failures >= policy.max_recent_failures:
         alerts.append("recent_delivery_failures_exceeded")
-    if pending_or_stuck and (
-        last_age is None or last_age > policy.max_last_delivery_age_seconds
-    ):
+
+    task_delivery_stale = (
+        (task_cards.pending + task_cards.delivering) > 0
+        and (
+            last_task_delivery is None
+            or _age(now, last_task_delivery) > policy.max_last_delivery_age_seconds
+        )
+    )
+    if task_delivery_stale or unbackpressured_delivery_stale:
         alerts.append("delivery_stale")
     if (
         admission.oldest_unadmitted_age_seconds is not None
@@ -205,6 +238,7 @@ def collect_delivery_health(
         execution_cards=execution_cards,
         recent_failures=recent_failures,
         recent_requeues=recent_requeues,
+        recent_surface_full_releases=recent_surface_full,
         failure_window_seconds=policy.failure_window_seconds,
         last_successful_delivery_age_seconds=last_age,
         workflows=workflows,
@@ -300,33 +334,135 @@ def _card_health(
 
 def _delivery_events(
     connection: object, since: datetime
-) -> tuple[int, int, datetime | None]:
-    """Failures and requeues counted apart, because they mean opposite things.
-
-    A `delivery_failed` says the transport could not present a card. A
-    `requeued` says a card was re-presented because nobody answered it for an
-    hour -- routine, and a fact about the reader rather than the system. Only
-    the first belongs in the alert; the second is still worth reporting, and
-    was the thing actually happening every time this alarm fired.
-    """
+) -> tuple[int, int, int, datetime | None, datetime | None, datetime | None]:
+    """Failures, requeues, surface-full releases, and delivery timestamps."""
     row = connection.execute(
         "SELECT "
         "SUM(CASE WHEN kind='delivery_failed' AND occurred_at>=? THEN 1 ELSE 0 END) AS recent_failures,"
         "SUM(CASE WHEN kind='requeued' AND occurred_at>=? THEN 1 ELSE 0 END) AS recent_requeues,"
-        "MAX(CASE WHEN kind='delivered' THEN occurred_at END) AS last_delivery "
+        "SUM(CASE WHEN kind='claim_released' AND action='surface_full' AND occurred_at>=? THEN 1 ELSE 0 END) AS recent_surface_full,"
+        "MAX(CASE WHEN kind='delivered' THEN occurred_at END) AS last_delivery,"
+        "MAX(CASE WHEN source='task' AND kind='delivered' THEN occurred_at END) AS last_task_delivery,"
+        "MAX(CASE WHEN source='execution' AND kind='delivered' THEN occurred_at END) AS last_execution_delivery "
         "FROM ("
-        "SELECT kind,occurred_at FROM task_review_card_events "
+        "SELECT 'task' AS source, kind, action, occurred_at FROM task_review_card_events "
         "UNION ALL "
-        "SELECT kind,occurred_at FROM execution_review_card_events"
+        "SELECT 'execution' AS source, kind, action, occurred_at FROM execution_review_card_events"
         ")",
-        (since.isoformat(timespec="seconds"),) * 2,
+        (since.isoformat(timespec="seconds"),) * 3,
     ).fetchone()
     last = row["last_delivery"]
+    last_task = row["last_task_delivery"]
+    last_exec = row["last_execution_delivery"]
     return (
         int(row["recent_failures"] or 0),
         int(row["recent_requeues"] or 0),
+        int(row["recent_surface_full"] or 0),
         None if last is None else _timestamp(str(last)),
+        None if last_task is None else _timestamp(str(last_task)),
+        None if last_exec is None else _timestamp(str(last_exec)),
     )
+
+
+def _execution_backpressure_and_status(
+    connection: object,
+    now: datetime,
+    policy: DeliveryHealthPolicy,
+) -> tuple[bool, bool, bool]:
+    """Calculate review backpressure and check un-backpressured consumers.
+
+    Returns:
+        (review_backpressure, unbackpressured_age_exceeded, unbackpressured_delivery_stale)
+    """
+    rows = connection.execute(
+        "SELECT "
+        "COALESCE(consumer_digest, '') AS consumer,"
+        "SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,"
+        "SUM(CASE WHEN status='delivering' THEN 1 ELSE 0 END) AS delivering,"
+        "SUM(CASE WHEN status='delivered' THEN 1 ELSE 0 END) AS delivered,"
+        "MIN(CASE WHEN status='pending' AND created_at<=? THEN created_at END) AS oldest_pending,"
+        "MAX(CASE WHEN status='delivered' THEN delivered_at END) AS last_delivered "
+        "FROM execution_review_cards "
+        "WHERE summary_only=0 "
+        "GROUP BY COALESCE(consumer_digest, '')",
+        (now.isoformat(timespec="seconds"),),
+    ).fetchall()
+
+    sf_rows = connection.execute(
+        "SELECT "
+        "COALESCE(c.consumer_digest, '') AS consumer,"
+        "MAX(e.occurred_at) AS last_surface_full "
+        "FROM execution_review_card_events e "
+        "LEFT JOIN execution_review_cards c ON c.id=e.card_id "
+        "WHERE e.kind='claim_released' AND e.action='surface_full' "
+        "GROUP BY COALESCE(c.consumer_digest, '')"
+    ).fetchall()
+    sf_by_consumer = {
+        row["consumer"]: _timestamp(str(row["last_surface_full"]))
+        for row in sf_rows
+        if row["last_surface_full"] is not None
+    }
+
+    deliv_rows = connection.execute(
+        "SELECT "
+        "COALESCE(c.consumer_digest, '') AS consumer,"
+        "MAX(e.occurred_at) AS last_delivery "
+        "FROM execution_review_card_events e "
+        "LEFT JOIN execution_review_cards c ON c.id=e.card_id "
+        "WHERE e.kind='delivered' "
+        "GROUP BY COALESCE(c.consumer_digest, '')"
+    ).fetchall()
+    deliv_by_consumer = {
+        row["consumer"]: _timestamp(str(row["last_delivery"]))
+        for row in deliv_rows
+        if row["last_delivery"] is not None
+    }
+
+    any_backpressure = False
+    unbackpressured_age_exceeded = False
+    unbackpressured_delivery_stale = False
+
+    for row in rows:
+        consumer = row["consumer"]
+        pending = int(row["pending"] or 0)
+        delivering = int(row["delivering"] or 0)
+        delivered = int(row["delivered"] or 0)
+        oldest_pending_raw = row["oldest_pending"]
+        last_deliv_raw = row["last_delivered"]
+
+        last_delivered_dt = None
+        if last_deliv_raw is not None:
+            last_delivered_dt = _timestamp(str(last_deliv_raw))
+        event_deliv = deliv_by_consumer.get(consumer)
+        if event_deliv is not None:
+            if last_delivered_dt is None or event_deliv > last_delivered_dt:
+                last_delivered_dt = event_deliv
+
+        last_sf_dt = sf_by_consumer.get(consumer)
+        if last_sf_dt is None and len(rows) == 1:
+            last_sf_dt = sf_by_consumer.get("")
+
+        sf_fresh = (
+            last_sf_dt is not None
+            and _age(now, last_sf_dt) <= policy.max_last_delivery_age_seconds
+        )
+        is_backpressured = (pending > 0 and delivered >= 1 and sf_fresh)
+        if is_backpressured:
+            any_backpressure = True
+        else:
+            if oldest_pending_raw is not None:
+                oldest_age = _age(now, _timestamp(str(oldest_pending_raw)))
+                if oldest_age > policy.max_pending_age_seconds:
+                    unbackpressured_age_exceeded = True
+
+            if (pending + delivering) > 0:
+                if (
+                    last_delivered_dt is None
+                    or _age(now, last_delivered_dt) > policy.max_last_delivery_age_seconds
+                ):
+                    unbackpressured_delivery_stale = True
+
+    return any_backpressure, unbackpressured_age_exceeded, unbackpressured_delivery_stale
 
 
 def _now(clock: Callable[[], datetime] | None) -> datetime:
