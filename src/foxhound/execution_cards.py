@@ -838,9 +838,11 @@ class ExecutionCardService:
                     connection.rollback()
                     return _refused_row(card_id, row, ExecutionCardRefusal.STALE_VERSION)
                 self._event(connection, card_id=card_id, task_id=int(row["task_id"]), kind="delivery_claimed",
-                             card_version=version, workflow_version=int(row["workflow_version"]), action=None, now=now)
+                             card_version=version, workflow_version=int(row["workflow_version"]), action=None, now=now,
+                             consumer_digest=consumer_digest)
                 self._event(connection, card_id=card_id, task_id=int(row["task_id"]), kind="delivered",
-                             card_version=version, workflow_version=int(row["workflow_version"]), action=None, now=now)
+                             card_version=version, workflow_version=int(row["workflow_version"]), action=None, now=now,
+                             consumer_digest=consumer_digest)
                 if action in {"discussion", "reassignment"}:
                     # Preserve the established input semantics in this same transaction.
                     target = int(row["workflow_version"]) + 1
@@ -1005,6 +1007,7 @@ class ExecutionCardService:
                     workflow_version=int(row["workflow_version"]),
                     action=None,
                     now=now,
+                    consumer_digest=consumer_digest,
                 )
                 connection.commit()
                 values = dict(row)
@@ -1094,6 +1097,7 @@ class ExecutionCardService:
                     workflow_version=int(row["workflow_version"]),
                     action=None,
                     now=now,
+                    consumer_digest=row["consumer_digest"],
                 )
                 connection.commit()
                 values = dict(row)
@@ -1233,6 +1237,7 @@ class ExecutionCardService:
                     workflow_version=int(row["workflow_version"]),
                     action=reason,
                     now=now,
+                    consumer_digest=consumer_digest,
                 )
                 connection.commit()
                 values = dict(row)
@@ -3117,11 +3122,12 @@ class ExecutionCardService:
         workflow_version: int,
         action: str | None,
         now: str,
+        consumer_digest: str | None = None,
     ) -> None:
         connection.execute(
             "INSERT INTO execution_review_card_events("
             "card_id,task_id,kind,card_version,workflow_version,action,"
-            "occurred_at) VALUES(?,?,?,?,?,?,?)",
+            "consumer_digest,occurred_at) VALUES(?,?,?,?,?,?,?,?)",
             (
                 card_id,
                 task_id,
@@ -3129,6 +3135,7 @@ class ExecutionCardService:
                 card_version,
                 workflow_version,
                 action,
+                consumer_digest,
                 now,
             ),
         )

@@ -304,12 +304,16 @@ and unacknowledged claims are relinquished with a bounded `surface_full` release
 `foxhound-delivery-health` distinguishes this reader backpressure from a broken
 delivery path:
 
-- While actionable execution cards are pending, at least one execution card is
-  delivered, and a `surface_full` release occurred within the delivery freshness
-  window (default 15 minutes), the execution cards report `review_backpressure: true`.
-- Under review backpressure, the execution backlog does not emit false `delivery_stale`
-  or execution-driven `pending_age_exceeded` alerts, as the sender is active and
-  gated only by an unanswered review card.
+- A release event records the consumer at occurrence time; health never infers
+  historical ownership from the card's mutable current row.
+- While actionable execution cards are pending, any consumer with a delivered
+  card and a matching `surface_full` release inside the delivery freshness
+  window (default 15 minutes) makes the execution cards report
+  `review_backpressure: true`.
+- The execution backlog suppresses `delivery_stale` and execution-driven
+  `pending_age_exceeded` only when every consumer that currently owns delivered
+  cards has fresh surface-full evidence. A full consumer therefore cannot hide
+  another consumer's stale delivery path.
 - Pending count and oldest pending age remain visible in the report so the review
   backlog remains observable.
 - Real `delivery_failed` events continue to trigger `recent_delivery_failures_exceeded`

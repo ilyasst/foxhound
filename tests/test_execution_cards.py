@@ -771,6 +771,19 @@ class ExecutionCardTests(unittest.TestCase):
             delivery_ref="message-beta",
         )
         self.assertEqual(delivered.card_status, ExecutionCardStatus.DELIVERED)
+        with closing(sqlite3.connect(self.database)) as conn:
+            card_consumer = conn.execute(
+                "SELECT consumer_digest FROM execution_review_cards WHERE id=?",
+                (third.card.id,),
+            ).fetchone()[0]
+            event_consumer = conn.execute(
+                "SELECT consumer_digest FROM execution_review_card_events "
+                "WHERE card_id=? AND kind='delivered' "
+                "ORDER BY sequence DESC LIMIT 1",
+                (third.card.id,),
+            ).fetchone()[0]
+        self.assertIsNotNone(event_consumer)
+        self.assertEqual(event_consumer, card_consumer)
         replay = self.cards.complete_delivery(
             third.card.id,
             expected_version=third.card.version,
@@ -809,7 +822,9 @@ class ExecutionCardTests(unittest.TestCase):
             self.assertIsNone(row["consumer_digest"])
 
             events = conn.execute(
-                "SELECT kind, action, card_version FROM execution_review_card_events WHERE card_id=? ORDER BY sequence",
+                "SELECT kind,action,card_version,consumer_digest "
+                "FROM execution_review_card_events WHERE card_id=? "
+                "ORDER BY sequence",
                 (claim.card.id,),
             ).fetchall()
             kinds = [e["kind"] for e in events]
@@ -818,6 +833,27 @@ class ExecutionCardTests(unittest.TestCase):
             released_event = [e for e in events if e["kind"] == "claim_released"][0]
             self.assertEqual(released_event["action"], "surface_full")
             self.assertEqual(released_event["card_version"], claim.card.version + 1)
+            self.assertEqual(released_event["consumer_digest"], consumer)
+
+        # A later claimant rewrites the mutable card owner. The immutable
+        # release event must continue to name the consumer that released it.
+        next_consumer = "b" * 64
+        next_claim = self.cards.claim_next(
+            lease_seconds=60, consumer_digest=next_consumer
+        )
+        self.assertIsNotNone(next_claim)
+        with closing(sqlite3.connect(self.database)) as conn:
+            event_consumer = conn.execute(
+                "SELECT consumer_digest FROM execution_review_card_events "
+                "WHERE card_id=? AND kind='claim_released'",
+                (claim.card.id,),
+            ).fetchone()[0]
+            current_consumer = conn.execute(
+                "SELECT consumer_digest FROM execution_review_cards WHERE id=?",
+                (claim.card.id,),
+            ).fetchone()[0]
+        self.assertEqual(event_consumer, consumer)
+        self.assertEqual(current_consumer, next_consumer)
 
     def test_release_delivery_with_client_rejected(self):
         self._schedule_workflow(1)

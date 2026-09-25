@@ -49,7 +49,7 @@ from .contracts.task_candidate import (
 )
 
 
-SCHEMA_VERSION = 59
+SCHEMA_VERSION = 60
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 _CUMULATIVE_SCHEMA_VERSIONS = {
@@ -458,6 +458,7 @@ _SCHEMA_COLUMNS = {
         "workflow_version",
         "action",
         "occurred_at",
+        "consumer_digest",
     ),
     "execution_card_retractions": (
         "card_id", "transport", "delivery_ref", "state", "attempts",
@@ -3161,6 +3162,41 @@ FROM execution_review_card_events_v58;
 )
 
 
+# Consumer ownership on a card is mutable: release clears it and a later
+# claim may replace it.  Delivery-health decisions must not recover the
+# consumer for an immutable event by joining back to that mutable row.
+# Record the bounded digest on the event at occurrence time instead.  Old
+# events remain explicitly unknown because their original consumer cannot be
+# reconstructed safely after the fact.
+_SCHEMA_V60_CARD_EVENT_TABLE = _SCHEMA_V59_CARD_EVENT_TABLE.replace(
+    "    occurred_at      TEXT NOT NULL,\n"
+    "    FOREIGN KEY(card_id)",
+    "    occurred_at      TEXT NOT NULL,\n"
+    "    consumer_digest  TEXT CHECK(consumer_digest IS NULL OR "
+    "length(consumer_digest) = 64),\n"
+    "    FOREIGN KEY(card_id)",
+)
+_SCHEMA_V60 = (
+    "DROP TRIGGER execution_review_card_events_no_update;",
+    "DROP TRIGGER execution_review_card_events_no_delete;",
+    "ALTER TABLE execution_review_card_events "
+    "RENAME TO execution_review_card_events_v59;",
+    _SCHEMA_V60_CARD_EVENT_TABLE,
+    """
+INSERT INTO execution_review_card_events(
+    sequence,card_id,task_id,kind,card_version,workflow_version,action,
+    consumer_digest,occurred_at
+)
+SELECT sequence,card_id,task_id,kind,card_version,workflow_version,action,
+       NULL,occurred_at
+FROM execution_review_card_events_v59;
+""",
+    "DROP TABLE execution_review_card_events_v59;",
+    _SCHEMA_V9[3],
+    _SCHEMA_V9[4],
+)
+
+
 # Context exhaustion is a separate terminal condition for one attempt. The
 # workflow table has a closed reason vocabulary, so admitting it requires a
 # table rebuild rather than silently recording it as an ordinary timeout.
@@ -4710,6 +4746,22 @@ class CandidateInbox:
                     connection.execute("PRAGMA legacy_alter_table = OFF")
                     connection.execute("PRAGMA foreign_keys = ON")
                 version = 59
+            if version == 59:
+                connection.execute("PRAGMA foreign_keys = OFF")
+                connection.execute("PRAGMA legacy_alter_table = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V60:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 60")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                finally:
+                    connection.execute("PRAGMA legacy_alter_table = OFF")
+                    connection.execute("PRAGMA foreign_keys = ON")
+                version = 60
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:
@@ -5381,6 +5433,9 @@ class CandidateInbox:
                 table == "task_review_cards"
                 and set(columns) == set(expected_columns) | {"claiming_consumer"}
                 and len(columns) == len(expected_columns) + 1
+            ) and not (
+                table == "execution_review_card_events"
+                and columns == expected_columns + ("consumer_digest",)
             ) and not (
                 table == "tasks"
                 and tuple(column for column in columns if column not in {
