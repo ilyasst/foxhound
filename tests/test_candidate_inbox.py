@@ -290,7 +290,7 @@ class CandidateInboxTests(unittest.TestCase):
         self.assertEqual(version, SCHEMA_VERSION)
         self.assertEqual(state, "superseded")
 
-    def test_version_fifty_nine_fresh_database_accepts_claim_released_and_enforces_triggers(self):
+    def test_version_sixty_fresh_database_records_release_consumer_and_enforces_triggers(self):
         migrate_database(self.database)
         now = NOW.isoformat(timespec="seconds")
         with closing(sqlite3.connect(self.database)) as connection:
@@ -317,23 +317,38 @@ class CandidateInboxTests(unittest.TestCase):
             )
             connection.execute(
                 "INSERT INTO execution_review_card_events("
-                "card_id,task_id,kind,card_version,workflow_version,action,occurred_at) "
-                "VALUES(1,1,'claim_released',2,1,'surface_full',?)",
-                (now,),
+                "card_id,task_id,kind,card_version,workflow_version,action,"
+                "consumer_digest,occurred_at) "
+                "VALUES(1,1,'claim_released',2,1,'surface_full',?,?)",
+                ("a" * 64, now),
             )
             connection.execute(
                 "INSERT INTO execution_review_card_events("
-                "card_id,task_id,kind,card_version,workflow_version,action,occurred_at) "
-                "VALUES(1,1,'claim_released',3,1,'client_rejected',?)",
-                (now,),
+                "card_id,task_id,kind,card_version,workflow_version,action,"
+                "consumer_digest,occurred_at) "
+                "VALUES(1,1,'claim_released',3,1,'client_rejected',?,?)",
+                ("b" * 64, now),
             )
             events = connection.execute(
-                "SELECT kind,action FROM execution_review_card_events WHERE card_id=1 ORDER BY sequence"
+                "SELECT kind,action,consumer_digest "
+                "FROM execution_review_card_events WHERE card_id=1 "
+                "ORDER BY sequence"
             ).fetchall()
             self.assertEqual(
                 events,
-                [("claim_released", "surface_full"), ("claim_released", "client_rejected")],
+                [
+                    ("claim_released", "surface_full", "a" * 64),
+                    ("claim_released", "client_rejected", "b" * 64),
+                ],
             )
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "INSERT INTO execution_review_card_events("
+                    "card_id,task_id,kind,card_version,workflow_version,action,"
+                    "consumer_digest,occurred_at) "
+                    "VALUES(1,1,'claim_released',4,1,'surface_full','short',?)",
+                    (now,),
+                )
             with self.assertRaises(sqlite3.DatabaseError):
                 connection.execute(
                     "UPDATE execution_review_card_events SET action='surface_full' WHERE card_id=1"
@@ -343,7 +358,7 @@ class CandidateInboxTests(unittest.TestCase):
                     "DELETE FROM execution_review_card_events WHERE card_id=1"
                 )
 
-    def test_version_fifty_nine_migration_preserves_events_and_accepts_claim_released(self):
+    def test_version_sixty_migration_preserves_old_events_as_unknown_consumers(self):
         migrate_database(self.database)
         now = NOW.isoformat(timespec="seconds")
         with closing(sqlite3.connect(self.database)) as connection:
@@ -371,11 +386,11 @@ class CandidateInboxTests(unittest.TestCase):
                 "VALUES(1,1,'delivered',1,1,NULL,?)",
                 (now,),
             )
-            # Roll user_version back to 58
-            connection.execute("PRAGMA user_version = 58")
+            # Model an event written before consumer attribution existed.
+            connection.execute("PRAGMA user_version = 59")
             connection.commit()
 
-        # Migrate from 58 to current
+        # Migrate from 59 to current.
         migrate_database(self.database)
 
         with closing(sqlite3.connect(self.database)) as connection:
@@ -383,15 +398,17 @@ class CandidateInboxTests(unittest.TestCase):
             self.assertEqual(version, SCHEMA_VERSION)
             # Existing event was preserved
             existing = connection.execute(
-                "SELECT kind,action FROM execution_review_card_events WHERE card_id=1"
+                "SELECT kind,action,consumer_digest "
+                "FROM execution_review_card_events WHERE card_id=1"
             ).fetchall()
-            self.assertEqual(existing, [("delivered", None)])
-            # Accepts claim_released
+            self.assertEqual(existing, [("delivered", None, None)])
+            # New events accept durable consumer attribution.
             connection.execute(
                 "INSERT INTO execution_review_card_events("
-                "card_id,task_id,kind,card_version,workflow_version,action,occurred_at) "
-                "VALUES(1,1,'claim_released',2,1,'surface_full',?)",
-                (now,),
+                "card_id,task_id,kind,card_version,workflow_version,action,"
+                "consumer_digest,occurred_at) "
+                "VALUES(1,1,'claim_released',2,1,'surface_full',?,?)",
+                ("a" * 64, now),
             )
             # Triggers still reject update and delete
             with self.assertRaises(sqlite3.DatabaseError):

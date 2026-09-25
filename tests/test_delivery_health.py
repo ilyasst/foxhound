@@ -160,13 +160,17 @@ class DeliveryHealthTests(unittest.TestCase):
         kind: str,
         at: datetime,
         action: str | None = None,
+        consumer_digest: str | None = None,
     ) -> None:
         with closing(sqlite3.connect(self.database)) as connection, connection:
             connection.execute(
                 "INSERT INTO execution_review_card_events("
-                "card_id,task_id,kind,card_version,workflow_version,action,occurred_at"
-                ") VALUES(?,?,?,1,1,?,?)",
-                (card_id, task_id, kind, action, self._time(at)),
+                "card_id,task_id,kind,card_version,workflow_version,action,"
+                "consumer_digest,occurred_at) VALUES(?,?,?,1,1,?,?,?)",
+                (
+                    card_id, task_id, kind, action, consumer_digest,
+                    self._time(at),
+                ),
             )
 
     @staticmethod
@@ -386,15 +390,15 @@ class DeliveryHealthTests(unittest.TestCase):
             task_id=1, status="delivered", created=NOW - timedelta(minutes=25),
             consumer_digest=consumer, delivered_at=NOW - timedelta(minutes=25),
         )
-        # 1 pending card for consumer A (created 20 mins ago)
+        # Pending cards are unowned, even when consumer A is the surface
+        # whose full state leaves this shared backlog waiting.
         card2 = self._insert_execution_card(
             task_id=2, status="pending", created=NOW - timedelta(minutes=20),
-            consumer_digest=consumer,
         )
         # surface_full release on card 2 within freshness window (2 minutes ago)
         self._execution_card_event(
             card2, task_id=2, kind="claim_released", at=NOW - timedelta(minutes=2),
-            action="surface_full",
+            action="surface_full", consumer_digest=consumer,
         )
 
         health = collect_delivery_health(self.database, clock=lambda: NOW)
@@ -424,12 +428,11 @@ class DeliveryHealthTests(unittest.TestCase):
         )
         card2 = self._insert_execution_card(
             task_id=2, status="pending", created=NOW - timedelta(minutes=20),
-            consumer_digest=consumer,
         )
         # surface_full release is aged out (20 minutes ago, beyond 15-minute freshness window)
         self._execution_card_event(
             card2, task_id=2, kind="claim_released", at=NOW - timedelta(minutes=20),
-            action="surface_full",
+            action="surface_full", consumer_digest=consumer,
         )
 
         health = collect_delivery_health(self.database, clock=lambda: NOW)
@@ -452,11 +455,10 @@ class DeliveryHealthTests(unittest.TestCase):
         )
         card2 = self._insert_execution_card(
             task_id=2, status="pending", created=NOW - timedelta(minutes=20),
-            consumer_digest=consumer,
         )
         self._execution_card_event(
             card2, task_id=2, kind="claim_released", at=NOW - timedelta(minutes=2),
-            action="surface_full",
+            action="surface_full", consumer_digest=consumer,
         )
         # 3 transport failures in the window
         for i in range(3):
@@ -487,11 +489,10 @@ class DeliveryHealthTests(unittest.TestCase):
         )
         card2 = self._insert_execution_card(
             task_id=2, status="pending", created=NOW - timedelta(minutes=20),
-            consumer_digest=consumer,
         )
         self._execution_card_event(
             card2, task_id=2, kind="claim_released", at=NOW - timedelta(minutes=2),
-            action="surface_full",
+            action="surface_full", consumer_digest=consumer,
         )
 
         # An old pending task card
@@ -518,17 +519,18 @@ class DeliveryHealthTests(unittest.TestCase):
         )
         card2 = self._insert_execution_card(
             task_id=2, status="pending", created=NOW - timedelta(minutes=20),
-            consumer_digest=consumer_a,
         )
         self._execution_card_event(
             card2, task_id=2, kind="claim_released", at=NOW - timedelta(minutes=2),
-            action="surface_full",
+            action="surface_full", consumer_digest=consumer_a,
         )
 
-        # Consumer B has an old pending card, 0 delivered cards, and no releases
-        card3 = self._insert_execution_card(
-            task_id=3, status="pending", created=NOW - timedelta(minutes=20),
+        # Consumer B still owns an old delivered presentation but has not
+        # reported a full surface. A's proof cannot hide B's stale path.
+        self._insert_execution_card(
+            task_id=3, status="delivered", created=NOW - timedelta(minutes=20),
             consumer_digest=consumer_b,
+            delivered_at=NOW - timedelta(minutes=20),
         )
 
         health = collect_delivery_health(self.database, clock=lambda: NOW)

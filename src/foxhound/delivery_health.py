@@ -369,33 +369,43 @@ def _execution_backpressure_and_status(
     now: datetime,
     policy: DeliveryHealthPolicy,
 ) -> tuple[bool, bool, bool]:
-    """Calculate review backpressure and check un-backpressured consumers.
+    """Calculate review backpressure without assigning pending work.
+
+    Pending execution cards are deliberately unowned.  A consumer owns a
+    presentation only while it is delivering or delivered, so grouping the
+    pending backlog by the card's mutable ``consumer_digest`` invents an
+    assignment that the authority does not make.  Immutable release events
+    carry the consumer that observed its own surface full; current delivered
+    cards say which consumers can presently block that shared backlog.
 
     Returns:
         (review_backpressure, unbackpressured_age_exceeded, unbackpressured_delivery_stale)
     """
-    rows = connection.execute(
+    backlog = connection.execute(
         "SELECT "
-        "COALESCE(consumer_digest, '') AS consumer,"
         "SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,"
         "SUM(CASE WHEN status='delivering' THEN 1 ELSE 0 END) AS delivering,"
-        "SUM(CASE WHEN status='delivered' THEN 1 ELSE 0 END) AS delivered,"
-        "MIN(CASE WHEN status='pending' AND created_at<=? THEN created_at END) AS oldest_pending,"
-        "MAX(CASE WHEN status='delivered' THEN delivered_at END) AS last_delivered "
+        "MIN(CASE WHEN status='pending' AND created_at<=? THEN created_at END) AS oldest_pending "
         "FROM execution_review_cards "
-        "WHERE summary_only=0 "
-        "GROUP BY COALESCE(consumer_digest, '')",
+        "WHERE summary_only=0",
         (now.isoformat(timespec="seconds"),),
+    ).fetchone()
+
+    delivered_rows = connection.execute(
+        "SELECT consumer_digest AS consumer,COUNT(*) AS delivered,"
+        "MAX(delivered_at) AS last_delivered "
+        "FROM execution_review_cards "
+        "WHERE summary_only=0 AND status='delivered' "
+        "AND consumer_digest IS NOT NULL "
+        "GROUP BY consumer_digest"
     ).fetchall()
 
     sf_rows = connection.execute(
-        "SELECT "
-        "COALESCE(c.consumer_digest, '') AS consumer,"
-        "MAX(e.occurred_at) AS last_surface_full "
-        "FROM execution_review_card_events e "
-        "LEFT JOIN execution_review_cards c ON c.id=e.card_id "
-        "WHERE e.kind='claim_released' AND e.action='surface_full' "
-        "GROUP BY COALESCE(c.consumer_digest, '')"
+        "SELECT consumer_digest AS consumer,"
+        "MAX(occurred_at) AS last_surface_full "
+        "FROM execution_review_card_events "
+        "WHERE kind='claim_released' AND action='surface_full' "
+        "AND consumer_digest IS NOT NULL GROUP BY consumer_digest"
     ).fetchall()
     sf_by_consumer = {
         row["consumer"]: _timestamp(str(row["last_surface_full"]))
@@ -404,13 +414,10 @@ def _execution_backpressure_and_status(
     }
 
     deliv_rows = connection.execute(
-        "SELECT "
-        "COALESCE(c.consumer_digest, '') AS consumer,"
-        "MAX(e.occurred_at) AS last_delivery "
-        "FROM execution_review_card_events e "
-        "LEFT JOIN execution_review_cards c ON c.id=e.card_id "
-        "WHERE e.kind='delivered' "
-        "GROUP BY COALESCE(c.consumer_digest, '')"
+        "SELECT consumer_digest AS consumer,MAX(occurred_at) AS last_delivery "
+        "FROM execution_review_card_events "
+        "WHERE kind='delivered' AND consumer_digest IS NOT NULL "
+        "GROUP BY consumer_digest"
     ).fetchall()
     deliv_by_consumer = {
         row["consumer"]: _timestamp(str(row["last_delivery"]))
@@ -418,51 +425,76 @@ def _execution_backpressure_and_status(
         if row["last_delivery"] is not None
     }
 
-    any_backpressure = False
-    unbackpressured_age_exceeded = False
-    unbackpressured_delivery_stale = False
+    pending = int(backlog["pending"] or 0)
+    delivering = int(backlog["delivering"] or 0)
+    oldest_pending_raw = backlog["oldest_pending"]
 
-    for row in rows:
-        consumer = row["consumer"]
-        pending = int(row["pending"] or 0)
-        delivering = int(row["delivering"] or 0)
-        delivered = int(row["delivered"] or 0)
-        oldest_pending_raw = row["oldest_pending"]
-        last_deliv_raw = row["last_delivered"]
-
-        last_delivered_dt = None
-        if last_deliv_raw is not None:
-            last_delivered_dt = _timestamp(str(last_deliv_raw))
-        event_deliv = deliv_by_consumer.get(consumer)
-        if event_deliv is not None:
-            if last_delivered_dt is None or event_deliv > last_delivered_dt:
-                last_delivered_dt = event_deliv
-
-        last_sf_dt = sf_by_consumer.get(consumer)
-        if last_sf_dt is None and len(rows) == 1:
-            last_sf_dt = sf_by_consumer.get("")
-
-        sf_fresh = (
-            last_sf_dt is not None
-            and _age(now, last_sf_dt) <= policy.max_last_delivery_age_seconds
+    delivered_consumers: dict[str, datetime | None] = {}
+    for row in delivered_rows:
+        consumer = str(row["consumer"])
+        last_delivered = (
+            None if row["last_delivered"] is None
+            else _timestamp(str(row["last_delivered"]))
         )
-        is_backpressured = (pending > 0 and delivered >= 1 and sf_fresh)
-        if is_backpressured:
-            any_backpressure = True
-        else:
-            if oldest_pending_raw is not None:
-                oldest_age = _age(now, _timestamp(str(oldest_pending_raw)))
-                if oldest_age > policy.max_pending_age_seconds:
-                    unbackpressured_age_exceeded = True
+        event_delivered = deliv_by_consumer.get(consumer)
+        if event_delivered is not None and (
+            last_delivered is None or event_delivered > last_delivered
+        ):
+            last_delivered = event_delivered
+        delivered_consumers[consumer] = last_delivered
 
-            if (pending + delivering) > 0:
-                if (
-                    last_delivered_dt is None
-                    or _age(now, last_delivered_dt) > policy.max_last_delivery_age_seconds
-                ):
-                    unbackpressured_delivery_stale = True
+    fresh_full_consumers = {
+        consumer for consumer, occurred_at in sf_by_consumer.items()
+        if _age(now, occurred_at) <= policy.max_last_delivery_age_seconds
+    }
+    backpressured_consumers = (
+        set(delivered_consumers) & fresh_full_consumers if pending else set()
+    )
+    any_backpressure = bool(backpressured_consumers)
+    all_delivered_consumers_full = (
+        pending > 0
+        and bool(delivered_consumers)
+        and set(delivered_consumers) <= fresh_full_consumers
+    )
 
-    return any_backpressure, unbackpressured_age_exceeded, unbackpressured_delivery_stale
+    unbackpressured_age_exceeded = False
+    if not all_delivered_consumers_full and oldest_pending_raw is not None:
+        unbackpressured_age_exceeded = (
+            _age(now, _timestamp(str(oldest_pending_raw)))
+            > policy.max_pending_age_seconds
+        )
+
+    unbackpressured_delivery_stale = False
+    if pending + delivering > 0 and not all_delivered_consumers_full:
+        unbackpressured = {
+            consumer: delivered_at
+            for consumer, delivered_at in delivered_consumers.items()
+            if consumer not in fresh_full_consumers
+        }
+        if unbackpressured:
+            unbackpressured_delivery_stale = any(
+                delivered_at is None
+                or _age(now, delivered_at)
+                > policy.max_last_delivery_age_seconds
+                for delivered_at in unbackpressured.values()
+            )
+        elif not delivered_consumers:
+            last_delivery_row = connection.execute(
+                "SELECT MAX(occurred_at) AS last_delivery "
+                "FROM execution_review_card_events WHERE kind='delivered'"
+            ).fetchone()
+            last_delivery = last_delivery_row["last_delivery"]
+            unbackpressured_delivery_stale = (
+                last_delivery is None
+                or _age(now, _timestamp(str(last_delivery)))
+                > policy.max_last_delivery_age_seconds
+            )
+
+    return (
+        any_backpressure,
+        unbackpressured_age_exceeded,
+        unbackpressured_delivery_stale,
+    )
 
 
 def _now(clock: Callable[[], datetime] | None) -> datetime:
