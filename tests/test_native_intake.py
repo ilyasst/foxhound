@@ -946,6 +946,34 @@ class NativeCandidateIntakeTests(unittest.TestCase):
             revised["source"]["history"]["revision"],
         )
 
+    def test_history_contract_upgrade_may_reset_generation(self):
+        self.activate()
+        upgraded = history_candidate(2)
+        for field in ("object", "action", "participants", "confidence"):
+            upgraded["task"].pop(field, None)
+        upgraded["source"]["revision"] = hashlib.sha256(
+            json.dumps(upgraded, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        initial = copy.deepcopy(upgraded)
+        initial["schema_version"] = 7
+        initial["source"].pop("history")
+        initial["source"]["revision"] = "b" * 64
+        initial["lifecycle"]["generation"] = 4
+        self.assertTrue(self.inbox.import_feed(feed(0, initial)).accepted)
+        self.intake()
+
+        imported = self.inbox.import_feed(feed(1, upgraded))
+
+        self.assertTrue(imported.accepted)
+        self.assertEqual((imported.updated, imported.unchanged), (1, 0))
+        self.assertEqual(
+            self.inbox.get(upgraded["candidate_id"]).lifecycle.generation, 1
+        )
+        self.assertEqual(self.intake().tasks_revised, 1)
+        state = self.ledger.work_revision_state(1)
+        self.assertIsNone(state.created.source_history)
+        self.assertEqual(state.current, state.created)
+
     def test_same_contract_change_at_same_generation_still_refuses(self):
         initial = history_candidate(1)
         self.assertTrue(self.inbox.import_feed(feed(0, initial)).accepted)

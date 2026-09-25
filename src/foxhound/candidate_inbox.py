@@ -5145,7 +5145,10 @@ class CandidateInbox:
             raise InboxError("candidate lifecycle state is incomplete")
         current_generation = int(row["lifecycle_generation"])
         incoming_generation = candidate.lifecycle.generation
-        if incoming_generation < current_generation:
+        contract_upgrade = _is_cumulative_contract_upgrade(
+            row["payload_json"], payload
+        )
+        if incoming_generation < current_generation and not contract_upgrade:
             return ImportResult(
                 ImportDisposition.REFUSED,
                 ImportRefusal.STALE_GENERATION,
@@ -5157,9 +5160,7 @@ class CandidateInbox:
                 row["source_revision"] != candidate.source.revision
                 or row["payload_json"] != payload
             )
-            and not _is_cumulative_contract_upgrade(
-                row["payload_json"], payload
-            )
+            and not contract_upgrade
         ):
             return ImportResult(
                 ImportDisposition.REFUSED,
@@ -5169,6 +5170,7 @@ class CandidateInbox:
             incoming_generation > current_generation
             and current_generation > 0
             and incoming_generation != current_generation + 1
+            and not contract_upgrade
         ):
             return ImportResult(
                 ImportDisposition.REFUSED,
@@ -5434,6 +5436,9 @@ def _is_cumulative_contract_upgrade(
             return normalized
         source.pop("revision", None)
         source.pop("history", None)
+        lifecycle = normalized.get("lifecycle")
+        if isinstance(lifecycle, dict):
+            lifecycle.pop("generation", None)
         if current_version < STRUCTURED_TASK_SCHEMA_VERSION:
             for field in ("object", "action", "participants", "confidence"):
                 task.pop(field, None)
