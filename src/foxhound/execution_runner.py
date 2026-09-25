@@ -83,6 +83,13 @@ from .worker_resolution import (
 NO_PROGRESS_EXIT_CODE = 70
 STARTUP_EXIT_CODE = 71
 TIMEOUT_EXIT_CODE = 124
+#: Distinct from ``TIMEOUT_EXIT_CODE`` so the card and the ledger can
+#: distinguish a run that was killed because the context refused to fit
+#: from one that simply burned through its time budget. 138 was chosen
+#: because 137 (SIGKILL) is reserved for out-of-memory / forced kill, and
+#: 136 is unused. The code is not a signal offset: the runner initiates
+#: this abort deliberately.
+CONTEXT_EXHAUSTED_EXIT_CODE = 138
 _RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _RUNNER_SLOT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
 # A gateway refusal with a measured request size is authoritative evidence
@@ -95,6 +102,20 @@ _CONTEXT_FILTER_REFUSAL = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _CONTEXT_EVIDENCE_BYTES = 256 * 1024
+#: Maximum number of polls that may see only refusals with no other evidence
+#: of progress before the runner aborts.  A single refusal is ambiguous: the
+#: gateway may have skipped one backend while another served the request.  Two
+#: consecutive polls with nothing but refusals between them is sufficient
+#: evidence that the request is consistently too large for every available
+#: backend.  The value is small enough to abort within a heartbeat window and
+#: large enough to avoid killing a run on a transient refusal followed by a
+#: successful serve on the next round.
+_CONTEXT_REFUSAL_THRESHOLD = 2
+#: Bytes of overlap retained between successive incremental reads so a refusal
+#: line split across two reads is still matched.  The refusal line is typically
+#: under 512 bytes, so 1024 is more than enough margin without meaningfully
+#: increasing the scan cost on a large transcript.
+_CONTEXT_OVERLAP_BYTES = 1024
 _SESSION_ID_LINE = re.compile(
     rb"(?m)^session_id:\s*([A-Za-z0-9][A-Za-z0-9._-]{0,127})\s*$"
 )
@@ -705,6 +726,8 @@ def _run_claim(
             transcript = _open_transcript(directory)
         except OSError:
             transcript = None
+        transcript_path = directory / TRANSCRIPT_NAME
+        context_scanner: _ContextRefusalScanner | None = None
         if transcript is not None:
             # The run directory and its transcript now exist together. The
             # pointer is optional (a database race must not cost the run),
@@ -715,6 +738,7 @@ def _run_claim(
                 claim_token=claim.token,
                 run_id=run_id,
             )
+            context_scanner = _ContextRefusalScanner(transcript_path)
         try:
             process = popen(
                 list(command),
@@ -788,6 +812,34 @@ def _run_claim(
                     )
                 next_heartbeat = now + profile.heartbeat_seconds
 
+            # Scan the transcript for context-filter refusals on each
+            # heartbeat cycle.  This check runs before the process poll
+            # because a child that is still alive but repeatedly refused
+            # should be stopped before it exhausts its turn budget.
+            if context_scanner is not None and transcript is not None:
+                transcript.flush()
+                context_scanner.poll()
+                if context_scanner.should_abort:
+                    # Verify no result was recorded before killing.
+                    # A run that already recorded its result and then
+                    # logged a refusal on the way out is not abortable.
+                    current = service.get(claim.task_id)
+                    terminal = _terminal_result(initial, current, claim.task_id)
+                    if terminal is None:
+                        forced = terminate(
+                            process, profile.kill_grace_seconds,
+                            sleep=sleep, clock=clock,
+                        )
+                        return _failure_result(
+                            service,
+                            claim,
+                            initial,
+                            reason="context_exhausted",
+                            outcome="context_exhausted",
+                            exit_code=CONTEXT_EXHAUSTED_EXIT_CODE,
+                            forced=forced,
+                        )
+
             child_exit = process.poll()
             if child_exit is not None:
                 current = service.get(claim.task_id)
@@ -849,19 +901,21 @@ def _run_claim(
                     process, profile.kill_grace_seconds,
                     sleep=sleep, clock=clock
                 )
-                reason = (
-                    "context_exhausted"
-                    if _context_window_exhausted(
-                        directory / TRANSCRIPT_NAME, transcript
-                    ) else "timeout"
-                )
+                if _context_window_exhausted(
+                    directory / TRANSCRIPT_NAME, transcript
+                ):
+                    reason = "context_exhausted"
+                    exit_code = CONTEXT_EXHAUSTED_EXIT_CODE
+                else:
+                    reason = "timeout"
+                    exit_code = TIMEOUT_EXIT_CODE
                 return _failure_result(
                     service,
                     claim,
                     initial,
                     reason=reason,
                     outcome=reason,
-                    exit_code=TIMEOUT_EXIT_CODE,
+                    exit_code=exit_code,
                     forced=forced,
                 )
             sleep(config.poll_seconds)
@@ -1141,6 +1195,72 @@ def _open_transcript(directory: Path):
         )
 
     return open(directory / TRANSCRIPT_NAME, "wb", opener=opener)
+
+
+class _ContextRefusalScanner:
+    """Incrementally scan the transcript for gateway context-filter refusals.
+
+    Reads only new bytes since the last poll, retaining a small overlap so a
+    refusal line split across two reads is still matched.  Requires a minimum
+    number of consecutive polls showing only refusals (no other progress
+    evidence) before concluding the run is doomed.  This prevents aborting a
+    run on a single refusal that another backend may subsequently serve.
+
+    The scanner is stateless regarding the transcript handle: it reads from
+    the file on disk each time ``poll`` is called, so the caller can flush
+    the writing handle first.
+    """
+
+    def __init__(self, transcript_path: Path) -> None:
+        self._path = transcript_path
+        self._offset: int = 0
+        self._consecutive_refusals: int = 0
+        self._overlap: bytes = b""
+
+    @property
+    def should_abort(self) -> bool:
+        """Whether the threshold of consecutive refusals has been reached."""
+        return self._consecutive_refusals >= _CONTEXT_REFUSAL_THRESHOLD
+
+    def poll(self) -> None:
+        """Read new bytes from the transcript and update the refusal count.
+
+        Returns immediately if no new data is available.  On success the
+        offset is advanced and the overlap retained for the next call.
+        """
+        try:
+            transcript_size = self._path.stat().st_size
+        except OSError:
+            return
+        if transcript_size <= self._offset - len(self._overlap):
+            return
+        # Read from just before the overlap region into the new data
+        read_start = max(0, self._offset - len(self._overlap))
+        try:
+            with self._path.open("rb") as handle:
+                handle.seek(read_start)
+                chunk = handle.read(transcript_size - read_start)
+        except OSError:
+            return
+        if not chunk:
+            return
+
+        self._offset = transcript_size
+        self._overlap = b""
+        if len(chunk) > _CONTEXT_OVERLAP_BYTES:
+            self._overlap = chunk[-_CONTEXT_OVERLAP_BYTES:]
+
+        # A refusal in this chunk means the gateway is rejecting the request
+        # due to context size. The threshold (consecutive polls) provides the
+        # safety margin: a single refusal could be one backend while another
+        # served, but two consecutive refusals with no successful response
+        # between them means the request is consistently too large.
+        if _CONTEXT_FILTER_REFUSAL.search(chunk) is not None:
+            self._consecutive_refusals += 1
+        else:
+            # No refusal in this chunk means the agent produced output that
+            # didn't trigger the filter -- reset the counter.
+            self._consecutive_refusals = 0
 
 
 def _context_window_exhausted(path: Path, transcript: object) -> bool:

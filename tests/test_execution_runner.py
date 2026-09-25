@@ -28,6 +28,7 @@ from foxhound.agent_profiles import (
 )
 from foxhound.candidate_inbox import CandidateInbox
 from foxhound.execution_runner import (
+    CONTEXT_EXHAUSTED_EXIT_CODE,
     ExecutionRunnerConfig,
     ExecutionRunnerError,
     ExecutionRunResult,
@@ -1105,13 +1106,135 @@ class ExecutionRunnerTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            (result.outcome, result.exit_code), ("context_exhausted", 124)
+            (result.outcome, result.exit_code), ("context_exhausted", 138)
         )
         state = self.service.get(1)
         self.assertEqual(state.status, WorkflowStatus.PARKED)
         self.assertEqual(state.last_failure_reason, "context_exhausted")
         self.assertIsNone(state.next_attempt_at)
         self.assertIsNone(self.service.claim_next())
+
+    def test_context_refusal_early_abort_stops_before_timeout(self):
+        """Two consecutive refusal writes across heartbeat cycles trigger an
+        early abort with CONTEXT_EXHAUSTED_EXIT_CODE, well before the timeout.
+        """
+        self._ready()
+        monotonic = MutableMonotonic()
+        profile = parse_profile({
+            **general_profile().document(),
+            "profile_id": "short-heartbeat",
+            "heartbeat_seconds": 5,
+        })
+        registry = AgentProfileRegistry((general_profile(), profile))
+
+        # FakeProcess variant that writes to transcript on each poll
+        class PollWriterProcess:
+            def __init__(self, transcript):
+                self.pid = 4242
+                self.transcript = transcript
+                self.poll_count = 0
+                self.terminated = False
+
+            def poll(self):
+                if self.terminated:
+                    return -15
+                self.poll_count += 1
+                # Write a refusal on every heartbeat cycle (every poll,
+                # since heartbeat_seconds == 1 and poll_seconds == 1)
+                self.transcript.write(
+                    b"context filter: light needs ~200000 tokens, "
+                    b"skipping host-a(140032)\n"
+                )
+                self.transcript.flush()
+                return None
+
+        def popen(*_args, **kwargs):
+            transcript = kwargs["stdout"]
+            transcript.write(b"agent started\n")
+            transcript.flush()
+            return PollWriterProcess(transcript)
+
+        result = run_once(
+            self._config(profile_registry=registry),
+            popen=popen,
+            clock=monotonic,
+            sleep=monotonic.sleep,
+            run_id_factory=lambda: "e" * 32,
+            terminate=self._terminator,
+        )
+
+        self.assertEqual(
+            (result.outcome, result.exit_code),
+            ("context_exhausted", CONTEXT_EXHAUSTED_EXIT_CODE),
+        )
+        # The run should have aborted well before the timeout elapsed
+        self.assertLess(
+            monotonic.value,
+            general_profile().timeout_seconds,
+        )
+        state = self.service.get(1)
+        self.assertEqual(state.status, WorkflowStatus.PARKED)
+        self.assertEqual(state.last_failure_reason, "context_exhausted")
+
+    def test_single_context_refusal_does_not_abort_immediately(self):
+        """A single refusal followed by non-refusal output does NOT trigger
+        an early abort -- the counter resets.
+        """
+        self._ready()
+        monotonic = MutableMonotonic()
+        profile = parse_profile({
+            **general_profile().document(),
+            "profile_id": "short-heartbeat",
+            "heartbeat_seconds": 5,
+        })
+        registry = AgentProfileRegistry((general_profile(), profile))
+
+        class MixedWriterProcess:
+            def __init__(self, transcript):
+                self.pid = 4242
+                self.transcript = transcript
+                self.poll_count = 0
+                self.terminated = False
+
+            def poll(self):
+                if self.terminated:
+                    return -15
+                self.poll_count += 1
+                # First heartbeat: refusal. Subsequent heartbeats: normal output.
+                if self.poll_count == 1:
+                    self.transcript.write(
+                        b"context filter: light needs ~200000 tokens, "
+                        b"skipping host-a(140032)\n"
+                    )
+                else:
+                    self.transcript.write(
+                        b"agent output: proceeding with reduced context\n"
+                    )
+                self.transcript.flush()
+                return None
+
+        def popen(*_args, **kwargs):
+            transcript = kwargs["stdout"]
+            transcript.write(b"agent started\n")
+            transcript.flush()
+            return MixedWriterProcess(transcript)
+
+        result = run_once(
+            self._config(profile_registry=registry),
+            popen=popen,
+            clock=monotonic,
+            sleep=monotonic.sleep,
+            run_id_factory=lambda: "e" * 32,
+            terminate=self._terminator,
+        )
+
+        # The timeout path still detects context_exhausted from the transcript
+        # (the refusal IS in the file), but the key is that the early abort
+        # didn't fire prematurely - the run ran to full timeout because the
+        # counter was reset by normal output.
+        self.assertEqual(result.outcome, "context_exhausted")
+        self.assertEqual(result.exit_code, CONTEXT_EXHAUSTED_EXIT_CODE)
+        self.assertEqual(monotonic.value, general_profile().timeout_seconds)
 
     def test_recorded_result_wins_a_race_with_process_failure(self):
         self._ready()
