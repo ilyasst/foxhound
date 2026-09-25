@@ -782,6 +782,146 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertIsNone(parse_execution_review_callback("fhe|01|1|start"))
         self.assertIsNone(parse_execution_review_callback("fhc|1|1|start"))
 
+    def test_release_delivery_returns_card_to_pending_without_delivery_failed_event(self):
+        self._schedule_workflow(1)
+        self.cards.schedule()
+        consumer = "a" * 64
+        claim = self.cards.claim_next(lease_seconds=60, consumer_digest=consumer)
+        self.assertIsNotNone(claim)
+
+        result = self.cards.release_delivery(
+            claim.card.id,
+            expected_version=claim.card.version,
+            claim_token=claim.token,
+            consumer_digest=consumer,
+            reason="surface_full",
+        )
+        self.assertEqual(result.disposition, ExecutionCardDisposition.APPLIED)
+        self.assertEqual(result.card_status, ExecutionCardStatus.PENDING)
+        self.assertEqual(result.card_version, claim.card.version + 1)
+
+        with closing(sqlite3.connect(self.database)) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM execution_review_cards WHERE id=?", (claim.card.id,)).fetchone()
+            self.assertEqual(row["status"], "pending")
+            self.assertIsNone(row["claim_token_digest"])
+            self.assertIsNone(row["claim_expires_at"])
+            self.assertIsNone(row["consumer_digest"])
+
+            events = conn.execute(
+                "SELECT kind, action, card_version FROM execution_review_card_events WHERE card_id=? ORDER BY sequence",
+                (claim.card.id,),
+            ).fetchall()
+            kinds = [e["kind"] for e in events]
+            self.assertIn("claim_released", kinds)
+            self.assertNotIn("delivery_failed", kinds)
+            released_event = [e for e in events if e["kind"] == "claim_released"][0]
+            self.assertEqual(released_event["action"], "surface_full")
+            self.assertEqual(released_event["card_version"], claim.card.version + 1)
+
+    def test_release_delivery_with_client_rejected(self):
+        self._schedule_workflow(1)
+        self.cards.schedule()
+        consumer = "b" * 64
+        claim = self.cards.claim_next(lease_seconds=60, consumer_digest=consumer)
+        self.assertIsNotNone(claim)
+
+        result = self.cards.release_delivery(
+            claim.card.id,
+            expected_version=claim.card.version,
+            claim_token=claim.token,
+            consumer_digest=consumer,
+            reason="client_rejected",
+        )
+        self.assertEqual(result.disposition, ExecutionCardDisposition.APPLIED)
+        self.assertEqual(result.card_status, ExecutionCardStatus.PENDING)
+
+        with closing(sqlite3.connect(self.database)) as conn:
+            conn.row_factory = sqlite3.Row
+            events = conn.execute(
+                "SELECT kind, action FROM execution_review_card_events WHERE card_id=? AND kind='claim_released'",
+                (claim.card.id,),
+            ).fetchall()
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["action"], "client_rejected")
+
+    def test_release_delivery_refusals(self):
+        self._schedule_workflow(1)
+        self.cards.schedule()
+        consumer = "c" * 64
+        claim = self.cards.claim_next(lease_seconds=60, consumer_digest=consumer)
+        self.assertIsNotNone(claim)
+
+        # 1. Invalid reason
+        bad_reason = self.cards.release_delivery(
+            claim.card.id,
+            expected_version=claim.card.version,
+            claim_token=claim.token,
+            consumer_digest=consumer,
+            reason="unknown_reason",
+        )
+        self.assertEqual(bad_reason.disposition, ExecutionCardDisposition.REFUSED)
+        self.assertEqual(bad_reason.refusal, ExecutionCardRefusal.INVALID_ARGUMENT)
+
+        # 2. Stale version
+        stale = self.cards.release_delivery(
+            claim.card.id,
+            expected_version=claim.card.version + 99,
+            claim_token=claim.token,
+            consumer_digest=consumer,
+            reason="surface_full",
+        )
+        self.assertEqual(stale.disposition, ExecutionCardDisposition.REFUSED)
+        self.assertEqual(stale.refusal, ExecutionCardRefusal.STALE_VERSION)
+
+        # 3. Wrong token
+        wrong_token = self.cards.release_delivery(
+            claim.card.id,
+            expected_version=claim.card.version,
+            claim_token="wrong-token-" + "w" * 32,
+            consumer_digest=consumer,
+            reason="surface_full",
+        )
+        self.assertEqual(wrong_token.disposition, ExecutionCardDisposition.REFUSED)
+        self.assertEqual(wrong_token.refusal, ExecutionCardRefusal.CLAIM_MISMATCH)
+
+        # 4. Wrong consumer
+        other_consumer = "f" * 64
+        wrong_consumer = self.cards.release_delivery(
+            claim.card.id,
+            expected_version=claim.card.version,
+            claim_token=claim.token,
+            consumer_digest=other_consumer,
+            reason="surface_full",
+        )
+        self.assertEqual(wrong_consumer.disposition, ExecutionCardDisposition.REFUSED)
+        self.assertEqual(wrong_consumer.refusal, ExecutionCardRefusal.CLAIM_MISMATCH)
+
+        # Card is still in delivering state with no mutations
+        with closing(sqlite3.connect(self.database)) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM execution_review_cards WHERE id=?", (claim.card.id,)).fetchone()
+            self.assertEqual(row["status"], "delivering")
+            self.assertEqual(row["version"], claim.card.version)
+
+        # 5. Non-delivering card (after completing delivery)
+        self.cards.complete_delivery(
+            claim.card.id,
+            expected_version=claim.card.version,
+            claim_token=claim.token,
+            transport="synthetic",
+            delivery_ref="ref-1",
+        )
+        non_delivering = self.cards.release_delivery(
+            claim.card.id,
+            expected_version=claim.card.version,
+            claim_token=claim.token,
+            consumer_digest=consumer,
+            reason="surface_full",
+        )
+        self.assertEqual(non_delivering.disposition, ExecutionCardDisposition.REFUSED)
+        self.assertEqual(non_delivering.refusal, ExecutionCardRefusal.INVALID_STATE)
+
     def test_other_owner_can_be_held_until_meeting_and_wakes_with_fresh_card(self):
         self._set_structured_owner(
             1,

@@ -253,6 +253,7 @@ class ClaimAtCeiling:
 EXECUTION_CARD_CLAIM_CEILINGS = {
     "queue_view": 2, "drip": 20, "queue_view_steer": 3, "drip_steer": 5,
 }
+EXECUTION_CARD_RELEASE_REASONS = frozenset({"surface_full", "client_rejected"})
 BOARD_CARD_LIMIT = 100
 STEER_DIGEST_REFRESH_INTERVAL = timedelta(minutes=30)
 STEER_DIGEST_MAX_ATTEMPTS = 3
@@ -1166,6 +1167,81 @@ class ExecutionCardService:
                     version=version,
                     claim_token_digest=None,
                     claim_expires_at=None,
+                )
+                return _operation(values, ExecutionCardDisposition.APPLIED)
+            except Exception:
+                connection.rollback()
+                raise
+
+    def release_delivery(
+        self,
+        card_id: int,
+        *,
+        expected_version: int,
+        claim_token: str,
+        consumer_digest: str,
+        reason: str,
+    ) -> ExecutionCardOperationResult:
+        if (
+            not _valid_identity(card_id, expected_version)
+            or not _valid_secret(claim_token)
+            or not _valid_digest(consumer_digest)
+            or reason not in EXECUTION_CARD_RELEASE_REASONS
+        ):
+            return _refused(card_id, ExecutionCardRefusal.INVALID_ARGUMENT)
+        now = self._now()
+        digest = _token_digest(claim_token)
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT * FROM execution_review_cards WHERE id=?",
+                    (card_id,),
+                ).fetchone()
+                refusal = _card_guard(row, expected_version)
+                if refusal is not None:
+                    connection.rollback()
+                    return _refused_row(card_id, row, refusal)
+                if row["status"] != ExecutionCardStatus.DELIVERING:
+                    connection.rollback()
+                    return _refused_row(
+                        card_id, row, ExecutionCardRefusal.INVALID_STATE
+                    )
+                if row["claim_token_digest"] != digest:
+                    connection.rollback()
+                    return _refused_row(
+                        card_id, row, ExecutionCardRefusal.CLAIM_MISMATCH
+                    )
+                if row["consumer_digest"] != consumer_digest:
+                    connection.rollback()
+                    return _refused_row(
+                        card_id, row, ExecutionCardRefusal.CLAIM_MISMATCH
+                    )
+                version = expected_version + 1
+                connection.execute(
+                    "UPDATE execution_review_cards SET status='pending',"
+                    "version=?,claim_token_digest=NULL,claim_expires_at=NULL,"
+                    "consumer_digest=NULL,updated_at=? WHERE id=? AND version=?",
+                    (version, now, card_id, expected_version),
+                )
+                self._event(
+                    connection,
+                    card_id=card_id,
+                    task_id=int(row["task_id"]),
+                    kind="claim_released",
+                    card_version=version,
+                    workflow_version=int(row["workflow_version"]),
+                    action=reason,
+                    now=now,
+                )
+                connection.commit()
+                values = dict(row)
+                values.update(
+                    status=ExecutionCardStatus.PENDING,
+                    version=version,
+                    claim_token_digest=None,
+                    claim_expires_at=None,
+                    consumer_digest=None,
                 )
                 return _operation(values, ExecutionCardDisposition.APPLIED)
             except Exception:

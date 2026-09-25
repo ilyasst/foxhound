@@ -1546,6 +1546,160 @@ class TaskCardServerTests(unittest.TestCase):
                 ("queued", "execute"),
             )
 
+    def test_execution_card_release_endpoint(self):
+        self.execution.schedule(1, expected_task_version=1)
+        self.execution_cards.schedule()
+        app = TaskCardApplication(
+            self.cards,
+            {DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: QUEUE_VIEW_TOKEN},
+            execution_cards=self.execution_cards,
+            execution_tokens={DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: QUEUE_VIEW_TOKEN},
+        )
+        with running_server(app) as endpoint:
+            # 1. Claim a card with DRIP_ROLE token
+            status, _, claimed = request(
+                endpoint,
+                "/v1/execution-cards/claim",
+                request_document(lease_seconds=60),
+                token=TOKEN,
+            )
+            self.assertEqual(status, 200)
+            claim = claimed["claim"]
+
+            # 2. Refuse invalid reason with 400
+            status, _, bad_reason = request(
+                endpoint,
+                "/v1/execution-cards/release",
+                request_document(
+                    card_id=claim["card_id"],
+                    card_version=claim["card_version"],
+                    claim_token=claim["claim_token"],
+                    reason="not_a_valid_reason",
+                ),
+                token=TOKEN,
+            )
+            self.assertEqual(status, 400)
+            self.assertEqual(bad_reason["error"]["code"], "invalid_request")
+
+            # 3. Refuse unauthenticated caller with 401
+            status, _, unauth = request(
+                endpoint,
+                "/v1/execution-cards/release",
+                request_document(
+                    card_id=claim["card_id"],
+                    card_version=claim["card_version"],
+                    claim_token=claim["claim_token"],
+                    reason="surface_full",
+                ),
+                token="bad-token-" + "x" * 20,
+            )
+            self.assertEqual(status, 401)
+            self.assertEqual(unauth["error"]["code"], "unauthorized")
+
+            # 4. Refuse wrong consumer (QUEUE_VIEW_TOKEN instead of TOKEN)
+            status, _, wrong_consumer = request(
+                endpoint,
+                "/v1/execution-cards/release",
+                request_document(
+                    card_id=claim["card_id"],
+                    card_version=claim["card_version"],
+                    claim_token=claim["claim_token"],
+                    reason="surface_full",
+                ),
+                token=QUEUE_VIEW_TOKEN,
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(wrong_consumer["disposition"], "refused")
+            self.assertEqual(wrong_consumer["refusal"], "claim_mismatch")
+
+            # 5. Refuse wrong token
+            status, _, wrong_token = request(
+                endpoint,
+                "/v1/execution-cards/release",
+                request_document(
+                    card_id=claim["card_id"],
+                    card_version=claim["card_version"],
+                    claim_token="wrong-token-" + "w" * 32,
+                    reason="surface_full",
+                ),
+                token=TOKEN,
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(wrong_token["disposition"], "refused")
+            self.assertEqual(wrong_token["refusal"], "claim_mismatch")
+
+            # 6. Refuse stale version
+            status, _, stale = request(
+                endpoint,
+                "/v1/execution-cards/release",
+                request_document(
+                    card_id=claim["card_id"],
+                    card_version=claim["card_version"] + 99,
+                    claim_token=claim["claim_token"],
+                    reason="surface_full",
+                ),
+                token=TOKEN,
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(stale["disposition"], "refused")
+            self.assertEqual(stale["refusal"], "stale_version")
+
+            # 7. Successful release with surface_full
+            status, _, released = request(
+                endpoint,
+                "/v1/execution-cards/release",
+                request_document(
+                    card_id=claim["card_id"],
+                    card_version=claim["card_version"],
+                    claim_token=claim["claim_token"],
+                    reason="surface_full",
+                ),
+                token=TOKEN,
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(released["schema"], EXECUTION_OPERATION_SCHEMA)
+            self.assertEqual(released["ok"], True)
+            self.assertEqual(released["disposition"], "applied")
+            self.assertEqual(released["card_status"], "pending")
+            self.assertEqual(released["card_version"], claim["card_version"] + 1)
+
+            # In DB: check events
+            with closing(sqlite3.connect(self.database)) as conn:
+                conn.row_factory = sqlite3.Row
+                events = conn.execute(
+                    "SELECT kind, action FROM execution_review_card_events WHERE card_id=? ORDER BY sequence",
+                    (claim["card_id"],),
+                ).fetchall()
+                kinds = [e["kind"] for e in events]
+                self.assertIn("claim_released", kinds)
+                self.assertNotIn("delivery_failed", kinds)
+                rel = [e for e in events if e["kind"] == "claim_released"][0]
+                self.assertEqual(rel["action"], "surface_full")
+
+            # 8. Re-claim and release with client_rejected
+            status, _, claimed2 = request(
+                endpoint,
+                "/v1/execution-cards/claim",
+                request_document(lease_seconds=60),
+                token=TOKEN,
+            )
+            claim2 = claimed2["claim"]
+            status, _, released2 = request(
+                endpoint,
+                "/v1/execution-cards/release",
+                request_document(
+                    card_id=claim2["card_id"],
+                    card_version=claim2["card_version"],
+                    claim_token=claim2["claim_token"],
+                    reason="client_rejected",
+                ),
+                token=TOKEN,
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(released2["ok"], True)
+            self.assertEqual(released2["disposition"], "applied")
+            self.assertEqual(released2["card_status"], "pending")
+
     def test_execution_claim_includes_voice_artifact_name_when_present(self):
         self.execution.schedule(1, expected_task_version=1)
         with running_server(self.app) as endpoint:

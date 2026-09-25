@@ -168,6 +168,7 @@ ROUTES = {
     "/v1/execution-cards/retraction-failed": "execution_retraction_failed",
     "/v1/execution-cards/delivered": "execution_delivered",
     "/v1/execution-cards/delivery-failed": "execution_delivery_failed",
+    "/v1/execution-cards/release": "execution_release",
     "/v1/execution-cards/action": "execution_action",
     "/v1/execution-cards/input": "execution_input",
     "/v1/execution-cards/comment-and-go": "execution_comment_and_go",
@@ -1027,6 +1028,38 @@ class TaskCardApplication:
                         request["card_version"], minimum=1
                     ),
                     claim_token=_secret(request["claim_token"]),
+                )
+            )
+        if operation == "execution_release":
+            request = _request(
+                payload,
+                required={"card_id", "card_version", "claim_token", "reason"},
+            )
+            identity = self.resolve_execution_consumer(authorization)
+            if identity is None:
+                raise TaskCardServerRequestError(
+                    "consumer_unresolved",
+                    "execution card consumer role is unresolved",
+                    HTTPStatus.FORBIDDEN,
+                )
+            reason = request["reason"]
+            if not isinstance(reason, str) or reason not in {
+                "surface_full",
+                "client_rejected",
+            }:
+                raise TaskCardServerRequestError(
+                    "invalid_request",
+                    "execution card release reason is invalid",
+                )
+            return _execution_operation_document(
+                self._execution_cards().release_delivery(
+                    _integer(request["card_id"], minimum=1),
+                    expected_version=_integer(
+                        request["card_version"], minimum=1
+                    ),
+                    claim_token=_secret(request["claim_token"]),
+                    consumer_digest=identity.digest,
+                    reason=reason,
                 )
             )
         if operation == "execution_action":

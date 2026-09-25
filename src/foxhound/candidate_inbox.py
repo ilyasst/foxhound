@@ -49,7 +49,7 @@ from .contracts.task_candidate import (
 )
 
 
-SCHEMA_VERSION = 58
+SCHEMA_VERSION = 59
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 _CUMULATIVE_SCHEMA_VERSIONS = {
@@ -3125,6 +3125,42 @@ END;""",
 )
 
 
+# Releasing an execution-card claim when the review surface is full or
+# locally rejected is a normal lease relinquishment, not a transport
+# delivery failure. Keep it in the immutable event ledger as a distinct
+# neutral event kind with bounded reasons.
+_SCHEMA_V59_CARD_EVENT_TABLE = (
+    _SCHEMA_V53_CARD_EVENT_TABLE
+    .replace(
+        "'cancelled','refreshed','retracted','requeued'",
+        "'cancelled','refreshed','retracted','requeued','claim_released'",
+    )
+    .replace(
+        "'reassign','drop','agent'",
+        "'reassign','drop','agent','surface_full','client_rejected'",
+    )
+)
+_SCHEMA_V59 = (
+    "DROP TRIGGER execution_review_card_events_no_update;",
+    "DROP TRIGGER execution_review_card_events_no_delete;",
+    "ALTER TABLE execution_review_card_events "
+    "RENAME TO execution_review_card_events_v58;",
+    _SCHEMA_V59_CARD_EVENT_TABLE,
+    """
+INSERT INTO execution_review_card_events(
+    sequence,card_id,task_id,kind,card_version,workflow_version,action,
+    occurred_at
+)
+SELECT sequence,card_id,task_id,kind,card_version,workflow_version,action,
+       occurred_at
+FROM execution_review_card_events_v58;
+""",
+    "DROP TABLE execution_review_card_events_v58;",
+    _SCHEMA_V9[3],
+    _SCHEMA_V9[4],
+)
+
+
 # Context exhaustion is a separate terminal condition for one attempt. The
 # workflow table has a closed reason vocabulary, so admitting it requires a
 # table rebuild rather than silently recording it as an ordinary timeout.
@@ -4658,6 +4694,22 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 58
+            if version == 58:
+                connection.execute("PRAGMA foreign_keys = OFF")
+                connection.execute("PRAGMA legacy_alter_table = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V59:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 59")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                finally:
+                    connection.execute("PRAGMA legacy_alter_table = OFF")
+                    connection.execute("PRAGMA foreign_keys = ON")
+                version = 59
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:
