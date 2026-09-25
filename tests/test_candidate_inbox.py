@@ -287,8 +287,121 @@ class CandidateInboxTests(unittest.TestCase):
             state = connection.execute(
                 "SELECT state FROM task_duplicate_proposals WHERE id=500"
             ).fetchone()[0]
-        self.assertEqual(version, 58)
+        self.assertEqual(version, SCHEMA_VERSION)
         self.assertEqual(state, "superseded")
+
+    def test_version_fifty_nine_fresh_database_accepts_claim_released_and_enforces_triggers(self):
+        migrate_database(self.database)
+        now = NOW.isoformat(timespec="seconds")
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            self.assertEqual(version, SCHEMA_VERSION)
+            connection.execute(
+                "INSERT INTO tasks(id,status,text,owner,due,version,created_at,updated_at) "
+                "VALUES(1,'open','T1','Person A',NULL,1,?,?)",
+                (now, now),
+            )
+            connection.execute(
+                "INSERT INTO task_execution_workflows("
+                "task_id,task_version,status,phase,version,failure_count,"
+                "created_at,updated_at) VALUES(1,1,'awaiting_start','plan',1,0,?,?)",
+                (now, now),
+            )
+            connection.execute(
+                "INSERT INTO execution_review_cards("
+                "id,task_id,task_version,workflow_version,kind,phase,status,"
+                "version,created_at,updated_at) VALUES(1,1,1,1,'start','plan',"
+                "'pending',1,?,?)",
+                (now, now),
+            )
+            connection.execute(
+                "INSERT INTO execution_review_card_events("
+                "card_id,task_id,kind,card_version,workflow_version,action,occurred_at) "
+                "VALUES(1,1,'claim_released',2,1,'surface_full',?)",
+                (now,),
+            )
+            connection.execute(
+                "INSERT INTO execution_review_card_events("
+                "card_id,task_id,kind,card_version,workflow_version,action,occurred_at) "
+                "VALUES(1,1,'claim_released',3,1,'client_rejected',?)",
+                (now,),
+            )
+            events = connection.execute(
+                "SELECT kind,action FROM execution_review_card_events WHERE card_id=1 ORDER BY sequence"
+            ).fetchall()
+            self.assertEqual(
+                events,
+                [("claim_released", "surface_full"), ("claim_released", "client_rejected")],
+            )
+            with self.assertRaises(sqlite3.DatabaseError):
+                connection.execute(
+                    "UPDATE execution_review_card_events SET action='surface_full' WHERE card_id=1"
+                )
+            with self.assertRaises(sqlite3.DatabaseError):
+                connection.execute(
+                    "DELETE FROM execution_review_card_events WHERE card_id=1"
+                )
+
+    def test_version_fifty_nine_migration_preserves_events_and_accepts_claim_released(self):
+        migrate_database(self.database)
+        now = NOW.isoformat(timespec="seconds")
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "INSERT INTO tasks(id,status,text,owner,due,version,created_at,updated_at) "
+                "VALUES(1,'open','T1','Person A',NULL,1,?,?)",
+                (now, now),
+            )
+            connection.execute(
+                "INSERT INTO task_execution_workflows("
+                "task_id,task_version,status,phase,version,failure_count,"
+                "created_at,updated_at) VALUES(1,1,'awaiting_start','plan',1,0,?,?)",
+                (now, now),
+            )
+            connection.execute(
+                "INSERT INTO execution_review_cards("
+                "id,task_id,task_version,workflow_version,kind,phase,status,"
+                "version,created_at,updated_at) VALUES(1,1,1,1,'start','plan',"
+                "'pending',1,?,?)",
+                (now, now),
+            )
+            connection.execute(
+                "INSERT INTO execution_review_card_events("
+                "card_id,task_id,kind,card_version,workflow_version,action,occurred_at) "
+                "VALUES(1,1,'delivered',1,1,NULL,?)",
+                (now,),
+            )
+            # Roll user_version back to 58
+            connection.execute("PRAGMA user_version = 58")
+            connection.commit()
+
+        # Migrate from 58 to current
+        migrate_database(self.database)
+
+        with closing(sqlite3.connect(self.database)) as connection:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            self.assertEqual(version, SCHEMA_VERSION)
+            # Existing event was preserved
+            existing = connection.execute(
+                "SELECT kind,action FROM execution_review_card_events WHERE card_id=1"
+            ).fetchall()
+            self.assertEqual(existing, [("delivered", None)])
+            # Accepts claim_released
+            connection.execute(
+                "INSERT INTO execution_review_card_events("
+                "card_id,task_id,kind,card_version,workflow_version,action,occurred_at) "
+                "VALUES(1,1,'claim_released',2,1,'surface_full',?)",
+                (now,),
+            )
+            # Triggers still reject update and delete
+            with self.assertRaises(sqlite3.DatabaseError):
+                connection.execute(
+                    "UPDATE execution_review_card_events SET action='surface_full' WHERE card_id=1"
+                )
+            with self.assertRaises(sqlite3.DatabaseError):
+                connection.execute(
+                    "DELETE FROM execution_review_card_events WHERE card_id=1"
+                )
 
     def test_fresh_and_migrated_databases_end_up_in_the_same_shape(self):
         fresh_database = Path(self.temporary.name) / "fresh.sqlite3"

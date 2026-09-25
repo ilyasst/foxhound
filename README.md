@@ -761,7 +761,7 @@ separate `/v1/execution-cards/*` route family. A trusted local gateway can read
 aggregate stats, read the bounded non-mutating `queue_view` projection at
 `POST /v1/execution-cards/queue`, run the explicit scheduler, claim one rendered card,
 or resolve one queue card atomically at `POST /v1/execution-cards/resolve`,
-acknowledge or retry delivery, submit one versioned reader action, submit
+acknowledge, release, or retry delivery, submit one versioned reader action, submit
 one bounded discussion or reassignment response, submit one bounded
 Comment-and-Go note, and read one delivered card's
 presentation back. That last route is a read like the task brief: it renders a
@@ -780,6 +780,43 @@ kind-dependent ones. Its agent-options and
 agent-selection operations remain a bounded integration contract with opaque
 callbacks and a refreshed Start-card presentation; they are not exposed as an
 extra control in the legacy-compatible Start keyboard.
+
+A consumer that claims an execution card but cannot present it immediately—because
+its review surface is full or local claim validation rejected markup—can
+relinquish the unacknowledged lease neutrally at `POST /v1/execution-cards/release`
+without recording a transport delivery failure:
+
+```json
+{
+  "card_id": 42,
+  "card_version": 2,
+  "claim_token": "fha|synthetic-token-data...",
+  "reason": "surface_full"
+}
+```
+
+The reason must be one of the bounded reasons: `"surface_full"` or `"client_rejected"`.
+The authenticated consumer must match the claiming consumer, and the card must be
+currently `delivering`. On success, the card is returned to `pending`, claim metadata
+is cleared, the card version increments, and a neutral `claim_released` event is
+recorded with the reason in the event action field:
+
+```json
+{
+  "schema": "foxhound.execution-card-service.operation",
+  "schema_version": 1,
+  "ok": true,
+  "disposition": "applied",
+  "card_id": 42,
+  "card_version": 3,
+  "card_status": "pending",
+  "workflow_version": 1,
+  "workflow_status": "in_progress",
+  "workflow_phase": "external_action",
+  "wake_at": null,
+  "refusal": null
+}
+```
 
 The same `queue_view` consumer may request current card detail at
 `POST /v1/execution-cards/detail`, using the exact card id and version from
