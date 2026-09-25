@@ -42,11 +42,21 @@ from .contracts import (
     task_shadow_feed_document,
     task_shadow_observation_document,
 )
+from .contracts.task_candidate import (
+    CUMULATIVE_SCHEMA_VERSION,
+    SOURCE_HISTORY_SCHEMA_VERSION,
+    STRUCTURED_TASK_SCHEMA_VERSION,
+)
 
 
 SCHEMA_VERSION = 58
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
+_CUMULATIVE_SCHEMA_VERSIONS = {
+    CUMULATIVE_SCHEMA_VERSION,
+    STRUCTURED_TASK_SCHEMA_VERSION,
+    SOURCE_HISTORY_SCHEMA_VERSION,
+}
 
 _SCHEMA_COLUMNS = {
     "candidate_inbox": (
@@ -5147,6 +5157,9 @@ class CandidateInbox:
                 row["source_revision"] != candidate.source.revision
                 or row["payload_json"] != payload
             )
+            and not _is_cumulative_contract_upgrade(
+                row["payload_json"], payload
+            )
         ):
             return ImportResult(
                 ImportDisposition.REFUSED,
@@ -5392,6 +5405,41 @@ def _receipt_timestamp(value: object) -> datetime:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise InboxError("shadow import cycle timestamp is invalid")
     return parsed
+
+
+def _is_cumulative_contract_upgrade(
+    current_payload: str, incoming_payload: str,
+) -> bool:
+    """Recognize an additive cumulative-contract upgrade of one source state."""
+    try:
+        current = json.loads(current_payload)
+        incoming = json.loads(incoming_payload)
+        current_version = current["schema_version"]
+        incoming_version = incoming["schema_version"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return False
+    if (
+        current_version not in _CUMULATIVE_SCHEMA_VERSIONS
+        or incoming_version not in _CUMULATIVE_SCHEMA_VERSIONS
+        or incoming_version <= current_version
+    ):
+        return False
+
+    def shared_shape(document: dict[str, object]) -> dict[str, object]:
+        normalized = json.loads(json.dumps(document))
+        normalized.pop("schema_version", None)
+        source = normalized.get("source")
+        task = normalized.get("task")
+        if not isinstance(source, dict) or not isinstance(task, dict):
+            return normalized
+        source.pop("revision", None)
+        source.pop("history", None)
+        if current_version < STRUCTURED_TASK_SCHEMA_VERSION:
+            for field in ("object", "action", "participants", "confidence"):
+                task.pop(field, None)
+        return normalized
+
+    return shared_shape(current) == shared_shape(incoming)
 
 
 def _canonical_payload(candidate: TaskCandidate) -> str:

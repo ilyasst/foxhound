@@ -912,6 +912,53 @@ class NativeCandidateIntakeTests(unittest.TestCase):
             revised["source"]["history"]["revision"],
         )
 
+    def test_history_contract_upgrade_keeps_generation_without_backfill(self):
+        self.activate()
+        upgraded = history_candidate(1)
+        initial = copy.deepcopy(upgraded)
+        initial["schema_version"] = 8
+        initial["source"].pop("history")
+        initial["source"]["revision"] = "a" * 64
+        self.assertTrue(self.inbox.import_feed(feed(0, initial)).accepted)
+        self.intake()
+
+        imported = self.inbox.import_feed(feed(1, upgraded))
+        self.assertTrue(imported.accepted)
+        self.assertEqual((imported.updated, imported.unchanged), (1, 0))
+        self.assertEqual(self.intake().tasks_revised, 1)
+
+        state = self.ledger.work_revision_state(1)
+        self.assertIsNone(state.created.source_history)
+        self.assertEqual(state.current, state.created)
+
+        revised = history_candidate(
+            1, generation=2, text="Prepare the revised synthetic summary"
+        )
+        self.assertTrue(self.inbox.import_feed(feed(2, revised)).accepted)
+        self.assertEqual(self.intake().tasks_revised, 1)
+
+        state = self.ledger.work_revision_state(1)
+        self.assertIsNone(state.created.source_history)
+        self.assertEqual(state.current.kind, "source_advance")
+        self.assertEqual(state.current.source_history.position, 2)
+        self.assertEqual(
+            state.current.source_history.revision,
+            revised["source"]["history"]["revision"],
+        )
+
+    def test_same_contract_change_at_same_generation_still_refuses(self):
+        initial = history_candidate(1)
+        self.assertTrue(self.inbox.import_feed(feed(0, initial)).accepted)
+        conflicting = history_candidate(
+            1, text="Prepare a conflicting synthetic summary"
+        )
+
+        result = self.inbox.import_feed(feed(1, conflicting))
+
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.refusal.value, "candidate_conflict")
+        self.assertEqual(self.inbox.feed_cursor("gw", "primary"), 1)
+
     def test_provenance_only_revision_preserves_an_active_workflow(self):
         self.activate()
         initial = candidate(1)
