@@ -27,6 +27,7 @@ OWNER_SCHEMA_VERSION = 5
 OWNER_PROVENANCE_SCHEMA_VERSION = 6
 CUMULATIVE_SCHEMA_VERSION = 7
 STRUCTURED_TASK_SCHEMA_VERSION = 8
+SOURCE_HISTORY_SCHEMA_VERSION = 9
 SUPPORTED_SCHEMA_VERSIONS = frozenset({
     SCHEMA_VERSION,
     PROJECTLESS_SCHEMA_VERSION,
@@ -36,6 +37,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset({
     OWNER_PROVENANCE_SCHEMA_VERSION,
     CUMULATIVE_SCHEMA_VERSION,
     STRUCTURED_TASK_SCHEMA_VERSION,
+    SOURCE_HISTORY_SCHEMA_VERSION,
 })
 LIFECYCLE_STATES = frozenset({"active", "withdrawn"})
 SOURCE_SYSTEMS = frozenset({"gw"})
@@ -87,6 +89,18 @@ class CandidateSource:
     kind: str
     record_id: str
     item_id: str
+    revision: str
+    history: CandidateSourceHistory | None = None
+
+
+@dataclass(frozen=True)
+class CandidateSourceHistory:
+    """The exact producer-owned history entry behind one projection."""
+
+    source: str
+    stream_id: str
+    item_id: str
+    position: int
     revision: str
 
 
@@ -169,6 +183,7 @@ def task_candidate_document(candidate: TaskCandidate) -> dict[str, Any]:
         candidate.schema_version in {
             PROVENANCE_SCHEMA_VERSION, OWNER_PROVENANCE_SCHEMA_VERSION,
             CUMULATIVE_SCHEMA_VERSION, STRUCTURED_TASK_SCHEMA_VERSION,
+            SOURCE_HISTORY_SCHEMA_VERSION,
         }
         and candidate.task.project is not None
     ) or (
@@ -179,6 +194,7 @@ def task_candidate_document(candidate: TaskCandidate) -> dict[str, Any]:
     if candidate.schema_version in {
         OWNER_SCHEMA_VERSION, OWNER_PROVENANCE_SCHEMA_VERSION,
         CUMULATIVE_SCHEMA_VERSION, STRUCTURED_TASK_SCHEMA_VERSION,
+        SOURCE_HISTORY_SCHEMA_VERSION,
     }:
         owner_ref = candidate.task.owner_ref
         task["owner_ref"] = None if owner_ref is None else {
@@ -189,7 +205,13 @@ def task_candidate_document(candidate: TaskCandidate) -> dict[str, Any]:
             "pinned": owner_ref.pinned,
             "provisional": owner_ref.provisional,
         }
-    if candidate.schema_version == STRUCTURED_TASK_SCHEMA_VERSION:
+    if (
+        candidate.schema_version == STRUCTURED_TASK_SCHEMA_VERSION
+        or (
+            candidate.schema_version == SOURCE_HISTORY_SCHEMA_VERSION
+            and candidate.task.object is not None
+        )
+    ):
         task.update({
             "object": candidate.task.object,
             "action": candidate.task.action,
@@ -218,10 +240,23 @@ def task_candidate_document(candidate: TaskCandidate) -> dict[str, Any]:
         },
         "created_at": candidate.created_at,
     }
+    if candidate.schema_version == SOURCE_HISTORY_SCHEMA_VERSION:
+        history = candidate.source.history
+        if history is None:
+            raise ContractError("candidate.source.history is required")
+        document["source"]["history"] = {
+            "source": history.source,
+            "stream_id": history.stream_id,
+            "item_id": history.item_id,
+            "position": history.position,
+            "revision": history.revision,
+        }
     if candidate.schema_version in {
         PROVENANCE_SCHEMA_VERSION, OWNER_PROVENANCE_SCHEMA_VERSION,
     } or (
-        candidate.schema_version == CUMULATIVE_SCHEMA_VERSION
+        candidate.schema_version in {
+            CUMULATIVE_SCHEMA_VERSION, SOURCE_HISTORY_SCHEMA_VERSION,
+        }
         and candidate.evidence.sources
     ):
         document["evidence"]["sources"] = [
@@ -234,7 +269,7 @@ def task_candidate_document(candidate: TaskCandidate) -> dict[str, Any]:
         ]
     if candidate.schema_version in {
         LIFECYCLE_SCHEMA_VERSION, CUMULATIVE_SCHEMA_VERSION,
-        STRUCTURED_TASK_SCHEMA_VERSION,
+        STRUCTURED_TASK_SCHEMA_VERSION, SOURCE_HISTORY_SCHEMA_VERSION,
     }:
         document["lifecycle"] = {
             "state": candidate.lifecycle.state,
@@ -282,7 +317,7 @@ def parse_task_candidate(document: object) -> TaskCandidate:
         "candidate",
         base_fields | ({"lifecycle"} if version in {
             LIFECYCLE_SCHEMA_VERSION, CUMULATIVE_SCHEMA_VERSION,
-            STRUCTURED_TASK_SCHEMA_VERSION,
+            STRUCTURED_TASK_SCHEMA_VERSION, SOURCE_HISTORY_SCHEMA_VERSION,
         } else set()),
     )
 
@@ -290,8 +325,48 @@ def parse_task_candidate(document: object) -> TaskCandidate:
     _exact_fields(
         source_doc,
         "candidate.source",
-        {"system", "kind", "record_id", "item_id", "revision"},
+        {"system", "kind", "record_id", "item_id", "revision"} | (
+            {"history"}
+            if version == SOURCE_HISTORY_SCHEMA_VERSION else set()
+        ),
     )
+    history = None
+    if version == SOURCE_HISTORY_SCHEMA_VERSION:
+        history_doc = _object(
+            source_doc["history"], "candidate.source.history"
+        )
+        _exact_fields(
+            history_doc,
+            "candidate.source.history",
+            {"source", "stream_id", "item_id", "position", "revision"},
+        )
+        position = history_doc["position"]
+        if (
+            isinstance(position, bool)
+            or not isinstance(position, int)
+            or not 1 <= position <= 9_223_372_036_854_775_807
+        ):
+            raise ContractError(
+                "candidate.source.history.position must be a positive integer"
+            )
+        history = CandidateSourceHistory(
+            source=_opaque_id(
+                history_doc["source"], "candidate.source.history.source"
+            ),
+            stream_id=_opaque_id(
+                history_doc["stream_id"],
+                "candidate.source.history.stream_id",
+            ),
+            item_id=_opaque_id(
+                history_doc["item_id"], "candidate.source.history.item_id"
+            ),
+            position=position,
+            revision=_pattern_text(
+                history_doc["revision"],
+                "candidate.source.history.revision",
+                _REVISION_RE,
+            ),
+        )
     source = CandidateSource(
         system=_choice(source_doc["system"], "candidate.source.system",
                        SOURCE_SYSTEMS),
@@ -301,6 +376,7 @@ def parse_task_candidate(document: object) -> TaskCandidate:
         item_id=_opaque_id(source_doc["item_id"], "candidate.source.item_id"),
         revision=_pattern_text(source_doc["revision"],
                                "candidate.source.revision", _REVISION_RE),
+        history=history,
     )
 
     candidate_id = _pattern_text(
@@ -316,7 +392,25 @@ def parse_task_candidate(document: object) -> TaskCandidate:
 
     task_doc = _object(root["task"], "candidate.task")
     base_task_fields = {"text", "owner", "due"}
-    if version == STRUCTURED_TASK_SCHEMA_VERSION:
+    structured_task = version == STRUCTURED_TASK_SCHEMA_VERSION
+    if version == SOURCE_HISTORY_SCHEMA_VERSION:
+        structured_fields = {"object", "action", "confidence"}
+        present_structured_fields = structured_fields & set(task_doc)
+        if present_structured_fields and present_structured_fields != structured_fields:
+            raise ContractError("candidate.task structure is incomplete")
+        if "participants" in task_doc and not present_structured_fields:
+            raise ContractError(
+                "candidate.task.participants requires a structure"
+            )
+        structured_task = bool(present_structured_fields)
+        _required_and_allowed_fields(
+            task_doc,
+            "candidate.task",
+            {"text", "owner", "owner_ref", "due"},
+            {"text", "owner", "owner_ref", "due", "project", "object",
+             "action", "participants", "confidence"},
+        )
+    elif version == STRUCTURED_TASK_SCHEMA_VERSION:
         _required_and_allowed_fields(
             task_doc,
             "candidate.task",
@@ -334,7 +428,7 @@ def parse_task_candidate(document: object) -> TaskCandidate:
         allowed = base_task_fields | {"project"}
         if version in {
             OWNER_SCHEMA_VERSION, OWNER_PROVENANCE_SCHEMA_VERSION,
-            CUMULATIVE_SCHEMA_VERSION,
+            CUMULATIVE_SCHEMA_VERSION, SOURCE_HISTORY_SCHEMA_VERSION,
         }:
             allowed.add("owner_ref")
         _required_and_allowed_fields(
@@ -363,6 +457,7 @@ def parse_task_candidate(document: object) -> TaskCandidate:
         if version in {
             OWNER_SCHEMA_VERSION, OWNER_PROVENANCE_SCHEMA_VERSION,
             CUMULATIVE_SCHEMA_VERSION, STRUCTURED_TASK_SCHEMA_VERSION,
+            SOURCE_HISTORY_SCHEMA_VERSION,
         }
         else None
     )
@@ -379,6 +474,7 @@ def parse_task_candidate(document: object) -> TaskCandidate:
                     OWNER_PROVENANCE_SCHEMA_VERSION,
                     CUMULATIVE_SCHEMA_VERSION,
                     STRUCTURED_TASK_SCHEMA_VERSION,
+                    SOURCE_HISTORY_SCHEMA_VERSION,
                 }
                 and "project" in task_doc
             ) else None
@@ -388,20 +484,19 @@ def parse_task_candidate(document: object) -> TaskCandidate:
         owner_ref=owner_ref,
         object=(
             _bounded_text(task_doc["object"], "candidate.task.object", 1, 200)
-            if version == STRUCTURED_TASK_SCHEMA_VERSION else None
+            if structured_task else None
         ),
         action=(
             _choice(task_doc["action"], "candidate.task.action", TASK_ACTIONS)
-            if version == STRUCTURED_TASK_SCHEMA_VERSION else None
+            if structured_task else None
         ),
         participants=(
             _participant_refs(task_doc["participants"])
-            if version == STRUCTURED_TASK_SCHEMA_VERSION
-            and "participants" in task_doc else ()
+            if structured_task and "participants" in task_doc else ()
         ),
         confidence=(
             _confidence(task_doc["confidence"])
-            if version == STRUCTURED_TASK_SCHEMA_VERSION else None
+            if structured_task else None
         ),
     )
 
@@ -409,10 +504,16 @@ def parse_task_candidate(document: object) -> TaskCandidate:
     evidence_fields = {"document_id", "locator"}
     if version in {
         PROVENANCE_SCHEMA_VERSION, OWNER_PROVENANCE_SCHEMA_VERSION,
-    } or (version in {CUMULATIVE_SCHEMA_VERSION, STRUCTURED_TASK_SCHEMA_VERSION}
+    } or (version in {
+        CUMULATIVE_SCHEMA_VERSION, STRUCTURED_TASK_SCHEMA_VERSION,
+        SOURCE_HISTORY_SCHEMA_VERSION,
+    }
           and "sources" in evidence_doc):
         evidence_fields.add("sources")
-    if version in {CUMULATIVE_SCHEMA_VERSION, STRUCTURED_TASK_SCHEMA_VERSION}:
+    if version in {
+        CUMULATIVE_SCHEMA_VERSION, STRUCTURED_TASK_SCHEMA_VERSION,
+        SOURCE_HISTORY_SCHEMA_VERSION,
+    }:
         _required_and_allowed_fields(
             evidence_doc,
             "candidate.evidence",
@@ -432,7 +533,10 @@ def parse_task_candidate(document: object) -> TaskCandidate:
         sources = _evidence_sources(
             evidence_doc["sources"], provenance_roles_for("meeting")
         )
-    elif version in {CUMULATIVE_SCHEMA_VERSION, STRUCTURED_TASK_SCHEMA_VERSION} \
+    elif version in {
+        CUMULATIVE_SCHEMA_VERSION, STRUCTURED_TASK_SCHEMA_VERSION,
+        SOURCE_HISTORY_SCHEMA_VERSION,
+    } \
             and "sources" in evidence_doc:
         sources = _evidence_sources(
             evidence_doc["sources"], provenance_roles_for(source.kind)
@@ -449,7 +553,7 @@ def parse_task_candidate(document: object) -> TaskCandidate:
     lifecycle = CandidateLifecycle("active", 0, None)
     if version in {
         LIFECYCLE_SCHEMA_VERSION, CUMULATIVE_SCHEMA_VERSION,
-        STRUCTURED_TASK_SCHEMA_VERSION,
+        STRUCTURED_TASK_SCHEMA_VERSION, SOURCE_HISTORY_SCHEMA_VERSION,
     }:
         lifecycle_doc = _object(root["lifecycle"], "candidate.lifecycle")
         _exact_fields(

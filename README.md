@@ -165,6 +165,13 @@ labels. A reader reassignment is pinned and cannot be replaced by a later
 producer revision. See
 [ADR 0033](docs/architecture/0033-structured-task-owner-identity.md).
 
+Candidate version 9 adds a bounded reference to the producer's exact immutable
+source-history entry. The first accepted work revision records that creation
+baseline, and later work advances record their own entries. Older candidates
+remain accepted with an explicitly unknown producer-history reference; the
+database migration never guesses one. See
+[ADR 0054](docs/architecture/0054-task-source-history-baselines.md).
+
 Meeting, email, Teams, and forge-issue candidates retain their actual source
 kind. A
 bounded authority cutover may additionally use the explicit `legacy` kind for
