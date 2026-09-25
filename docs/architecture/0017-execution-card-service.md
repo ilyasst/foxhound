@@ -35,7 +35,16 @@ canonical IPv4 loopback bind, body and response limits, request timeout,
 serialized application handling, no-store response policy, and content-free
 error boundary. Execution routes use distinct response schemas and delivery
 keys. Only a successful claim returns private rendered content and its
-short-lived delivery capability. A complete rendered body may exceed one chat
+short-lived delivery capability.
+
+### Claim schema versions and source routing
+
+The `/v1/execution-cards/claim` response uses the `foxhound.execution-card-service.claim` schema:
+
+- **Version 1 (`schema_version: 1`)**: Contains `card_id`, `card_version`, `kind`, `phase`, `claim_token`, `expires_at`, `delivery_key`, `superseded_delivery_ref`, `superseded_transport`, `body`, `reply_markup`, and optional `voice_artifact_name`.
+- **Version 2 (`schema_version: 2`)**: The current default response shape (Issue #688). Extends the claim payload with `source_kind: str | null`, populated from the underlying task workflow's origin (`issue`, `review_request`, `meeting`, `email`, `teams`, `calendar`, `mention`, `alert`, `legacy`, or `null`).
+
+Clients may request version 1 explicitly via `claim_version: 1` in the request document. A complete rendered body may exceed one chat
 message while remaining within the bounded response contract; safe transport
 chunking does not weaken the card's single versioned decision capability.
 Free-text input is accepted only at `/v1/execution-cards/input`; prompt-only

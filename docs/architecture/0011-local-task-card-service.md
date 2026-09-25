@@ -47,6 +47,15 @@ framing, and over-limit bodies fail before a task operation begins. Responses
 are also versioned. Only a successful claim contains private card text, its
 bounded callback keyboard, and a short-lived claim capability.
 
+### Claim schema versions and source routing
+
+The `/v1/task-cards/claim` response uses the `foxhound.task-card-service.claim` schema:
+
+- **Version 1 (`schema_version: 1`)**: The legacy response shape. Contains `card_id`, `card_version`, `claim_token`, `expires_at`, `delivery_key`, `body`, and `reply_markup`.
+- **Version 2 (`schema_version: 2`)**: The current default response shape (Issue #688). Extends the claim payload with `source_kind: str | null`, populated from the card's accepted origin (`issue`, `review_request`, `meeting`, `email`, `teams`, `calendar`, `mention`, `alert`, `legacy`, or `null`). It contains only bounded routing metadata, never private identifiers, source record IDs, or card body content.
+
+Clients may request version 1 explicitly via `claim_version: 1` in the request document.
+
 The pilot server accepts only canonical IPv4 loopback binds. It processes one
 request at a time and applies a socket deadline before reading request headers,
 which makes concurrency and resource use explicitly bounded. It is not a

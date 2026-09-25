@@ -428,3 +428,14 @@ WantedBy=multi-user.target
    systemctl enable --now foxhound-execution-runner@slot-3.service
    ```
    The original single runner can eventually be migrated to `foxhound-execution-runner@slot-1.service` during a natural idle window, or safely disabled while the others pick up the load. To scale down, `systemctl stop` a worker; active execution state remains durable and the scheduled task will either finish its phase and exit or time out gracefully.
+
+## Claim schema versions and rollout order (Issue #688, GW #1156)
+
+Foxhound card claim endpoints (`/v1/task-cards/claim` and `/v1/execution-cards/claim`) expose a bounded `source_kind` field under claim schema version 2.
+
+Rollout must proceed in the following order:
+
+1. **Deploy consumer compatibility first**: Update delivery consumers (such as GW) to accept both claim schema version 1 and version 2, while routing configuration remains unconfigured (all cards continue using the configured default destination).
+2. **Deploy Foxhound version 2**: Deploy Foxhound with version 2 claim responses enabled. Consumers accept version 2 claims and deliver to their default destination.
+3. **Enable consumer per-source routing**: Configure topic-by-source mapping in the consumer (e.g. `GW_CARDS_SOURCE_TOPICS`).
+

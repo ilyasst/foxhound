@@ -79,6 +79,7 @@ ERROR_SCHEMA = "foxhound.task-card-service.error"
 HEALTH_SCHEMA = "foxhound.task-card-service.health"
 SCHEDULE_SCHEMA = "foxhound.task-card-service.schedule"
 CLAIM_SCHEMA = "foxhound.task-card-service.claim"
+CLAIM_SCHEMA_VERSION = 2
 OPERATION_SCHEMA = "foxhound.task-card-service.operation"
 STATS_SCHEMA = "foxhound.task-card-service.stats"
 STATS_SCHEMA_VERSION = 2
@@ -91,6 +92,7 @@ VIEW_SCHEMA = "foxhound.task-card-service.view"
 RESOLVE_SCHEMA_VERSION = 1
 EXECUTION_SCHEDULE_SCHEMA = "foxhound.execution-card-service.schedule"
 EXECUTION_CLAIM_SCHEMA = "foxhound.execution-card-service.claim"
+EXECUTION_CLAIM_SCHEMA_VERSION = 2
 EXECUTION_OPERATION_SCHEMA = "foxhound.execution-card-service.operation"
 EXECUTION_STATS_SCHEMA = "foxhound.execution-card-service.stats"
 EXECUTION_BRIEF_SCHEMA = "foxhound.execution-card-service.brief"
@@ -126,6 +128,24 @@ DRIP_ROLE = "drip"
 QUEUE_VIEW_ROLE = "queue_view"
 TASK_CARD_CONSUMER_ROLES = frozenset({DRIP_ROLE, QUEUE_VIEW_ROLE})
 EXECUTION_CARD_CONSUMER_ROLES = TASK_CARD_CONSUMER_ROLES
+
+BOUNDED_SOURCE_KINDS = frozenset({
+    "issue",
+    "review_request",
+    "meeting",
+    "email",
+    "teams",
+    "calendar",
+    "mention",
+    "alert",
+    "legacy",
+})
+
+
+def _bounded_source_kind(origin_kind: object) -> str | None:
+    if isinstance(origin_kind, str) and origin_kind in BOUNDED_SOURCE_KINDS:
+        return origin_kind
+    return None
 
 ROUTES = {
     "/v1/task-cards/stats": "stats",
@@ -525,8 +545,17 @@ class TaskCardApplication:
                 "resolution": _operation_document(result),
             }
         if operation == "claim":
-            request = _request(payload, required={"lease_seconds"})
+            request = _strict_request(
+                payload,
+                required={"lease_seconds"},
+                optional={"claim_version"},
+            )
             lease = _integer(request["lease_seconds"], minimum=5, maximum=300)
+            claim_version = _integer(
+                request.get("claim_version", CLAIM_SCHEMA_VERSION),
+                minimum=1,
+                maximum=CLAIM_SCHEMA_VERSION,
+            )
             # ADR 0036 decision 2: a claim is a consumer-scoped operation
             # (invariant 2) -- the resolved identity is bound to the card
             # inside `claim_next` itself, in the same transaction as the
@@ -559,7 +588,7 @@ class TaskCardApplication:
             if isinstance(claim, ClaimAtCeiling):
                 return {
                     "schema": CLAIM_SCHEMA,
-                    "schema_version": SERVICE_VERSION,
+                    "schema_version": claim_version,
                     "ok": True,
                     "status": "at_ceiling",
                     "held_count": claim.held_count,
@@ -569,29 +598,34 @@ class TaskCardApplication:
             if claim is None:
                 return {
                     "schema": CLAIM_SCHEMA,
-                    "schema_version": SERVICE_VERSION,
+                    "schema_version": claim_version,
                     "ok": True,
                     "status": "empty",
                     "claim": None,
                 }
             body, reply_markup = render_task_review_card(claim.card)
+            claim_payload = {
+                "card_id": claim.card.id,
+                "card_version": claim.card.version,
+                "claim_token": claim.token,
+                "expires_at": claim.expires_at,
+                "delivery_key": (
+                    f"foxhound-task-card-{claim.card.id}-"
+                    f"v{claim.card.version}"
+                ),
+                "body": body,
+                "reply_markup": reply_markup,
+            }
+            if claim_version == 2:
+                claim_payload["source_kind"] = _bounded_source_kind(
+                    claim.card.origin_kind
+                )
             return {
                 "schema": CLAIM_SCHEMA,
-                "schema_version": SERVICE_VERSION,
+                "schema_version": claim_version,
                 "ok": True,
                 "status": "claimed",
-                "claim": {
-                    "card_id": claim.card.id,
-                    "card_version": claim.card.version,
-                    "claim_token": claim.token,
-                    "expires_at": claim.expires_at,
-                    "delivery_key": (
-                        f"foxhound-task-card-{claim.card.id}-"
-                        f"v{claim.card.version}"
-                    ),
-                    "body": body,
-                    "reply_markup": reply_markup,
-                },
+                "claim": claim_payload,
             }
         if operation == "delivered":
             request = _request(
@@ -862,8 +896,17 @@ class TaskCardApplication:
                 )
             )
         if operation == "execution_claim":
-            request = _request(payload, required={"lease_seconds"})
+            request = _strict_request(
+                payload,
+                required={"lease_seconds"},
+                optional={"claim_version"},
+            )
             lease = _integer(request["lease_seconds"], minimum=5, maximum=300)
+            claim_version = _integer(
+                request.get("claim_version", EXECUTION_CLAIM_SCHEMA_VERSION),
+                minimum=1,
+                maximum=EXECUTION_CLAIM_SCHEMA_VERSION,
+            )
             identity = self.resolve_execution_consumer(authorization)
             if identity is None:
                 raise TaskCardServerRequestError("consumer_unresolved", "execution card consumer role is unresolved", HTTPStatus.FORBIDDEN)
@@ -871,14 +914,14 @@ class TaskCardApplication:
                 lease_seconds=lease, consumer_digest=identity.digest,
                 consumer_role=identity.role)
             if isinstance(claim, ExecutionClaimAtCeiling):
-                return {"schema": EXECUTION_CLAIM_SCHEMA, "schema_version": SERVICE_VERSION,
+                return {"schema": EXECUTION_CLAIM_SCHEMA, "schema_version": claim_version,
                         "ok": True, "status": "at_ceiling",
                         "held_count": claim.held_count, "ceiling": claim.ceiling,
                         "claim": None}
             if claim is None:
                 return {
                     "schema": EXECUTION_CLAIM_SCHEMA,
-                    "schema_version": SERVICE_VERSION,
+                    "schema_version": claim_version,
                     "ok": True,
                     "status": "empty",
                     "claim": None,
@@ -912,9 +955,13 @@ class TaskCardApplication:
                             claim_payload["voice_artifact_name"] = "voice_summary.wav"
                 except Exception:
                     pass
+            if claim_version == 2:
+                claim_payload["source_kind"] = _bounded_source_kind(
+                    claim.card.origin_kind
+                )
             return {
                 "schema": EXECUTION_CLAIM_SCHEMA,
-                "schema_version": SERVICE_VERSION,
+                "schema_version": claim_version,
                 "ok": True,
                 "status": "claimed",
                 "claim": claim_payload,
