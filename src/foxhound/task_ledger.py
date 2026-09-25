@@ -23,6 +23,7 @@ from typing import Callable
 from . import task_duplicate_detection
 from .candidate_inbox import CandidateInbox, InboxError, SCHEMA_VERSION
 from .contracts import (
+    CandidateSourceHistory,
     ContractError,
     EQUIVALENCE_BASIS,
     EQUIVALENCE_BASES,
@@ -190,6 +191,26 @@ class TaskOrigin:
     kind: str
     record_id: str
     item_id: str
+
+
+@dataclass(frozen=True)
+class TaskWorkRevision:
+    """One source state that Foxhound actually folded into task work."""
+
+    id: int
+    source_revision: str
+    task_version: int
+    kind: str
+    source_history: CandidateSourceHistory | None
+
+
+@dataclass(frozen=True)
+class TaskWorkRevisionState:
+    """The creation baseline and most recent accepted work for one task."""
+
+    task_id: int
+    created: TaskWorkRevision
+    current: TaskWorkRevision
 
 
 @dataclass(frozen=True)
@@ -955,6 +976,7 @@ class TaskLedger:
                         candidate_id=candidate.candidate_id,
                         source_revision=candidate.source.revision,
                         task_version=version, now=now,
+                        source_history=candidate.source.history,
                     )
                     connection.execute(
                         "INSERT INTO task_events("
@@ -1560,6 +1582,34 @@ class TaskLedger:
             expected_revision=row["source_revision"],
         )
 
+    def work_revision_state(
+        self, task_id: int,
+    ) -> TaskWorkRevisionState | None:
+        """Return the task's creation baseline and current accepted work.
+
+        Legacy work revisions have no producer history reference. That is an
+        explicit unknown state, not grounds to infer one from the latest
+        candidate binding.
+        """
+        if isinstance(task_id, bool) or not isinstance(task_id, int) or task_id < 1:
+            return None
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT r.id,r.source_revision,r.task_version,r.kind,"
+                "r.source_history_source,r.source_history_stream_id,"
+                "r.source_history_item_id,r.source_history_position,"
+                "r.source_history_revision "
+                "FROM work_items AS w JOIN work_revisions AS r "
+                "ON r.work_item_id=w.id WHERE w.task_id=? ORDER BY r.id",
+                (task_id,),
+            ).fetchall()
+        if not rows:
+            return None
+        revisions = tuple(_task_work_revision(row) for row in rows)
+        return TaskWorkRevisionState(
+            task_id=task_id, created=revisions[0], current=revisions[-1]
+        )
+
     def count(self) -> int:
         with closing(self._connect()) as connection:
             row = connection.execute("SELECT COUNT(*) AS total FROM tasks").fetchone()
@@ -1599,6 +1649,7 @@ class TaskLedger:
         connection: sqlite3.Connection,
         *, task_id: int, candidate_id: str, source_revision: str,
         task_version: int, now: str,
+        source_history: CandidateSourceHistory | None = None,
     ) -> None:
         """Append only a source state the ledger actually folded into work.
 
@@ -1614,9 +1665,18 @@ class TaskLedger:
             raise _NativeIntakeConflict
         connection.execute(
             "INSERT INTO work_revisions(work_item_id,candidate_id,"
-            "source_revision,task_version,kind,created_at) VALUES(?,?,?,?,"
-            "'source_advance',?)",
-            (int(row["id"]), candidate_id, source_revision, task_version, now),
+            "source_revision,task_version,kind,created_at,"
+            "source_history_source,source_history_stream_id,"
+            "source_history_item_id,source_history_position,"
+            "source_history_revision) VALUES(?,?,?,?,'source_advance',?,?,?,?,?,?)",
+            (
+                int(row["id"]), candidate_id, source_revision, task_version, now,
+                None if source_history is None else source_history.source,
+                None if source_history is None else source_history.stream_id,
+                None if source_history is None else source_history.item_id,
+                None if source_history is None else source_history.position,
+                None if source_history is None else source_history.revision,
+            ),
         )
 
     @staticmethod
@@ -2027,6 +2087,31 @@ def _row_owner_values(row: sqlite3.Row) -> tuple[object, ...]:
         row["owner_speaker_registry_id"],
         int(row["owner_pinned"]),
         int(row["owner_provisional"]),
+    )
+
+
+def _task_work_revision(row: sqlite3.Row) -> TaskWorkRevision:
+    history_values = (
+        row["source_history_source"], row["source_history_stream_id"],
+        row["source_history_item_id"], row["source_history_position"],
+        row["source_history_revision"],
+    )
+    if all(value is None for value in history_values):
+        history = None
+    elif any(value is None for value in history_values):
+        raise TaskLedgerError("work revision source history is incomplete")
+    else:
+        history = CandidateSourceHistory(
+            source=str(history_values[0]),
+            stream_id=str(history_values[1]),
+            item_id=str(history_values[2]),
+            position=int(history_values[3]),
+            revision=str(history_values[4]),
+        )
+    return TaskWorkRevision(
+        id=int(row["id"]), source_revision=str(row["source_revision"]),
+        task_version=int(row["task_version"]), kind=str(row["kind"]),
+        source_history=history,
     )
 
 

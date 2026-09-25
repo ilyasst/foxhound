@@ -287,7 +287,7 @@ class CandidateInboxTests(unittest.TestCase):
             state = connection.execute(
                 "SELECT state FROM task_duplicate_proposals WHERE id=500"
             ).fetchone()[0]
-        self.assertEqual(version, 57)
+        self.assertEqual(version, 58)
         self.assertEqual(state, "superseded")
 
     def test_fresh_and_migrated_databases_end_up_in_the_same_shape(self):

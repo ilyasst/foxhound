@@ -219,6 +219,37 @@ def cumulative_candidate(index: int, kind: str) -> dict:
     return item
 
 
+def history_candidate(
+    index: int, *, generation: int = 1, text: str | None = None,
+) -> dict:
+    """A current candidate tied to one immutable producer history entry."""
+    item = cumulative_candidate(index, "email")
+    item["schema_version"] = 9
+    item["source"]["history"] = {
+        "source": "email",
+        "stream_id": "primary",
+        "item_id": f"message-{index:03d}",
+        "position": generation,
+        "revision": hashlib.sha256(
+            f"history-{index}-{generation}".encode("utf-8")
+        ).hexdigest(),
+    }
+    item["task"].update({
+        "text": text or item["task"]["text"],
+        "object": f"synthetic summary {index}",
+        "action": "create",
+        "confidence": 0.8,
+    })
+    item["lifecycle"].update({
+        "generation": generation,
+        "changed_at": f"2030-02-{generation:02d}T12:00:00Z",
+    })
+    item["source"]["revision"] = hashlib.sha256(
+        json.dumps(item, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return item
+
+
 def review_candidate(
     head_oid: str,
     *,
@@ -852,6 +883,33 @@ class NativeCandidateIntakeTests(unittest.TestCase):
                 (initial["source"]["revision"], 1, "accepted"),
                 (revised["source"]["revision"], 2, "source_advance"),
             ],
+        )
+
+    def test_work_revisions_retain_creation_and_current_source_history(self):
+        self.activate()
+        initial = history_candidate(1)
+        self.inbox.import_feed(feed(0, initial))
+        self.intake()
+
+        created = self.ledger.work_revision_state(1)
+        self.assertIsNotNone(created)
+        self.assertEqual(created.created.kind, "accepted")
+        self.assertEqual(created.created.source_history.position, 1)
+        self.assertEqual(created.current, created.created)
+
+        revised = history_candidate(
+            1, generation=2, text="Prepare the revised synthetic summary"
+        )
+        self.inbox.import_feed(feed(1, revised))
+        self.intake()
+
+        state = self.ledger.work_revision_state(1)
+        self.assertEqual(state.created.source_history.position, 1)
+        self.assertEqual(state.current.kind, "source_advance")
+        self.assertEqual(state.current.source_history.position, 2)
+        self.assertEqual(
+            state.current.source_history.revision,
+            revised["source"]["history"]["revision"],
         )
 
     def test_provenance_only_revision_preserves_an_active_workflow(self):

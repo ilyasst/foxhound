@@ -44,7 +44,7 @@ from .contracts import (
 )
 
 
-SCHEMA_VERSION = 57
+SCHEMA_VERSION = 58
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
@@ -3069,6 +3069,52 @@ _SCHEMA_V57 = (
 )
 
 
+# A work revision already names the candidate projection folded into a task.
+# Candidate v9 additionally names the producer's immutable source-history row.
+# Legacy rows remain explicitly unknown: migration must not guess which source
+# observation preceded an old candidate.
+_SCHEMA_V58_COLUMNS = (
+    "source_history_source",
+    "source_history_stream_id",
+    "source_history_item_id",
+    "source_history_position",
+    "source_history_revision",
+)
+_SCHEMA_V58 = (
+    "ALTER TABLE work_revisions ADD COLUMN source_history_source TEXT;",
+    "ALTER TABLE work_revisions ADD COLUMN source_history_stream_id TEXT;",
+    "ALTER TABLE work_revisions ADD COLUMN source_history_item_id TEXT;",
+    "ALTER TABLE work_revisions ADD COLUMN source_history_position INTEGER "
+    "CHECK(source_history_position IS NULL OR source_history_position > 0);",
+    "ALTER TABLE work_revisions ADD COLUMN source_history_revision TEXT "
+    "CHECK(source_history_revision IS NULL OR "
+    "length(source_history_revision) = 64);",
+    "DROP TRIGGER IF EXISTS work_revision_on_accepted_binding;",
+    """CREATE TRIGGER work_revision_on_accepted_binding
+AFTER INSERT ON task_candidate_bindings WHEN NEW.relation='accepted'
+BEGIN
+    INSERT OR IGNORE INTO work_items(task_id,created_at,updated_at)
+    SELECT NEW.task_id,NEW.decided_at,NEW.decided_at;
+    INSERT INTO work_revisions(
+        work_item_id,candidate_id,source_revision,task_version,kind,created_at,
+        source_history_source,source_history_stream_id,source_history_item_id,
+        source_history_position,source_history_revision
+    )
+    SELECT w.id,NEW.candidate_id,NEW.source_revision,
+           (SELECT version FROM tasks WHERE id=NEW.task_id),'accepted',
+           NEW.decided_at,
+           json_extract(i.payload_json,'$.source.history.source'),
+           json_extract(i.payload_json,'$.source.history.stream_id'),
+           json_extract(i.payload_json,'$.source.history.item_id'),
+           json_extract(i.payload_json,'$.source.history.position'),
+           json_extract(i.payload_json,'$.source.history.revision')
+    FROM work_items AS w
+    JOIN candidate_inbox AS i ON i.candidate_id=NEW.candidate_id
+    WHERE w.task_id=NEW.task_id;
+END;""",
+)
+
+
 # Context exhaustion is a separate terminal condition for one attempt. The
 # workflow table has a closed reason vocabulary, so admitting it requires a
 # table rebuild rather than silently recording it as an ordinary timeout.
@@ -4580,6 +4626,28 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 57
+            if version == 57:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    columns = {
+                        row["name"] for row in connection.execute(
+                            "PRAGMA table_info(work_revisions)"
+                        )
+                    }
+                    for column, statement in zip(
+                        _SCHEMA_V58_COLUMNS, _SCHEMA_V58[:5], strict=True
+                    ):
+                        if column not in columns:
+                            connection.execute(statement)
+                    for statement in _SCHEMA_V58[5:]:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 58")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 58
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:

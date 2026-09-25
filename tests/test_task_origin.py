@@ -116,6 +116,18 @@ class TaskOriginRead(unittest.TestCase):
                 "ORDER BY r.id"
             ).fetchall()
         self.assertEqual(rows, [(1, "b" * 64)])
+        state = self.ledger.work_revision_state(1)
+        self.assertEqual(state.created, state.current)
+        self.assertIsNone(state.current.source_history)
+
+    def test_legacy_work_history_is_explicitly_unknown(self) -> None:
+        self._bind(1, _issue_candidate(42))
+
+        state = self.ledger.work_revision_state(1)
+
+        self.assertIsNotNone(state)
+        self.assertEqual(state.created.kind, "accepted")
+        self.assertIsNone(state.created.source_history)
 
     def test_a_repeated_source_digest_is_still_an_auditable_advance(self) -> None:
         self._bind(1, _issue_candidate(42))

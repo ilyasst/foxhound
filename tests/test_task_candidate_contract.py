@@ -616,6 +616,56 @@ class TaskCandidateContractTests(unittest.TestCase):
         self.assertEqual(parsed.task.participants, ())
         self.assertEqual(task_candidate_document(parsed), required_only)
 
+    def test_version_9_carries_the_exact_producer_history_entry(self):
+        document = fixture("meeting-candidate-v2.json")
+        document["schema_version"] = 9
+        document["source"]["history"] = {
+            "source": "email",
+            "stream_id": "primary",
+            "item_id": "message-017",
+            "position": 17,
+            "revision": "f" * 64,
+        }
+        document["task"].update({
+            "owner_ref": {
+                "kind": "person", "speaker_id": "SPK_101",
+                "canonical_speaker_id": "SPK_001",
+                "speaker_registry_id": "registry-alpha", "pinned": False,
+                "provisional": False,
+            },
+            "object": "synthetic sample", "action": "review",
+            "confidence": 0.75,
+        })
+        document["lifecycle"] = {
+            "state": "active", "generation": 1,
+            "changed_at": "2030-01-01T00:00:00Z",
+        }
+
+        candidate = parse_task_candidate(document)
+
+        self.assertEqual(candidate.source.history.position, 17)
+        self.assertEqual(candidate.source.history.revision, "f" * 64)
+        self.assertEqual(task_candidate_document(candidate), document)
+
+        for field, value in (
+            ("position", 0), ("position", True),
+            ("revision", "f" * 63), ("extra", "unexpected"),
+        ):
+            invalid = copy.deepcopy(document)
+            invalid["source"]["history"][field] = value
+            with self.subTest(field=field, value=value):
+                with self.assertRaises(ContractError):
+                    parse_task_candidate(invalid)
+
+        schema = json.loads(
+            (Path(__file__).parents[1] / "src" / "foxhound" / "contracts" /
+             "schemas" / "task-candidate-v9.schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(schema["properties"]["schema_version"]["const"], 9)
+        self.assertIn("history", schema["properties"]["source"]["required"])
+
 
 if __name__ == "__main__":
     unittest.main()
