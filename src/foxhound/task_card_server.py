@@ -62,6 +62,9 @@ from .task_cards import (
 )
 from .task_ledger import TaskLedgerError
 from .task_execution import (
+    BOARD_OWNER_MAX,
+    BOARD_SUMMARY_MAX,
+    BOARD_TEXT_MAX,
     WORK_BODY_PROJECTION_MAX,
     WORKFLOW_BOARD_STATUSES,
     TaskExecutionService,
@@ -235,7 +238,12 @@ class TaskCardConsumerIdentityError(RuntimeError):
 @dataclass(frozen=True)
 class TaskCardServerLimits:
     max_body_bytes: int = 16 * 1024
-    max_response_bytes: int = 64 * 1024
+    #: Sized against the largest reply this service offers to build: a board at
+    #: its maximum `limit` of 100 rows, each bounded by the constants above,
+    #: measures ~80 KiB at worst. 64 KiB was below that, so the board route
+    #: refused the bound it advertised once a queue grew into it. Consumers
+    #: guard their own reads at 256 KiB, which this stays under.
+    max_response_bytes: int = 192 * 1024
     max_artifact_bytes: int = 2 * 1024 * 1024
     request_timeout_seconds: float = 5.0
 
@@ -1773,7 +1781,15 @@ def _execution_queue_card_document(card: Any) -> dict[str, Any]:
 
 
 def _execution_board_card_document(card: Any) -> dict[str, Any]:
-    """Small, explicit execution-board face; no profile ids or raw sources."""
+    """Small, explicit execution-board face; no profile ids or raw sources.
+
+    A board row is a headline. It used to carry a task at 500 characters and
+    a summary at 1000, which measured ~900 bytes a row in practice: the route
+    accepts `limit` up to 100, so it could serialize about 69 of them before
+    the reply exceeded `max_response_bytes` and every caller got a 502. The
+    detail routes carry the full text, and the column totals carry the true
+    counts, so the row does not need to.
+    """
     return {
         "id": card.id,
         "version": card.version,
@@ -1784,11 +1800,11 @@ def _execution_board_card_document(card: Any) -> dict[str, Any]:
         "delivery_status": card.status.value,
         "kind": card.kind.value,
         "phase": card.phase.value,
-        "task": _queue_projection_text(card.task_text, 500),
-        "owner": _queue_projection_text(card.owner, 200),
+        "task": _queue_projection_text(card.task_text, BOARD_TEXT_MAX),
+        "owner": _queue_projection_text(card.owner, BOARD_OWNER_MAX),
         "agent": _queue_projection_text(card.agent_display_name, 200),
         "source": _queue_projection_text(card.origin_kind, 80),
-        "summary": _queue_projection_text(card.summary, 1_000),
+        "summary": _queue_projection_text(card.summary, BOARD_SUMMARY_MAX),
         "state_since": _queue_projection_text(card.created_at, 64),
     }
 

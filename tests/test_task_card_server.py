@@ -29,13 +29,19 @@ from foxhound.agent_profiles import (
     parse_profile,
 )
 from foxhound.execution_cards import (
+    EXECUTION_BOARD_STATUSES,
+    ExecutionCardKind,
     ExecutionCardStats,
     ExecutionCardService,
+    ExecutionCardStatus,
+    ExecutionReviewCard,
     parse_execution_agent_callback,
     parse_execution_review_callback,
 )
 from foxhound.knowledge_client import OwnerUpcomingMeeting
 from foxhound.task_card_server import (
+    _execution_board_card_document,
+    _workflow_board_document,
     BOUNDED_SOURCE_KINDS,
     CLAIM_SCHEMA,
     CLAIM_SCHEMA_VERSION,
@@ -85,7 +91,14 @@ from foxhound.task_card_server import (
 from review_card_fixture import raise_review_cards
 from foxhound.task_cards import TASK_CARD_READS, TaskCardService
 from foxhound.task_execution import (
+    BOARD_OWNER_MAX,
+    BOARD_SUMMARY_MAX,
+    BOARD_TEXT_MAX,
+    WORKFLOW_BOARD_STATUSES,
     WORK_BODY_PROJECTION_MAX,
+    WorkflowBoard,
+    WorkflowBoardEntry,
+    WorkflowPhase,
     ExecutionOutcome,
     ExecutionResultEnvelope,
     TaskExecutionService,
@@ -764,6 +777,90 @@ class TaskCardServerTests(unittest.TestCase):
             authorization=f"Bearer {queue_token}",
         )
         self.assertEqual(held["cards"], [])
+
+    @staticmethod
+    def _maximal_board_card(card_id: int) -> ExecutionReviewCard:
+        """One board row with every bounded field at its bound."""
+        return ExecutionReviewCard(
+            id=card_id,
+            task_id=card_id,
+            task_version=1,
+            workflow_version=9,
+            work_revision_id=None,
+            kind=ExecutionCardKind.RESULT_REVIEW,
+            phase=WorkflowPhase.EXECUTE,
+            result_id="r" * 32,
+            status=ExecutionCardStatus.PENDING,
+            version=3,
+            created_at="2030-03-01T12:00:00+00:00",
+            workflow_status=WorkflowStatus.AWAITING_REVIEW,
+            agent_profile_id="synthetic-profile",
+            agent_profile_revision="p" * 64,
+            agent_display_name="A" * 200,
+            task_text="T" * (BOARD_TEXT_MAX + 500),
+            owner="O" * (BOARD_OWNER_MAX + 200),
+            due=None,
+            first_raised=None,
+            last_mentioned=None,
+            summary="S" * (BOARD_SUMMARY_MAX + 1_000),
+        )
+
+    def test_a_full_board_reply_fits_the_response_limit(self):
+        """The bound a route advertises has to be one it can serialize.
+
+        Both board routes accept `limit` up to 100. At the previous row bounds
+        an execution row measured around 900 bytes, so a reply of 70-odd rows
+        passed 64 KiB and the route answered 502 for every caller — with the
+        length of the text in the rows deciding when that started. The rows
+        are projected here rather than raised through a hundred-workflow
+        fixture: what this has to hold is the arithmetic between the row
+        bounds and the limit, and that is where it lives.
+        """
+        limit = TaskCardServerLimits().max_response_bytes
+        cards = [self._maximal_board_card(i) for i in range(1, 101)]
+        execution_board = {
+            "schema": EXECUTION_BOARD_SCHEMA,
+            "schema_version": 2,
+            "ok": True,
+            "columns": [
+                {"status": status, "total": 100}
+                for status in EXECUTION_BOARD_STATUSES
+            ],
+            "held_elsewhere": 100,
+            "cards": [
+                _execution_board_card_document(card) for card in cards
+            ],
+        }
+        rendered = json.dumps(
+            execution_board, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        self.assertLess(len(rendered), limit)
+        row = execution_board["cards"][0]
+        self.assertEqual(len(row["task"]), BOARD_TEXT_MAX)
+        self.assertEqual(len(row["summary"]), BOARD_SUMMARY_MAX)
+        self.assertEqual(len(row["owner"]), BOARD_OWNER_MAX)
+
+        entries = tuple(
+            WorkflowBoardEntry(
+                task_id=i,
+                workflow_version=9,
+                board_status="result_review",
+                phase=WorkflowPhase.EXECUTE,
+                task="T" * BOARD_TEXT_MAX,
+                owner="O" * BOARD_OWNER_MAX,
+                agent="A" * 64,
+                state_since="2030-03-01T12:00:00+00:00",
+            )
+            for i in range(1, 101)
+        )
+        workflow_board = _workflow_board_document(WorkflowBoard(
+            entries,
+            {status: 100 for status in WORKFLOW_BOARD_STATUSES},
+        ))
+        rendered_workflows = json.dumps(
+            workflow_board, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        self.assertLess(len(rendered_workflows), limit)
 
     def test_execution_detail_is_bounded_versioned_and_queue_scoped(self):
         card = self._queue_card()
