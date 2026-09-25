@@ -102,7 +102,7 @@ EXECUTION_DETAIL_SCHEMA_VERSION = 2
 EXECUTION_QUEUE_SCHEMA = "foxhound.execution-card-service.queue"
 EXECUTION_QUEUE_SCHEMA_VERSION = 1
 EXECUTION_BOARD_SCHEMA = "foxhound.execution-card-service.board"
-EXECUTION_BOARD_SCHEMA_VERSION = 1
+EXECUTION_BOARD_SCHEMA_VERSION = 2
 EXECUTION_RESOLVE_SCHEMA = "foxhound.execution-card-service.resolve"
 EXECUTION_RESOLVE_SCHEMA_VERSION = 1
 EXECUTION_AGENT_OPTIONS_SCHEMA = (
@@ -1692,6 +1692,8 @@ def _execution_board_card_document(card: Any) -> dict[str, Any]:
     return {
         "id": card.id,
         "version": card.version,
+        "task_id": card.task_id,
+        "workflow_version": card.workflow_version,
         "handle": f"execution-{card.id}",
         "board_status": execution_board_status(card),
         "delivery_status": card.status.value,

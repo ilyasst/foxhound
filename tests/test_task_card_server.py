@@ -250,18 +250,24 @@ class TaskCardServerTests(unittest.TestCase):
             "execution_board", request_document(limit=1),
             authorization=f"Bearer {QUEUE_VIEW_TOKEN}",
         )
-        self.assertEqual((board["schema"], board["ok"]),
-                         (EXECUTION_BOARD_SCHEMA, True))
+        self.assertEqual(
+            (board["schema"], board["schema_version"], board["ok"]),
+            (EXECUTION_BOARD_SCHEMA, 2, True),
+        )
         self.assertEqual(board["columns"][0],
                          {"status": "ready_to_start", "total": 1})
         self.assertEqual(len(board["cards"]), 1)
         card = board["cards"][0]
         self.assertEqual(card["board_status"], "ready_to_start")
         self.assertEqual(set(card), {
-            "id", "version", "handle", "board_status", "delivery_status",
-            "kind", "phase", "task", "owner", "agent", "source",
-            "summary", "state_since",
+            "id", "version", "task_id", "workflow_version", "handle",
+            "board_status", "delivery_status", "kind", "phase", "task",
+            "owner", "agent", "source", "summary", "state_since",
         })
+        self.assertEqual(
+            (card["task_id"], card["workflow_version"]),
+            (1, self.execution.get(1).version),
+        )
         self.assertNotIn("agent_profile_id", card)
         with self.assertRaises(TaskCardServerRequestError):
             app.dispatch(
@@ -294,7 +300,7 @@ class TaskCardServerTests(unittest.TestCase):
             )
             self.assertEqual(status, 200)
             self.assertEqual((board["schema"], board["schema_version"]),
-                             (EXECUTION_BOARD_SCHEMA, 1))
+                             (EXECUTION_BOARD_SCHEMA, 2))
             status, _, refused = request(
                 endpoint, "/v1/execution-cards/board",
                 request_document(limit=1), token=TOKEN,
