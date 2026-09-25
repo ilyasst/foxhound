@@ -23,6 +23,10 @@ from .knowledge_client import (
     GwKnowledgeClient,
     KnowledgeClientConfig,
     KnowledgeClientError,
+    KnowledgeConfigError,
+    KnowledgeRequestError,
+    KnowledgeResponseError,
+    KnowledgeTransportError,
     KnowledgeSearchResult,
 )
 from .contracts import SourceSnapshotContractError
@@ -479,13 +483,26 @@ class ExecutionWorker:
         max_results_per_layer: int = 10,
     ) -> dict[str, Any]:
         state, service = self._active()
-        result = GwKnowledgeClient(self._knowledge_config).search(
-            query,
-            layers=layers,
-            context_lines=context_lines,
-            max_matches_per_document=max_matches_per_document,
-            max_results_per_layer=max_results_per_layer,
-        )
+        try:
+            result = GwKnowledgeClient(self._knowledge_config).search(
+                query,
+                layers=layers,
+                context_lines=context_lines,
+                max_matches_per_document=max_matches_per_document,
+                max_results_per_layer=max_results_per_layer,
+            )
+        except KnowledgeConfigError:
+            self._renew(service, state)
+            return _search_refused("config")
+        except KnowledgeRequestError:
+            self._renew(service, state)
+            return _search_refused("request")
+        except KnowledgeTransportError:
+            self._renew(service, state)
+            return _search_refused("transport")
+        except KnowledgeResponseError:
+            self._renew(service, state)
+            return _search_refused("response")
         self._renew(service, state)
         return _search_document(result)
 
@@ -1472,6 +1489,7 @@ def _search_document(result: KnowledgeSearchResult) -> dict[str, Any]:
     return {
         "schema": WORKER_SEARCH_SCHEMA,
         "schema_version": WORKER_SCHEMA_VERSION,
+        "status": "ok",
         "layers": [
             {
                 "name": layer.name,
@@ -1491,6 +1509,22 @@ def _search_document(result: KnowledgeSearchResult) -> dict[str, Any]:
             }
             for layer in result.layers
         ],
+    }
+
+
+def _search_refused(reason: str) -> dict[str, Any]:
+    """Return a content-free refusal document for a failed search.
+
+    `reason` is one of: config, request, transport, response.
+    The document carries the same schema as a successful search so the
+    agent can inspect the status field without special error handling.
+    """
+    return {
+        "schema": WORKER_SEARCH_SCHEMA,
+        "schema_version": WORKER_SCHEMA_VERSION,
+        "status": f"refused_{reason}",
+        "reason": reason,
+        "layers": [],
     }
 
 
