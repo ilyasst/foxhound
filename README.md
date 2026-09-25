@@ -838,9 +838,11 @@ work-state tokens supplied by Foxhound, not delivery states.  A card carries
 its delivery state only as a small attribute.
 
 The projections expose only a bounded board face: stable card handle and
-version, work-state and delivery tokens, short task/summary text, optional
-owner, source kind, agent display name, and a bounded timestamp.  They never
-expose raw provenance, prompts, transcripts, logs, filesystem paths,
+version, the execution card's numeric task/workflow identity, work-state and
+delivery tokens, short task/summary text, optional owner, source kind, agent
+display name, and a bounded timestamp.  The stable identity lets another
+bounded projection correlate the card without comparing display text.  They
+never expose raw provenance, prompts, transcripts, logs, filesystem paths,
 credentials, or agent profile identifiers.  idroid is the intended consumer;
 it keeps all mutations on the existing version-fenced resolve routes.
 
