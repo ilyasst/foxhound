@@ -38,6 +38,12 @@ from foxhound.execution_cards import (
     parse_execution_agent_callback,
     parse_execution_review_callback,
 )
+from foxhound.contracts import candidate_id_for
+from foxhound.card_provenance import (
+    MAX_CARD_EXTRACT_CHARS,
+    MAX_PROJECTED_SOURCE_NAME,
+    MAX_PROJECTED_SOURCES,
+)
 from foxhound.knowledge_client import OwnerUpcomingMeeting
 from foxhound.task_card_server import (
     _execution_board_card_document,
@@ -890,6 +896,8 @@ class TaskCardServerTests(unittest.TestCase):
         # profile revisions -- not the account of the run itself.
         self.assertEqual(detail["work_markdown"], "")
         self.assertNotIn("task_work_directory", detail)
+        # A synthetic task with no accepted candidate records no origin.
+        self.assertIsNone(detail["provenance"])
         self.assertEqual((self.execution_cards.count(), self.execution_cards.event_count()), before)
         with self.assertRaises(TaskCardServerRequestError):
             app.dispatch(
@@ -915,6 +923,143 @@ class TaskCardServerTests(unittest.TestCase):
         )
         self.assertFalse(held["ok"])
         self.assertIsNone(held["summary"])
+
+    def _accept_candidate_evidence(self, task_id: int) -> None:
+        """Bind an accepted candidate carrying role-tagged evidence.
+
+        A meeting candidate, because that is the shape the contract documents
+        with `sources` at this version; the projection under test reads roles
+        it does not interpret, so the vocabulary is not what is being tested.
+        """
+        record_id = f"synthetic-record-{task_id}"
+        item_id = f"synthetic-item-{task_id}"
+        candidate_id = candidate_id_for(
+            system="gw", kind="meeting", record_id=record_id, item_id=item_id,
+        )
+        payload = json.dumps({
+            "schema": "foxhound.task-candidate",
+            "schema_version": 4,
+            "candidate_id": candidate_id,
+            "source": {
+                "system": "gw", "kind": "meeting",
+                "record_id": record_id, "item_id": item_id,
+                "revision": "a" * 64,
+            },
+            "task": {
+                "text": f"Synthetic task {task_id}",
+                "owner": "Person A", "due": None,
+            },
+            "evidence": {
+                "document_id": record_id,
+                "locator": item_id,
+                "sources": [
+                    {
+                        "name": "20300301_example_protocol.md",
+                        "role": "protocol",
+                        # Multi-line on purpose: the regular expressions this
+                        # replaces stopped at the first newline.
+                        "extract": "Summary:\nA report was requested.",
+                    },
+                    {
+                        "name": "20300301_example_transcript.txt",
+                        "role": "transcript",
+                        "extract": "[Person A] I will prepare the report.",
+                    },
+                ],
+            },
+            "created_at": "2030-01-01T00:00:00Z",
+        }, separators=(",", ":"), sort_keys=True)
+        stamp = NOW.isoformat(timespec="seconds")
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "INSERT INTO candidate_inbox(candidate_id,source_system,"
+                "source_kind,source_record_id,source_item_id,source_revision,"
+                "payload_json,created_at,first_imported_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (candidate_id, "gw", "meeting", record_id, item_id,
+                 "a" * 64, payload, stamp, stamp, stamp),
+            )
+            connection.execute(
+                "INSERT INTO candidate_revision_history(candidate_id,"
+                "source_revision,payload_json,created_at,imported_at) "
+                "VALUES(?,?,?,?,?)",
+                (candidate_id, "a" * 64, payload, stamp, stamp),
+            )
+            connection.execute(
+                "INSERT INTO task_candidate_bindings(candidate_id,"
+                "source_revision,task_id,relation,decided_at) "
+                "VALUES(?,?,?,'accepted',?)",
+                (candidate_id, "a" * 64, task_id, stamp),
+            )
+
+    def test_detail_routes_carry_provenance_as_structure(self):
+        """Where the task came from, in the shape the ledger holds it.
+
+        A console used to recover this by running regular expressions over
+        `task_brief` -- a document that says in its own docstring that it is
+        plain text for pasting somewhere else. Reformatting that rendering
+        silently emptied a panel, and the pattern stopped at a newline so a
+        multi-line extract arrived cut. Both are properties of the parsing.
+        """
+        self._accept_candidate_evidence(1)
+        card = self._queue_card()
+        queue = "q" * 43
+        app = TaskCardApplication(
+            self.cards, {DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: queue},
+            execution_cards=self.execution_cards,
+            execution_workflows=self.execution,
+            execution_tokens={DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: queue},
+        )
+        detail = app.dispatch(
+            "execution_detail",
+            request_document(card_id=card.id, card_version=card.version),
+            authorization=f"Bearer {queue}",
+        )
+        provenance = detail["provenance"]
+        self.assertEqual(provenance["kind"], "meeting")
+        roles = {source["role"]: source for source in provenance["sources"]}
+        self.assertEqual(sorted(roles), ["protocol", "transcript"])
+        self.assertEqual(
+            roles["protocol"]["extract"], "Summary:\nA report was requested."
+        )
+        self.assertEqual(
+            roles["protocol"]["name"], "20300301_example_protocol.md"
+        )
+        # Locators identify a mailbox item or an issue; nothing shown needs
+        # them, so they are not in this projection.
+        self.assertNotIn("record", provenance)
+        self.assertNotIn("item", provenance)
+
+        # The workflow route reads it from the task, so origin does not depend
+        # on a card existing or being unclaimed.
+        workflow = app.dispatch(
+            "workflow_detail",
+            request_document(task_id=1, workflow_version=1),
+            authorization=f"Bearer {queue}",
+        )
+        self.assertEqual(workflow["provenance"], provenance)
+
+    def test_provenance_is_absent_rather_than_empty_without_evidence(self):
+        card = self._queue_card()
+        queue = "q" * 43
+        app = TaskCardApplication(
+            self.cards, {DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: queue},
+            execution_cards=self.execution_cards,
+            execution_workflows=self.execution,
+            execution_tokens={DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: queue},
+        )
+        detail = app.dispatch(
+            "execution_detail",
+            request_document(card_id=card.id, card_version=card.version),
+            authorization=f"Bearer {queue}",
+        )
+        self.assertIsNone(detail["provenance"])
+        workflow = app.dispatch(
+            "workflow_detail",
+            request_document(task_id=1, workflow_version=1),
+            authorization=f"Bearer {queue}",
+        )
+        self.assertIsNone(workflow["provenance"])
 
     def test_detail_routes_carry_the_recorded_work_body(self):
         """The account of a run reaches a reader, bounded, on both routes.
@@ -1030,6 +1175,7 @@ class TaskCardServerTests(unittest.TestCase):
         self.assertIsNone(response["summary"])
         self.assertIsNone(response["work_digest"])
         self.assertIsNone(response["work_markdown"])
+        self.assertIsNone(response["provenance"])
         self.assertEqual(response["deliverables"], [])
         self.assertIsNone(response["failure_reason"])
         self.assertIsNone(response["failure_exit_code"])

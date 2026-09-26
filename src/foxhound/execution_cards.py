@@ -30,7 +30,9 @@ from .candidate_inbox import CandidateInbox, InboxError, SCHEMA_VERSION
 from .card_provenance import (
     ADDRESSABLE_ORIGINS,
     CardSourceEvidence,
+    origin_kind_subquery,
     origin_lines as shared_origin_lines,
+    origin_payload_subquery,
     origin_url,
     stored_origin_sources,
 )
@@ -474,6 +476,11 @@ class ExecutionCardDetail:
     #: through. Bounded where it is serialized, as they are.
     work_markdown: str = field(default="", repr=False)
     deliverables: tuple[CardRecord, ...] = field(default=(), repr=False)
+    #: Where the task came from, as the candidate recorded it. A reader asked
+    #: to authorise work needs to see what asked for it.
+    origin_kind: str = field(default="", repr=False)
+    origin_sources: tuple[CardSourceEvidence, ...] = field(
+        default=(), repr=False)
     failure_reason: str | None = None
     failure_exit_code: int | None = None
     failure_run_id: str | None = None
@@ -2126,6 +2133,8 @@ class ExecutionCardService:
                 work_digest="" if row["work_digest"] is None else str(row["work_digest"]),
                 work_markdown="" if row["work_markdown"] is None else str(row["work_markdown"]),
                 deliverables=_stored_collection(row["deliverables_json"]),
+                origin_kind=str(row["origin_kind"] or ""),
+                origin_sources=stored_origin_sources(row["origin_payload"]),
                 failure_reason=row["workflow_failure_reason"],
                 failure_exit_code=row["workflow_failure_exit_code"],
                 failure_run_id=row["workflow_failure_run_id"],
@@ -3058,10 +3067,7 @@ class ExecutionCardService:
             " AS unchanged_from_previous,"
             # Where the task came from. A reader asked to authorise work on
             # an issue cannot answer without being told which issue.
-            "(SELECT o.source_kind FROM task_candidate_bindings AS b "
-            " JOIN candidate_inbox AS o ON o.candidate_id=b.candidate_id "
-            " WHERE b.task_id=c.task_id AND b.relation='accepted') "
-            " AS origin_kind,"
+            + origin_kind_subquery("c") + " AS origin_kind,"
             "(SELECT o.source_record_id FROM task_candidate_bindings AS b "
             " JOIN candidate_inbox AS o ON o.candidate_id=b.candidate_id "
             " WHERE b.task_id=c.task_id AND b.relation='accepted') "
@@ -3104,12 +3110,7 @@ class ExecutionCardService:
             " WHERE r.withdrawn_at IS NULL "
             "   AND (r.subject_id=c.task_id OR r.object_id=c.task_id)) "
             " AS task_relations,"
-            "(SELECT h.payload_json FROM task_candidate_bindings AS b "
-            " JOIN candidate_revision_history AS h "
-            " ON h.candidate_id=b.candidate_id "
-            " AND h.source_revision=b.source_revision "
-            " WHERE b.task_id=c.task_id AND b.relation='accepted') "
-            " AS origin_payload "
+            + origin_payload_subquery("c") + " AS origin_payload "
             "FROM execution_review_cards AS c "
             "JOIN tasks AS t ON t.id=c.task_id "
             "JOIN task_execution_workflows AS w ON w.task_id=c.task_id "
