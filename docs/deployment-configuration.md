@@ -145,6 +145,10 @@ before it existed is brought forward.
       "enabled": true,
       "limit": 100
     },
+    "execution_card_schedule": {
+      "enabled": true,
+      "limit": 100
+    },
     "task_card_requeue": {
       "enabled": true,
       "limit": 100
@@ -180,6 +184,14 @@ only version 13 can declare the complete deployment boundary.
 `task_card_requeue` may be omitted from an existing version 5 document during
 the transition. Rendering `task-card-requeue` then refuses safely; add it with
 an enabled or disabled declaration before using that component.
+
+`execution_card_schedule` may be omitted on the same terms, and for the same
+reason: it was added after hosts were already running. It creates the review
+cards that workflows waiting at a gate are owed. Leaving it out means cards are
+created only when a delivering side asks for them as a side effect of topping up
+its own surface — which makes a card's existence conditional on that surface
+having room, and leaves a console reader unable to answer work that is waiting.
+A host with a console should enable it.
 
 Validate before changing a service definition or restarting anything:
 
