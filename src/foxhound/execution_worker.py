@@ -15,7 +15,7 @@ import shutil
 import stat
 import sys
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -114,6 +114,21 @@ _RESULT_INPUTS = (
 def _local_today() -> str:
     """Return the host's authoritative local calendar date."""
     return datetime.now().astimezone().date().isoformat()
+
+
+def _handoff_written_at(
+    task_work_directory: str | None, phase: str
+) -> str | None:
+    """When the note for this phase was last written, if there is one."""
+    if not task_work_directory:
+        return None
+    path = Path(task_work_directory) / f"handoff-{phase}.md"
+    try:
+        stamp = path.stat().st_mtime
+    except OSError:
+        return None
+    return datetime.fromtimestamp(stamp, tz=timezone.utc).isoformat(
+        timespec="seconds")
 
 
 def _read_handoff(task_work_directory: str | None, phase: str) -> str | None:
@@ -302,6 +317,11 @@ class ExecutionWorker:
         ):
             raise ExecutionWorkerClaimError("execution claim is unavailable")
         origin = TaskLedger(state.database_path).origin(state.task_id)
+        reader_input = service.reader_instruction_with_time(
+            state.task_id,
+            expected_version=state.workflow_version,
+            claim_token=state.claim_token,
+        )
 
         working_group_context = None
         try:
@@ -402,10 +422,22 @@ class ExecutionWorker:
                 ),
                 "agent_profile_id": state.agent_profile_id,
                 "agent_profile_revision": state.agent_profile_revision,
-                "reader_instruction": service.reader_instruction(
-                    state.task_id,
-                    expected_version=state.workflow_version,
-                    claim_token=state.claim_token,
+                "reader_instruction": (
+                    None if reader_input is None else reader_input.text
+                ),
+                # Both the reader's request and any note from an earlier
+                # attempt are delivered, each saying when it arrived, and
+                # the agent decides between them.  Withholding the older
+                # one would be the simpler rule and the wrong one: a note
+                # can describe an approach the reader has since redirected
+                # and still hold the only record of what was changed and
+                # where.  What it cannot do is be weighed without its date.
+                "reader_instruction_received_at": (
+                    None if reader_input is None
+                    else reader_input.received_at
+                ),
+                "handoff_written_at": _handoff_written_at(
+                    state.task_work_directory, state.phase.value
                 ),
                 # Why earlier attempts at this phase stopped, most recent
                 # first and bounded. Evidence about what has already been
