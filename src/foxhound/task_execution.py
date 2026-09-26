@@ -3025,23 +3025,31 @@ def _apply_start_action(
     # `plan` would throw that approval away and silently ask the agent to
     # redo work that was accepted.
     phase = WorkflowPhase(row["phase"])
+    # Preserve parked_at when snoozing a parked workflow so the card
+    # scheduler can still classify it as a parked card rather than
+    # falling through to awaiting_start.
+    parked_at_value: str | None
+    if action in _SNOOZE_ACTIONS:
+        parked_at_value = row["parked_at"]
+    else:
+        parked_at_value = None
     connection.execute(
         "UPDATE task_execution_workflows SET status=?,phase=?,version=?,"
         "due_at=?,claim_token_digest=NULL,claimed_at=NULL,"
         "claim_heartbeat_at=NULL,claim_expires_at=NULL,"
         "current_run_id=NULL,"
-        # Restarting clears what parked it, so a retry gets a full set of
-        # attempts rather than immediately parking again on the next slip.
         "failure_count=0,last_failure_reason=NULL,"
         "last_failure_exit_code=NULL,last_failure_run_id=NULL,"
         "last_failure_at=NULL,"
-        "next_attempt_at=NULL,parked_at=NULL,updated_at=?,completed_at=? "
+        "next_attempt_at=?,parked_at=?,updated_at=?,completed_at=? "
         "WHERE task_id=? AND version=?",
         (
             status,
             phase,
             version,
             wake,
+            None,
+            parked_at_value,
             now,
             completed,
             task_id,
@@ -3153,6 +3161,14 @@ def _apply_review_action(
         kind = "phase_approved"
         wake = None
     version = expected_version + 1
+    # Preserve parked_at when snoozing a parked workflow so the card
+    # scheduler can still classify it as a parked card rather than
+    # falling through to awaiting_start.
+    parked_at_value: str | None
+    if action in _SNOOZE_ACTIONS:
+        parked_at_value = row["parked_at"]
+    else:
+        parked_at_value = None
     connection.execute(
         "UPDATE task_execution_workflows SET status=?,phase=?,version=?,"
         "due_at=?,claim_token_digest=NULL,claimed_at=NULL,"
@@ -3160,13 +3176,14 @@ def _apply_review_action(
         "current_run_id=NULL,"
         "last_failure_reason=NULL,last_failure_exit_code=NULL,"
         "last_failure_run_id=NULL,last_failure_at=NULL,next_attempt_at=NULL,"
-        "parked_at=NULL,updated_at=?,completed_at=? "
+        "parked_at=?,updated_at=?,completed_at=? "
         "WHERE task_id=? AND version=?",
         (
             status,
             phase,
             version,
             wake,
+            parked_at_value,
             now,
             completed,
             task_id,
