@@ -2472,6 +2472,82 @@ class TaskExecutionTests(unittest.TestCase):
         self.assertNotIn(TOKEN, repr(health))
 
 
+class PhaseAttemptCountTests(TaskExecutionTests):
+    """What a run is told about how many times this phase has been tried."""
+
+    def test_the_count_survives_a_park_and_reclaim(self):
+        """The defect this exists for.
+
+        `claim_next` resets `failure_count` when it reclaims a parked
+        workflow.  An agent told it is on its first attempt, on its
+        seventh, has been handed the one fact most likely to make it
+        repeat an approach that has already failed.
+        """
+        patient = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: TOKEN,
+            max_attempts=3,
+        )
+        self._schedule_and_start()
+        seen = []
+        for _ in range(2):
+            for _ in range(3):
+                self.clock.advance(hours=1)
+                claim = patient.claim_next()
+                self.assertIsNotNone(claim)
+                seen.append(patient.phase_attempts(
+                    1,
+                    expected_version=claim.workflow_version,
+                    claim_token=claim.token,
+                ))
+                patient.fail(
+                    1,
+                    expected_version=claim.workflow_version,
+                    claim_token=claim.token,
+                    reason="process_exit",
+                )
+            # Parked. A reader answering Start is what resets the counter.
+            self.assertEqual(
+                patient.get(1).status, WorkflowStatus.PARKED)
+            patient.start_action(
+                1, expected_version=patient.get(1).version, action="start")
+
+        self.assertEqual(seen, [1, 2, 3, 4, 5, 6])
+
+    def test_the_count_is_scoped_to_the_current_phase(self):
+        self._bind_origin(1, "issue")
+        service = self._grant_service("issue")
+        scheduled = service.schedule(1, expected_task_version=1)
+        service.start_action(
+            1, expected_version=scheduled.version, action="start")
+        plan = service.claim_next()
+        self.assertEqual(plan.phase, WorkflowPhase.PLAN)
+        service.record_result(self._result(plan))
+
+        execute = service.claim_next()
+        self.assertEqual(execute.phase, WorkflowPhase.EXECUTE)
+        # One claim in execute, whatever happened in plan.
+        self.assertEqual(
+            service.phase_attempts(
+                1,
+                expected_version=execute.workflow_version,
+                claim_token=execute.token,
+            ),
+            1,
+        )
+
+    def test_only_the_run_it_belongs_to_may_read_it(self):
+        self._schedule_and_start()
+        claim = self._claim()
+        with self.assertRaises(TaskLedgerError):
+            self.service.phase_attempts(
+                1,
+                expected_version=claim.workflow_version,
+                claim_token="execution-token-" + "z" * 32,
+            )
+
+
 class PriorFailureEvidenceTests(TaskExecutionTests):
     """What a run is told about the attempts that failed before it.
 

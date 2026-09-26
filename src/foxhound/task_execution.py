@@ -2413,6 +2413,51 @@ class TaskExecutionService:
     #: handful that message is already delivered while the context is not.
     PRIOR_FAILURE_LIMIT = 3
 
+    def phase_attempts(
+        self,
+        task_id: int,
+        *,
+        expected_version: int,
+        claim_token: str,
+    ) -> int:
+        """How many times this phase has been claimed, across every park.
+
+        Derived from the event log rather than read from `failure_count`,
+        for the reason #498 exists: `claim_next` resets that counter when it
+        reclaims a parked workflow, so it reports attempts since the last
+        park and not attempts.  An agent told it is on its first try, on its
+        twentieth, has been given the one fact most likely to make it repeat
+        what has already failed three times.
+
+        Scoped to the phase the workflow is in now: a plan that succeeded is
+        not an execute that is stuck.
+        """
+        if (
+            not _valid_identity(task_id, expected_version)
+            or not _valid_secret(claim_token)
+        ):
+            raise TaskLedgerError("execution claim is unavailable")
+        now = self._now()
+        with closing(self._connect()) as connection:
+            row = self._workflow_with_task(connection, task_id)
+            refusal = _running_guard(
+                row,
+                expected_version,
+                _token_digest(claim_token),
+                now,
+            )
+            if refusal is None:
+                refusal = _task_guard(row, int(row["task_version"]))
+            if refusal is not None:
+                raise TaskLedgerError("execution claim is unavailable")
+            found = connection.execute(
+                "SELECT count(*) FROM task_execution_events "
+                "WHERE task_id=? AND kind='claimed' AND phase=? "
+                "AND task_version=?",
+                (task_id, str(row["phase"]), int(row["task_version"])),
+            ).fetchone()
+        return int(found[0] or 0)
+
     def prior_failures(
         self,
         task_id: int,
