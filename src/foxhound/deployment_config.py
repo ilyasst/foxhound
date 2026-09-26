@@ -257,6 +257,12 @@ class DatabaseConsumersConfig:
     #: How many failed attempts one digest pass explains.  Absent means the
     #: consumer is disabled, as it does for every other entry here.
     failure_digest: int | None = None
+    #: How many waiting gates one scheduling pass may card. Absent means the
+    #: consumer is disabled. Cards used to be created only as a side effect of
+    #: a chat surface topping itself up, which made their existence depend on
+    #: that surface having room; this is the same call, on this service's own
+    #: schedule.
+    execution_card_schedule: int | None = None
 
     def argv(self, component: str, database: Path) -> list[str]:
         if component == "candidate-feed-import":
@@ -287,6 +293,14 @@ class DatabaseConsumersConfig:
                 "foxhound-execution-card-requeue",
                 "--database", str(database),
                 "--limit", str(self.execution_card_requeue),
+            ]
+        if component == "execution-card-schedule":
+            if self.execution_card_schedule is None:
+                raise DeploymentConfigError("database consumer is disabled")
+            return [
+                "foxhound-execution-card-schedule",
+                "--database", str(database),
+                "--limit", str(self.execution_card_schedule),
             ]
         if component == "task-card-requeue":
             if self.task_card_requeue is None:
@@ -819,7 +833,8 @@ def _parse_database_consumers(
     # the digest pass is a valid deployment, and every host would otherwise
     # have to be edited before any of them could run it.
     optional_fields = (
-        {"task_card_requeue", "failure_digest"} if version >= 5 else set()
+        {"task_card_requeue", "failure_digest", "execution_card_schedule"}
+        if version >= 5 else set()
     )
     document = _object(value, fields, optional_fields)
     candidate = _parse_candidate_feed_import(document["candidate_feed_import"])
@@ -842,11 +857,16 @@ def _parse_database_consumers(
         _parse_failure_digest(document["failure_digest"])
         if "failure_digest" in document else None
     )
+    card_schedule = (
+        _parse_execution_card_schedule(document["execution_card_schedule"])
+        if "execution_card_schedule" in document else None
+    )
     return DatabaseConsumersConfig(
         candidate_feed_import=candidate,
         native_intake_run=intake,
         task_card_requeue=task_requeue,
         execution_card_requeue=requeue,
+        execution_card_schedule=card_schedule,
         lifecycle_outcome_export=lifecycle,
         fused_task_titles=titles,
         duplicate_card_schedule=duplicates,
@@ -887,6 +907,11 @@ def _parse_native_intake_run(value: object) -> tuple[str, str, int] | None:
 
 
 def _parse_execution_card_requeue(value: object) -> int | None:
+    document = _enabled_document(value, {"limit"})
+    return None if document is None else _positive_int(document["limit"])
+
+
+def _parse_execution_card_schedule(value: object) -> int | None:
     document = _enabled_document(value, {"limit"})
     return None if document is None else _positive_int(document["limit"])
 
