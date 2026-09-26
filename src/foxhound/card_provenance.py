@@ -64,6 +64,72 @@ def stored_origin_sources(value: object) -> tuple[CardSourceEvidence, ...]:
     )
 
 
+#: How many evidence sources one projection carries. Candidate evidence has
+#: been three in practice (`handoff`, `subject`, `message`); the bound is what
+#: keeps a detail reply a bounded reply rather than whatever a producer wrote.
+MAX_PROJECTED_SOURCES = 8
+MAX_PROJECTED_SOURCE_NAME = 200
+
+
+#: Where a task came from, reachable from the task id alone. Defined once and
+#: formatted per caller: both the card select and the workflow board detail
+#: read the same two facts, and a second copy of either is a copy that stops
+#: agreeing. `alias` is the table whose `task_id` column identifies the task.
+_ORIGIN_KIND_SUBQUERY = (
+    "(SELECT o.source_kind FROM task_candidate_bindings AS b "
+    " JOIN candidate_inbox AS o ON o.candidate_id=b.candidate_id "
+    " WHERE b.task_id={alias}.task_id AND b.relation='accepted')"
+)
+_ORIGIN_PAYLOAD_SUBQUERY = (
+    "(SELECT h.payload_json FROM task_candidate_bindings AS b "
+    " JOIN candidate_revision_history AS h "
+    " ON h.candidate_id=b.candidate_id "
+    " AND h.source_revision=b.source_revision "
+    " WHERE b.task_id={alias}.task_id AND b.relation='accepted')"
+)
+
+
+def origin_kind_subquery(alias: str) -> str:
+    """The accepted candidate's source kind, for a select on `alias`."""
+    return _ORIGIN_KIND_SUBQUERY.format(alias=alias)
+
+
+def origin_payload_subquery(alias: str) -> str:
+    """The accepted candidate's stored payload, for a select on `alias`."""
+    return _ORIGIN_PAYLOAD_SUBQUERY.format(alias=alias)
+
+
+def provenance_document(
+    kind: object, sources: Sequence[CardSourceEvidence]
+) -> dict[str, object] | None:
+    """Serialize where a task came from, or `None` when nothing is recorded.
+
+    Structured rather than rendered. A console used to recover this by running
+    regular expressions over `task_brief` -- a document that says in its own
+    docstring that it is plain text for pasting somewhere else -- so
+    reformatting that rendering silently emptied a panel, and a multi-line
+    extract arrived cut at its first newline.
+
+    Locators stay out: `origin_record` and `origin_item` identify a mailbox
+    item or an issue, and nothing a reader is shown needs them.
+    """
+    shown = tuple(sources)[:MAX_PROJECTED_SOURCES]
+    kind_text = kind if isinstance(kind, str) else ""
+    if not kind_text and not shown:
+        return None
+    return {
+        "kind": kind_text[:MAX_PROJECTED_SOURCE_NAME],
+        "sources": [
+            {
+                "role": source.role[:MAX_PROJECTED_SOURCE_NAME],
+                "name": source.name[:MAX_PROJECTED_SOURCE_NAME],
+                "extract": source.extract[:MAX_CARD_EXTRACT_CHARS],
+            }
+            for source in shown
+        ],
+    }
+
+
 def origin_lines(
     *,
     kind: str,

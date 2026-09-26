@@ -21,6 +21,12 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Callable, Sequence
 
+from .card_provenance import (
+    CardSourceEvidence,
+    origin_kind_subquery,
+    origin_payload_subquery,
+    stored_origin_sources,
+)
 from .task_owner import normalized_aliases, reader_owned
 from .agent_profiles import (
     AgentProfile,
@@ -284,6 +290,11 @@ class WorkflowBoardDetail:
     #: this is the only field a reader can be shown the actual work through.
     work_markdown: str = ""
     deliverables: tuple[Mapping[str, str], ...] = ()
+    #: Where the task came from. Read from the task rather than from a card,
+    #: so a reader is told the origin whether or not a card exists for this
+    #: gate or has been delivered somewhere else.
+    origin_kind: str = ""
+    origin_sources: tuple[CardSourceEvidence, ...] = ()
     refusal: WorkflowRefusal | None = None
 
 
@@ -1877,7 +1888,9 @@ class TaskExecutionService:
         with closing(self._connect()) as connection:
             row = connection.execute(
                 "SELECT w.task_id,w.version,w.status,w.phase,w.updated_at,"
-                "r.summary,r.work_digest,r.work_markdown,r.deliverables_json "
+                "r.summary,r.work_digest,r.work_markdown,r.deliverables_json,"
+                + origin_kind_subquery("w") + " AS origin_kind,"
+                + origin_payload_subquery("w") + " AS origin_payload "
                 "FROM task_execution_workflows AS w "
                 "LEFT JOIN task_execution_results AS r ON r.result_id=w.last_result_id "
                 "WHERE w.task_id=?", (task_id,),
@@ -1893,6 +1906,8 @@ class TaskExecutionService:
             work_digest=_board_text(row["work_digest"], 800),
             work_markdown=_board_text(row["work_markdown"], WORK_BODY_PROJECTION_MAX),
             deliverables=_board_deliverables(row["deliverables_json"]),
+            origin_kind=_board_text(row["origin_kind"], BOARD_TEXT_MAX),
+            origin_sources=stored_origin_sources(row["origin_payload"]),
         )
 
     def reader_instruction(
