@@ -1861,8 +1861,10 @@ class TaskExecutionService:
         entries = tuple(WorkflowBoardEntry(
             task_id=int(row["task_id"]), workflow_version=int(row["version"]),
             board_status=_workflow_board_status(WorkflowStatus(row["status"]), WorkflowPhase(row["phase"])),
-            phase=WorkflowPhase(row["phase"]), task=_board_text(row["text"], 500),
-            owner=_board_text(row["owner"], 200), agent=_board_text(row["agent_profile_id"], 64),
+            phase=WorkflowPhase(row["phase"]),
+            task=_board_text(row["text"], BOARD_TEXT_MAX),
+            owner=_board_text(row["owner"], BOARD_OWNER_MAX),
+            agent=_board_text(row["agent_profile_id"], 64),
             state_since=str(row["updated_at"]),
         ) for row in rows)
         return WorkflowBoard(entries, totals)
@@ -3214,6 +3216,15 @@ def _workflow_board_status(status: WorkflowStatus, phase: WorkflowPhase) -> str:
 #: rather than a sentence about one, and small enough that a detail read stays
 #: one bounded response.
 WORK_BODY_PROJECTION_MAX = 16_000
+
+#: A board row is a headline, and a full board has to fit one reply. Defined
+#: here and imported by the card service's board projections rather than
+#: restated there: two copies of one bound is how a reply grows past a limit
+#: nobody re-derived. See `max_response_bytes` in `task_card_server`, which is
+#: sized against these.
+BOARD_TEXT_MAX = 300
+BOARD_SUMMARY_MAX = 200
+BOARD_OWNER_MAX = 120
 
 
 def _board_text(value: object, maximum: int) -> str:
