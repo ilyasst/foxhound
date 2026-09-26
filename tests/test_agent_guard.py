@@ -14,6 +14,24 @@ INSTALL_SCRIPT = (
 )
 
 
+# Environment variables that mark an unattended agent session.
+AGENT_MARKER_VARS = frozenset({
+    "HERMES_CRON_SESSION",
+    "HERMES_SESSION_SOURCE",
+    "FOXHOUND_WORKFLOW_STATE",
+})
+
+# Git environment variables that leak parent repository state into child git commands.
+GIT_LEAK_VARS = frozenset({
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_COMMON_DIR",
+    "GIT_PREFIX",
+})
+
+
 class AgentGuardTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -28,9 +46,16 @@ class AgentGuardTests(unittest.TestCase):
         self._git(["add", "file.txt"], cwd=self.repo)
         self._git(["commit", "-m", "initial commit"], cwd=self.repo)
 
+    def _base_env(self) -> dict[str, str]:
+        """Return environment stripped of agent markers and git repository pointers."""
+        env = dict(os.environ)
+        for var in AGENT_MARKER_VARS | GIT_LEAK_VARS:
+            env.pop(var, None)
+        return env
+
     def _git(self, args: list[str], *, cwd: Path, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-        full_env = dict(os.environ)
-        if env:
+        full_env = self._base_env()
+        if env is not None:
             full_env.update(env)
         return subprocess.run(
             ["git", *args],
@@ -45,6 +70,7 @@ class AgentGuardTests(unittest.TestCase):
         return subprocess.run(
             [str(INSTALL_SCRIPT)],
             cwd=cwd,
+            env=self._base_env(),
             capture_output=True,
             text=True,
             check=False,
