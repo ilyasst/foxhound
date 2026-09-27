@@ -386,7 +386,13 @@ class CandidateFeedShadowImportTests(unittest.TestCase):
         )
         self.assertEqual(failed.returncode, 1)
         self.assertEqual(failed.stdout, "")
-        self.assertEqual(failed.stderr, "candidate feed import failed\n")
+        # The reason travels with the failure now -- a bare "import failed"
+        # cost hours of tracing a stalled feed. The path still must not.
+        self.assertEqual(
+            failed.stderr,
+            "candidate feed import failed: "
+            "producer outbox contains an unrecognized entry\n",
+        )
         self.assertNotIn(str(self.outbox), failed.stderr)
 
     def _outbox_state(self) -> tuple[tuple[str, int, str], ...]:
