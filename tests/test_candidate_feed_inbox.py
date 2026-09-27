@@ -19,7 +19,7 @@ from foxhound import (
     FeedImportRefusal,
     InboxError,
 )
-from foxhound.candidate_inbox import SCHEMA_VERSION
+from foxhound.candidate_inbox import SCHEMA_VERSION, ImportRefusal
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "contracts"
@@ -158,6 +158,35 @@ class CandidateFeedInboxTests(unittest.TestCase):
         self.assertEqual(self._receipt_count(), 0)
         email_id = page["items"][0]["candidate"]["candidate_id"]
         self.assertIsNone(self.inbox.get(email_id))
+
+    def test_candidate_conflict_names_the_offending_record(self):
+        """A refusal has to say which candidate, and why.
+
+        One refusal rolls the whole page back and halts every page behind it,
+        so an aggregate `candidate_conflict` left an operator replaying
+        `_apply_candidate` by hand against a copy of the database to learn
+        that a single record had conflicted.
+        """
+        meeting = fixture("meeting-candidate-v1.json")
+        self.inbox.import_document(meeting)
+        page = fixture()
+        page["items"].reverse()
+        page["items"][0]["sequence"] = 1
+        page["items"][1]["sequence"] = 2
+        page["items"][1]["candidate"]["task"]["text"] = (
+            "Contradictory synthetic action"
+        )
+        offending = page["items"][1]["candidate"]["candidate_id"]
+
+        result = self.inbox.import_feed(page)
+
+        self.assertEqual(result.refusal, FeedImportRefusal.CANDIDATE_CONFLICT)
+        self.assertEqual(result.candidate_id, offending)
+        self.assertEqual(
+            result.candidate_refusal, ImportRefusal.REVISION_CONFLICT
+        )
+        # Still atomic: naming the record must not apply any of the page.
+        self.assertEqual(self.inbox.feed_cursor("gw", "primary"), 0)
 
     def test_invalid_page_is_refused_without_writes(self):
         document = fixture()

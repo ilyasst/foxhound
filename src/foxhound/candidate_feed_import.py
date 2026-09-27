@@ -100,8 +100,19 @@ def import_outbox(
             for document in snapshot.pages:
                 result = inbox.import_feed(document)
                 if not result.accepted:
+                    # Name the reason and the record. A refusal rolls the whole
+                    # page back and halts every page behind it, so "was
+                    # refused" leaves the operator bisecting a stalled stream
+                    # to find one candidate. Both parts are content-free.
+                    detail = result.refusal or "unknown"
+                    if result.candidate_refusal is not None:
+                        detail = result.candidate_refusal
+                    where = ""
+                    if result.candidate_id is not None:
+                        where = f" (candidate {result.candidate_id})"
                     raise CandidateFeedImportError(
-                        "candidate feed page was refused by the inbox"
+                        "candidate feed page was refused by the inbox: "
+                        f"{detail}{where}"
                     )
                 if result.disposition is FeedImportDisposition.APPLIED:
                     applied += 1
@@ -115,8 +126,12 @@ def import_outbox(
         except CandidateFeedImportError:
             raise
         except (InboxError, OSError, sqlite3.Error) as exc:
+            # Carry the cause. Every InboxError message is a literal, so this
+            # stays content-free, and the bare sentence hid a plain schema
+            # mismatch behind a message about applying the ledger.
             raise CandidateFeedImportError(
-                "candidate inbox could not apply the producer ledger"
+                "candidate inbox could not apply the producer ledger: "
+                f"{exc}"
             ) from exc
 
     disposition = (
@@ -385,8 +400,11 @@ def main(argv: list[str] | None = None) -> int:
             database_path=args.database,
             stream_id=args.stream_id,
         )
-    except CandidateFeedImportError:
-        print("candidate feed import failed", file=sys.stderr)
+    except CandidateFeedImportError as exc:
+        # Print the reason. Every message on this path is content-free by
+        # construction, and the bare string cost hours of tracing a stalled
+        # feed that already knew exactly which candidate it had refused.
+        print(f"candidate feed import failed: {exc}", file=sys.stderr)
         return 1
     print(json.dumps({
         "candidates_inserted": result.candidates_inserted,

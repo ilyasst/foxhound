@@ -3452,6 +3452,14 @@ class FeedImportResult:
     updated: int = 0
     unchanged: int = 0
     refusal: FeedImportRefusal | None = None
+    #: Which candidate was refused and why. `refusal` says only that some
+    #: candidate in the page conflicted, which is not enough to act on: one
+    #: refusal rolls the whole page back, so without these an operator has to
+    #: replay `_apply_candidate` by hand against a copy of the database to
+    #: learn what happened. Both stay content-free -- the reason is a fixed
+    #: vocabulary and the identifier is an opaque digest.
+    candidate_refusal: ImportRefusal | None = None
+    candidate_id: str | None = None
 
     @property
     def accepted(self) -> bool:
@@ -4860,6 +4868,8 @@ class CandidateInbox:
                         return FeedImportResult(
                             FeedImportDisposition.REFUSED,
                             refusal=FeedImportRefusal.CANDIDATE_CONFLICT,
+                            candidate_refusal=result.refusal,
+                            candidate_id=item.candidate.candidate_id,
                         )
                     counts[result.disposition] += 1
                     connection.execute(
