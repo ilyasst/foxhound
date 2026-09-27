@@ -19,7 +19,15 @@ from foxhound import (
     FeedImportRefusal,
     InboxError,
 )
-from foxhound.candidate_inbox import SCHEMA_VERSION, ImportRefusal
+from foxhound.contracts.task_candidate import (
+    SOURCE_HISTORY_SCHEMA_VERSION,
+)
+from foxhound.candidate_inbox import (
+    _CUMULATIVE_SCHEMA_VERSIONS,
+    _is_cumulative_contract_upgrade,
+    ImportRefusal,
+    SCHEMA_VERSION,
+)
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "contracts"
@@ -158,6 +166,64 @@ class CandidateFeedInboxTests(unittest.TestCase):
         self.assertEqual(self._receipt_count(), 0)
         email_id = page["items"][0]["candidate"]["candidate_id"]
         self.assertIsNone(self.inbox.get(email_id))
+
+    def test_same_version_additive_change_is_not_an_upgrade(self):
+        """Decided 2026-09-27: the generation counter stays strict.
+
+        A candidate arriving at the version already stored, with fields added
+        but the change counter unmoved, is NOT excused as a contract upgrade.
+        gw is responsible for advancing the counter, and this refusal is the
+        only signal the inbox has that a producer stopped doing so -- excusing
+        it would have swallowed ilyasst/gw#1196 instead of surfacing it.
+        """
+        stored = fixture()["items"][0]["candidate"]
+        stored["schema_version"] = max(_CUMULATIVE_SCHEMA_VERSIONS)
+        incoming = copy.deepcopy(stored)
+        incoming["task"]["priority"] = "synthetic-added-field"
+
+        self.assertFalse(
+            _is_cumulative_contract_upgrade(
+                json.dumps(stored, sort_keys=True),
+                json.dumps(incoming, sort_keys=True),
+            )
+        )
+
+    def test_upgrade_path_is_reachable_for_every_non_newest_version(self):
+        """Guard the dead branch this function becomes at the newest version.
+
+        `_is_cumulative_contract_upgrade` only fires when the arriving version
+        is strictly higher than the stored one, so it can never fire for
+        whichever cumulative version is currently the newest -- and that is the
+        version every candidate converges on. The rule is deliberate (see the
+        test above), but the dead branch is easy to forget.
+
+        If this fails because a newer cumulative version was added, that is the
+        moment to re-read that decision: the version that used to be newest is
+        now upgradable, so confirm the additive `shared_shape` normalization
+        covers the fields the new version adds, then update the expectation.
+        """
+        newest = max(_CUMULATIVE_SCHEMA_VERSIONS)
+        self.assertEqual(
+            newest,
+            SOURCE_HISTORY_SCHEMA_VERSION,
+            "a newer cumulative schema version was added -- re-read the "
+            "docstring before updating this expectation",
+        )
+        # Every other cumulative version can still reach the upgrade path.
+        for older in sorted(_CUMULATIVE_SCHEMA_VERSIONS - {newest}):
+            with self.subTest(stored=older):
+                stored = fixture()["items"][0]["candidate"]
+                stored["schema_version"] = older
+                stored["source"].pop("history", None)
+                incoming = copy.deepcopy(stored)
+                incoming["schema_version"] = newest
+                self.assertTrue(
+                    _is_cumulative_contract_upgrade(
+                        json.dumps(stored, sort_keys=True),
+                        json.dumps(incoming, sort_keys=True),
+                    ),
+                    f"version {older} can no longer upgrade to {newest}",
+                )
 
     def test_candidate_conflict_names_the_offending_record(self):
         """A refusal has to say which candidate, and why.
