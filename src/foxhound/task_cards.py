@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import html
+import json
 import os
 import secrets
 import re
@@ -298,6 +299,18 @@ class CardDuplicateProposal:
     other_raised: str | None = field(default=None, repr=False)
     other_closed_at: str | None = field(default=None, repr=False)
     basis: str = field(default="", repr=False)
+    #: What the verification agent cited when it judged the pair one task.
+    #: Empty for proposals raised by other detectors.
+    evidence: tuple["CardDuplicateEvidence", ...] = field(default=(), repr=False)
+    evidence_confidence: float | None = field(default=None, repr=False)
+
+
+@dataclass(frozen=True)
+class CardDuplicateEvidence:
+    """One knowledge-base passage the verification agent cited."""
+
+    label: str = field(repr=False)
+    excerpt: str = field(repr=False)
 
 
 @dataclass(frozen=True)
@@ -2176,6 +2189,12 @@ class TaskCardService:
             " other.created_at) AS duplicate_other_created,"
             "other.closed_at AS duplicate_other_closed,"
             "d.basis AS duplicate_basis,"
+            "(SELECT v.citations_json FROM task_duplicate_verifications AS v "
+            " WHERE v.proposal_id=d.id ORDER BY v.verified_at DESC LIMIT 1) "
+            " AS duplicate_evidence,"
+            "(SELECT v.confidence FROM task_duplicate_verifications AS v "
+            " WHERE v.proposal_id=d.id ORDER BY v.verified_at DESC LIMIT 1) "
+            " AS duplicate_evidence_confidence,"
             "(SELECT o.source_kind FROM task_candidate_bindings AS b "
             " JOIN candidate_inbox AS o ON o.candidate_id=b.candidate_id "
             " WHERE b.task_id=(CASE WHEN d.left_task_id=c.task_id "
@@ -2458,6 +2477,7 @@ def _render_duplicate_check(
     )
     if reason:
         lines.extend(("", f"🔎 <b>Matched on:</b> {reason}"))
+    lines.extend(_evidence_lines(duplicate, expanded=expanded))
     lines.extend((
         "",
         (
@@ -2581,12 +2601,40 @@ def _comparison_facts(*, owner: str | None, due: str | None,
     return (" · ".join(parts),) if parts else ()
 
 
+def _evidence_lines(
+    duplicate: CardDuplicateProposal, *, expanded: bool
+) -> list[str]:
+    """The passages the verification agent cited, so one tap can decide.
+
+    Bounded hard: an expanded card is edited in place, and an edited message
+    cannot be split, so the whole card must stay inside one message. Compact
+    shows two short passages; expanded shows three longer ones.
+    """
+    if not duplicate.evidence:
+        return []
+    shown = duplicate.evidence[: 3 if expanded else 2]
+    limit = 400 if expanded else 160
+    confidence = (
+        f" — confidence {duplicate.evidence_confidence:.0%}"
+        if duplicate.evidence_confidence is not None else ""
+    )
+    lines = ["", f"🧾 <b>Checked against your records</b>{confidence}"]
+    for item in shown:
+        excerpt = item.excerpt if len(item.excerpt) <= limit else (
+            item.excerpt[: limit - 1].rstrip() + "…"
+        )
+        lines.append(f"• <i>{_escape(item.label)}</i>: “{_escape(excerpt)}”")
+    return lines
+
+
 def _duplicate_reason(basis: str) -> str:
     """The detector's evidence, in the reader's words rather than its own."""
     if not basis:
         return ""
     if "later reading" in basis:
         return "the same source was read again later and carded twice"
+    if basis.startswith("agent verified"):
+        return "an agent checked both against your meetings and emails"
     match = re.search(r"shared task terms[^:]*:\s*(.+)$", basis)
     if match:
         terms = ", ".join(
@@ -2746,7 +2794,69 @@ def _duplicate(row) -> CardDuplicateProposal | None:
         other_raised=_optional_text(row["duplicate_other_created"]),
         other_closed_at=_optional_text(row["duplicate_other_closed"]),
         basis=str(row["duplicate_basis"] or ""),
+        evidence=_duplicate_evidence(_row_value(row, "duplicate_evidence")),
+        evidence_confidence=_evidence_confidence(
+            _row_value(row, "duplicate_evidence_confidence")
+        ),
     )
+
+
+def _row_value(row, key: str) -> object:
+    """A column only some card queries select."""
+    return row[key] if key in row.keys() else None
+
+
+_EVIDENCE_DATE_RE = re.compile(r"(20[0-9]{2})[-_]?([01][0-9])[-_]?([0-3][0-9])")
+MAX_CARD_EVIDENCE = 3
+
+
+def _duplicate_evidence(value: object) -> tuple[CardDuplicateEvidence, ...]:
+    """Parse stored citations defensively; a bad row shows no evidence."""
+    if not isinstance(value, str) or not value:
+        return ()
+    try:
+        citations = json.loads(value)
+    except (TypeError, ValueError):
+        return ()
+    if not isinstance(citations, list):
+        return ()
+    evidence = []
+    for citation in citations[:MAX_CARD_EVIDENCE]:
+        if not isinstance(citation, dict):
+            continue
+        excerpt = citation.get("excerpt")
+        if not isinstance(excerpt, str) or not excerpt.strip():
+            continue
+        evidence.append(CardDuplicateEvidence(
+            label=_evidence_label(citation.get("document_id"), citation.get("locator")),
+            excerpt=" ".join(excerpt.split()),
+        ))
+    return tuple(evidence)
+
+
+def _evidence_label(document_id: object, locator: object) -> str:
+    """Name a cited source the way the reader knows it: kind and date."""
+    identifier = document_id if isinstance(document_id, str) else ""
+    path = locator if isinstance(locator, str) else identifier
+    layer = identifier.split(":", 1)[0] if ":" in identifier else ""
+    lowered = path.lower()
+    if layer == "emails" or lowered.startswith("mail"):
+        kind = "email"
+    elif "meeting" in lowered or "_protocol" in lowered:
+        kind = "meeting"
+    else:
+        kind = "note"
+    match = _EVIDENCE_DATE_RE.search(path)
+    if match:
+        return f"{kind} {match.group(1)}-{match.group(2)}-{match.group(3)}"
+    name = path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    return f"{kind} {name[:40]}" if name else kind
+
+
+def _evidence_confidence(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if 0 <= value <= 1 else None
 
 
 def _optional_text(value: object) -> str | None:
