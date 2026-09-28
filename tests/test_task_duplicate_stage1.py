@@ -83,7 +83,7 @@ class StageOneTests(unittest.TestCase):
             basis="Synthetic calibration pair.",
             detector="synthetic-calibration",
             now=NOW,
-            allow_unconfirmed_owner=True,
+            
         )
         proposals.settle(
             self.connection,
@@ -160,7 +160,7 @@ class StageOneTests(unittest.TestCase):
         routes = self.connection.execute(
             "SELECT route FROM task_duplicate_candidate_routes"
         ).fetchall()
-        self.assertEqual({row["route"] for row in routes}, {"words"})
+        self.assertEqual({row["route"] for row in routes}, {"words", "owner"})
 
     def test_persistent_embedding_failure_does_not_starve_the_queue(self) -> None:
         """A failing embedding path must not freeze local signals.

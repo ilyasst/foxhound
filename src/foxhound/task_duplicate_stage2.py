@@ -42,7 +42,9 @@ _SYSTEM = (
     "verdict (same, related, or different), confidence (0 through 1), and "
     "citations. Every citation must copy one supplied document_id and locator "
     "and a short exact excerpt from that document. Same means one piece of "
-    "work represented twice; related work remains independently actionable."
+    "work represented twice; related work remains independently actionable. "
+    "Owners are unreliable hints: agreement supports \"same\", disagreement is "
+    "weak evidence against. Keep the verdict grounded in cited knowledge."
 )
 
 
@@ -63,6 +65,7 @@ class TaskSnapshot:
     source_kind: str
     text: str = field(repr=False)
     owner: str | None = field(repr=False)
+    owner_reliability: str = "unknown"
     due: str | None = None
     object: str | None = field(default=None, repr=False)
     action: str | None = None
@@ -75,6 +78,7 @@ class CandidatePair:
     candidate_id: int
     left: TaskSnapshot
     right: TaskSnapshot
+    routes: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -176,6 +180,7 @@ class LocalVerificationAgent:
             raise VerificationError("knowledge search returned no evidence")
         payload = {
             "tasks": [_task_document(pair.left), _task_document(pair.right)],
+            "routes": pair.routes,
             "evidence": [
                 {
                     "document_id": item.id,
@@ -440,10 +445,18 @@ def _pair(connection: sqlite3.Connection, candidate_id: int) -> CandidatePair:
     ).fetchone()
     if row is None:
         raise VerificationError("candidate pair is unavailable")
+    
+    route_rows = connection.execute(
+        "SELECT route,score FROM task_duplicate_candidate_routes WHERE candidate_id=?",
+        (candidate_id,),
+    ).fetchall()
+    routes = {r["route"]: float(r["score"]) for r in route_rows}
+    
     return CandidatePair(
         candidate_id,
         _task(connection, int(row["left_task_id"]), int(row["left_task_version"])),
         _task(connection, int(row["right_task_id"]), int(row["right_task_version"])),
+        routes=routes,
     )
 
 
@@ -452,7 +465,8 @@ def _task(
 ) -> TaskSnapshot:
     row = connection.execute(
         "SELECT task.id,task.version,task.text,task.owner,task.due,task.object,"
-        "task.action,task.created_at,task.updated_at,inbox.source_kind "
+        "task.action,task.created_at,task.updated_at,inbox.source_kind,"
+        "task.owner_ref_version,task.owner_kind,task.owner_provisional "
         "FROM tasks AS task JOIN task_candidate_bindings AS binding "
         "ON binding.task_id=task.id AND binding.relation='accepted' "
         "JOIN candidate_inbox AS inbox ON inbox.candidate_id=binding.candidate_id "
@@ -461,12 +475,23 @@ def _task(
     ).fetchone()
     if row is None or int(row["version"]) != expected_version:
         raise VerificationError("candidate task version is stale")
+    
+    reliability = "unknown"
+    if row["owner_kind"] == "group":
+        reliability = "group"
+    elif row["owner_kind"] == "person":
+        if row["owner_provisional"]:
+            reliability = "provisional"
+        else:
+            reliability = "confirmed"
+
     return TaskSnapshot(
         id=int(row["id"]),
         version=int(row["version"]),
         source_kind=str(row["source_kind"]),
         text=str(row["text"]),
         owner=row["owner"],
+        owner_reliability=reliability,
         due=row["due"],
         object=row["object"],
         action=row["action"],
@@ -554,7 +579,7 @@ def _record_verification(
                     basis="agent verified the pair as one task from cited knowledge",
                     detector=DETECTOR,
                     now=now,
-                    allow_unconfirmed_owner=True,
+                    
                 )
                 proposal_id = outcome.proposal_id
                 disposition = outcome.disposition
@@ -615,6 +640,7 @@ def _task_document(task: TaskSnapshot) -> dict[str, object]:
         "version": task.version,
         "text": task.text,
         "owner": task.owner,
+        "owner_reliability": task.owner_reliability,
         "source_kind": task.source_kind,
         "due": task.due,
         "object": task.object,

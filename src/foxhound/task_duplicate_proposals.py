@@ -22,7 +22,7 @@ MAX_ACTOR = 200
 MAX_REASON = 500
 MAX_OPEN_PROPOSALS_PER_TASK = 5
 RECENTLY_CLOSED_DAYS = 30
-PROPOSAL_ROUTES = frozenset({"words", "reread", "object", "participant", "legacy"})
+PROPOSAL_ROUTES = frozenset({"words", "reread", "object", "participant", "legacy", "owner"})
 
 
 class DuplicateProposalError(ValueError):
@@ -102,7 +102,7 @@ def propose(
     basis: str,
     detector: str,
     now: str,
-    allow_unconfirmed_owner: bool = False,
+    strict_owner: bool = False,
     routes: Iterable[str] = ("legacy",),
 ) -> ProposalResult:
     """Record one unordered candidate pair for later reader review.
@@ -141,7 +141,7 @@ def propose(
             ProposalDisposition.REFUSED,
             refusal=ProposalRefusal.TASK_NOT_OPEN,
         )
-    if not allow_unconfirmed_owner and not _same_confirmed_owner(rows[0], rows[1]):
+    if strict_owner and not _same_confirmed_owner(rows[0], rows[1]):
         return ProposalResult(
             ProposalDisposition.REFUSED,
             refusal=ProposalRefusal.INCOMPATIBLE_OWNER,

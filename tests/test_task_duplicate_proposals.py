@@ -102,7 +102,7 @@ class DuplicateProposalTests(unittest.TestCase):
         self.connection.execute(
             "UPDATE tasks SET owner_speaker_registry_id='registry-B' WHERE id=2")
         self.assertIs(
-            self._propose().refusal,
+            self._propose(strict_owner=True).refusal,
             duplicates.ProposalRefusal.INCOMPATIBLE_OWNER,
         )
 
@@ -126,19 +126,27 @@ class DuplicateProposalTests(unittest.TestCase):
             duplicates.ProposalRefusal.TASK_NOT_OPEN,
         )
 
+
+    def test_provisional_and_confirmed_owner_of_same_name_is_recorded(self) -> None:
+        self._same_owner(1, 2)
+        # Task 1 confirmed, Task 2 provisional
+        self.connection.execute("UPDATE tasks SET owner_provisional=0 WHERE id=1")
+        self.connection.execute("UPDATE tasks SET owner_provisional=1 WHERE id=2")
+        result = self._propose(strict_owner=False)
+        self.assertIs(result.disposition, duplicates.ProposalDisposition.RECORDED)
     def test_refuses_unconfirmed_and_provisional_owners(self) -> None:
         self._same_owner(1, 2)
         self.connection.execute(
             "UPDATE tasks SET owner_provisional=1 WHERE id=2")
         self.assertIs(
-            self._propose().refusal,
+            self._propose(strict_owner=True).refusal,
             duplicates.ProposalRefusal.INCOMPATIBLE_OWNER,
         )
         self.connection.execute(
             "UPDATE tasks SET owner_provisional=0,owner_kind='external'"
         )
         self.assertIs(
-            self._propose().refusal,
+            self._propose(strict_owner=True).refusal,
             duplicates.ProposalRefusal.INCOMPATIBLE_OWNER,
         )
 

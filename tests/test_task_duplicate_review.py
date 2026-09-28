@@ -830,7 +830,7 @@ class DuplicateSchedulingCollisionTests(DuplicateReviewCardTests):
         result = proposals.propose(
             self.connection, task_id_a=1, task_id_b=2,
             basis="synthetic repeat", detector="synthetic-detector",
-            now=NOW.isoformat(), allow_unconfirmed_owner=True,
+            now=NOW.isoformat(), 
         )
 
         self.assertIs(result.disposition, proposals.ProposalDisposition.RECORDED)
