@@ -33,6 +33,7 @@ from foxhound.task_duplicate_card_schedule import (
     _parser as duplicate_schedule_parser,
 )
 from foxhound.task_duplicate_stage1 import _parser as duplicate_stage1_parser
+from foxhound.task_duplicate_stage2 import _parser as duplicate_stage2_parser
 from foxhound import task_card_server
 from foxhound.task_lifecycle_outcome_export import _parser as lifecycle_export_parser
 
@@ -776,6 +777,29 @@ class DeploymentConfigTests(unittest.TestCase):
             "--limit", "20", "--top-k", "5", "--pair-limit", "100",
         ])
         duplicate_stage1_parser().parse_args(command[1:])
+
+    def test_optional_stage_two_consumer_reuses_bounded_gw_credentials(self) -> None:
+        document = self._document()
+        document["database_consumers"]["duplicate_stage2"] = {  # type: ignore[index]
+            "enabled": True,
+            "model": "example-model",
+            "endpoint": f"http://{LOOPBACK}:8800",
+            "dialect": "openai",
+            "limit": 10,
+            "daily_budget": 50,
+            "timeout_seconds": 600,
+        }
+        self._write_config(document)
+
+        config = load_deployment_config(self.config_path)
+        command = config.argv("duplicate-stage2")
+
+        self.assertEqual(command[0], "foxhound-task-duplicate-stage2")
+        self.assertEqual(command[command.index("--daily-budget") + 1], "50")
+        self.assertEqual(
+            command[command.index("--gw-token-file") + 1], str(self.gateway_token)
+        )
+        duplicate_stage2_parser().parse_args(command[1:])
 
     def test_refuses_a_non_loopback_fused_title_endpoint(self) -> None:
         document = self._document()

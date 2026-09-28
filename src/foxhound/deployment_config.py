@@ -255,6 +255,7 @@ class DatabaseConsumersConfig:
     fused_task_titles: str | None
     duplicate_card_schedule: int | None
     duplicate_stage1: tuple[int, int, int] | None = None
+    duplicate_stage2: tuple[str, str, str, int, int, int] | None = None
     #: How many failed attempts one digest pass explains.  Absent means the
     #: consumer is disabled, as it does for every other entry here.
     failure_digest: int | None = None
@@ -384,9 +385,37 @@ class DeploymentConfig:
             raise DeploymentConfigError("deployment component is unknown")
         if component == "failure-digest":
             return self._failure_digest_argv()
+        if component == "duplicate-stage2":
+            return self._duplicate_stage2_argv()
         if self.database_consumers is not None:
             return self.database_consumers.argv(component, self.database)
         raise DeploymentConfigError("deployment component is unknown")
+
+    def _duplicate_stage2_argv(self) -> list[str]:
+        if (
+            self.database_consumers is None
+            or self.database_consumers.duplicate_stage2 is None
+            or self.card_service.gw_endpoint is None
+            or self.card_service.gw_alias is None
+            or self.card_service.gw_token_file is None
+        ):
+            raise DeploymentConfigError("database consumer is disabled")
+        model, endpoint, dialect, limit, daily_budget, timeout = (
+            self.database_consumers.duplicate_stage2
+        )
+        return [
+            "foxhound-task-duplicate-stage2",
+            "--database", str(self.database),
+            "--model", model,
+            "--endpoint", endpoint,
+            "--dialect", dialect,
+            "--gw-endpoint", self.card_service.gw_endpoint,
+            "--gw-alias", self.card_service.gw_alias,
+            "--gw-token-file", str(self.card_service.gw_token_file),
+            "--limit", str(limit),
+            "--daily-budget", str(daily_budget),
+            "--timeout", str(timeout),
+        ]
 
     def _failure_digest_argv(self) -> list[str]:
         """Explain failed runs from the transcripts this deployment wrote.
@@ -846,7 +875,7 @@ def _parse_database_consumers(
     # have to be edited before any of them could run it.
     optional_fields = (
         {"task_card_requeue", "failure_digest", "execution_card_schedule",
-         "duplicate_stage1"}
+         "duplicate_stage1", "duplicate_stage2"}
         if version >= 5 else set()
     )
     document = _object(value, fields, optional_fields)
@@ -878,6 +907,10 @@ def _parse_database_consumers(
         _parse_duplicate_stage1(document["duplicate_stage1"])
         if "duplicate_stage1" in document else None
     )
+    duplicate_stage2 = (
+        _parse_duplicate_stage2(document["duplicate_stage2"])
+        if "duplicate_stage2" in document else None
+    )
     return DatabaseConsumersConfig(
         candidate_feed_import=candidate,
         native_intake_run=intake,
@@ -888,6 +921,7 @@ def _parse_database_consumers(
         fused_task_titles=titles,
         duplicate_card_schedule=duplicates,
         duplicate_stage1=duplicate_stage1,
+        duplicate_stage2=duplicate_stage2,
         failure_digest=digests,
     )
 
@@ -995,6 +1029,43 @@ def _parse_duplicate_stage1(value: object) -> tuple[int, int, int] | None:
         _positive_int(document["limit"]),
         _positive_int(document["top_k"]),
         _positive_int(document["pair_limit"]),
+    )
+
+
+def _parse_duplicate_stage2(
+    value: object,
+) -> tuple[str, str, str, int, int, int] | None:
+    document = _enabled_document(
+        value,
+        {"model", "endpoint", "dialect", "limit", "daily_budget",
+         "timeout_seconds"},
+    )
+    if document is None:
+        return None
+    model = document["model"]
+    dialect = document["dialect"]
+    if (
+        not isinstance(model, str)
+        or model != model.strip()
+        or not 1 <= len(model) <= 120
+        or any(char.isspace() for char in model)
+        or dialect not in {"openai", "runner"}
+    ):
+        raise DeploymentConfigError("database consumer configuration is invalid")
+    endpoint = _parse_fused_task_titles({
+        "enabled": True, "endpoint": document["endpoint"]
+    })
+    assert endpoint is not None
+    timeout = _positive_int(document["timeout_seconds"])
+    if timeout > 3_600:
+        raise DeploymentConfigError("database consumer configuration is invalid")
+    return (
+        model,
+        endpoint,
+        str(dialect),
+        _positive_int(document["limit"]),
+        _positive_int(document["daily_budget"]),
+        timeout,
     )
 
 

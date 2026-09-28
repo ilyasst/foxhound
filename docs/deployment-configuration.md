@@ -172,6 +172,15 @@ before it existed is brought forward.
       "limit": 20,
       "top_k": 5,
       "pair_limit": 100
+    },
+    "duplicate_stage2": {
+      "enabled": true,
+      "model": "example-model",
+      "endpoint": "http://<canonical IPv4 loopback address>:8800",
+      "dialect": "openai",
+      "limit": 10,
+      "daily_budget": 50,
+      "timeout_seconds": 600
     }
   }
 }
@@ -207,6 +216,13 @@ incident to any task, and `pair_limit` bounds all pairs written by one pass.
 The consumer never downloads a model and leaves embedding work queued when the
 local runtime, model, or reader-derived calibration labels are unavailable.
 
+`duplicate_stage2` is optional too. It reuses the card service's GW endpoint,
+alias, and private token file, so a deployment without that complete GW
+configuration refuses to render it. Its inference endpoint must be canonical
+loopback HTTP. `limit` bounds a pass, `daily_budget` is a durable UTC-day cap on
+agent attempts (including failed attempts), and `timeout_seconds` bounds each
+pair. Its output is aggregate-only; citations remain in the private database.
+
 Validate before changing a service definition or restarting anything:
 
 ```sh
@@ -234,7 +250,7 @@ Supported names are `task-cards`, `execution-schedule`,
 `execution-runner:<slot>`, `candidate-feed-import`, `native-intake-run`,
 `execution-card-requeue`, `task-card-requeue`, `lifecycle-outcome-export`, and
 `fused-task-titles`.
-`duplicate-card-schedule` and `duplicate-stage1` are also available. Use the
+`duplicate-card-schedule`, `duplicate-stage1`, and `duplicate-stage2` are also available. Use the
 configured slot name when rendering a runner. Rendering reads no token contents. Its JSON output does
 contain private paths, so consume it only in the private deployment mechanism,
 never in a repository, issue, or shared log.
