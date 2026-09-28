@@ -197,7 +197,6 @@ def scan(connection: sqlite3.Connection, *, now: str,
             connection,
             task_id_a=left_id, task_id_b=right_id,
             basis=_basis(routes, by_id[left_id], by_id[right_id]), detector=DETECTOR, now=now,
-            allow_unconfirmed_owner=True,
             routes=routes,
         )
         if result.disposition is proposals.ProposalDisposition.RECORDED:

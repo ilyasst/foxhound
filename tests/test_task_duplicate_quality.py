@@ -39,7 +39,7 @@ class QualityReportTests(unittest.TestCase):
         return proposals.propose(
             connection, task_id_a=left, task_id_b=right,
             basis="synthetic basis", detector=detector, now=NOW,
-            allow_unconfirmed_owner=True,
+            
         )
 
     def test_report_separates_detectors_and_withholds_rate_until_answered(self):

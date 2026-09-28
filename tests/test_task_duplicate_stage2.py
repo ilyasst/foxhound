@@ -122,6 +122,55 @@ class StageTwoTests(unittest.TestCase):
         self._task(2, "Send the fictional rollout checklist", kind="email")
         return self._pair(1, 2)
 
+
+    def test_agent_prompt_carries_owner_reliability_and_fired_routes(self) -> None:
+        class Opener:
+            def __init__(self):
+                self.requests = []
+            def open(self, request, timeout):
+                self.requests.append(request)
+                import io
+                return io.BytesIO(b'{"choices": [{"message": {"content": "{\\"verdict\\": \\"same\\", \\"confidence\\": 1.0, \\"citations\\": []}"}}], "usage": {"prompt_tokens": 10, "completion_tokens": 10}}')
+                
+        agent = stage2.LocalVerificationAgent(model="synthetic", opener=Opener())
+        
+        pair = stage2.CandidatePair(
+            candidate_id=1,
+            left=stage2.TaskSnapshot(id=1, version=1, source_kind="email", text="A", owner="Person", owner_reliability="confirmed"),
+            right=stage2.TaskSnapshot(id=2, version=1, source_kind="email", text="A", owner="Person", owner_reliability="provisional"),
+            routes={"words": 0.9, "owner": 0.5}
+        )
+        
+        class Knowledge:
+            def search(self, *args, **kwargs):
+                return KnowledgeSearchResult((KnowledgeLayer("kb", 1, False, (KnowledgeDocument("doc", "path", "excerpt"),)),))
+                
+        agent.verify(pair, Knowledge(), timeout=10.0)
+        
+        req = agent.opener.requests[0]
+        payload = json.loads(req.data.decode("utf-8"))
+        
+        # Check system prompt
+        self.assertIn("owners are unreliable hints", payload["messages"][0]["content"].lower())
+        
+        # Check user prompt
+        user_msg = json.loads(payload["messages"][1]["content"])
+        self.assertEqual(user_msg["routes"], {"words": 0.9, "owner": 0.5})
+        self.assertEqual(user_msg["tasks"][0]["owner_reliability"], "confirmed")
+        self.assertEqual(user_msg["tasks"][1]["owner_reliability"], "provisional")
+
+    def test_a_person_with_no_identity_is_not_a_confirmed_owner(self) -> None:
+        """A bare name with no speaker or person id confirms nothing."""
+        candidate_id = self._basic_pair()
+        self.connection.execute(
+            "UPDATE tasks SET owner_kind='person',owner_provisional=0,"
+            "owner_speaker_id=NULL,owner_canonical_speaker_id=NULL,"
+            "owner_person_id=NULL WHERE id=1"
+        )
+        self.connection.commit()
+        pair = stage2._pair(self.connection, candidate_id)
+        self.assertEqual(pair.left.owner_reliability, "unknown")
+
     def test_same_creates_one_proposal_with_private_citations(self) -> None:
         candidate_id = self._basic_pair()
         agent = FakeAgent("same")

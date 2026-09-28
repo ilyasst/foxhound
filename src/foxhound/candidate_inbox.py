@@ -50,7 +50,7 @@ from .contracts.task_candidate import (
 )
 
 
-SCHEMA_VERSION = 63
+SCHEMA_VERSION = 64
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 _CUMULATIVE_SCHEMA_VERSIONS = {
@@ -3379,6 +3379,34 @@ CREATE TABLE task_duplicate_candidate_routes (
 )
 
 
+_SCHEMA_V64 = (
+    "ALTER TABLE task_duplicate_proposal_routes RENAME TO task_duplicate_proposal_routes_v64",
+    """
+CREATE TABLE task_duplicate_proposal_routes (
+    proposal_id INTEGER NOT NULL REFERENCES task_duplicate_proposals(id),
+    route       TEXT NOT NULL CHECK(route IN (
+                    'words','reread','object','participant','legacy','owner'
+                )),
+    PRIMARY KEY(proposal_id, route)
+)
+""",
+    "INSERT INTO task_duplicate_proposal_routes(proposal_id, route) SELECT proposal_id, route FROM task_duplicate_proposal_routes_v64",
+    "DROP TABLE task_duplicate_proposal_routes_v64",
+    "ALTER TABLE task_duplicate_candidate_routes RENAME TO task_duplicate_candidate_routes_v64",
+    """
+CREATE TABLE task_duplicate_candidate_routes (
+    candidate_id INTEGER NOT NULL REFERENCES task_duplicate_candidates(id),
+    route        TEXT NOT NULL CHECK(route IN (
+                     'words','embedding','reread','participant','working_group','owner'
+                 )),
+    score        REAL CHECK(score IS NULL OR (score >= 0 AND score <= 1)),
+    PRIMARY KEY(candidate_id, route)
+)
+""",
+    "INSERT INTO task_duplicate_candidate_routes(candidate_id, route, score) SELECT candidate_id, route, score FROM task_duplicate_candidate_routes_v64",
+    "DROP TABLE task_duplicate_candidate_routes_v64"
+)
+
 _SCHEMA_V63 = (
     """
 CREATE TABLE IF NOT EXISTS task_duplicate_verification_claims (
@@ -3491,7 +3519,7 @@ CREATE TABLE task_participants (
 CREATE TABLE task_duplicate_proposal_routes (
     proposal_id INTEGER NOT NULL REFERENCES task_duplicate_proposals(id),
     route       TEXT NOT NULL CHECK(route IN (
-                    'words','reread','object','participant','legacy'
+                    'words','reread','object','participant','legacy','owner'
                 )),
     PRIMARY KEY(proposal_id, route)
 );
@@ -5072,6 +5100,22 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 63
+            if version == 63:
+                connection.execute("PRAGMA foreign_keys = OFF")
+                connection.execute("PRAGMA legacy_alter_table = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V64:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 64")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                finally:
+                    connection.execute("PRAGMA legacy_alter_table = OFF")
+                    connection.execute("PRAGMA foreign_keys = ON")
+                version = 64
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:
