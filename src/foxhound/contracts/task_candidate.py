@@ -29,6 +29,7 @@ CUMULATIVE_SCHEMA_VERSION = 7
 STRUCTURED_TASK_SCHEMA_VERSION = 8
 SOURCE_HISTORY_SCHEMA_VERSION = 9
 PERSON_IDENTITY_HISTORY_SCHEMA_VERSION = 11
+WORKING_GROUP_SCHEMA_VERSION = 12
 SUPPORTED_SCHEMA_VERSIONS = frozenset({
     SCHEMA_VERSION,
     PROJECTLESS_SCHEMA_VERSION,
@@ -40,13 +41,19 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset({
     STRUCTURED_TASK_SCHEMA_VERSION,
     SOURCE_HISTORY_SCHEMA_VERSION,
     PERSON_IDENTITY_HISTORY_SCHEMA_VERSION,
+    WORKING_GROUP_SCHEMA_VERSION,
 })
 _HISTORY_SCHEMA_VERSIONS = frozenset({
     SOURCE_HISTORY_SCHEMA_VERSION,
     PERSON_IDENTITY_HISTORY_SCHEMA_VERSION,
+    WORKING_GROUP_SCHEMA_VERSION,
 })
 _PERSON_IDENTITY_SCHEMA_VERSIONS = frozenset({
     PERSON_IDENTITY_HISTORY_SCHEMA_VERSION,
+    WORKING_GROUP_SCHEMA_VERSION,
+})
+_WORKING_GROUP_SCHEMA_VERSIONS = frozenset({
+    WORKING_GROUP_SCHEMA_VERSION,
 })
 LIFECYCLE_STATES = frozenset({"active", "withdrawn"})
 SOURCE_SYSTEMS = frozenset({"gw"})
@@ -76,6 +83,7 @@ _OPAQUE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$")
 _REVISION_RE = re.compile(r"^[0-9a-f]{64}$")
 _CANDIDATE_ID_RE = re.compile(r"^tc_[0-9a-f]{64}$")
 _PERSON_ID_RE = re.compile(r"^person_[0-9a-f]{32}$")
+_WORKING_GROUP_KEY_RE = re.compile(r"^wg_[0-9a-f]{32}$")
 OWNER_KINDS = frozenset({"person", "unresolved", "external", "group"})
 TASK_ACTIONS = frozenset({
     "arrange", "complete", "create", "decide", "deliver", "investigate",
@@ -125,6 +133,7 @@ class CandidateTask:
     action: str | None = None
     participants: tuple[CandidateSpeakerRef, ...] = ()
     confidence: float | None = None
+    working_group: str | None = None
 
 
 @dataclass(frozen=True)
@@ -196,6 +205,7 @@ def task_candidate_document(candidate: TaskCandidate) -> dict[str, Any]:
             PROVENANCE_SCHEMA_VERSION, OWNER_PROVENANCE_SCHEMA_VERSION,
             CUMULATIVE_SCHEMA_VERSION, STRUCTURED_TASK_SCHEMA_VERSION,
             SOURCE_HISTORY_SCHEMA_VERSION, PERSON_IDENTITY_HISTORY_SCHEMA_VERSION,
+            WORKING_GROUP_SCHEMA_VERSION,
         }
         and candidate.task.project is not None
     ) or (
@@ -207,6 +217,7 @@ def task_candidate_document(candidate: TaskCandidate) -> dict[str, Any]:
         OWNER_SCHEMA_VERSION, OWNER_PROVENANCE_SCHEMA_VERSION,
         CUMULATIVE_SCHEMA_VERSION, STRUCTURED_TASK_SCHEMA_VERSION,
         SOURCE_HISTORY_SCHEMA_VERSION, PERSON_IDENTITY_HISTORY_SCHEMA_VERSION,
+        WORKING_GROUP_SCHEMA_VERSION,
     }:
         owner_ref = candidate.task.owner_ref
         task["owner_ref"] = None if owner_ref is None else {
@@ -219,16 +230,13 @@ def task_candidate_document(candidate: TaskCandidate) -> dict[str, Any]:
         }
         if (
             owner_ref is not None
-            and candidate.schema_version == PERSON_IDENTITY_HISTORY_SCHEMA_VERSION
+            and candidate.schema_version in _PERSON_IDENTITY_SCHEMA_VERSIONS
         ):
             task["owner_ref"]["person_id"] = owner_ref.person_id
     if (
         candidate.schema_version == STRUCTURED_TASK_SCHEMA_VERSION
         or (
-            candidate.schema_version in {
-                SOURCE_HISTORY_SCHEMA_VERSION,
-                PERSON_IDENTITY_HISTORY_SCHEMA_VERSION,
-            }
+            candidate.schema_version in _HISTORY_SCHEMA_VERSIONS
             and candidate.task.object is not None
         )
     ):
@@ -243,19 +251,24 @@ def task_candidate_document(candidate: TaskCandidate) -> dict[str, Any]:
                     reference,
                     person_identity=(
                         candidate.schema_version
-                        == PERSON_IDENTITY_HISTORY_SCHEMA_VERSION
+                        in _PERSON_IDENTITY_SCHEMA_VERSIONS
                     ),
                 )
                 for reference in candidate.task.participants
             ]
     elif (
-        candidate.schema_version == PERSON_IDENTITY_HISTORY_SCHEMA_VERSION
+        candidate.schema_version in _PERSON_IDENTITY_SCHEMA_VERSIONS
         and candidate.task.participants
     ):
         task["participants"] = [
             _speaker_ref_document(reference, person_identity=True)
             for reference in candidate.task.participants
         ]
+    if (
+        candidate.schema_version in _WORKING_GROUP_SCHEMA_VERSIONS
+        and candidate.task.working_group is not None
+    ):
+        task["working_group"] = candidate.task.working_group
     document = {
         "schema": candidate.schema,
         "schema_version": candidate.schema_version,
@@ -274,9 +287,7 @@ def task_candidate_document(candidate: TaskCandidate) -> dict[str, Any]:
         },
         "created_at": candidate.created_at,
     }
-    if candidate.schema_version in {
-        SOURCE_HISTORY_SCHEMA_VERSION, PERSON_IDENTITY_HISTORY_SCHEMA_VERSION,
-    }:
+    if candidate.schema_version in _HISTORY_SCHEMA_VERSIONS:
         history = candidate.source.history
         if history is None:
             raise ContractError("candidate.source.history is required")
@@ -293,6 +304,7 @@ def task_candidate_document(candidate: TaskCandidate) -> dict[str, Any]:
         candidate.schema_version in {
             CUMULATIVE_SCHEMA_VERSION, SOURCE_HISTORY_SCHEMA_VERSION,
             PERSON_IDENTITY_HISTORY_SCHEMA_VERSION,
+            WORKING_GROUP_SCHEMA_VERSION,
         }
         and candidate.evidence.sources
     ):
@@ -308,6 +320,7 @@ def task_candidate_document(candidate: TaskCandidate) -> dict[str, Any]:
         LIFECYCLE_SCHEMA_VERSION, CUMULATIVE_SCHEMA_VERSION,
         STRUCTURED_TASK_SCHEMA_VERSION, SOURCE_HISTORY_SCHEMA_VERSION,
         PERSON_IDENTITY_HISTORY_SCHEMA_VERSION,
+        WORKING_GROUP_SCHEMA_VERSION,
     }:
         document["lifecycle"] = {
             "state": candidate.lifecycle.state,
@@ -357,6 +370,7 @@ def parse_task_candidate(document: object) -> TaskCandidate:
             LIFECYCLE_SCHEMA_VERSION, CUMULATIVE_SCHEMA_VERSION,
             STRUCTURED_TASK_SCHEMA_VERSION, SOURCE_HISTORY_SCHEMA_VERSION,
             PERSON_IDENTITY_HISTORY_SCHEMA_VERSION,
+            WORKING_GROUP_SCHEMA_VERSION,
         } else set()),
     )
 
@@ -446,12 +460,17 @@ def parse_task_candidate(document: object) -> TaskCandidate:
                 "candidate.task.participants requires a structure"
             )
         structured_task = bool(present_structured_fields)
+        allowed = {
+            "text", "owner", "owner_ref", "due", "project", "object",
+            "action", "participants", "confidence",
+        }
+        if version in _WORKING_GROUP_SCHEMA_VERSIONS:
+            allowed.add("working_group")
         _required_and_allowed_fields(
             task_doc,
             "candidate.task",
             {"text", "owner", "owner_ref", "due"},
-            {"text", "owner", "owner_ref", "due", "project", "object",
-             "action", "participants", "confidence"},
+            allowed,
         )
     elif version == STRUCTURED_TASK_SCHEMA_VERSION:
         _required_and_allowed_fields(
@@ -473,6 +492,7 @@ def parse_task_candidate(document: object) -> TaskCandidate:
             OWNER_SCHEMA_VERSION, OWNER_PROVENANCE_SCHEMA_VERSION,
             CUMULATIVE_SCHEMA_VERSION, SOURCE_HISTORY_SCHEMA_VERSION,
             PERSON_IDENTITY_HISTORY_SCHEMA_VERSION,
+            WORKING_GROUP_SCHEMA_VERSION,
         }:
             allowed.add("owner_ref")
         _required_and_allowed_fields(
@@ -505,9 +525,19 @@ def parse_task_candidate(document: object) -> TaskCandidate:
             OWNER_SCHEMA_VERSION, OWNER_PROVENANCE_SCHEMA_VERSION,
             CUMULATIVE_SCHEMA_VERSION, STRUCTURED_TASK_SCHEMA_VERSION,
             SOURCE_HISTORY_SCHEMA_VERSION, PERSON_IDENTITY_HISTORY_SCHEMA_VERSION,
+            WORKING_GROUP_SCHEMA_VERSION,
         }
         else None
     )
+    working_group = None
+    if version in _WORKING_GROUP_SCHEMA_VERSIONS and "working_group" in task_doc:
+        raw_working_group = task_doc["working_group"]
+        if raw_working_group is not None:
+            working_group = _pattern_text(
+                raw_working_group,
+                "candidate.task.working_group",
+                _WORKING_GROUP_KEY_RE,
+            )
     task = CandidateTask(
         text=_bounded_text(task_doc["text"], "candidate.task.text", 1, 1_000),
         project=(
@@ -523,6 +553,7 @@ def parse_task_candidate(document: object) -> TaskCandidate:
                     STRUCTURED_TASK_SCHEMA_VERSION,
                     SOURCE_HISTORY_SCHEMA_VERSION,
                     PERSON_IDENTITY_HISTORY_SCHEMA_VERSION,
+                    WORKING_GROUP_SCHEMA_VERSION,
                 }
                 and "project" in task_doc
             ) else None
@@ -555,6 +586,7 @@ def parse_task_candidate(document: object) -> TaskCandidate:
             _confidence(task_doc["confidence"])
             if structured_task else None
         ),
+        working_group=working_group,
     )
 
     evidence_doc = _object(root["evidence"], "candidate.evidence")
@@ -564,12 +596,14 @@ def parse_task_candidate(document: object) -> TaskCandidate:
     } or (version in {
         CUMULATIVE_SCHEMA_VERSION, STRUCTURED_TASK_SCHEMA_VERSION,
         SOURCE_HISTORY_SCHEMA_VERSION, PERSON_IDENTITY_HISTORY_SCHEMA_VERSION,
+        WORKING_GROUP_SCHEMA_VERSION,
     }
           and "sources" in evidence_doc):
         evidence_fields.add("sources")
     if version in {
         CUMULATIVE_SCHEMA_VERSION, STRUCTURED_TASK_SCHEMA_VERSION,
         SOURCE_HISTORY_SCHEMA_VERSION, PERSON_IDENTITY_HISTORY_SCHEMA_VERSION,
+        WORKING_GROUP_SCHEMA_VERSION,
     }:
         _required_and_allowed_fields(
             evidence_doc,
@@ -593,6 +627,7 @@ def parse_task_candidate(document: object) -> TaskCandidate:
     elif version in {
         CUMULATIVE_SCHEMA_VERSION, STRUCTURED_TASK_SCHEMA_VERSION,
         SOURCE_HISTORY_SCHEMA_VERSION, PERSON_IDENTITY_HISTORY_SCHEMA_VERSION,
+        WORKING_GROUP_SCHEMA_VERSION,
     } \
             and "sources" in evidence_doc:
         sources = _evidence_sources(
@@ -612,6 +647,7 @@ def parse_task_candidate(document: object) -> TaskCandidate:
         LIFECYCLE_SCHEMA_VERSION, CUMULATIVE_SCHEMA_VERSION,
         STRUCTURED_TASK_SCHEMA_VERSION, SOURCE_HISTORY_SCHEMA_VERSION,
         PERSON_IDENTITY_HISTORY_SCHEMA_VERSION,
+        WORKING_GROUP_SCHEMA_VERSION,
     }:
         lifecycle_doc = _object(root["lifecycle"], "candidate.lifecycle")
         _exact_fields(
