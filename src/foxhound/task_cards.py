@@ -218,6 +218,17 @@ class ScheduleResult:
     refusal: CardRefusal | None = None
 
 
+@dataclass(frozen=True)
+class DuplicateSupersedeResult:
+    """Content-free counts for one proposal cancellation pass."""
+
+    matched: int
+    cards_matched: int = 0
+    superseded: int = 0
+    cards_cancelled: int = 0
+    applied: bool = False
+
+
 #: A `delivering` row whose lease has run out. `claim_next` returns these to
 #: `pending` before it serves anyone, so nothing is on screen for them and
 #: nothing is being delivered. Shared so the reaper and the counts that
@@ -505,6 +516,73 @@ class TaskCardService:
                     created=raised,
                     cancelled=cancelled,
                     asked=asked,
+                )
+            except Exception:
+                connection.rollback()
+                raise
+
+    def supersede_duplicate_proposals(
+        self,
+        *,
+        detector: str | None = None,
+        apply: bool = False,
+        actor: str = "operator",
+        reason: str = "duplicate proposal queue reset",
+    ) -> DuplicateSupersedeResult:
+        """Cancel selected unanswered proposals and their reader cards."""
+        if detector is not None and (
+            not isinstance(detector, str)
+            or not detector.strip()
+            or len(detector) > duplicates.MAX_DETECTOR
+        ):
+            raise duplicates.DuplicateProposalError("detector is invalid")
+        now = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                where = "state='proposed'"
+                parameters: tuple[object, ...] = ()
+                if detector is not None:
+                    where += " AND detector=?"
+                    parameters = (detector,)
+                rows = connection.execute(
+                    "SELECT id,card_id,EXISTS(SELECT 1 FROM task_review_cards "
+                    "WHERE id=task_duplicate_proposals.card_id AND status IN "
+                    "('pending','delivering','delivered','snoozed')) AS card_active "
+                    "FROM task_duplicate_proposals WHERE "
+                    + where + " ORDER BY id",
+                    parameters,
+                ).fetchall()
+                cards_matched = sum(
+                    int(row["card_active"]) for row in rows
+                )
+                if not apply:
+                    connection.rollback()
+                    return DuplicateSupersedeResult(
+                        matched=len(rows), cards_matched=int(cards_matched)
+                    )
+                cards_cancelled = superseded = 0
+                for row in rows:
+                    if row["card_id"] is not None:
+                        cards_cancelled += self._cancel_bound_duplicate_card(
+                            connection, int(row["card_id"]), now=now
+                        )
+                    if duplicates.supersede(
+                        connection,
+                        proposal_id=int(row["id"]),
+                        actor=actor,
+                        reason=reason,
+                        now=now,
+                    ):
+                        superseded += 1
+                connection.commit()
+                return DuplicateSupersedeResult(
+                    matched=len(rows),
+                    cards_matched=int(cards_matched),
+                    superseded=superseded,
+                    cards_cancelled=cards_cancelled,
+                    applied=True,
                 )
             except Exception:
                 connection.rollback()
@@ -1650,9 +1728,8 @@ class TaskCardService:
         carded_task = (
             f"CASE WHEN {open_left} THEN left_task_id ELSE right_task_id END"
         )
-        updated = connection.execute(
-            "UPDATE task_duplicate_proposals SET state='superseded',"
-            "settled_at=?,updated_at=? "
+        rows = connection.execute(
+            "SELECT id FROM task_duplicate_proposals "
             "WHERE state='proposed' AND card_id IS NULL "
             # Either the comparison has moved, or there is no open task left
             # to consolidate into, an active duplicate_of relation makes
@@ -1664,9 +1741,17 @@ class TaskCardService:
             f"OR {relation_left} OR {relation_right} OR "
             + _preserved_open_withdrawal(carded_task)
             + ")",
-            (now, now),
+        ).fetchall()
+        return sum(
+            duplicates.supersede(
+                connection,
+                proposal_id=int(row["id"]),
+                actor="duplicate-card-scheduler",
+                reason="task state or revision made proposal unaskable",
+                now=now,
+            )
+            for row in rows
         )
-        return int(updated.rowcount)
 
     def _ask_duplicate_proposals(
         self, connection: sqlite3.Connection, now: str, *, limit: int
@@ -1910,6 +1995,46 @@ class TaskCardService:
                 kind="cancelled", card_version=next_version,
                 task_version=int(stale["task_version"]), now=now,
             )
+
+    def _cancel_bound_duplicate_card(
+        self, connection: sqlite3.Connection, card_id: int, *, now: str
+    ) -> int:
+        """Withdraw one bound proposal card using the normal card transition."""
+        row = connection.execute(
+            "SELECT id,task_id,task_version,version,status "
+            "FROM task_review_cards WHERE id=?",
+            (card_id,),
+        ).fetchone()
+        cancelled = 0
+        if row is not None and row["status"] in {
+            CardStatus.PENDING,
+            CardStatus.DELIVERING,
+            CardStatus.DELIVERED,
+            CardStatus.SNOOZED,
+        }:
+            next_version = int(row["version"]) + 1
+            updated = connection.execute(
+                "UPDATE task_review_cards SET status='cancelled',version=?,"
+                "claim_token_digest=NULL,claim_expires_at=NULL,"
+                "consumer_digest=NULL,resolved_at=?,updated_at=? "
+                "WHERE id=? AND version=?",
+                (next_version, now, now, card_id, int(row["version"])),
+            )
+            if updated.rowcount != 1:
+                raise TaskLedgerError("task card state changed")
+            completion.release(connection, card_id)
+            self._event(
+                connection,
+                card_id=card_id,
+                task_id=int(row["task_id"]),
+                kind="cancelled",
+                card_version=next_version,
+                task_version=int(row["task_version"]),
+                now=now,
+            )
+            cancelled = 1
+        duplicates.release_for_card(connection, card_id, now=now)
+        return cancelled
 
     def _cancel_stale(self, connection: sqlite3.Connection, now: str) -> int:
         rows = connection.execute(
