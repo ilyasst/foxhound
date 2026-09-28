@@ -39,6 +39,7 @@ foxhound-task-local-duplicate-eval = "foxhound.task_duplicate_semantic:main"
 foxhound-task-duplicate-queue-diagnostic = "foxhound.task_duplicate_queue_diagnostic:main"
 foxhound-task-duplicate-supersede = "foxhound.task_duplicate_supersede:main"
 foxhound-task-duplicate-stage1 = "foxhound.task_duplicate_stage1:main"
+foxhound-task-duplicate-stage2 = "foxhound.task_duplicate_stage2:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

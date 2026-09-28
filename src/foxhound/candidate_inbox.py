@@ -50,7 +50,7 @@ from .contracts.task_candidate import (
 )
 
 
-SCHEMA_VERSION = 62
+SCHEMA_VERSION = 63
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 _CUMULATIVE_SCHEMA_VERSIONS = {
@@ -823,6 +823,20 @@ _SCHEMA_COLUMNS.update({
     ),
 })
 
+_SCHEMA_COLUMNS.update({
+    "task_duplicate_verification_claims": (
+        "candidate_id", "claimed_at", "attempts",
+    ),
+    "task_duplicate_verification_days": (
+        "day", "runs", "updated_at",
+    ),
+    "task_duplicate_verifications": (
+        "candidate_id", "verdict", "confidence", "citations_json",
+        "latency_ms", "prompt_tokens", "completion_tokens", "verified_at",
+        "proposal_id",
+    ),
+})
+
 # The versioned maps above are used to validate historical schemas while they
 # migrate.  V45 is additive, so remove its tables and task columns from every
 # predecessor map rather than teaching an old migration to expect the future.
@@ -880,6 +894,10 @@ _SCHEMA_OBJECTS = {
     "task_duplicate_checks_pending": "index",
     "task_duplicate_candidates_pair": "index",
     "task_duplicate_candidates_queued": "index",
+    "task_duplicate_verifications_verdict": "index",
+    "task_duplicate_verification_claims_age": "index",
+    "task_duplicate_verifications_no_update": "trigger",
+    "task_duplicate_verifications_no_delete": "trigger",
     "task_duplicate_assessments_pair": "index",
     "task_duplicate_assessments_no_update": "trigger",
     "task_duplicate_assessments_no_delete": "trigger",
@@ -3361,6 +3379,61 @@ CREATE TABLE task_duplicate_candidate_routes (
 )
 
 
+_SCHEMA_V63 = (
+    """
+CREATE TABLE IF NOT EXISTS task_duplicate_verification_claims (
+    candidate_id INTEGER PRIMARY KEY REFERENCES task_duplicate_candidates(id),
+    claimed_at   TEXT NOT NULL,
+    attempts     INTEGER NOT NULL DEFAULT 1 CHECK(attempts >= 1)
+);
+""",
+    """
+CREATE INDEX IF NOT EXISTS task_duplicate_verification_claims_age
+    ON task_duplicate_verification_claims(claimed_at,candidate_id);
+""",
+    """
+CREATE TABLE IF NOT EXISTS task_duplicate_verification_days (
+    day        TEXT PRIMARY KEY CHECK(length(day)=10),
+    runs       INTEGER NOT NULL CHECK(runs >= 0),
+    updated_at TEXT NOT NULL
+);
+""",
+    """
+CREATE TABLE IF NOT EXISTS task_duplicate_verifications (
+    candidate_id     INTEGER PRIMARY KEY REFERENCES task_duplicate_candidates(id),
+    verdict          TEXT NOT NULL CHECK(verdict IN ('same','related','different')),
+    confidence       REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+    citations_json   TEXT NOT NULL CHECK(
+                         length(citations_json) BETWEEN 2 AND 24000
+                     ),
+    latency_ms       INTEGER NOT NULL CHECK(latency_ms >= 0),
+    prompt_tokens    INTEGER NOT NULL CHECK(prompt_tokens >= 0),
+    completion_tokens INTEGER NOT NULL CHECK(completion_tokens >= 0),
+    verified_at      TEXT NOT NULL,
+    proposal_id      INTEGER REFERENCES task_duplicate_proposals(id)
+);
+""",
+    """
+CREATE INDEX IF NOT EXISTS task_duplicate_verifications_verdict
+    ON task_duplicate_verifications(verdict,candidate_id);
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS task_duplicate_verifications_no_update
+BEFORE UPDATE ON task_duplicate_verifications
+BEGIN
+    SELECT RAISE(ABORT, 'duplicate verification history is immutable');
+END;
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS task_duplicate_verifications_no_delete
+BEFORE DELETE ON task_duplicate_verifications
+BEGIN
+    SELECT RAISE(ABORT, 'duplicate verification history is immutable');
+END;
+""",
+)
+
+
 # Context exhaustion is a separate terminal condition for one attempt. The
 # workflow table has a closed reason vocabulary, so admitting it requires a
 # table rebuild rather than silently recording it as an ordinary timeout.
@@ -4987,6 +5060,18 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 62
+            if version == 62:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V63:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 63")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 63
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:
