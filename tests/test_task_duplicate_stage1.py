@@ -50,7 +50,10 @@ class StageOneTests(unittest.TestCase):
         self.connection.row_factory = sqlite3.Row
         self.addCleanup(self.connection.close)
 
-    def _task(self, task_id: int, text: str, *, kind: str = "email") -> None:
+    def _task(self, task_id: int, text: str, *, kind: str = "email",
+              speaker: str | None = "SPK_1",
+              registry: str | None = "registry-synthetic",
+              provisional: bool = False) -> None:
         candidate_id = f"candidate-{task_id}"
         revision = f"{task_id:064x}"
         self.connection.execute(
@@ -58,8 +61,9 @@ class StageOneTests(unittest.TestCase):
             "owner_ref_version,owner_kind,owner_speaker_id,"
             "owner_canonical_speaker_id,owner_speaker_registry_id,"
             "owner_pinned,owner_provisional) VALUES(?, 'open', ?, 1, ?, ?,"
-            "1,'person','SPK_1','SPK_1','registry-synthetic',0,0)",
-            (task_id, text, NOW, NOW),
+            "1,'person',?,?,?,0,?)",
+            (task_id, text, NOW, NOW, speaker, speaker, registry,
+             int(provisional)),
         )
         self.connection.execute(
             "INSERT INTO candidate_inbox(candidate_id,source_system,source_kind,"
@@ -83,7 +87,6 @@ class StageOneTests(unittest.TestCase):
             basis="Synthetic calibration pair.",
             detector="synthetic-calibration",
             now=NOW,
-            
         )
         proposals.settle(
             self.connection,
@@ -332,3 +335,68 @@ class StageOneTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OwnerSignalTests(StageOneTests):
+    """Owners strengthen a pair; they never create one and never block one."""
+
+    def _routes(self) -> dict[tuple[int, int], dict[str, float]]:
+        found: dict[tuple[int, int], dict[str, float]] = {}
+        for row in self.connection.execute(
+            "SELECT c.left_task_id,c.right_task_id,r.route,r.score "
+            "FROM task_duplicate_candidates AS c "
+            "JOIN task_duplicate_candidate_routes AS r ON r.candidate_id=c.id"
+        ):
+            found.setdefault((row[0], row[1]), {})[row[2]] = row[3]
+        return found
+
+    def test_a_shared_owner_alone_queues_nothing(self) -> None:
+        """One person owns dozens of unrelated tasks; that is not a lead."""
+        self._task(1, "Book the synthetic venue for the spring workshop")
+        self._task(2, "Review the fictional grant budget spreadsheet")
+        stage1.enqueue(self.connection, 1, now=NOW)
+        stage1.run(self.connection, now=NOW, backend=FailingEmbeddings())
+        self.assertEqual(self._routes(), {})
+
+    def test_a_provisional_owner_still_strengthens_the_pair(self) -> None:
+        self._task(1, "Prepare the synthetic rollout checklist")
+        self._task(2, "Draft the synthetic rollout checklist",
+                   kind="meeting", provisional=True)
+        stage1.enqueue(self.connection, 1, now=NOW)
+        stage1.run(self.connection, now=NOW, backend=FailingEmbeddings())
+        self.assertEqual(self._routes()[(1, 2)]["owner"], 0.5)
+
+    def test_speaker_ids_from_different_registries_do_not_match(self) -> None:
+        self._task(1, "Prepare the synthetic rollout checklist")
+        self._task(2, "Draft the synthetic rollout checklist",
+                   kind="meeting", registry="registry-other")
+        stage1.enqueue(self.connection, 1, now=NOW)
+        stage1.run(self.connection, now=NOW, backend=FailingEmbeddings())
+        self.assertNotIn("owner", self._routes()[(1, 2)])
+
+    def test_a_different_owner_scores_the_same_as_an_unknown_one(self) -> None:
+        self._task(1, "Prepare the synthetic rollout checklist")
+        self._task(2, "Draft the synthetic rollout checklist",
+                   kind="meeting", speaker="SPK_2")
+        self._task(3, "Prepare the synthetic rollout checklist", kind="teams",
+                   speaker=None, registry=None)
+        self._task(4, "Draft the synthetic rollout checklist",
+                   kind="meeting", speaker=None, registry=None)
+        stage1.enqueue(self.connection, 1, now=NOW)
+        stage1.enqueue(self.connection, 3, now=NOW)
+        stage1.run(self.connection, now=NOW, backend=FailingEmbeddings())
+        scores = dict(self.connection.execute(
+            "SELECT left_task_id||'-'||right_task_id, rank_score "
+            "FROM task_duplicate_candidates"
+        ).fetchall())
+        self.assertEqual(scores["1-2"], scores["3-4"])
+
+    def test_independent_signals_outrank_one_shared_participant(self) -> None:
+        agreeing = stage1._combined_score(
+            {"words": 0.6, "embedding": 0.96, "owner": 1.0}
+        )
+        participant_only = stage1._combined_score({"participant": 0.9})
+        self.assertGreater(agreeing, participant_only)
+        self.assertGreater(
+            agreeing, stage1._combined_score({"words": 0.6, "embedding": 0.96})
+        )

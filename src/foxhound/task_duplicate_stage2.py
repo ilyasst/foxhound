@@ -78,7 +78,7 @@ class CandidatePair:
     candidate_id: int
     left: TaskSnapshot
     right: TaskSnapshot
-    routes: dict[str, float] = field(default_factory=dict)
+    routes: dict[str, float | None] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -445,13 +445,14 @@ def _pair(connection: sqlite3.Connection, candidate_id: int) -> CandidatePair:
     ).fetchone()
     if row is None:
         raise VerificationError("candidate pair is unavailable")
-    
     route_rows = connection.execute(
         "SELECT route,score FROM task_duplicate_candidate_routes WHERE candidate_id=?",
         (candidate_id,),
     ).fetchall()
-    routes = {r["route"]: float(r["score"]) for r in route_rows}
-    
+    routes = {
+        r["route"]: None if r["score"] is None else float(r["score"])
+        for r in route_rows
+    }
     return CandidatePair(
         candidate_id,
         _task(connection, int(row["left_task_id"]), int(row["left_task_version"])),
@@ -466,7 +467,9 @@ def _task(
     row = connection.execute(
         "SELECT task.id,task.version,task.text,task.owner,task.due,task.object,"
         "task.action,task.created_at,task.updated_at,inbox.source_kind,"
-        "task.owner_ref_version,task.owner_kind,task.owner_provisional "
+        "task.owner_ref_version,task.owner_kind,task.owner_provisional,"
+        "task.owner_speaker_id,task.owner_canonical_speaker_id,"
+        "task.owner_person_id "
         "FROM tasks AS task JOIN task_candidate_bindings AS binding "
         "ON binding.task_id=task.id AND binding.relation='accepted' "
         "JOIN candidate_inbox AS inbox ON inbox.candidate_id=binding.candidate_id "
@@ -475,12 +478,18 @@ def _task(
     ).fetchone()
     if row is None or int(row["version"]) != expected_version:
         raise VerificationError("candidate task version is stale")
-    
     reliability = "unknown"
     if row["owner_kind"] == "group":
         reliability = "group"
     elif row["owner_kind"] == "person":
-        if row["owner_provisional"]:
+        identified = bool(
+            row["owner_person_id"] or row["owner_canonical_speaker_id"]
+            or row["owner_speaker_id"]
+        )
+        if not identified:
+            # A person with no identity at all is a name, not a confirmation.
+            reliability = "unknown"
+        elif row["owner_provisional"]:
             reliability = "provisional"
         else:
             reliability = "confirmed"
@@ -579,7 +588,6 @@ def _record_verification(
                     basis="agent verified the pair as one task from cited knowledge",
                     detector=DETECTOR,
                     now=now,
-                    
                 )
                 proposal_id = outcome.proposal_id
                 disposition = outcome.disposition

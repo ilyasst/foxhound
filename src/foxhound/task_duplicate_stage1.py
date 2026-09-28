@@ -26,6 +26,11 @@ DEFAULT_TOP_K = 5
 DEFAULT_PAIR_LIMIT = 100
 CALIBRATION_PRECISION_FLOOR = 0.80
 
+#: Routes that only strengthen a pair another route found. An owner is shared
+#: by dozens of unrelated tasks, so on its own it would fill the stage-2 queue
+#: with "same person, different work" pairs.
+BOOST_ONLY_ROUTES = frozenset({"owner"})
+
 ROUTE_WEIGHTS = {
     "words": 1.0,
     "participant": 0.2,
@@ -365,19 +370,27 @@ def _measure_threshold(
 
 
 def _owner_score(left: lexical.DuplicateCandidate, right: lexical.DuplicateCandidate) -> float | None:
+    """How strongly two owners agree; None when they do not visibly agree.
+
+    Never a penalty: owners are often provisional or missing, so a mismatch
+    says little. Speaker ids are only comparable inside one registry.
+    """
     if left.owner_kind != "person" or right.owner_kind != "person":
         return None
     if left.owner_person_id and right.owner_person_id and left.owner_person_id == right.owner_person_id:
         return 1.0
-    
     left_id = left.owner_canonical_speaker_id or left.owner_speaker_id
     right_id = right.owner_canonical_speaker_id or right.owner_speaker_id
-    
-    if left_id and right_id and left_id == right_id:
+    if (
+        left_id and right_id and left_id == right_id
+        and left.owner_speaker_registry_id
+        and left.owner_speaker_registry_id == right.owner_speaker_registry_id
+    ):
         if not left.owner_provisional and not right.owner_provisional:
             return 1.0
         return 0.5
     return None
+
 
 def run(
     connection: sqlite3.Connection,
@@ -447,7 +460,6 @@ def run(
                 offer(left, right, "reread", 1.0)
             if lexical._resolved_participants(left.participants) & lexical._resolved_participants(right.participants):
                 offer(left, right, "participant", 0.9)
-            
             owner_score = _owner_score(left, right)
             if owner_score is not None:
                 offer(left, right, "owner", owner_score)
@@ -469,6 +481,10 @@ def run(
     except (EmbeddingUnavailable, OSError, RuntimeError, ValueError):
         embedding_failed = True
 
+    offers = {
+        key: routes for key, routes in offers.items()
+        if set(routes) - BOOST_ONLY_ROUTES
+    }
     offered = sorted(
         offers,
         key=lambda key: (

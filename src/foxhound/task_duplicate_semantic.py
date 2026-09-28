@@ -226,7 +226,6 @@ def scan(
                     basis="local semantic evaluator classified this pair as redundant",
                     detector=DETECTOR,
                     now=now,
-                    
                 )
                 if outcome.disposition is proposals.ProposalDisposition.RECORDED:
                     proposal_recorded += 1
