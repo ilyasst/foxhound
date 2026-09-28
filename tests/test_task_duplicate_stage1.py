@@ -190,35 +190,81 @@ class StageOneTests(unittest.TestCase):
         )
         self.assertTrue(all(row["embedding_done"] == 0 for row in rows))
 
-    def test_local_backend_is_pinned_to_cpu(self) -> None:
-        """The shared GPU belongs to speech recognition and model serving."""
-        import sys
-        import types
+    def test_caproute_backend_prefixes_batches_and_orders(self) -> None:
+        """E5 needs `query: `; batches stay bounded; order follows `index`."""
+        import io
+        import json as json_module
 
-        created: list[dict] = []
+        requests: list[dict] = []
 
-        class FakeModel:
-            def __init__(self, model_id, **kwargs):
-                created.append({"model_id": model_id, **kwargs})
+        class Opener:
+            def open(self, request, timeout):
+                body = json_module.loads(request.data.decode("utf-8"))
+                requests.append({"url": request.full_url, **body})
+                data = [
+                    {"index": index, "embedding": [float(index + 1), 0.0]}
+                    for index in range(len(body["input"]))
+                ]
+                data.reverse()  # the gateway may answer out of order
+                return io.BytesIO(json_module.dumps({"data": data}).encode())
 
-            def encode(self, texts, **kwargs):
+        backend = stage1.CaprouteEmbeddingBackend(opener=Opener())
+        texts = [f"synthetic task {number}" for number in range(40)]
+
+        vectors = backend.encode(texts)
+
+        self.assertEqual(backend.model_id, "caproute:embedding-multilingual")
+        self.assertEqual([len(request["input"]) for request in requests], [32, 8])
+        self.assertTrue(all(
+            request["url"] == stage1.DEFAULT_EMBEDDING_ENDPOINT + "/v1/embeddings"
+            and request["model"] == "embedding-multilingual"
+            for request in requests
+        ))
+        self.assertEqual(requests[0]["input"][0], "query: synthetic task 0")
+        self.assertEqual(vectors[0], [1.0, 0.0])
+        self.assertEqual(vectors[33], [2.0, 0.0])
+
+    def test_caproute_failure_is_content_free(self) -> None:
+        class Opener:
+            def open(self, request, timeout):
+                raise OSError("synthetic task text in a transport error")
+
+        backend = stage1.CaprouteEmbeddingBackend(opener=Opener())
+        with self.assertRaises(stage1.EmbeddingUnavailable) as caught:
+            backend.encode(["synthetic task text"])
+        self.assertNotIn("synthetic", str(caught.exception))
+
+    def test_embedding_endpoint_must_be_loopback(self) -> None:
+        with self.assertRaises(ValueError):
+            stage1.CaprouteEmbeddingBackend(endpoint="http://192.0.2.10:8800")
+
+    def test_embeddings_are_fetched_without_the_write_lock(self) -> None:
+        """Intake shares the write lock and waits only seconds for it."""
+        self._task(1, "Prepare the synthetic rollout checklist")
+        self._task(2, "Draft the synthetic rollout checklist", kind="meeting")
+        stage1.enqueue(self.connection, 1, now=NOW)
+        self.connection.commit()
+        database = self.database
+        calls: list[int] = []
+
+        class LockCheckingEmbeddings:
+            model_id = "caproute:synthetic"
+
+            def encode(self, texts):
+                with sqlite3.connect(database, timeout=0.1) as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    connection.rollback()
+                calls.append(len(texts))
                 return [[1.0, 0.0] for _ in texts]
 
-        fake = types.ModuleType("sentence_transformers")
-        fake.SentenceTransformer = FakeModel
-        original = sys.modules.get("sentence_transformers")
-        sys.modules["sentence_transformers"] = fake
-        try:
-            stage1.SentenceTransformerBackend().encode(["synthetic text"])
-        finally:
-            if original is None:
-                sys.modules.pop("sentence_transformers", None)
-            else:
-                sys.modules["sentence_transformers"] = original
+        stage1.run_database(self.database, backend=LockCheckingEmbeddings())
 
-        self.assertEqual(len(created), 1)
-        self.assertEqual(created[0]["device"], "cpu")
-        self.assertIs(created[0]["local_files_only"], True)
+        self.assertEqual(calls, [2])
+        cached = self.connection.execute(
+            "SELECT count(*) FROM task_duplicate_embeddings WHERE model_id=?",
+            ("caproute:synthetic",),
+        ).fetchone()[0]
+        self.assertEqual(cached, 2)
 
     def test_top_k_and_global_pair_cap_are_honoured(self) -> None:
         backend = self._calibrated_fixture()

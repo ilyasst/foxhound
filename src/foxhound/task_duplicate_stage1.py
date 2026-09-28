@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import sqlite3
+import urllib.request
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -15,6 +16,8 @@ from typing import Protocol, Sequence
 
 from .candidate_inbox import CandidateInbox, InboxError
 from . import task_duplicate_detection as lexical
+from . import task_duplicate_semantic as semantic
+from .caproute_attribution import request_headers
 
 
 MODEL_ID = "intfloat/multilingual-e5-base"
@@ -35,43 +38,94 @@ class EmbeddingBackend(Protocol):
         """Return one vector per text."""
 
 
-class SentenceTransformerBackend:
-    """Lazy in-process E5 backend; model files must already be local."""
+#: The caproute capability serving intfloat/multilingual-e5-base. Served by
+#: the fleet's embedding hosts; verified against the reference model at
+#: cosine >= 0.999 on every host.
+DEFAULT_EMBEDDING_CAPABILITY = "embedding-multilingual"
+DEFAULT_EMBEDDING_ENDPOINT = semantic.DEFAULT_ENDPOINT
+EMBEDDING_TIMEOUT_SECONDS = 30.0
+EMBEDDING_BATCH = 32
+MAX_EMBEDDING_RESPONSE_BYTES = 16 * 1024 * 1024
 
-    model_id = MODEL_ID
 
-    def __init__(self) -> None:
-        self._model = None
+class CaprouteEmbeddingBackend:
+    """E5 embeddings from the loopback caproute gateway.
+
+    Caproute, not an in-process model: the hosts that run this share one GPU
+    with speech recognition and model serving, and an in-process model both
+    competed for it and required shipping PyTorch in every release. The
+    gateway serves one copy of the model to the whole fleet.
+
+    E5 expects a `query: ` prefix on symmetric comparisons; this backend adds
+    it, so callers pass plain task text. Any failure is content-free and
+    leaves the work queued: see `EmbeddingUnavailable`.
+    """
+
+    def __init__(
+        self,
+        *,
+        capability: str = DEFAULT_EMBEDDING_CAPABILITY,
+        endpoint: str | None = None,
+        timeout: float = EMBEDDING_TIMEOUT_SECONDS,
+        opener: object | None = None,
+    ) -> None:
+        if not isinstance(capability, str) or not capability.strip() or len(capability) > 200:
+            raise ValueError("embedding capability is invalid")
+        self.capability = capability
+        self.endpoint = semantic._local_endpoint(endpoint or DEFAULT_EMBEDDING_ENDPOINT)
+        self.timeout = timeout
+        self.opener = opener or semantic._OPENER
+        # Cached vectors are keyed by this. Naming the route keeps them apart
+        # from any vector produced another way.
+        self.model_id = f"caproute:{capability}"
+
+    def encode(self, texts: Sequence[str]) -> Sequence[Sequence[float]]:
+        vectors: list[Sequence[float]] = []
+        for offset in range(0, len(texts), EMBEDDING_BATCH):
+            vectors.extend(self._batch(list(texts[offset:offset + EMBEDDING_BATCH])))
+        return vectors
+
+    def _batch(self, texts: list[str]) -> list[Sequence[float]]:
+        request = urllib.request.Request(
+            self.endpoint.rstrip("/") + "/v1/embeddings",
+            data=json.dumps(
+                {"model": self.capability,
+                 "input": [f"query: {text}" for text in texts]},
+                ensure_ascii=False, separators=(",", ":"),
+            ).encode("utf-8"),
+            headers={"content-type": "application/json",
+                     **request_headers("task_duplicate_stage1")},
+            method="POST",
+        )
+        try:
+            with self.opener.open(request, timeout=self.timeout) as response:
+                raw = response.read(MAX_EMBEDDING_RESPONSE_BYTES + 1)
+            if len(raw) > MAX_EMBEDDING_RESPONSE_BYTES:
+                raise EmbeddingUnavailable("caproute embedding reply is too large")
+            data = json.loads(raw.decode("utf-8"))["data"]
+            ordered = sorted(data, key=lambda item: int(item["index"]))
+            vectors = [item["embedding"] for item in ordered]
+        except EmbeddingUnavailable:
+            raise
+        except Exception as exc:  # no request or reply detail may escape
+            raise EmbeddingUnavailable("caproute embedding request failed") from exc
+        if len(vectors) != len(texts):
+            raise EmbeddingUnavailable("caproute embedding batch is incomplete")
+        return vectors
+
+
+class _PrefetchedEmbeddings:
+    """Vectors fetched before the write transaction, served inside it."""
+
+    def __init__(self, model_id: str, vectors: dict[str, Sequence[float]]) -> None:
+        self.model_id = model_id
+        self._vectors = vectors
 
     def encode(self, texts: Sequence[str]) -> Sequence[Sequence[float]]:
         try:
-            from sentence_transformers import SentenceTransformer
-        except (ImportError, OSError) as exc:  # pragma: no cover - deployment path
-            raise EmbeddingUnavailable("local embedding runtime unavailable") from exc
-        if self._model is None:
-            try:
-                # CPU, deliberately. The hosts that run this share one GPU
-                # with speech recognition and local model serving; on a busy
-                # card the default device fails with CUDA out-of-memory, and
-                # a background candidacy pass must not compete with, or be
-                # starved by, the workloads the operator is actually waiting
-                # on. The E5 base model encodes a batch of task texts on CPU
-                # in well under a second.
-                self._model = SentenceTransformer(
-                    self.model_id,
-                    local_files_only=True,
-                    device="cpu",
-                )
-            except (OSError, RuntimeError, ValueError) as exc:
-                raise EmbeddingUnavailable("local embedding model unavailable") from exc
-        try:
-            return self._model.encode(
-                [f"query: {text}" for text in texts],
-                normalize_embeddings=True,
-                convert_to_numpy=True,
-            )
-        except (OSError, RuntimeError, ValueError) as exc:
-            raise EmbeddingUnavailable("local embedding inference failed") from exc
+            return [self._vectors[text] for text in texts]
+        except KeyError as exc:
+            raise EmbeddingUnavailable("embedding was not prefetched") from exc
 
 
 @dataclass(frozen=True)
@@ -456,6 +510,32 @@ def run(
     )
 
 
+def _prefetch(
+    connection: sqlite3.Connection, backend: EmbeddingBackend,
+) -> _PrefetchedEmbeddings:
+    """Fetch every vector the pass will need, holding no write lock."""
+    texts: list[str] = []
+    for candidate in lexical._candidates(connection):
+        row = connection.execute(
+            "SELECT 1 FROM task_duplicate_embeddings WHERE task_id=? "
+            "AND task_version=? AND content_digest=? AND model_id=?",
+            (candidate.task_id, candidate.task_version,
+             _candidate_digest(candidate), backend.model_id),
+        ).fetchone()
+        if row is None:
+            texts.append(_embedding_text(candidate))
+    unique = list(dict.fromkeys(texts))
+    vectors: dict[str, Sequence[float]] = {}
+    if unique:
+        try:
+            encoded = backend.encode(unique)
+            if len(encoded) == len(unique):
+                vectors = dict(zip(unique, encoded))
+        except (EmbeddingUnavailable, OSError, RuntimeError, ValueError):
+            vectors = {}  # the pass runs its other signals and retries later
+    return _PrefetchedEmbeddings(backend.model_id, vectors)
+
+
 def run_database(
     database_path: str | Path,
     *,
@@ -467,15 +547,22 @@ def run_database(
     inbox = CandidateInbox(database_path)
     if not inbox.database_path.is_file() or inbox.database_path.is_symlink():
         raise InboxError("candidate inbox is not initialized")
+    backend = backend or CaprouteEmbeddingBackend()
     with closing(sqlite3.connect(inbox.database_path, timeout=5)) as connection:
         connection.row_factory = sqlite3.Row
         inbox._require_current_schema(connection)
+        # Embed BEFORE taking the write lock. Fetching vectors is a network
+        # call that can take seconds; intake needs the same lock and waits
+        # only a few seconds before failing, so holding it across the call
+        # would let a slow gateway fail intake. Anything that arrives between
+        # here and the transaction is simply embedded on the next pass.
+        prefetched = _prefetch(connection, backend)
         connection.execute("BEGIN IMMEDIATE")
         try:
             result = run(
                 connection,
                 now=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                backend=backend or SentenceTransformerBackend(),
+                backend=prefetched,
                 task_limit=task_limit,
                 top_k=top_k,
                 pair_limit=pair_limit,
@@ -490,12 +577,14 @@ def run_database(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="foxhound-task-duplicate-stage1",
-        description="Run one bounded local duplicate-candidacy pass",
+        description="Run one bounded duplicate-candidacy pass",
     )
     parser.add_argument("--database", required=True, type=Path)
     parser.add_argument("--limit", default=DEFAULT_TASK_LIMIT, type=int)
     parser.add_argument("--top-k", default=DEFAULT_TOP_K, type=int)
     parser.add_argument("--pair-limit", default=DEFAULT_PAIR_LIMIT, type=int)
+    parser.add_argument("--embedding-capability", default=DEFAULT_EMBEDDING_CAPABILITY)
+    parser.add_argument("--embedding-endpoint", default=None)
     return parser
 
 
@@ -504,6 +593,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = run_database(
             arguments.database,
+            backend=CaprouteEmbeddingBackend(
+                capability=arguments.embedding_capability,
+                endpoint=arguments.embedding_endpoint,
+            ),
             task_limit=arguments.limit,
             top_k=arguments.top_k,
             pair_limit=arguments.pair_limit,

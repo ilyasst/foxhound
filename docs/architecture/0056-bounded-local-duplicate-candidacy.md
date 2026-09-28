@@ -19,12 +19,20 @@ signals. It writes versioned candidate pairs for Stage 2, with both a per-task
 top-K bound and a per-run pair bound. Only Stage 2 may turn a verified same-task
 verdict into a reader proposal.
 
-The embedding route uses `intfloat/multilingual-e5-base` through the local
-`sentence-transformers` runtime. Model files must already be installed on the
-host: the consumer requests local files only and never downloads during a
-pass. Inputs use the model's `query: ` prefix and vectors are normalized before
-storage and comparison. A vector is cached by task version, comparable text
-digest, and model identifier.
+The embedding route uses `intfloat/multilingual-e5-base`, served by the
+fleet's loopback caproute gateway as the `embedding-multilingual` capability.
+An earlier revision loaded the model in-process through `sentence-transformers`;
+that shipped PyTorch in every release and competed for a GPU shared with speech
+recognition and model serving, where it failed with CUDA out-of-memory. The
+gateway's vectors match the reference model at cosine >= 0.999.
+
+Vectors are fetched **before** the pass takes its write transaction. Intake
+needs the same lock and waits only seconds for it, so a network call made while
+holding it could fail intake. Work that arrives between the fetch and the
+transaction is embedded on the next pass. Inputs use the model's `query: `
+prefix and vectors are normalized before storage and comparison. A vector is
+cached by task version, comparable text digest, and model identifier
+(`caproute:<capability>`), so vectors produced another way are never mixed in.
 
 The similarity cutoff is measured from settled reader proposals. Every pass
 requires both confirmed and rejected labels represented in the current vector

@@ -7,7 +7,7 @@ name = "foxhound"
 version = "0.1.0"
 description = "Task lifecycle and execution service."
 requires-python = ">=3.11"
-dependencies = ["sentence-transformers>=3,<6"]
+dependencies = []
 
 [project.scripts]
 foxhound-task-cards = "foxhound.task_card_server:main"
