@@ -752,6 +752,91 @@ class TaskCandidateContractTests(unittest.TestCase):
         self.assertEqual(schema["properties"]["schema_version"]["const"], 11)
         self.assertIn("person_id", schema["$defs"]["ownerRef"]["required"])
 
+    def test_task_candidate_v12_accepts_and_validates_working_group_key(self):
+        payload = fixture("meeting-candidate-v2.json")
+        payload["schema_version"] = 12
+        payload["source"]["history"] = {
+            "source": "meeting",
+            "stream_id": "primary",
+            "item_id": payload["candidate_id"],
+            "position": 1,
+            "revision": "d" * 64,
+        }
+        payload["task"]["owner_ref"] = {
+            "kind": "person", "speaker_id": "SPK_101",
+            "canonical_speaker_id": "SPK_001",
+            "speaker_registry_id": "registry-alpha", "pinned": False,
+            "provisional": False, "person_id": "person_" + "a" * 32,
+        }
+        payload["task"]["participants"] = [{
+            "kind": "person", "speaker_id": None,
+            "canonical_speaker_id": None, "speaker_registry_id": None,
+            "person_id": "person_" + "b" * 32,
+        }]
+        payload["lifecycle"] = {
+            "state": "active", "generation": 1,
+            "changed_at": "2030-01-01T00:00:00Z",
+        }
+        payload["task"]["working_group"] = "wg_" + "c" * 32
+
+        parsed = parse_task_candidate(payload)
+        self.assertEqual(parsed.schema_version, 12)
+        self.assertEqual(parsed.task.working_group, "wg_" + "c" * 32)
+
+        # task_candidate_document roundtrip preserves key
+        doc = task_candidate_document(parsed)
+        self.assertEqual(doc["task"]["working_group"], "wg_" + "c" * 32)
+
+        # null working_group is accepted
+        payload_null = copy.deepcopy(payload)
+        payload_null["task"]["working_group"] = None
+        parsed_null = parse_task_candidate(payload_null)
+        self.assertIsNone(parsed_null.task.working_group)
+        self.assertNotIn("working_group", task_candidate_document(parsed_null)["task"])
+
+        # omitted working_group is accepted
+        payload_omitted = copy.deepcopy(payload)
+        del payload_omitted["task"]["working_group"]
+        parsed_omitted = parse_task_candidate(payload_omitted)
+        self.assertIsNone(parsed_omitted.task.working_group)
+        self.assertNotIn("working_group", task_candidate_document(parsed_omitted)["task"])
+
+        # malformed keys are strictly refused
+        invalid_keys = [
+            "wg_short",
+            "wg_" + "z" * 32,
+            "group_" + "c" * 32,
+            "wg_" + "C" * 32,
+            "wg_" + "c" * 33,
+            " wg_" + "c" * 32,
+            12345,
+            True,
+            {},
+        ]
+        for invalid_key in invalid_keys:
+            with self.subTest(invalid_key=invalid_key):
+                bad = copy.deepcopy(payload)
+                bad["task"]["working_group"] = invalid_key
+                with self.assertRaises(ContractError):
+                    parse_task_candidate(bad)
+
+        # older version (v11) carrying working_group is refused
+        v11_bad = copy.deepcopy(payload)
+        v11_bad["schema_version"] = 11
+        with self.assertRaises(ContractError) as ctx:
+            parse_task_candidate(v11_bad)
+        self.assertIn("contains additional fields", str(ctx.exception))
+
+        # schema file validation
+        schema = json.loads(
+            (Path(__file__).parents[1] / "src" / "foxhound" / "contracts" /
+             "schemas" / "task-candidate-v12.schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(schema["properties"]["schema_version"]["const"], 12)
+        self.assertIn("working_group", schema["properties"]["task"]["properties"])
+
 
 if __name__ == "__main__":
     unittest.main()

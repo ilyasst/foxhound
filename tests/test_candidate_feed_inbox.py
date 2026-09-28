@@ -21,6 +21,7 @@ from foxhound import (
 )
 from foxhound.contracts.task_candidate import (
     PERSON_IDENTITY_HISTORY_SCHEMA_VERSION,
+    WORKING_GROUP_SCHEMA_VERSION,
 )
 from foxhound.candidate_inbox import (
     _CUMULATIVE_SCHEMA_VERSIONS,
@@ -205,7 +206,7 @@ class CandidateFeedInboxTests(unittest.TestCase):
         newest = max(_CUMULATIVE_SCHEMA_VERSIONS)
         self.assertEqual(
             newest,
-            PERSON_IDENTITY_HISTORY_SCHEMA_VERSION,
+            WORKING_GROUP_SCHEMA_VERSION,
             "a newer cumulative schema version was added -- re-read the "
             "docstring before updating this expectation",
         )
@@ -224,6 +225,25 @@ class CandidateFeedInboxTests(unittest.TestCase):
                     ),
                     f"version {older} can no longer upgrade to {newest}",
                 )
+
+    def test_version_11_can_add_working_group_as_a_contract_upgrade(self):
+        stored = fixture()["items"][0]["candidate"]
+        stored["schema_version"] = 11
+        stored["task"]["owner_ref"] = {
+            "kind": "person", "speaker_id": "SPK_101",
+            "canonical_speaker_id": "SPK_001",
+            "speaker_registry_id": "registry-alpha", "pinned": False,
+            "provisional": False,
+            "person_id": "person_" + "a" * 32,
+        }
+        incoming = copy.deepcopy(stored)
+        incoming["schema_version"] = 12
+        incoming["task"]["working_group"] = "wg_" + "b" * 32
+
+        self.assertTrue(_is_cumulative_contract_upgrade(
+            json.dumps(stored, sort_keys=True),
+            json.dumps(incoming, sort_keys=True),
+        ))
 
     def test_version_9_can_add_person_ids_as_a_contract_upgrade(self):
         stored = fixture()["items"][0]["candidate"]

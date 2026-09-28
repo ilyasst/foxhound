@@ -47,10 +47,11 @@ from .contracts.task_candidate import (
     PERSON_IDENTITY_HISTORY_SCHEMA_VERSION,
     SOURCE_HISTORY_SCHEMA_VERSION,
     STRUCTURED_TASK_SCHEMA_VERSION,
+    WORKING_GROUP_SCHEMA_VERSION,
 )
 
 
-SCHEMA_VERSION = 64
+SCHEMA_VERSION = 65
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 _CUMULATIVE_SCHEMA_VERSIONS = {
@@ -58,6 +59,7 @@ _CUMULATIVE_SCHEMA_VERSIONS = {
     STRUCTURED_TASK_SCHEMA_VERSION,
     SOURCE_HISTORY_SCHEMA_VERSION,
     PERSON_IDENTITY_HISTORY_SCHEMA_VERSION,
+    WORKING_GROUP_SCHEMA_VERSION,
 }
 
 _SCHEMA_COLUMNS = {
@@ -803,7 +805,7 @@ _SCHEMA_COLUMNS["task_review_cards"] += ("claiming_consumer",)
 # V62 is intentionally appended after every historical schema map above is
 # derived. A predecessor being migrated must not be asked to already carry
 # the duplicate-check queue or the additive person identity fields.
-_SCHEMA_COLUMNS["tasks"] += ("owner_person_id",)
+_SCHEMA_COLUMNS["tasks"] += ("owner_person_id", "working_group")
 _SCHEMA_COLUMNS["task_participants"] += ("person_id",)
 _SCHEMA_COLUMNS.update({
     "task_duplicate_checks": (
@@ -3461,6 +3463,10 @@ END;
 """,
 )
 
+_SCHEMA_V65 = (
+    "ALTER TABLE tasks ADD COLUMN working_group TEXT;",
+)
+
 
 # Context exhaustion is a separate terminal condition for one attempt. The
 # workflow table has a closed reason vocabulary, so admitting it requires a
@@ -5116,6 +5122,24 @@ class CandidateInbox:
                     connection.execute("PRAGMA legacy_alter_table = OFF")
                     connection.execute("PRAGMA foreign_keys = ON")
                 version = 64
+            if version == 64:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    task_columns = {
+                        row["name"] for row in connection.execute(
+                            "PRAGMA table_info(tasks)"
+                        )
+                    }
+                    if "working_group" not in task_columns:
+                        for statement in _SCHEMA_V65:
+                            connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 65")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 65
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:
@@ -5795,7 +5819,8 @@ class CandidateInbox:
             ) and not (
                 table == "tasks"
                 and tuple(column for column in columns if column not in {
-                    "object", "action", "confidence", "owner_person_id"
+                    "object", "action", "confidence", "owner_person_id",
+                    "working_group",
                 }) == expected_columns
             ) and not (
                 # ALTER TABLE preserves data but a historical rehearsal that
@@ -5914,6 +5939,8 @@ def _is_cumulative_contract_upgrade(
                 for participant in participants:
                     if isinstance(participant, dict):
                         participant.pop("person_id", None)
+        if current_version < WORKING_GROUP_SCHEMA_VERSION:
+            task.pop("working_group", None)
         return normalized
 
     return shared_shape(current) == shared_shape(incoming)

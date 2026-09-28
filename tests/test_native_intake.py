@@ -17,7 +17,11 @@ from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
 
-from foxhound.candidate_inbox import CandidateInbox, SCHEMA_VERSION
+from foxhound.candidate_inbox import (
+    CandidateInbox,
+    FeedImportRefusal,
+    SCHEMA_VERSION,
+)
 from foxhound.contracts import candidate_id_for, comparable_task_digest
 from foxhound.native_intake import main
 from review_card_fixture import raise_review_cards
@@ -266,6 +270,25 @@ def person_identity_candidate(index: int, *, kind: str = "email") -> dict:
         "canonical_speaker_id": None, "speaker_registry_id": None,
         "person_id": person_id,
     }]
+    item["source"]["revision"] = hashlib.sha256(
+        json.dumps(item, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return item
+
+
+def working_group_candidate(
+    index: int,
+    *,
+    kind: str = "email",
+    working_group: str | None = "wg_" + "c" * 32,
+) -> dict:
+    """A v12 candidate carrying an optional working group key."""
+    item = person_identity_candidate(index, kind=kind)
+    item["schema_version"] = 12
+    if working_group is not None:
+        item["task"]["working_group"] = working_group
+    else:
+        item["task"]["working_group"] = None
     item["source"]["revision"] = hashlib.sha256(
         json.dumps(item, sort_keys=True).encode("utf-8")
     ).hexdigest()
@@ -704,6 +727,85 @@ class NativeCandidateIntakeTests(unittest.TestCase):
                 "SELECT person_id FROM task_participants WHERE task_id=1"
             ).fetchone()
         self.assertEqual(participant, ("person_" + "a" * 32,))
+
+    def test_working_group_key_is_persisted_for_task(self):
+        self.activate()
+        item = working_group_candidate(1, working_group="wg_" + "e" * 32)
+        self.assertTrue(self.inbox.import_feed(feed(0, item)).accepted)
+
+        self.assertEqual(self.intake().tasks_created, 1)
+
+        task = self.ledger.get(1)
+        self.assertEqual(task.working_group, "wg_" + "e" * 32)
+
+    def test_working_group_candidate_without_key_imports_as_null(self):
+        self.activate()
+        item = working_group_candidate(1, working_group=None)
+        self.assertTrue(self.inbox.import_feed(feed(0, item)).accepted)
+
+        self.assertEqual(self.intake().tasks_created, 1)
+
+        task = self.ledger.get(1)
+        self.assertIsNone(task.working_group)
+
+    def test_malformed_working_group_key_is_refused(self):
+        self.activate()
+        item = working_group_candidate(1, working_group="invalid_key_format")
+        result = self.inbox.import_feed(feed(0, item))
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.refusal, FeedImportRefusal.INVALID_CONTRACT)
+        self.assertEqual(self.intake().tasks_created, 0)
+
+    def test_older_version_candidate_still_imports(self):
+        self.activate()
+        item = person_identity_candidate(1)  # v11 candidate
+        self.assertTrue(self.inbox.import_feed(feed(0, item)).accepted)
+
+        self.assertEqual(self.intake().tasks_created, 1)
+        task = self.ledger.get(1)
+        self.assertIsNone(task.working_group)
+
+    def test_older_to_newer_revision_updates_working_group(self):
+        """A key is enrichment: stored and re-checked, but the work is unchanged.
+
+        Enabling the producer attaches a key to most open tasks at once. A
+        version bump there would withdraw every card and stale every workflow.
+        """
+        self.activate()
+        # 1. Import v11 candidate (no working group)
+        item_v11 = person_identity_candidate(1)
+        self.assertTrue(self.inbox.import_feed(feed(0, item_v11)).accepted)
+        self.assertEqual(self.intake().tasks_created, 1)
+
+        task = self.ledger.get(1)
+        self.assertEqual(task.version, 1)
+        self.assertIsNone(task.working_group)
+
+        # 2. Revise to v12 with working group key
+        item_v12 = copy.deepcopy(item_v11)
+        item_v12["schema_version"] = 12
+        item_v12["task"]["working_group"] = "wg_" + "f" * 32
+        item_v12["lifecycle"]["generation"] = 2
+        item_v12["lifecycle"]["changed_at"] = "2030-01-02T00:00:00Z"
+        item_v12["source"]["revision"] = hashlib.sha256(
+            json.dumps(item_v12, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+
+        self.assertTrue(self.inbox.import_feed(feed(1, item_v12)).accepted)
+        outcome = self.intake()
+        self.assertEqual(outcome.tasks_revised, 1)
+
+        task = self.ledger.get(1)
+        self.assertEqual(task.version, 1)
+        self.assertEqual(task.working_group, "wg_" + "f" * 32)
+
+        # The comparison changed, so duplicate detection looks again.
+        with closing(sqlite3.connect(self.database)) as connection:
+            check = connection.execute(
+                "SELECT task_id, task_version FROM task_duplicate_checks WHERE task_id=1"
+            ).fetchone()
+            self.assertIsNotNone(check)
+            self.assertEqual(tuple(check), (1, 1))
 
     def test_stage_one_enqueue_failure_rolls_back_intake(self):
         self.activate()

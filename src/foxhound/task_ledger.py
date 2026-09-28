@@ -235,6 +235,7 @@ class TaskRecord:
     owner_person_id: str | None
     owner_pinned: bool
     owner_provisional: bool
+    working_group: str | None = None
 
 
 @dataclass(frozen=True)
@@ -711,6 +712,7 @@ class TaskLedger:
                         != _candidate_structure_values(candidate)[:2]
                         or _stored_participants(connection, int(task["id"]))
                         != _candidate_participants(candidate)
+                        or task["working_group"] != candidate.task.working_group
                     )
                     # Does this revision change the task, or only what is known
                     # about it? Two branches below deliberately keep the task
@@ -833,7 +835,8 @@ class TaskLedger:
                             "owner_ref_version=?,owner_kind=?,"
                             "owner_speaker_id=?,owner_canonical_speaker_id=?,"
                             "owner_speaker_registry_id=?,owner_pinned=?,"
-                            "owner_provisional=?,owner_person_id=? WHERE id=?",
+                            "owner_provisional=?,owner_person_id=?,"
+                            "working_group=? WHERE id=?",
                             (
                                 candidate.task.text,
                                 desired_owner[0],
@@ -841,6 +844,7 @@ class TaskLedger:
                                 *_candidate_structure_values(candidate),
                                 now,
                                 *desired_owner[1:],
+                                candidate.task.working_group,
                                 int(binding["task_id"]),
                             ),
                         )
@@ -902,6 +906,22 @@ class TaskLedger:
                         # Advancing the binding is necessary so cards read the
                         # new evidence; advancing the task version would make
                         # an active workflow stale for no task-level change.
+                        #
+                        # The working-group key is enrichment too: it says
+                        # which cluster the task sits in, not what the work
+                        # is. Turning the producer switch on attaches a key to
+                        # most open tasks at once; bumping their versions
+                        # would withdraw every card and stale every workflow
+                        # on them. It still changes what duplicate detection
+                        # compares, so the task is re-checked.
+                        if task["working_group"] != candidate.task.working_group:
+                            connection.execute(
+                                "UPDATE tasks SET working_group=?,updated_at=? "
+                                "WHERE id=?",
+                                (candidate.task.working_group, now,
+                                 int(binding["task_id"])),
+                            )
+                            duplicate_check_task_ids.add(int(binding["task_id"]))
                         connection.execute(
                             "UPDATE task_candidate_bindings SET "
                             "source_revision=?,decided_at=? "
@@ -947,7 +967,8 @@ class TaskLedger:
                         "updated_at=?,owner_ref_version=?,owner_kind=?,"
                         "owner_speaker_id=?,owner_canonical_speaker_id=?,"
                         "owner_speaker_registry_id=?,owner_pinned=?,"
-                        "owner_provisional=?,owner_person_id=? WHERE id=?",
+                        "owner_provisional=?,owner_person_id=?,"
+                        "working_group=? WHERE id=?",
                         (
                             candidate.task.text,
                             desired_owner[0],
@@ -956,6 +977,7 @@ class TaskLedger:
                             version,
                             now,
                             *desired_owner[1:],
+                            candidate.task.working_group,
                             int(binding["task_id"]),
                         ),
                     )
@@ -1879,7 +1901,8 @@ class TaskLedger:
                 "confidence=?,version=?,updated_at=?,"
                 "owner_ref_version=?,owner_kind=?,owner_speaker_id=?,"
                 "owner_canonical_speaker_id=?,owner_speaker_registry_id=?,"
-                "owner_pinned=?,owner_provisional=?,owner_person_id=? WHERE id=?",
+                "owner_pinned=?,owner_provisional=?,owner_person_id=?,"
+                "working_group=? WHERE id=?",
                 (
                     candidate.task.text,
                     desired_owner[0],
@@ -1888,6 +1911,7 @@ class TaskLedger:
                     version,
                     now,
                     *desired_owner[1:],
+                    candidate.task.working_group,
                     int(binding["task_id"]),
                 ),
             )
@@ -2002,11 +2026,11 @@ class TaskLedger:
             "updated_at,closed_at,owner_ref_version,owner_kind,"
             "owner_speaker_id,owner_canonical_speaker_id,"
             "owner_speaker_registry_id,owner_pinned,owner_provisional,"
-            "owner_person_id) "
-            "VALUES('open',?,?,?,?,?,?,?,?,?,NULL,?,?,?,?,?,?,?,?)",
+            "owner_person_id,working_group) "
+            "VALUES('open',?,?,?,?,?,?,?,?,?,NULL,?,?,?,?,?,?,?,?,?)",
             (task.text, owner_values[0], task.due,
              *_candidate_structure_values(candidate), 1, now, now,
-             *owner_values[1:]),
+             *owner_values[1:], task.working_group),
         )
         task_id = int(cursor.lastrowid)
         _replace_participants(connection, task_id, candidate)
@@ -2196,6 +2220,7 @@ def _task_record(row: sqlite3.Row) -> TaskRecord:
             owner_person_id=row["owner_person_id"],
             owner_pinned=bool(row["owner_pinned"]),
             owner_provisional=bool(row["owner_provisional"]),
+            working_group=row["working_group"],
         )
     except (IndexError, KeyError, TypeError, ValueError) as exc:
         raise InboxError("task ledger contains invalid state") from exc
