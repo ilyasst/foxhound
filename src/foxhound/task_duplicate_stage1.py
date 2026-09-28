@@ -50,9 +50,17 @@ class SentenceTransformerBackend:
             raise EmbeddingUnavailable("local embedding runtime unavailable") from exc
         if self._model is None:
             try:
+                # CPU, deliberately. The hosts that run this share one GPU
+                # with speech recognition and local model serving; on a busy
+                # card the default device fails with CUDA out-of-memory, and
+                # a background candidacy pass must not compete with, or be
+                # starved by, the workloads the operator is actually waiting
+                # on. The E5 base model encodes a batch of task texts on CPU
+                # in well under a second.
                 self._model = SentenceTransformer(
                     self.model_id,
                     local_files_only=True,
+                    device="cpu",
                 )
             except (OSError, RuntimeError, ValueError) as exc:
                 raise EmbeddingUnavailable("local embedding model unavailable") from exc
@@ -302,7 +310,13 @@ def run(
     queue = connection.execute(
         "SELECT task_id,task_version,content_digest FROM task_duplicate_checks "
         "WHERE embedding_done=0 OR signals_done=0 "
-        "ORDER BY enqueued_at,task_id LIMIT ?",
+        # Outstanding work first, oldest within it. Ordering by enqueue time
+        # alone starved the queue: when embeddings keep failing, the oldest
+        # tasks stay `embedding_done=0` and head the queue forever, so tasks
+        # behind them never got even their local signals. Tasks still owed
+        # signals come first; embedding retries follow, least-tried first,
+        # so a persistent embedding outage rotates instead of stalling.
+        "ORDER BY signals_done,embedding_attempts,enqueued_at,task_id LIMIT ?",
         (task_limit,),
     ).fetchall()
     if not queue:
