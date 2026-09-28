@@ -209,12 +209,12 @@ having room, and leaves a console reader unable to answer work that is waiting.
 A host with a console should enable it.
 
 `duplicate_stage1` is also optional for an existing version 5 document. Enable
-it only after the selected release and the local
-`intfloat/multilingual-e5-base` model files are present on every host that will
-run it. `limit` bounds tasks selected per pass, `top_k` bounds candidate pairs
-incident to any task, and `pair_limit` bounds all pairs written by one pass.
-The consumer never downloads a model and leaves embedding work queued when the
-local runtime, model, or reader-derived calibration labels are unavailable.
+it only after the selected release is present and the host's loopback caproute
+answers `POST /v1/embeddings` for the `embedding-multilingual` capability.
+`limit` bounds tasks selected per pass, `top_k` bounds candidate pairs incident
+to any task, and `pair_limit` bounds all pairs written by one pass. The consumer
+leaves embedding work queued, and still runs its local signals, when the gateway
+or reader-derived calibration labels are unavailable.
 
 `duplicate_stage2` is optional too. It reuses the card service's GW endpoint,
 alias, and private token file, so a deployment without that complete GW
