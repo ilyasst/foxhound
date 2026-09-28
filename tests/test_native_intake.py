@@ -250,6 +250,28 @@ def history_candidate(
     return item
 
 
+def person_identity_candidate(index: int, *, kind: str = "email") -> dict:
+    """A v11 candidate using one opaque identity across source registries."""
+    item = history_candidate(index)
+    item["schema_version"] = 11
+    item["source"]["kind"] = kind
+    item["candidate_id"] = candidate_id_for(
+        system="gw", kind=kind, record_id=item["source"]["record_id"],
+        item_id=item["source"]["item_id"],
+    )
+    person_id = "person_" + "a" * 32
+    item["task"]["owner_ref"]["person_id"] = person_id
+    item["task"]["participants"] = [{
+        "kind": "person", "speaker_id": None,
+        "canonical_speaker_id": None, "speaker_registry_id": None,
+        "person_id": person_id,
+    }]
+    item["source"]["revision"] = hashlib.sha256(
+        json.dumps(item, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return item
+
+
 def review_candidate(
     head_oid: str,
     *,
@@ -668,7 +690,44 @@ class NativeCandidateIntakeTests(unittest.TestCase):
         self.assertFalse(task.owner_pinned)
         self.assertFalse(task.owner_provisional)
 
-    def test_new_task_scans_the_existing_open_queue_for_duplicates(self):
+    def test_person_identity_is_persisted_for_owner_and_participants(self):
+        self.activate()
+        item = person_identity_candidate(1)
+        self.assertTrue(self.inbox.import_feed(feed(0, item)).accepted)
+
+        self.assertEqual(self.intake().tasks_created, 1)
+
+        task = self.ledger.get(1)
+        self.assertEqual(task.owner_person_id, "person_" + "a" * 32)
+        with closing(sqlite3.connect(self.database)) as connection:
+            participant = connection.execute(
+                "SELECT person_id FROM task_participants WHERE task_id=1"
+            ).fetchone()
+        self.assertEqual(participant, ("person_" + "a" * 32,))
+
+    def test_stage_one_enqueue_failure_rolls_back_intake(self):
+        self.activate()
+        item = candidate(1)
+        self.assertTrue(self.inbox.import_feed(feed(0, item)).accepted)
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "CREATE TRIGGER synthetic_queue_failure "
+                "BEFORE INSERT ON task_duplicate_checks BEGIN "
+                "SELECT RAISE(ABORT,'synthetic queue failure'); END"
+            )
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.intake()
+
+        self.assertEqual(self.ledger.count(), 0)
+        with closing(sqlite3.connect(self.database)) as connection:
+            cursor = connection.execute(
+                "SELECT cursor FROM native_candidate_intakes WHERE producer='gw' "
+                "AND stream_id='primary'"
+            ).fetchone()[0]
+        self.assertEqual(cursor, 0)
+
+    def test_new_task_enqueues_stage_one_without_creating_a_proposal(self):
         self.activate()
         first = cross_source_owner_candidate(
             1, kind="meeting", text="Prepare the synthetic rollout checklist"
@@ -683,13 +742,17 @@ class NativeCandidateIntakeTests(unittest.TestCase):
         self.assertEqual(self.intake().tasks_created, 1)
 
         with closing(sqlite3.connect(self.database)) as connection:
-            proposal = connection.execute(
-                "SELECT left_task_id,right_task_id,state "
-                "FROM task_duplicate_proposals"
-            ).fetchone()
-        self.assertEqual(proposal, (1, 2, "proposed"))
+            queued = connection.execute(
+                "SELECT task_id,task_version FROM task_duplicate_checks "
+                "ORDER BY task_id"
+            ).fetchall()
+            proposal_count = connection.execute(
+                "SELECT count(*) FROM task_duplicate_proposals"
+            ).fetchone()[0]
+        self.assertEqual(queued, [(1, 1), (2, 1)])
+        self.assertEqual(proposal_count, 0)
 
-    def test_new_task_scans_a_recently_closed_task_for_duplicates(self):
+    def test_new_task_enqueues_even_when_an_older_task_is_closed(self):
         self.activate()
         closed = cross_source_owner_candidate(
             1, kind="meeting", text="Prepare the synthetic rollout checklist"
@@ -707,13 +770,17 @@ class NativeCandidateIntakeTests(unittest.TestCase):
         self.assertEqual(self.intake().tasks_created, 1)
 
         with closing(sqlite3.connect(self.database)) as connection:
-            proposal = connection.execute(
-                "SELECT left_task_id,right_task_id,state "
-                "FROM task_duplicate_proposals"
-            ).fetchone()
-        self.assertEqual(proposal, (1, 2, "proposed"))
+            queued = connection.execute(
+                "SELECT task_id,task_version FROM task_duplicate_checks "
+                "ORDER BY task_id"
+            ).fetchall()
+            proposal_count = connection.execute(
+                "SELECT count(*) FROM task_duplicate_proposals"
+            ).fetchone()[0]
+        self.assertEqual(queued, [(1, 1), (2, 1)])
+        self.assertEqual(proposal_count, 0)
 
-    def test_task_revision_does_not_trigger_duplicate_scan(self):
+    def test_task_revision_with_comparable_change_requeues_stage_one(self):
         self.activate()
         first = cross_source_owner_candidate(
             1, kind="meeting", text="Prepare the rollout checklist"
@@ -725,6 +792,8 @@ class NativeCandidateIntakeTests(unittest.TestCase):
         self.assertEqual(self.intake().tasks_created, 1)
         self.assertTrue(self.inbox.import_feed(feed(1, second)).accepted)
         self.assertEqual(self.intake().tasks_created, 1)
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute("DELETE FROM task_duplicate_checks")
 
         revised = cross_source_owner_candidate(
             2, kind="email", text="Draft the rollout checklist"
@@ -733,10 +802,32 @@ class NativeCandidateIntakeTests(unittest.TestCase):
         self.assertEqual(self.intake().tasks_revised, 1)
 
         with closing(sqlite3.connect(self.database)) as connection:
+            queued = connection.execute(
+                "SELECT task_id,task_version FROM task_duplicate_checks"
+            ).fetchall()
             proposal_count = connection.execute(
                 "SELECT count(*) FROM task_duplicate_proposals"
             ).fetchone()[0]
+        self.assertEqual(queued, [(2, 2)])
         self.assertEqual(proposal_count, 0)
+
+    def test_source_only_revision_does_not_requeue_stage_one(self):
+        self.activate()
+        initial = history_candidate(1, generation=1)
+        self.assertTrue(self.inbox.import_feed(feed(0, initial)).accepted)
+        self.assertEqual(self.intake().tasks_created, 1)
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute("DELETE FROM task_duplicate_checks")
+
+        revised = history_candidate(1, generation=2)
+        self.assertTrue(self.inbox.import_feed(feed(1, revised)).accepted)
+        self.assertEqual(self.intake().tasks_revised, 1)
+
+        with closing(sqlite3.connect(self.database)) as connection:
+            queued = connection.execute(
+                "SELECT count(*) FROM task_duplicate_checks"
+            ).fetchone()[0]
+        self.assertEqual(queued, 0)
 
     def test_pinned_owner_survives_a_later_candidate_revision(self):
         self.activate()

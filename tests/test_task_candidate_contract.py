@@ -696,6 +696,62 @@ class TaskCandidateContractTests(unittest.TestCase):
         with self.assertRaises(ContractError):
             parse_task_candidate(invalid)
 
+    def test_version_11_carries_person_identity_without_task_structure(self):
+        document = fixture("meeting-candidate-v2.json")
+        document["schema_version"] = 11
+        document["source"]["history"] = {
+            "source": "meeting",
+            "stream_id": "primary",
+            "item_id": document["candidate_id"],
+            "position": 1,
+            "revision": "d" * 64,
+        }
+        document["task"]["owner_ref"] = {
+            "kind": "person", "speaker_id": "SPK_101",
+            "canonical_speaker_id": "SPK_001",
+            "speaker_registry_id": "registry-alpha", "pinned": False,
+            "provisional": False, "person_id": "person_" + "a" * 32,
+        }
+        document["task"]["participants"] = [{
+            "kind": "person", "speaker_id": None,
+            "canonical_speaker_id": None, "speaker_registry_id": None,
+            "person_id": "person_" + "b" * 32,
+        }]
+        document["lifecycle"] = {
+            "state": "active", "generation": 1,
+            "changed_at": "2030-01-01T00:00:00Z",
+        }
+
+        candidate = parse_task_candidate(document)
+
+        self.assertEqual(candidate.task.owner_ref.person_id,
+                         "person_" + "a" * 32)
+        self.assertEqual(candidate.task.participants[0].person_id,
+                         "person_" + "b" * 32)
+        self.assertIsNone(candidate.task.object)
+        self.assertEqual(task_candidate_document(candidate), document)
+
+        for mutation in ("missing", "invalid", "wrong_kind"):
+            invalid = copy.deepcopy(document)
+            if mutation == "missing":
+                del invalid["task"]["participants"][0]["person_id"]
+            elif mutation == "invalid":
+                invalid["task"]["owner_ref"]["person_id"] = "person_invalid"
+            else:
+                invalid["task"]["participants"][0]["kind"] = "group"
+            with self.subTest(mutation=mutation):
+                with self.assertRaises(ContractError):
+                    parse_task_candidate(invalid)
+
+        schema = json.loads(
+            (Path(__file__).parents[1] / "src" / "foxhound" / "contracts" /
+             "schemas" / "task-candidate-v11.schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(schema["properties"]["schema_version"]["const"], 11)
+        self.assertIn("person_id", schema["$defs"]["ownerRef"]["required"])
+
 
 if __name__ == "__main__":
     unittest.main()

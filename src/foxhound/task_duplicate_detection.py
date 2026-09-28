@@ -109,8 +109,11 @@ class DuplicateCandidate:
     owner_canonical_speaker_id: str | None
     owner_speaker_registry_id: str | None
     owner_provisional: bool
+    owner_person_id: str | None = None
     object: str | None = None
-    participants: tuple[tuple[str, str | None, str | None, str | None], ...] = ()
+    participants: tuple[
+        tuple[str, str | None, str | None, str | None, str | None], ...
+    ] = ()
     terms: frozenset[str] = frozenset()
     identifiers: tuple[tuple[str, frozenset[str]], ...] = ()
 
@@ -369,7 +372,7 @@ def _candidates(connection: sqlite3.Connection) -> Iterable[DuplicateCandidate]:
         "c.source_record_id,"
         "t.owner_ref_version,t.owner_kind,t.owner_speaker_id,"
         "t.owner_canonical_speaker_id,t.owner_speaker_registry_id,"
-        "t.owner_provisional "
+        "t.owner_provisional,t.owner_person_id "
         "FROM tasks AS t "
         "JOIN task_candidate_bindings AS b ON b.task_id=t.id "
         "JOIN candidate_inbox AS c ON c.candidate_id=b.candidate_id "
@@ -378,14 +381,18 @@ def _candidates(connection: sqlite3.Connection) -> Iterable[DuplicateCandidate]:
         "ORDER BY t.id"
     ).fetchall()
     participant_rows = connection.execute(
-        "SELECT task_id,kind,speaker_id,canonical_speaker_id,speaker_registry_id "
+        "SELECT task_id,kind,speaker_id,canonical_speaker_id,speaker_registry_id,"
+        "person_id "
         "FROM task_participants ORDER BY task_id,position"
     ).fetchall()
-    participants: dict[int, list[tuple[str, str | None, str | None, str | None]]] = {}
+    participants: dict[int, list[
+        tuple[str, str | None, str | None, str | None, str | None]
+    ]] = {}
     for participant in participant_rows:
         participants.setdefault(int(participant["task_id"]), []).append(
             (participant["kind"], participant["speaker_id"],
              participant["canonical_speaker_id"], participant["speaker_registry_id"])
+            + (participant["person_id"],)
         )
     for row in rows:
         text = row["text"]
@@ -404,6 +411,7 @@ def _candidates(connection: sqlite3.Connection) -> Iterable[DuplicateCandidate]:
             owner_canonical_speaker_id=row["owner_canonical_speaker_id"],
             owner_speaker_registry_id=row["owner_speaker_registry_id"],
             owner_provisional=bool(row["owner_provisional"]),
+            owner_person_id=row["owner_person_id"],
             object=row["object"],
             participants=tuple(participants.get(int(row["id"]), [])),
             terms=frozenset(_terms(text)),
@@ -448,14 +456,22 @@ def _object_key(value: str) -> str:
 
 
 def _resolved_participants(
-    references: tuple[tuple[str, str | None, str | None, str | None], ...]
+    references: tuple[
+        tuple[str, str | None, str | None, str | None, str | None], ...
+    ]
 ) -> set[tuple[str, str]]:
     """Return comparable people; unresolved references never self-match."""
-    return {
+    speaker_keys = {
         (registry_id, canonical_id or speaker_id)
-        for kind, speaker_id, canonical_id, registry_id in references
+        for kind, speaker_id, canonical_id, registry_id, _person_id in references
         if kind == "person" and speaker_id is not None and registry_id is not None
     }
+    person_keys = {
+        ("person", person_id)
+        for kind, _speaker_id, _canonical_id, _registry_id, person_id in references
+        if kind == "person" and person_id is not None
+    }
+    return speaker_keys | person_keys
 
 
 def _basis(

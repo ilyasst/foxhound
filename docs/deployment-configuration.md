@@ -166,6 +166,12 @@ before it existed is brought forward.
     "duplicate_card_schedule": {
       "enabled": true,
       "limit": 100
+    },
+    "duplicate_stage1": {
+      "enabled": true,
+      "limit": 20,
+      "top_k": 5,
+      "pair_limit": 100
     }
   }
 }
@@ -192,6 +198,14 @@ created only when a delivering side asks for them as a side effect of topping up
 its own surface — which makes a card's existence conditional on that surface
 having room, and leaves a console reader unable to answer work that is waiting.
 A host with a console should enable it.
+
+`duplicate_stage1` is also optional for an existing version 5 document. Enable
+it only after the selected release and the local
+`intfloat/multilingual-e5-base` model files are present on every host that will
+run it. `limit` bounds tasks selected per pass, `top_k` bounds candidate pairs
+incident to any task, and `pair_limit` bounds all pairs written by one pass.
+The consumer never downloads a model and leaves embedding work queued when the
+local runtime, model, or reader-derived calibration labels are unavailable.
 
 Validate before changing a service definition or restarting anything:
 
@@ -220,8 +234,8 @@ Supported names are `task-cards`, `execution-schedule`,
 `execution-runner:<slot>`, `candidate-feed-import`, `native-intake-run`,
 `execution-card-requeue`, `task-card-requeue`, `lifecycle-outcome-export`, and
 `fused-task-titles`.
-`duplicate-card-schedule` is also available. Use the configured slot name when
-rendering a runner. Rendering reads no token contents. Its JSON output does
+`duplicate-card-schedule` and `duplicate-stage1` are also available. Use the
+configured slot name when rendering a runner. Rendering reads no token contents. Its JSON output does
 contain private paths, so consume it only in the private deployment mechanism,
 never in a repository, issue, or shared log.
 
@@ -450,4 +464,3 @@ Rollout must proceed in the following order:
 1. **Deploy consumer compatibility first**: Update delivery consumers (such as GW) to accept both claim schema version 1 and version 2, while routing configuration remains unconfigured (all cards continue using the configured default destination).
 2. **Deploy Foxhound version 2**: Deploy Foxhound with version 2 claim responses enabled. Consumers accept version 2 claims and deliver to their default destination.
 3. **Enable consumer per-source routing**: Configure topic-by-source mapping in the consumer (e.g. `GW_CARDS_SOURCE_TOPICS`).
-

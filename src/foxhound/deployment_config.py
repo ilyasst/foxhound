@@ -254,6 +254,7 @@ class DatabaseConsumersConfig:
     lifecycle_outcome_export: tuple[Path, str, int] | None
     fused_task_titles: str | None
     duplicate_card_schedule: int | None
+    duplicate_stage1: tuple[int, int, int] | None = None
     #: How many failed attempts one digest pass explains.  Absent means the
     #: consumer is disabled, as it does for every other entry here.
     failure_digest: int | None = None
@@ -336,6 +337,17 @@ class DatabaseConsumersConfig:
                 "foxhound-task-duplicate-card-schedule",
                 "--database", str(database),
                 "--limit", str(self.duplicate_card_schedule),
+            ]
+        if component == "duplicate-stage1":
+            if self.duplicate_stage1 is None:
+                raise DeploymentConfigError("database consumer is disabled")
+            limit, top_k, pair_limit = self.duplicate_stage1
+            return [
+                "foxhound-task-duplicate-stage1",
+                "--database", str(database),
+                "--limit", str(limit),
+                "--top-k", str(top_k),
+                "--pair-limit", str(pair_limit),
             ]
         raise DeploymentConfigError("deployment component is unknown")
 
@@ -833,7 +845,8 @@ def _parse_database_consumers(
     # the digest pass is a valid deployment, and every host would otherwise
     # have to be edited before any of them could run it.
     optional_fields = (
-        {"task_card_requeue", "failure_digest", "execution_card_schedule"}
+        {"task_card_requeue", "failure_digest", "execution_card_schedule",
+         "duplicate_stage1"}
         if version >= 5 else set()
     )
     document = _object(value, fields, optional_fields)
@@ -861,6 +874,10 @@ def _parse_database_consumers(
         _parse_execution_card_schedule(document["execution_card_schedule"])
         if "execution_card_schedule" in document else None
     )
+    duplicate_stage1 = (
+        _parse_duplicate_stage1(document["duplicate_stage1"])
+        if "duplicate_stage1" in document else None
+    )
     return DatabaseConsumersConfig(
         candidate_feed_import=candidate,
         native_intake_run=intake,
@@ -870,6 +887,7 @@ def _parse_database_consumers(
         lifecycle_outcome_export=lifecycle,
         fused_task_titles=titles,
         duplicate_card_schedule=duplicates,
+        duplicate_stage1=duplicate_stage1,
         failure_digest=digests,
     )
 
@@ -967,6 +985,17 @@ def _parse_fused_task_titles(value: object) -> str | None:
 def _parse_duplicate_card_schedule(value: object) -> int | None:
     document = _enabled_document(value, {"limit"})
     return None if document is None else _positive_int(document["limit"])
+
+
+def _parse_duplicate_stage1(value: object) -> tuple[int, int, int] | None:
+    document = _enabled_document(value, {"limit", "top_k", "pair_limit"})
+    if document is None:
+        return None
+    return (
+        _positive_int(document["limit"]),
+        _positive_int(document["top_k"]),
+        _positive_int(document["pair_limit"]),
+    )
 
 
 def _parse_failure_digest(value: object) -> int | None:

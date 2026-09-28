@@ -53,7 +53,10 @@
               {"$ref": "task-candidate-v4.schema.json"},
               {"$ref": "task-candidate-v5.schema.json"},
               {"$ref": "task-candidate-v6.schema.json"},
-              {"$ref": "task-candidate-v7.schema.json"}
+              {"$ref": "task-candidate-v7.schema.json"},
+              {"$ref": "task-candidate-v8.schema.json"},
+              {"$ref": "task-candidate-v9.schema.json"},
+              {"$ref": "task-candidate-v11.schema.json"}
             ]
           }
         },
