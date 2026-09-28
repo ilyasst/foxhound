@@ -11,7 +11,7 @@ import socket
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit
 
@@ -110,6 +110,8 @@ class KnowledgeDocument:
     kb_path: str | None = None
     section: str | None = None
     ranking_score: float | None = None
+    #: The document's own date (``YYYY-MM-DD``) when GW could determine one.
+    date: str | None = None
 
 
 @dataclass(frozen=True)
@@ -682,7 +684,11 @@ def _context_text_list(
 def _parse_document(value: object, layer: str) -> KnowledgeDocument:
     document = _object(value, "search document")
     required = {"id", "path", "excerpt"}
-    optional = {"kb_path", "section", "ranking"}
+    # `date` is GW's search-contract date (gw#967, shipped in gw#1126). GW
+    # added it before this parser learned it, and an unknown field refuses
+    # the whole response -- so every search returning a dated document
+    # failed. It is optional: GW omits it when nothing dates the document.
+    optional = {"kb_path", "section", "ranking", "date"}
     if required - set(document) or set(document) - required - optional:
         raise KnowledgeResponseError("GW knowledge document fields are invalid")
     path = _relative_path(document["path"], "document path")
@@ -709,6 +715,10 @@ def _parse_document(value: object, layer: str) -> KnowledgeDocument:
                 or not math.isfinite(score) or not 0 <= score <= 1):
             raise KnowledgeResponseError("GW knowledge ranking is invalid")
         ranking_score = float(score)
+    document_date = (
+        _calendar_date(document["date"], "document date")
+        if "date" in document else None
+    )
     return KnowledgeDocument(
         id=identifier,
         path=path,
@@ -716,7 +726,24 @@ def _parse_document(value: object, layer: str) -> KnowledgeDocument:
         kb_path=kb_path,
         section=section,
         ranking_score=ranking_score,
+        date=document_date,
     )
+
+
+_CALENDAR_DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+
+
+def _calendar_date(value: object, field_name: str) -> str:
+    """Accept exactly an ISO calendar date, as GW's search contract sends."""
+    if not isinstance(value, str) or not _CALENDAR_DATE_RE.fullmatch(value):
+        raise KnowledgeResponseError(f"GW knowledge {field_name} is invalid")
+    try:
+        date.fromisoformat(value)
+    except ValueError as exc:
+        raise KnowledgeResponseError(
+            f"GW knowledge {field_name} is invalid"
+        ) from exc
+    return value
 
 
 def _relative_path(value: object, field_name: str) -> str:
