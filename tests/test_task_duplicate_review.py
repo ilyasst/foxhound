@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from foxhound import migrate_database
 
+import dataclasses
 import json
 import pathlib
 import sqlite3
@@ -626,6 +627,10 @@ class DuplicateBasisTests(unittest.TestCase):
     """
 
     def _card_text(self, basis: str) -> str:
+        return render_task_review_card(self._card(basis))[0]
+
+    def _card(self, basis: str, *, citations: str | None = None,
+              confidence: float = 0.9):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         database = Path(directory.name) / "foxhound.sqlite3"
@@ -660,10 +665,18 @@ class DuplicateBasisTests(unittest.TestCase):
                 "VALUES(?,?,?,'accepted',?)",
                 (f"candidate-{task_id}", revision, task_id, NOW.isoformat()),
             )
-        proposals.propose(
+        proposal_id = proposals.propose(
             connection, task_id_a=1, task_id_b=2, basis=basis,
             detector="synthetic-detector", now=NOW.isoformat(),
         )
+        if citations is not None:
+            connection.execute(
+                "INSERT INTO task_duplicate_verifications(candidate_id,verdict,"
+                "confidence,citations_json,latency_ms,prompt_tokens,"
+                "completion_tokens,verified_at,proposal_id) "
+                "VALUES(1,'same',?,?,0,0,0,?,?)",
+                (confidence, citations, NOW.isoformat(), proposal_id.proposal_id),
+            )
         connection.commit()
         cards = TaskCardService(
             database, clock=lambda: NOW, token_factory=lambda: TOKEN
@@ -672,7 +685,7 @@ class DuplicateBasisTests(unittest.TestCase):
         claim = cards.claim_next(consumer_digest=CONSUMER)
         self.assertIsNotNone(claim)
         self.assertIsNotNone(claim.card.duplicate)
-        return render_task_review_card(claim.card)[0]
+        return claim.card
 
     def test_shared_wording_is_shown_as_the_matched_terms(self) -> None:
         text = self._card_text(
@@ -688,6 +701,76 @@ class DuplicateBasisTests(unittest.TestCase):
             "one email source record carded again at a later reading"
         )
         self.assertIn("read again later", text)
+
+    AGENT_BASIS = "agent verified the pair as one task from cited knowledge"
+
+    @staticmethod
+    def _citations(*excerpts: str) -> str:
+        return json.dumps([
+            {
+                "document_id": f"kb:Meetings/2030010{n}_120000_mix_protocol.md",
+                "locator": f"Meetings/2030010{n}_120000_mix_protocol.md",
+                "excerpt": excerpt,
+            }
+            for n, excerpt in enumerate(excerpts, start=1)
+        ])
+
+    def test_an_agent_verified_pair_shows_what_the_agent_cited(self) -> None:
+        """One tap should be enough: the card quotes the records it rests on."""
+        card = self._card(self.AGENT_BASIS, citations=self._citations(
+            "We agreed to send the synthetic checklist by Friday.",
+            "Reminder: the synthetic checklist is still owed.",
+        ), confidence=0.87)
+        text = render_task_review_card(card)[0]
+        self.assertIn("agent checked both against your meetings and emails", text)
+        self.assertIn("Checked against your records", text)
+        self.assertIn("confidence 87%", text)
+        self.assertIn("meeting 2030-01-01", text)
+        self.assertIn("synthetic checklist by Friday", text)
+        self.assertIn("still owed", text)
+
+    def test_compact_shows_two_passages_and_expanded_shows_three(self) -> None:
+        card = self._card(self.AGENT_BASIS, citations=self._citations(
+            "first synthetic passage", "second synthetic passage",
+            "third synthetic passage", "fourth synthetic passage",
+        ))
+        compact = render_task_review_card(card)[0]
+        self.assertIn("second synthetic passage", compact)
+        self.assertNotIn("third synthetic passage", compact)
+        expanded = render_duplicate_view(
+            dataclasses.replace(card, status=CardStatus.DELIVERED), expanded=True
+        )[0]
+        self.assertIn("third synthetic passage", expanded)
+        self.assertNotIn("fourth synthetic passage", expanded)
+
+    def test_cited_text_is_escaped_and_bounded(self) -> None:
+        """Knowledge text is untrusted; it must not break the card's HTML,
+        and an expanded card must still fit one editable message."""
+        card = self._card(self.AGENT_BASIS, citations=self._citations(
+            "<b>bold</b> & " + "x" * 5000,
+            "y" * 5000,
+            "z" * 5000,
+        ))
+        compact = render_task_review_card(card)[0]
+        self.assertIn("&lt;b&gt;bold&lt;/b&gt; &amp;", compact)
+        self.assertNotIn("<b>bold</b>", compact)
+        expanded = render_duplicate_view(
+            dataclasses.replace(card, status=CardStatus.DELIVERED), expanded=True
+        )[0]
+        self.assertNotIn("x" * 500, expanded)
+        self.assertLess(len(expanded), 4096)
+
+    def test_unreadable_citations_show_no_evidence_but_keep_the_card(self):
+        card = self._card(self.AGENT_BASIS, citations="{not json")
+        text = render_task_review_card(card)[0]
+        self.assertNotIn("Checked against your records", text)
+        self.assertIn("Matched on", text)
+
+    def test_other_detectors_show_no_evidence_section(self) -> None:
+        text = self._card_text(
+            "shared task terms across email and meeting: alpha, beta"
+        )
+        self.assertNotIn("Checked against your records", text)
 
 
 class DuplicateSchedulingCollisionTests(DuplicateReviewCardTests):
