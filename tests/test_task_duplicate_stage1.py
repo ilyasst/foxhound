@@ -162,6 +162,64 @@ class StageOneTests(unittest.TestCase):
         ).fetchall()
         self.assertEqual({row["route"] for row in routes}, {"words"})
 
+    def test_persistent_embedding_failure_does_not_starve_the_queue(self) -> None:
+        """A failing embedding path must not freeze local signals.
+
+        Ordering the queue by enqueue time alone kept the oldest tasks, each
+        still owed an embedding, at the head of every pass, so the tasks
+        behind them never got their words, reread or participant signals.
+        Seen for real when a shared GPU ran out of memory mid-backfill.
+        """
+        for task_id in range(1, 6):
+            self._task(task_id, f"Synthetic task number {task_id}")
+            stage1.enqueue(self.connection, task_id, now=NOW)
+
+        for _pass in range(3):
+            stage1.run(
+                self.connection, now=NOW, backend=FailingEmbeddings(),
+                task_limit=2,
+            )
+
+        rows = self.connection.execute(
+            "SELECT task_id,signals_done,embedding_done "
+            "FROM task_duplicate_checks ORDER BY task_id"
+        ).fetchall()
+        self.assertEqual(
+            [(row["task_id"], row["signals_done"]) for row in rows],
+            [(task_id, 1) for task_id in range(1, 6)],
+        )
+        self.assertTrue(all(row["embedding_done"] == 0 for row in rows))
+
+    def test_local_backend_is_pinned_to_cpu(self) -> None:
+        """The shared GPU belongs to speech recognition and model serving."""
+        import sys
+        import types
+
+        created: list[dict] = []
+
+        class FakeModel:
+            def __init__(self, model_id, **kwargs):
+                created.append({"model_id": model_id, **kwargs})
+
+            def encode(self, texts, **kwargs):
+                return [[1.0, 0.0] for _ in texts]
+
+        fake = types.ModuleType("sentence_transformers")
+        fake.SentenceTransformer = FakeModel
+        original = sys.modules.get("sentence_transformers")
+        sys.modules["sentence_transformers"] = fake
+        try:
+            stage1.SentenceTransformerBackend().encode(["synthetic text"])
+        finally:
+            if original is None:
+                sys.modules.pop("sentence_transformers", None)
+            else:
+                sys.modules["sentence_transformers"] = original
+
+        self.assertEqual(len(created), 1)
+        self.assertEqual(created[0]["device"], "cpu")
+        self.assertIs(created[0]["local_files_only"], True)
+
     def test_top_k_and_global_pair_cap_are_honoured(self) -> None:
         backend = self._calibrated_fixture()
         for task_id in (1, 2, 3):
