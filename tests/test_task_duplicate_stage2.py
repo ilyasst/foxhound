@@ -12,6 +12,7 @@ from foxhound import migrate_database
 from foxhound.knowledge_client import (
     KnowledgeDocument,
     KnowledgeLayer,
+    KnowledgeResponseError,
     KnowledgeSearchResult,
 )
 from foxhound import task_duplicate_stage2 as stage2
@@ -212,6 +213,36 @@ class StageTwoTests(unittest.TestCase):
                 "SELECT 1 FROM task_duplicate_verifications WHERE candidate_id=?",
                 (candidate_id,),
             ).fetchone())
+
+    def test_retries_say_why_without_carrying_content(self) -> None:
+        """A retry names its cause as a fixed code.
+
+        Counting retries alone hid a real outage: every pair failed in 250 ms
+        because GW's search contract had grown a field this client refused,
+        and the only visible outcome was `retries: 10`.
+        """
+        self._basic_pair()
+
+        class FailingKnowledge(FakeKnowledge):
+            def search(self, query, **_options):
+                raise KnowledgeResponseError(
+                    "GW knowledge document fields are invalid"
+                )
+
+        search_failed = stage2.run_database(
+            self.database, agent=FakeAgent(), knowledge=FailingKnowledge(),
+            now=NOW,
+        )
+        ungrounded = stage2.run_database(
+            self.database, agent=FakeAgent(usable=False),
+            knowledge=FakeKnowledge(), now=NOW,
+        )
+
+        self.assertEqual(search_failed.retry_reasons, {"knowledge_search": 1})
+        self.assertEqual(ungrounded.retry_reasons, {"citation_not_grounded": 1})
+        rendered = json.dumps(ungrounded.retry_reasons)
+        self.assertNotIn("fictional", rendered)
+        self.assertNotIn("emails:", rendered)
 
     def test_daily_budget_stops_the_pass(self) -> None:
         self._task(1, "Synthetic task one", kind="meeting")

@@ -117,6 +117,12 @@ class StageTwoResult:
     related: int = 0
     different: int = 0
     retries: int = 0
+    #: Why each retry happened, as fixed codes. A retry used to be only a
+    #: count, and every failure inside the agent became the same generic
+    #: error -- so ten pairs failing in 250 ms each said nothing about the
+    #: cause (it was a GW search contract mismatch). Codes are derived from
+    #: fixed error messages, never from task text, evidence or model output.
+    retry_reasons: dict[str, int] = field(default_factory=dict)
     proposals_recorded: int = 0
     proposals_unchanged: int = 0
     proposals_refused: int = 0
@@ -242,6 +248,7 @@ def run_database(
     attempted: set[int] = set()
     counts = {verdict: 0 for verdict in Verdict}
     claimed = retries = recorded = unchanged = refused = latency = 0
+    reasons: dict[str, int] = {}
     exhausted = False
     for _ in range(limit):
         claim = _claim_next(
@@ -288,16 +295,19 @@ def run_database(
             RuntimeError,
             TimeoutError,
             ValueError,
-        ):
+        ) as exc:
             latency += max(0, round((time.monotonic() - started) * 1000))
             _release_claim(inbox, pair.candidate_id)
             retries += 1
+            reason = _retry_reason(exc)
+            reasons[reason] = reasons.get(reason, 0) + 1
     return StageTwoResult(
         pairs_claimed=claimed,
         same=counts[Verdict.SAME],
         related=counts[Verdict.RELATED],
         different=counts[Verdict.DIFFERENT],
         retries=retries,
+        retry_reasons=dict(sorted(reasons.items())),
         proposals_recorded=recorded,
         proposals_unchanged=unchanged,
         proposals_refused=refused,
@@ -305,6 +315,39 @@ def run_database(
         latency_ms=latency,
         average_latency_ms=0 if claimed == 0 else round(latency / claimed),
     )
+
+
+_RETRY_REASONS = {
+    "knowledge search is unavailable": "knowledge_unavailable",
+    "knowledge search returned no evidence": "no_evidence",
+    "verification agent failed": "model_call_failed",
+    "verification reply is too large": "reply_too_large",
+    "verification reply is not text": "reply_not_text",
+    "verification reply has invalid fields": "reply_invalid",
+    "verification verdict is invalid": "reply_invalid",
+    "verification confidence is invalid": "reply_invalid",
+    "verification text is invalid": "reply_invalid",
+    "verification text has invalid length": "reply_invalid",
+    "verification citations have invalid length": "citations_invalid",
+    "verification citation has invalid fields": "citations_invalid",
+    "verification citation is duplicated": "citations_invalid",
+    "verification citation is not grounded": "citation_not_grounded",
+    "candidate pair is unavailable": "pair_unavailable",
+    "candidate task version is stale": "pair_stale",
+}
+
+
+def _retry_reason(exc: BaseException) -> str:
+    """Map a failure to a fixed, content-free code."""
+    if isinstance(exc, VerificationError):
+        return _RETRY_REASONS.get(str(exc), "verification_other")
+    if isinstance(exc, KnowledgeClientError):
+        return "knowledge_search"
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    if isinstance(exc, OSError):
+        return "io"
+    return "internal"
 
 
 def _claim_next(
