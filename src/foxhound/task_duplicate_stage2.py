@@ -389,7 +389,12 @@ def _claim_next(
                 "AND candidate.right_task_version=right_task.version "
                 "AND (claim.candidate_id IS NULL OR claim.claimed_at<=?) "
                 + exclusion
-                + " ORDER BY candidate.id LIMIT 1",
+                # Strongest first. Stage one ranks and caps its candidates so
+                # the daily budget is spent where duplicates are likeliest;
+                # claiming by insertion order threw that away, and on a real
+                # queue (496 pairs, 407 raised only by a shared participant)
+                # the high-scoring embedding pairs were never reached.
+                + " ORDER BY candidate.rank_score DESC,candidate.id LIMIT 1",
                 parameters,
             ).fetchone()
             if row is None:

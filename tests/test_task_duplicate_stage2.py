@@ -106,13 +106,13 @@ class StageTwoTests(unittest.TestCase):
             (candidate_id, revision, task_id, NOW),
         )
 
-    def _pair(self, left: int, right: int) -> int:
+    def _pair(self, left: int, right: int, *, rank_score: float = 0.9) -> int:
         cursor = self.connection.execute(
             "INSERT INTO task_duplicate_candidates("
             "left_task_id,right_task_id,left_task_version,right_task_version,"
             "rank_score,state,created_at,updated_at) "
-            "VALUES(?,?,1,1,0.9,'queued',?,?)",
-            (left, right, NOW, NOW),
+            "VALUES(?,?,1,1,?,'queued',?,?)",
+            (left, right, rank_score, NOW, NOW),
         )
         self.connection.commit()
         return int(cursor.lastrowid)
@@ -243,6 +243,23 @@ class StageTwoTests(unittest.TestCase):
         rendered = json.dumps(ungrounded.retry_reasons)
         self.assertNotIn("fictional", rendered)
         self.assertNotIn("emails:", rendered)
+
+    def test_strongest_candidate_is_verified_first(self) -> None:
+        """The budget goes to stage one's best candidates, not its oldest."""
+        self._task(1, "Prepare the synthetic rollout checklist", kind="meeting")
+        self._task(2, "Draft the synthetic rollout checklist", kind="email")
+        self._task(3, "Order synthetic lab supplies", kind="email")
+        weak = self._pair(1, 3, rank_score=0.3)
+        strong = self._pair(1, 2, rank_score=0.97)
+        agent = FakeAgent()
+
+        stage2.run_database(
+            self.database, agent=agent, knowledge=FakeKnowledge(), now=NOW,
+            limit=1,
+        )
+
+        self.assertLess(weak, strong)
+        self.assertEqual(agent.calls, [strong])
 
     def test_daily_budget_stops_the_pass(self) -> None:
         self._task(1, "Synthetic task one", kind="meeting")
