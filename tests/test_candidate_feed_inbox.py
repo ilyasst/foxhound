@@ -20,7 +20,7 @@ from foxhound import (
     InboxError,
 )
 from foxhound.contracts.task_candidate import (
-    SOURCE_HISTORY_SCHEMA_VERSION,
+    PERSON_IDENTITY_HISTORY_SCHEMA_VERSION,
 )
 from foxhound.candidate_inbox import (
     _CUMULATIVE_SCHEMA_VERSIONS,
@@ -205,7 +205,7 @@ class CandidateFeedInboxTests(unittest.TestCase):
         newest = max(_CUMULATIVE_SCHEMA_VERSIONS)
         self.assertEqual(
             newest,
-            SOURCE_HISTORY_SCHEMA_VERSION,
+            PERSON_IDENTITY_HISTORY_SCHEMA_VERSION,
             "a newer cumulative schema version was added -- re-read the "
             "docstring before updating this expectation",
         )
@@ -224,6 +224,35 @@ class CandidateFeedInboxTests(unittest.TestCase):
                     ),
                     f"version {older} can no longer upgrade to {newest}",
                 )
+
+    def test_version_9_can_add_person_ids_as_a_contract_upgrade(self):
+        stored = fixture()["items"][0]["candidate"]
+        stored["schema_version"] = 9
+        stored["task"]["owner_ref"] = {
+            "kind": "person", "speaker_id": "SPK_101",
+            "canonical_speaker_id": "SPK_001",
+            "speaker_registry_id": "registry-alpha", "pinned": False,
+            "provisional": False,
+        }
+        incoming = copy.deepcopy(stored)
+        incoming["schema_version"] = 11
+        incoming["task"]["owner_ref"]["person_id"] = "person_" + "a" * 32
+        incoming["task"]["participants"] = [{
+            "kind": "person", "speaker_id": None,
+            "canonical_speaker_id": None, "speaker_registry_id": None,
+            "person_id": "person_" + "b" * 32,
+        }]
+        # v9 could already carry participants only with structure. Remove the
+        # entire new list from both sides of this focused owner-id comparison.
+        stored["task"]["participants"] = [{
+            key: value for key, value in incoming["task"]["participants"][0].items()
+            if key != "person_id"
+        }]
+
+        self.assertTrue(_is_cumulative_contract_upgrade(
+            json.dumps(stored, sort_keys=True),
+            json.dumps(incoming, sort_keys=True),
+        ))
 
     def test_candidate_conflict_names_the_offending_record(self):
         """A refusal has to say which candidate, and why.

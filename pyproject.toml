@@ -7,6 +7,7 @@ name = "foxhound"
 version = "0.1.0"
 description = "Task lifecycle and execution service."
 requires-python = ">=3.11"
+dependencies = ["sentence-transformers>=3,<6"]
 
 [project.scripts]
 foxhound-task-cards = "foxhound.task_card_server:main"
@@ -37,6 +38,7 @@ foxhound-task-structure-status = "foxhound.task_structure_status:main"
 foxhound-task-local-duplicate-eval = "foxhound.task_duplicate_semantic:main"
 foxhound-task-duplicate-queue-diagnostic = "foxhound.task_duplicate_queue_diagnostic:main"
 foxhound-task-duplicate-supersede = "foxhound.task_duplicate_supersede:main"
+foxhound-task-duplicate-stage1 = "foxhound.task_duplicate_stage1:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

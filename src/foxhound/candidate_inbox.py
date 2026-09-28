@@ -44,18 +44,20 @@ from .contracts import (
 )
 from .contracts.task_candidate import (
     CUMULATIVE_SCHEMA_VERSION,
+    PERSON_IDENTITY_HISTORY_SCHEMA_VERSION,
     SOURCE_HISTORY_SCHEMA_VERSION,
     STRUCTURED_TASK_SCHEMA_VERSION,
 )
 
 
-SCHEMA_VERSION = 61
+SCHEMA_VERSION = 62
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 _CUMULATIVE_SCHEMA_VERSIONS = {
     CUMULATIVE_SCHEMA_VERSION,
     STRUCTURED_TASK_SCHEMA_VERSION,
     SOURCE_HISTORY_SCHEMA_VERSION,
+    PERSON_IDENTITY_HISTORY_SCHEMA_VERSION,
 }
 
 _SCHEMA_COLUMNS = {
@@ -798,6 +800,29 @@ _SCHEMA_COLUMNS["execution_review_cards"] += ("summary_only",)
 # should not expect it.
 _SCHEMA_COLUMNS["task_review_cards"] += ("claiming_consumer",)
 
+# V62 is intentionally appended after every historical schema map above is
+# derived. A predecessor being migrated must not be asked to already carry
+# the duplicate-check queue or the additive person identity fields.
+_SCHEMA_COLUMNS["tasks"] += ("owner_person_id",)
+_SCHEMA_COLUMNS["task_participants"] += ("person_id",)
+_SCHEMA_COLUMNS.update({
+    "task_duplicate_checks": (
+        "task_id", "task_version", "content_digest", "signals_done",
+        "embedding_done", "embedding_attempts", "enqueued_at", "updated_at",
+    ),
+    "task_duplicate_embeddings": (
+        "task_id", "task_version", "content_digest", "model_id", "vector_json",
+        "created_at",
+    ),
+    "task_duplicate_candidates": (
+        "id", "left_task_id", "right_task_id", "left_task_version",
+        "right_task_version", "rank_score", "state", "created_at", "updated_at",
+    ),
+    "task_duplicate_candidate_routes": (
+        "candidate_id", "route", "score",
+    ),
+})
+
 # The versioned maps above are used to validate historical schemas while they
 # migrate.  V45 is additive, so remove its tables and task columns from every
 # predecessor map rather than teaching an old migration to expect the future.
@@ -852,6 +877,9 @@ _SCHEMA_OBJECTS = {
     "task_duplicate_proposal_events_no_delete": "trigger",
     "task_duplicate_proposals_no_delete": "trigger",
     "task_duplicate_proposals_settle_only": "trigger",
+    "task_duplicate_checks_pending": "index",
+    "task_duplicate_candidates_pair": "index",
+    "task_duplicate_candidates_queued": "index",
     "task_duplicate_assessments_pair": "index",
     "task_duplicate_assessments_no_update": "trigger",
     "task_duplicate_assessments_no_delete": "trigger",
@@ -3257,6 +3285,82 @@ ORDER BY proposal.id;
 )
 
 
+# Stage-one duplicate discovery is durable but not reader-facing. Intake only
+# enqueues the affected task in its own transaction; a timer-driven pass owns
+# local inference and records ranked pairs for the verification stage.
+_SCHEMA_V62 = (
+    "ALTER TABLE tasks ADD COLUMN owner_person_id TEXT;",
+    "ALTER TABLE task_participants ADD COLUMN person_id TEXT;",
+    """
+CREATE TABLE task_duplicate_checks (
+    task_id            INTEGER PRIMARY KEY REFERENCES tasks(id),
+    task_version       INTEGER NOT NULL CHECK(task_version >= 1),
+    content_digest     TEXT NOT NULL CHECK(
+                           length(content_digest)=64
+                           AND content_digest NOT GLOB '*[^0-9a-f]*'
+                       ),
+    signals_done       INTEGER NOT NULL DEFAULT 0 CHECK(signals_done IN (0,1)),
+    embedding_done     INTEGER NOT NULL DEFAULT 0 CHECK(embedding_done IN (0,1)),
+    embedding_attempts INTEGER NOT NULL DEFAULT 0 CHECK(embedding_attempts >= 0),
+    enqueued_at        TEXT NOT NULL,
+    updated_at         TEXT NOT NULL
+);
+""",
+    """
+CREATE INDEX task_duplicate_checks_pending
+    ON task_duplicate_checks(embedding_done, signals_done, enqueued_at, task_id);
+""",
+    """
+CREATE TABLE task_duplicate_embeddings (
+    task_id        INTEGER NOT NULL REFERENCES tasks(id),
+    task_version   INTEGER NOT NULL CHECK(task_version >= 1),
+    content_digest TEXT NOT NULL CHECK(
+                       length(content_digest)=64
+                       AND content_digest NOT GLOB '*[^0-9a-f]*'
+                   ),
+    model_id       TEXT NOT NULL CHECK(length(model_id) BETWEEN 1 AND 200),
+    vector_json    TEXT NOT NULL CHECK(length(vector_json) BETWEEN 3 AND 40000),
+    created_at     TEXT NOT NULL,
+    PRIMARY KEY(task_id, task_version)
+);
+""",
+    """
+CREATE TABLE task_duplicate_candidates (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    left_task_id       INTEGER NOT NULL REFERENCES tasks(id),
+    right_task_id      INTEGER NOT NULL REFERENCES tasks(id),
+    left_task_version  INTEGER NOT NULL CHECK(left_task_version >= 1),
+    right_task_version INTEGER NOT NULL CHECK(right_task_version >= 1),
+    rank_score         REAL NOT NULL CHECK(rank_score >= 0 AND rank_score <= 1),
+    state              TEXT NOT NULL DEFAULT 'queued' CHECK(state IN ('queued')),
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL,
+    CHECK(left_task_id < right_task_id)
+);
+""",
+    """
+CREATE UNIQUE INDEX task_duplicate_candidates_pair
+    ON task_duplicate_candidates(
+        left_task_id,right_task_id,left_task_version,right_task_version
+    );
+""",
+    """
+CREATE INDEX task_duplicate_candidates_queued
+    ON task_duplicate_candidates(state,id);
+""",
+    """
+CREATE TABLE task_duplicate_candidate_routes (
+    candidate_id INTEGER NOT NULL REFERENCES task_duplicate_candidates(id),
+    route        TEXT NOT NULL CHECK(route IN (
+                     'words','embedding','reread','participant','working_group'
+                 )),
+    score        REAL CHECK(score IS NULL OR (score >= 0 AND score <= 1)),
+    PRIMARY KEY(candidate_id, route)
+);
+""",
+)
+
+
 # Context exhaustion is a separate terminal condition for one attempt. The
 # workflow table has a closed reason vocabulary, so admitting it requires a
 # table rebuild rather than silently recording it as an ordinary timeout.
@@ -4852,6 +4956,37 @@ class CandidateInbox:
                     connection.execute("PRAGMA legacy_alter_table = OFF")
                     connection.execute("PRAGMA foreign_keys = ON")
                 version = 61
+            if version == 61:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    task_columns = {
+                        row["name"] for row in connection.execute(
+                            "PRAGMA table_info(tasks)"
+                        )
+                    }
+                    if "owner_person_id" not in task_columns:
+                        connection.execute(_SCHEMA_V62[0])
+                    participant_columns = {
+                        row["name"] for row in connection.execute(
+                            "PRAGMA table_info(task_participants)"
+                        )
+                    }
+                    if "person_id" not in participant_columns:
+                        connection.execute(_SCHEMA_V62[1])
+                    exists = connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' "
+                        "AND name='task_duplicate_checks'"
+                    ).fetchone()
+                    if exists is None:
+                        for statement in _SCHEMA_V62[2:]:
+                            connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 62")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 62
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:
@@ -5531,7 +5666,7 @@ class CandidateInbox:
             ) and not (
                 table == "tasks"
                 and tuple(column for column in columns if column not in {
-                    "object", "action", "confidence"
+                    "object", "action", "confidence", "owner_person_id"
                 }) == expected_columns
             ) and not (
                 # ALTER TABLE preserves data but a historical rehearsal that
@@ -5641,6 +5776,15 @@ def _is_cumulative_contract_upgrade(
         if current_version < STRUCTURED_TASK_SCHEMA_VERSION:
             for field in ("object", "action", "participants", "confidence"):
                 task.pop(field, None)
+        if current_version < PERSON_IDENTITY_HISTORY_SCHEMA_VERSION:
+            owner_ref = task.get("owner_ref")
+            if isinstance(owner_ref, dict):
+                owner_ref.pop("person_id", None)
+            participants = task.get("participants")
+            if isinstance(participants, list):
+                for participant in participants:
+                    if isinstance(participant, dict):
+                        participant.pop("person_id", None)
         return normalized
 
     return shared_shape(current) == shared_shape(incoming)

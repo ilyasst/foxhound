@@ -20,7 +20,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Callable
 
-from . import task_duplicate_detection
+from . import task_duplicate_stage1
 from .candidate_inbox import CandidateInbox, InboxError, SCHEMA_VERSION
 from .contracts import (
     CandidateSourceHistory,
@@ -232,6 +232,7 @@ class TaskRecord:
     owner_speaker_id: str | None
     owner_canonical_speaker_id: str | None
     owner_speaker_registry_id: str | None
+    owner_person_id: str | None
     owner_pinned: bool
     owner_provisional: bool
 
@@ -578,7 +579,7 @@ class TaskLedger:
 
                 expected_sequence = previous_cursor + 1
                 tasks_created = tasks_revised = candidates_unchanged = 0
-                created_task_ids: list[int] = []
+                duplicate_check_task_ids: set[int] = set()
                 candidates_withdrawn = candidates_after_close = 0
                 for row in rows:
                     if int(row["sequence"]) != expected_sequence:
@@ -668,7 +669,7 @@ class TaskLedger:
                             now=now,
                         )
                         tasks_created += 1
-                        created_task_ids.append(task_id)
+                        duplicate_check_task_ids.add(task_id)
                         continue
 
                     if binding["source_revision"] == candidate.source.revision:
@@ -683,6 +684,7 @@ class TaskLedger:
                             binding=binding,
                             now=now,
                         )
+                        duplicate_check_task_ids.add(int(binding["task_id"]))
                         tasks_revised += 1
                         continue
                     task = connection.execute(
@@ -701,6 +703,14 @@ class TaskLedger:
                         _row_owner_values(task)
                         if bool(task["owner_pinned"])
                         else _candidate_owner_values(candidate)
+                    )
+                    duplicate_comparable_changed = (
+                        task["text"] != candidate.task.text
+                        or _row_owner_values(task) != desired_owner
+                        or _row_structure_values(task)[:2]
+                        != _candidate_structure_values(candidate)[:2]
+                        or _stored_participants(connection, int(task["id"]))
+                        != _candidate_participants(candidate)
                     )
                     # Does this revision change the task, or only what is known
                     # about it? Two branches below deliberately keep the task
@@ -823,7 +833,7 @@ class TaskLedger:
                             "owner_ref_version=?,owner_kind=?,"
                             "owner_speaker_id=?,owner_canonical_speaker_id=?,"
                             "owner_speaker_registry_id=?,owner_pinned=?,"
-                            "owner_provisional=? WHERE id=?",
+                            "owner_provisional=?,owner_person_id=? WHERE id=?",
                             (
                                 candidate.task.text,
                                 desired_owner[0],
@@ -837,6 +847,8 @@ class TaskLedger:
                         _replace_participants(
                             connection, int(binding["task_id"]), candidate
                         )
+                        if duplicate_comparable_changed:
+                            duplicate_check_task_ids.add(int(binding["task_id"]))
                         connection.execute(
                             "UPDATE task_candidate_bindings SET "
                             "source_revision=?,decided_at=? "
@@ -935,7 +947,7 @@ class TaskLedger:
                         "updated_at=?,owner_ref_version=?,owner_kind=?,"
                         "owner_speaker_id=?,owner_canonical_speaker_id=?,"
                         "owner_speaker_registry_id=?,owner_pinned=?,"
-                        "owner_provisional=? WHERE id=?",
+                        "owner_provisional=?,owner_person_id=? WHERE id=?",
                         (
                             candidate.task.text,
                             desired_owner[0],
@@ -950,6 +962,8 @@ class TaskLedger:
                     _replace_participants(
                         connection, int(binding["task_id"]), candidate
                     )
+                    if duplicate_comparable_changed:
+                        duplicate_check_task_ids.add(int(binding["task_id"]))
                     connection.execute(
                         "UPDATE task_candidate_bindings SET source_revision=?,"
                         "decided_at=? WHERE candidate_id=?",
@@ -1022,16 +1036,11 @@ class TaskLedger:
                     candidates_unchanged=candidates_unchanged,
                     now=now,
                 )
-                # Intake is the durable task-addition boundary.  Scan the
-                # complete eligible queue only after this batch adds a task,
-                # so it can be compared with every earlier cross-source task
-                # and recently closed work.  The proposal ledger makes
-                # repeated scans idempotent, and the whole change remains one
-                # transaction: a failed scan cannot advance intake alone.
-                if tasks_created:
-                    task_duplicate_detection.scan(
-                        connection, now=now, focus_task_ids=created_task_ids
-                    )
+                # Intake performs no inference or network I/O. It records the
+                # durable obligation in this transaction; a bounded database
+                # consumer performs the duplicate check after commit.
+                for task_id in sorted(duplicate_check_task_ids):
+                    task_duplicate_stage1.enqueue(connection, task_id, now=now)
                 connection.commit()
                 return NativeIntakeResult(
                     NativeIntakeDisposition.APPLIED,
@@ -1870,7 +1879,7 @@ class TaskLedger:
                 "confidence=?,version=?,updated_at=?,"
                 "owner_ref_version=?,owner_kind=?,owner_speaker_id=?,"
                 "owner_canonical_speaker_id=?,owner_speaker_registry_id=?,"
-                "owner_pinned=?,owner_provisional=? WHERE id=?",
+                "owner_pinned=?,owner_provisional=?,owner_person_id=? WHERE id=?",
                 (
                     candidate.task.text,
                     desired_owner[0],
@@ -1992,8 +2001,9 @@ class TaskLedger:
             "version,created_at,"
             "updated_at,closed_at,owner_ref_version,owner_kind,"
             "owner_speaker_id,owner_canonical_speaker_id,"
-            "owner_speaker_registry_id,owner_pinned,owner_provisional) "
-            "VALUES('open',?,?,?,?,?,?,?,?,?,NULL,?,?,?,?,?,?,?)",
+            "owner_speaker_registry_id,owner_pinned,owner_provisional,"
+            "owner_person_id) "
+            "VALUES('open',?,?,?,?,?,?,?,?,?,NULL,?,?,?,?,?,?,?,?)",
             (task.text, owner_values[0], task.due,
              *_candidate_structure_values(candidate), 1, now, now,
              *owner_values[1:]),
@@ -2064,7 +2074,7 @@ def _candidate_owner_values(
     if display != candidate.task.owner:
         reference = None
     if reference is None:
-        return (display, 0, None, None, None, None, 0, 1)
+        return (display, 0, None, None, None, None, 0, 1, None)
     return (
         display,
         1,
@@ -2074,6 +2084,7 @@ def _candidate_owner_values(
         reference.speaker_registry_id,
         int(reference.pinned),
         int(reference.provisional),
+        reference.person_id,
     )
 
 
@@ -2087,6 +2098,7 @@ def _row_owner_values(row: sqlite3.Row) -> tuple[object, ...]:
         row["owner_speaker_registry_id"],
         int(row["owner_pinned"]),
         int(row["owner_provisional"]),
+        row["owner_person_id"],
     )
 
 
@@ -2126,7 +2138,7 @@ def _row_structure_values(row: sqlite3.Row) -> tuple[object, ...]:
 def _candidate_participants(candidate: TaskCandidate) -> tuple[tuple[object, ...], ...]:
     return tuple(
         (reference.kind, reference.speaker_id, reference.canonical_speaker_id,
-         reference.speaker_registry_id)
+         reference.speaker_registry_id, reference.person_id)
         for reference in candidate.task.participants
     )
 
@@ -2135,13 +2147,13 @@ def _stored_participants(
     connection: sqlite3.Connection, task_id: int
 ) -> tuple[tuple[object, ...], ...]:
     rows = connection.execute(
-        "SELECT kind,speaker_id,canonical_speaker_id,speaker_registry_id "
+        "SELECT kind,speaker_id,canonical_speaker_id,speaker_registry_id,person_id "
         "FROM task_participants WHERE task_id=? ORDER BY position",
         (task_id,),
     ).fetchall()
     return tuple(
         (row["kind"], row["speaker_id"], row["canonical_speaker_id"],
-         row["speaker_registry_id"])
+         row["speaker_registry_id"], row["person_id"])
         for row in rows
     )
 
@@ -2153,7 +2165,7 @@ def _replace_participants(
     connection.executemany(
         "INSERT INTO task_participants("
         "task_id,position,kind,speaker_id,canonical_speaker_id,"
-        "speaker_registry_id) VALUES(?,?,?,?,?,?)",
+        "speaker_registry_id,person_id) VALUES(?,?,?,?,?,?,?)",
         (
             (task_id, position, *reference)
             for position, reference in enumerate(_candidate_participants(candidate))
@@ -2181,6 +2193,7 @@ def _task_record(row: sqlite3.Row) -> TaskRecord:
             owner_speaker_id=row["owner_speaker_id"],
             owner_canonical_speaker_id=row["owner_canonical_speaker_id"],
             owner_speaker_registry_id=row["owner_speaker_registry_id"],
+            owner_person_id=row["owner_person_id"],
             owner_pinned=bool(row["owner_pinned"]),
             owner_provisional=bool(row["owner_provisional"]),
         )

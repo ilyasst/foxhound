@@ -154,6 +154,9 @@ class CandidateFeedContractTests(unittest.TestCase):
                 "task-candidate-v5.schema.json",
                 "task-candidate-v6.schema.json",
                 "task-candidate-v7.schema.json",
+                "task-candidate-v8.schema.json",
+                "task-candidate-v9.schema.json",
+                "task-candidate-v11.schema.json",
             ],
         )
 
