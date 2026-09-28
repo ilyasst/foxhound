@@ -415,6 +415,39 @@ class KnowledgeClientTests(unittest.TestCase):
             "max_results_per_layer": 4,
         })
 
+    def test_search_accepts_the_document_date_gw_sends(self):
+        """GW's search contract carries a document date (gw#967, gw#1126).
+
+        GW shipped it before this parser learned it, and one unknown field
+        refuses the whole response -- so every search returning a dated KB
+        document failed, which is every protocol and dated page.
+        """
+        def add_date(document):
+            document["layers"][0]["documents"][0]["date"] = "2026-09-12"
+            return document
+
+        with server(transform=add_date) as (endpoint, _requests):
+            result = client(endpoint).search("synthetic query", layers=("kb",))
+        self.assertEqual(result.layers[0].documents[0].date, "2026-09-12")
+
+        with server() as (endpoint, _requests):
+            undated = client(endpoint).search("synthetic query", layers=("kb",))
+        self.assertIsNone(undated.layers[0].documents[0].date)
+
+    def test_search_document_date_is_strictly_a_calendar_date(self):
+        for value in ("2026-13-45", "12/09/2026", "2026-09-12T10:00:00",
+                      20260912, None, ""):
+            def add_date(document, value=value):
+                document["layers"][0]["documents"][0]["date"] = value
+                return document
+
+            with self.subTest(value=value):
+                with server(transform=add_date) as (endpoint, _requests):
+                    with self.assertRaises(KnowledgeResponseError):
+                        client(endpoint).search(
+                            "synthetic query", layers=("kb",)
+                        )
+
     def test_search_accepts_bounded_aggregate_exclusion_counts(self):
         def add_exclusions(document):
             document["excluded"] = {
