@@ -49,7 +49,7 @@ from .contracts.task_candidate import (
 )
 
 
-SCHEMA_VERSION = 60
+SCHEMA_VERSION = 61
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 _CUMULATIVE_SCHEMA_VERSIONS = {
@@ -285,6 +285,7 @@ _SCHEMA_COLUMNS = {
         "proposal_id",
         "kind",
         "actor",
+        "reason",
         "occurred_at",
     ),
     "task_duplicate_assessments": (
@@ -3197,6 +3198,65 @@ FROM execution_review_card_events_v59;
 )
 
 
+# Superseding is an expiration, not a reader answer. It needs its own event
+# kind and a bounded reason so an operator can distinguish a deliberate queue
+# reset from the scheduler expiring a comparison whose task revisions moved.
+# Existing events predate reasons and remain explicitly unknown.
+_SCHEMA_V61_EVENT_TABLE = """
+CREATE TABLE task_duplicate_proposal_events (
+    sequence     INTEGER PRIMARY KEY AUTOINCREMENT,
+    proposal_id  INTEGER NOT NULL,
+    kind         TEXT NOT NULL CHECK(kind IN (
+                     'proposed','confirmed','rejected','reopened','superseded'
+                 )),
+    actor        TEXT NOT NULL CHECK(length(actor) BETWEEN 1 AND 200),
+    reason       TEXT CHECK(reason IS NULL OR length(reason) BETWEEN 1 AND 500),
+    occurred_at  TEXT NOT NULL,
+    CHECK((kind = 'superseded') = (reason IS NOT NULL)),
+    FOREIGN KEY(proposal_id) REFERENCES task_duplicate_proposals(id)
+);
+"""
+_SCHEMA_V61 = (
+    "DROP TRIGGER task_duplicate_proposal_events_no_update;",
+    "DROP TRIGGER task_duplicate_proposal_events_no_delete;",
+    "ALTER TABLE task_duplicate_proposal_events "
+    "RENAME TO task_duplicate_proposal_events_v60;",
+    _SCHEMA_V61_EVENT_TABLE,
+    """
+INSERT INTO task_duplicate_proposal_events(
+    sequence,proposal_id,kind,actor,reason,occurred_at
+)
+SELECT sequence,proposal_id,kind,actor,NULL,occurred_at
+FROM task_duplicate_proposal_events_v60;
+""",
+    "DROP TABLE task_duplicate_proposal_events_v60;",
+    # Before version 61 the duplicate-card scheduler expired unaskable
+    # proposals with a bare state update, because the ledger had no kind to
+    # record it with. Those rows are `superseded` with no event saying so.
+    # The ledger is append-only from here on, so this is the one place the
+    # history can be completed: give each such proposal exactly one event,
+    # dated when it was settled, with a reason that says it was not recorded
+    # at the time rather than pretending to know why.
+    """
+INSERT INTO task_duplicate_proposal_events(
+    proposal_id,kind,actor,reason,occurred_at
+)
+SELECT proposal.id,'superseded','schema-migration-61',
+       'superseded before supersession events were recorded',
+       COALESCE(proposal.settled_at,proposal.updated_at,proposal.created_at)
+FROM task_duplicate_proposals AS proposal
+WHERE proposal.state='superseded'
+  AND NOT EXISTS (
+      SELECT 1 FROM task_duplicate_proposal_events AS event
+      WHERE event.proposal_id=proposal.id AND event.kind='superseded'
+  )
+ORDER BY proposal.id;
+""",
+    _SCHEMA_V27[4],
+    _SCHEMA_V27[5],
+)
+
+
 # Context exhaustion is a separate terminal condition for one attempt. The
 # workflow table has a closed reason vocabulary, so admitting it requires a
 # table rebuild rather than silently recording it as an ordinary timeout.
@@ -4770,6 +4830,28 @@ class CandidateInbox:
                     connection.execute("PRAGMA legacy_alter_table = OFF")
                     connection.execute("PRAGMA foreign_keys = ON")
                 version = 60
+            if version == 60:
+                connection.execute("PRAGMA foreign_keys = OFF")
+                connection.execute("PRAGMA legacy_alter_table = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    columns = {
+                        row["name"] for row in connection.execute(
+                            "PRAGMA table_info(task_duplicate_proposal_events)"
+                        )
+                    }
+                    if "reason" not in columns:
+                        for statement in _SCHEMA_V61:
+                            connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 61")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                finally:
+                    connection.execute("PRAGMA legacy_alter_table = OFF")
+                    connection.execute("PRAGMA foreign_keys = ON")
+                version = 61
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:

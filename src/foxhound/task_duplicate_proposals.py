@@ -19,6 +19,7 @@ from typing import Iterable
 MAX_BASIS = 1_200
 MAX_DETECTOR = 64
 MAX_ACTOR = 200
+MAX_REASON = 500
 MAX_OPEN_PROPOSALS_PER_TASK = 5
 RECENTLY_CLOSED_DAYS = 30
 PROPOSAL_ROUTES = frozenset({"words", "reread", "object", "participant", "legacy"})
@@ -243,6 +244,40 @@ def settle(
         "INSERT INTO task_duplicate_proposal_events("
         "proposal_id,kind,actor,occurred_at) VALUES(?,?,?,?)",
         (proposal_id, decision.value, actor, now),
+    )
+    return True
+
+
+def supersede(
+    connection: sqlite3.Connection,
+    *,
+    proposal_id: int,
+    actor: str,
+    reason: str,
+    now: str,
+) -> bool:
+    """Expire one unanswered, unbound proposal and record why.
+
+    Card withdrawal belongs to the card service. Requiring the binding to be
+    clear here prevents a caller from making a delivered question stale while
+    it is still actionable on the reader's device.
+    """
+    proposal_id = _identifier(proposal_id, "proposal id")
+    actor = _bounded(actor, "actor", MAX_ACTOR)
+    reason = _bounded(reason, "reason", MAX_REASON)
+    now = _bounded(now, "timestamp", 40)
+    cursor = connection.execute(
+        "UPDATE task_duplicate_proposals SET state='superseded',updated_at=?,"
+        "settled_at=? WHERE id=? AND state='proposed' AND card_id IS NULL",
+        (now, now, proposal_id),
+    )
+    if cursor.rowcount != 1:
+        return False
+    connection.execute(
+        "INSERT INTO task_duplicate_proposal_events("
+        "proposal_id,kind,actor,reason,occurred_at) "
+        "VALUES(?,'superseded',?,?,?)",
+        (proposal_id, actor, reason, now),
     )
     return True
 
