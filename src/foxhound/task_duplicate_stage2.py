@@ -46,7 +46,8 @@ _SYSTEM = (
     "Owners are unreliable hints: agreement supports \"same\", disagreement is "
     "weak evidence against. Working group agreement (same_working_group: true, "
     "false, or unknown) is supporting context: tasks in the same working group "
-    "often address related commitments, but it is not proof of duplication. "
+    "often address related commitments, but it is not proof of duplication; "
+    "different or missing working groups are not evidence against duplication. "
     "Keep the verdict grounded in cited knowledge."
 )
 

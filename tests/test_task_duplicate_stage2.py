@@ -153,6 +153,10 @@ class StageTwoTests(unittest.TestCase):
         # Check system prompt
         self.assertIn("owners are unreliable hints", payload["messages"][0]["content"].lower())
         self.assertIn("same_working_group", payload["messages"][0]["content"])
+        self.assertIn(
+            "not evidence against duplication",
+            payload["messages"][0]["content"].lower(),
+        )
         
         # Check user prompt
         user_msg = json.loads(payload["messages"][1]["content"])

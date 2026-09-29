@@ -419,7 +419,7 @@ class WorkingGroupSignalTests(StageOneTests):
 
     def test_equal_keys_offer_working_group_route(self) -> None:
         key = "wg_" + "a" * 32
-        self._task(1, "Prepare the synthetic rollout checklist", working_group=key)
+        self._task(1, "Prepare the synthetic rollout checklist alpha", working_group=key)
         self._task(2, "Draft the synthetic rollout checklist", kind="meeting", working_group=key)
         stage1.enqueue(self.connection, 1, now=NOW)
         stage1.run(self.connection, now=NOW, backend=FailingEmbeddings())
@@ -480,3 +480,64 @@ class WorkingGroupSignalTests(StageOneTests):
         self.assertEqual(small_score, 1.0)
         self.assertEqual(large_score, 0.5)
         self.assertGreater(small_score, large_score)
+
+    def test_old_closed_tasks_do_not_dilute_an_active_small_group(self) -> None:
+        key = "wg_" + "a" * 32
+        self._task(1, "Prepare the synthetic rollout checklist", working_group=key)
+        self._task(
+            2,
+            "Draft the synthetic rollout checklist",
+            kind="meeting",
+            working_group=key,
+        )
+        for task_id in range(3, 23):
+            self._task(
+                task_id,
+                f"Archived synthetic action {task_id}",
+                working_group=key,
+            )
+            self.connection.execute(
+                "UPDATE tasks SET status='done',closed_at=? WHERE id=?",
+                ("2020-01-01T00:00:00+00:00", task_id),
+            )
+
+        stage1.enqueue(self.connection, 1, now=NOW)
+        stage1.run(self.connection, now=NOW, backend=FailingEmbeddings())
+
+        routes = self._routes()[(1, 2)]
+        self.assertEqual(routes["working_group"], 1.0)
+
+    def test_changed_key_removes_stale_route_and_rank_boost(self) -> None:
+        key = "wg_" + "a" * 32
+        self._task(
+            1,
+            "Prepare the synthetic rollout checklist alpha",
+            working_group=key,
+        )
+        self._task(
+            2,
+            "Draft the synthetic rollout checklist beta",
+            kind="meeting",
+            working_group=key,
+        )
+        stage1.enqueue(self.connection, 1, now=NOW)
+        stage1.run(self.connection, now=NOW, backend=FailingEmbeddings())
+        before = self.connection.execute(
+            "SELECT rank_score FROM task_duplicate_candidates "
+            "WHERE left_task_id=1 AND right_task_id=2"
+        ).fetchone()[0]
+        self.assertIn("working_group", self._routes()[(1, 2)])
+
+        self.connection.execute(
+            "UPDATE tasks SET working_group=? WHERE id=1",
+            ("wg_" + "b" * 32,),
+        )
+        stage1.enqueue(self.connection, 1, now=NOW)
+        stage1.run(self.connection, now=NOW, backend=FailingEmbeddings())
+
+        after = self.connection.execute(
+            "SELECT rank_score FROM task_duplicate_candidates "
+            "WHERE left_task_id=1 AND right_task_id=2"
+        ).fetchone()[0]
+        self.assertNotIn("working_group", self._routes()[(1, 2)])
+        self.assertLess(after, before)
