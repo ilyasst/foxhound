@@ -24,6 +24,13 @@ resolution is provisional, and whether a reader pinned it. A speaker
 identifier is accepted only with its registry. Unresolved owners render as
 `(unassigned)`; raw speaker identifiers are never valid card labels.
 
+A speaker identifier has one grammar, `(?:SPK_\d+|CLU_\d{6})`, defined in
+`foxhound.speaker_ids`: a legacy per-recording id or an authority cluster id
+of exactly six digits. Both forms are opaque and compared only for equality;
+widening to the cluster form accepted more without a contract or schema
+version change, because every contract version validates through the same
+grammar.
+
 Foxhound schema version 18 persists those fields separately. Rows created from
 older candidate contracts remain reference version zero and provisional. A
 reader reassignment creates a version-one external reference, clears the

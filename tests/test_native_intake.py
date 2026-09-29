@@ -295,6 +295,28 @@ def working_group_candidate(
     return item
 
 
+def cluster_speaker_candidate(
+    index: int,
+    *,
+    speaker_id: str = "CLU_000101",
+    canonical_speaker_id: str = "CLU_000001",
+    participant_speaker_id: str = "CLU_000404",
+) -> dict:
+    """A v12 candidate whose speaker ids use the authority cluster form."""
+    item = working_group_candidate(index)
+    item["task"]["owner_ref"]["speaker_id"] = speaker_id
+    item["task"]["owner_ref"]["canonical_speaker_id"] = canonical_speaker_id
+    item["task"]["participants"] = [{
+        "kind": "unresolved", "speaker_id": participant_speaker_id,
+        "canonical_speaker_id": None, "speaker_registry_id": "registry-alpha",
+        "person_id": None,
+    }]
+    item["source"]["revision"] = hashlib.sha256(
+        json.dumps(item, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return item
+
+
 def review_candidate(
     head_oid: str,
     *,
@@ -754,6 +776,63 @@ class NativeCandidateIntakeTests(unittest.TestCase):
         result = self.inbox.import_feed(feed(0, item))
         self.assertFalse(result.accepted)
         self.assertEqual(result.refusal, FeedImportRefusal.INVALID_CONTRACT)
+        self.assertEqual(self.intake().tasks_created, 0)
+
+    def test_cluster_speaker_ids_import_and_persist(self):
+        self.activate()
+        item = cluster_speaker_candidate(1)
+        self.assertTrue(self.inbox.import_feed(feed(0, item)).accepted)
+
+        self.assertEqual(self.intake().tasks_created, 1)
+
+        task = self.ledger.get(1)
+        self.assertEqual(task.owner, "Person A")
+        self.assertEqual(task.owner_speaker_id, "CLU_000101")
+        self.assertEqual(task.owner_canonical_speaker_id, "CLU_000001")
+        with closing(sqlite3.connect(self.database)) as connection:
+            participant = connection.execute(
+                "SELECT speaker_id FROM task_participants WHERE task_id=1"
+                " AND kind='unresolved'"
+            ).fetchone()
+        self.assertEqual(participant, ("CLU_000404",))
+
+    def test_page_mixing_legacy_and_cluster_speaker_ids_imports(self):
+        self.activate()
+        legacy = owner_candidate(1)
+        cluster = cluster_speaker_candidate(2)
+        mixed = cluster_speaker_candidate(
+            3, speaker_id="SPK_103", canonical_speaker_id="CLU_000003",
+            participant_speaker_id="SPK_404",
+        )
+        result = self.inbox.import_feed(feed(0, legacy, cluster, mixed))
+        self.assertTrue(result.accepted)
+        self.assertEqual(result.inserted, 3)
+
+        self.assertEqual(self.intake().tasks_created, 3)
+        self.assertEqual(
+            [
+                (self.ledger.get(task_id).owner_speaker_id,
+                 self.ledger.get(task_id).owner_canonical_speaker_id)
+                for task_id in (1, 2, 3)
+            ],
+            [("SPK_101", "SPK_001"), ("CLU_000101", "CLU_000001"),
+             ("SPK_103", "CLU_000003")],
+        )
+
+    def test_malformed_cluster_speaker_id_refuses_the_page(self):
+        self.activate()
+        for malformed in ("CLU_1708", "CLU_0017080", "clu_001708"):
+            for field in (
+                "speaker_id", "canonical_speaker_id", "participant_speaker_id"
+            ):
+                bad = cluster_speaker_candidate(2, **{field: malformed})
+                page = feed(0, owner_candidate(1), bad)
+                with self.subTest(value=malformed, field=field):
+                    result = self.inbox.import_feed(page)
+                    self.assertFalse(result.accepted)
+                    self.assertEqual(
+                        result.refusal, FeedImportRefusal.INVALID_CONTRACT
+                    )
         self.assertEqual(self.intake().tasks_created, 0)
 
     def test_older_version_candidate_still_imports(self):

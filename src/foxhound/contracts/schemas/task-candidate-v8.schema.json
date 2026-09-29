@@ -16,7 +16,7 @@
   },
   "$defs": {
     "opaqueId": {"type": "string", "minLength": 1, "maxLength": 200, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$"},
-    "speakerId": {"type": "string", "pattern": "^SPK_[0-9]+$"},
+    "speakerId": {"type": "string", "pattern": "^(?:SPK_[0-9]+|CLU_[0-9]{6})$"},
     "speakerRef": {"type": "object", "required": ["kind", "speaker_id", "canonical_speaker_id", "speaker_registry_id"], "properties": {"kind": {"enum": ["person", "unresolved", "external", "group"]}, "speaker_id": {"oneOf": [{"$ref": "#/$defs/speakerId"}, {"type": "null"}]}, "canonical_speaker_id": {"oneOf": [{"$ref": "#/$defs/speakerId"}, {"type": "null"}]}, "speaker_registry_id": {"oneOf": [{"$ref": "#/$defs/opaqueId"}, {"type": "null"}]}} , "additionalProperties": false},
     "ownerRef": {"type": "object", "required": ["kind", "speaker_id", "canonical_speaker_id", "speaker_registry_id", "pinned", "provisional"], "properties": {"kind": {"enum": ["person", "unresolved", "external", "group"]}, "speaker_id": {"oneOf": [{"$ref": "#/$defs/speakerId"}, {"type": "null"}]}, "canonical_speaker_id": {"oneOf": [{"$ref": "#/$defs/speakerId"}, {"type": "null"}]}, "speaker_registry_id": {"oneOf": [{"$ref": "#/$defs/opaqueId"}, {"type": "null"}]}, "pinned": {"type": "boolean"}, "provisional": {"type": "boolean"}}, "additionalProperties": false}
   },

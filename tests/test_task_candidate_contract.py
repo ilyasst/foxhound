@@ -838,5 +838,105 @@ class TaskCandidateContractTests(unittest.TestCase):
         self.assertIn("working_group", schema["properties"]["task"]["properties"])
 
 
+    def _structured_speaker_document(
+        self, owner_id: str, canonical_id: str, participant_id: str
+    ) -> dict:
+        document = fixture("meeting-candidate-v2.json")
+        document["schema_version"] = 8
+        document["task"]["owner_ref"] = {
+            "kind": "person", "speaker_id": owner_id,
+            "canonical_speaker_id": canonical_id,
+            "speaker_registry_id": "registry-alpha", "pinned": False,
+            "provisional": False,
+        }
+        document["task"].update({
+            "object": "synthetic sample", "action": "review",
+            "participants": [{
+                "kind": "unresolved", "speaker_id": participant_id,
+                "canonical_speaker_id": None,
+                "speaker_registry_id": "registry-alpha",
+            }],
+            "confidence": 0.75,
+        })
+        document["lifecycle"] = {
+            "state": "active", "generation": 1,
+            "changed_at": "2030-01-01T00:00:00Z",
+        }
+        return document
+
+    def test_cluster_speaker_ids_are_accepted_everywhere_a_speaker_id_is(self):
+        for owner_id, canonical_id, participant_id in (
+            ("CLU_000101", "CLU_000001", "CLU_000404"),
+            ("SPK_101", "CLU_000001", "SPK_404"),
+            ("CLU_000101", "SPK_001", "CLU_999999"),
+            ("SPK_101", "SPK_001", "SPK_404"),
+        ):
+            document = self._structured_speaker_document(
+                owner_id, canonical_id, participant_id
+            )
+            with self.subTest(ids=(owner_id, canonical_id, participant_id)):
+                candidate = parse_task_candidate(document)
+                self.assertEqual(candidate.task.owner_ref.speaker_id, owner_id)
+                self.assertEqual(
+                    candidate.task.owner_ref.canonical_speaker_id, canonical_id
+                )
+                self.assertEqual(
+                    candidate.task.participants[0].speaker_id, participant_id
+                )
+                self.assertEqual(task_candidate_document(candidate), document)
+
+    def test_malformed_speaker_ids_are_still_refused(self):
+        malformed = (
+            "CLU_1708", "CLU_0017080", "clu_001708", "CLU_", "CLU_00170a",
+            "CLU_001708 ", "SPK_", "spk_101", "SPK_101x", "PER_000101",
+        )
+        for value in malformed:
+            for path in (
+                ("owner_ref", "speaker_id"),
+                ("owner_ref", "canonical_speaker_id"),
+                ("participants", 0, "speaker_id"),
+            ):
+                document = self._structured_speaker_document(
+                    "SPK_101", "SPK_001", "SPK_404"
+                )
+                target = document["task"]
+                for key in path[:-1]:
+                    target = target[key]
+                target[path[-1]] = value
+                with self.subTest(value=value, path=path):
+                    with self.assertRaises(ContractError):
+                        parse_task_candidate(document)
+
+    def test_owner_display_may_not_expose_a_cluster_speaker_id(self):
+        for owner in ("Person A (CLU_000101)", "CLU_000101"):
+            document = self._structured_speaker_document(
+                "CLU_000101", "CLU_000001", "CLU_000404"
+            )
+            document["task"]["owner"] = owner
+            with self.subTest(owner=owner):
+                with self.assertRaisesRegex(ContractError, "speaker identifier"):
+                    parse_task_candidate(document)
+
+    def test_published_schemas_carry_the_shared_speaker_grammar(self):
+        schemas = (
+            Path(__file__).parents[1] / "src" / "foxhound" / "contracts"
+            / "schemas"
+        )
+        carrying = [
+            path for path in sorted(schemas.glob("task-candidate-v*.schema.json"))
+            if "speakerId" in json.loads(path.read_text(encoding="utf-8")).get(
+                "$defs", {}
+            )
+        ]
+        self.assertTrue(carrying)
+        for path in carrying:
+            schema = json.loads(path.read_text(encoding="utf-8"))
+            with self.subTest(schema=path.name):
+                self.assertEqual(
+                    schema["$defs"]["speakerId"]["pattern"],
+                    "^(?:SPK_[0-9]+|CLU_[0-9]{6})$",
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

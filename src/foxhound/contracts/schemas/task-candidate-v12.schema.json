@@ -81,7 +81,7 @@
     "revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "personId": {"oneOf": [{"type": "string", "pattern": "^person_[0-9a-f]{32}$"}, {"type": "null"}]},
     "workingGroupKey": {"oneOf": [{"type": "string", "pattern": "^wg_[0-9a-f]{32}$"}, {"type": "null"}]},
-    "speakerId": {"type": "string", "pattern": "^SPK_[0-9]+$"},
+    "speakerId": {"type": "string", "pattern": "^(?:SPK_[0-9]+|CLU_[0-9]{6})$"},
     "speakerRef": {
       "type": "object",
       "required": ["kind", "speaker_id", "canonical_speaker_id", "speaker_registry_id", "person_id"],

@@ -16,6 +16,7 @@ from datetime import date, datetime
 from typing import Any, Mapping
 
 from foxhound.source_policy import provenance_roles_for, source_kinds_accepting
+from foxhound.speaker_ids import SPEAKER_ID_PATTERN, SPEAKER_ID_RE
 
 
 SCHEMA_ID = "foxhound.task-candidate"
@@ -90,8 +91,10 @@ TASK_ACTIONS = frozenset({
     "request", "review", "schedule", "send", "update",
 })
 UNRESOLVED_OWNER_DISPLAY = "(unassigned)"
-_SPEAKER_ID_RE = re.compile(r"^SPK_\d+$")
-_SPEAKER_ID_IN_DISPLAY_RE = re.compile(r"(?<![A-Za-z0-9_])SPK_\d+(?!\d)")
+_SPEAKER_ID_RE = SPEAKER_ID_RE
+_SPEAKER_ID_IN_DISPLAY_RE = re.compile(
+    rf"(?<![A-Za-z0-9_]){SPEAKER_ID_PATTERN}(?!\d)"
+)
 MAX_EVIDENCE_SOURCES = 3
 MAX_EVIDENCE_SOURCE_NAME = 255
 MAX_EVIDENCE_EXTRACT = 1_200
