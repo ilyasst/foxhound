@@ -89,7 +89,7 @@
     "opaqueId": {"type": "string", "minLength": 1, "maxLength": 200, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$"},
     "shortText": {"type": "string", "minLength": 1, "maxLength": 200},
     "taskText": {"type": "string", "minLength": 1, "maxLength": 1000},
-    "speakerId": {"type": "string", "pattern": "^SPK_[0-9]+$"},
+    "speakerId": {"type": "string", "pattern": "^(?:SPK_[0-9]+|CLU_[0-9]{6})$"},
     "ownerRef": {
       "type": "object",
       "required": ["kind", "speaker_id", "canonical_speaker_id", "speaker_registry_id", "pinned", "provisional"],

@@ -116,7 +116,7 @@
     },
     "shortText": {"type": "string", "minLength": 1, "maxLength": 200},
     "taskText": {"type": "string", "minLength": 1, "maxLength": 1000},
-    "speakerId": {"type": "string", "pattern": "^SPK_[0-9]+$"},
+    "speakerId": {"type": "string", "pattern": "^(?:SPK_[0-9]+|CLU_[0-9]{6})$"},
     "ownerRef": {
       "type": "object",
       "required": [

@@ -6,9 +6,13 @@ import re
 import unicodedata
 from collections.abc import Iterable, Mapping
 
+from .speaker_ids import SPEAKER_ID_PATTERN
+
 
 UNRESOLVED_DISPLAY = "(unassigned)"
-_SPEAKER_TOKEN = r"SPK_\d+(?:/(?:SPK_)?\d+)*"
+# One speaker id, optionally followed by more joined with "/"; a legacy
+# continuation may also be a bare number ("SPK_1/2").
+_SPEAKER_TOKEN = rf"{SPEAKER_ID_PATTERN}(?:/(?:{SPEAKER_ID_PATTERN}|\d+))*"
 _PARENTHETICAL_SPEAKER = re.compile(rf"\s*\(\s*{_SPEAKER_TOKEN}\s*\)")
 _BARE_SPEAKER = re.compile(rf"(?<![A-Za-z0-9_]){_SPEAKER_TOKEN}(?!\d)")
 
