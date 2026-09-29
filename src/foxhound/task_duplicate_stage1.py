@@ -27,10 +27,10 @@ DEFAULT_TOP_K = 5
 DEFAULT_PAIR_LIMIT = 100
 CALIBRATION_PRECISION_FLOOR = 0.80
 
-#: Routes that only strengthen a pair another route found. Owners and working
-#: groups are shared across unrelated work, while one source record routinely
-#: contains several independent actions. None is a sufficient lead alone.
-BOOST_ONLY_ROUTES = frozenset({"owner", "working_group", "reread"})
+#: Routes that only strengthen a pair another route found. Owners, participants,
+#: and working groups are shared across unrelated work, while one source record
+#: routinely contains several independent actions. None is a sufficient lead alone.
+BOOST_ONLY_ROUTES = frozenset({"owner", "working_group", "reread", "participant"})
 
 ROUTE_WEIGHTS = {
     "words": 1.0,

@@ -48,11 +48,8 @@ _SYSTEM = (
     "citations. Every citation must copy one supplied document_id and locator "
     "and a short exact excerpt from that document. Same means one piece of "
     "work represented twice; related work remains independently actionable. "
-    "Owners are unreliable hints: agreement supports \"same\", disagreement is "
-    "weak evidence against. Working group agreement (same_working_group: true, "
-    "false, or unknown) is supporting context: tasks in the same working group "
-    "often address related commitments, but it is not proof of duplication; "
-    "different or missing working groups are not evidence against duplication. "
+    "Owner, participant, and working-group agreement is supporting context "
+    "only; disagreement or absence is not evidence against duplication. "
     "Keep the verdict grounded in cited knowledge."
 )
 
