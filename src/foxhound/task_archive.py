@@ -48,7 +48,12 @@ MAX_ARTIFACTS = 100
 MAX_ARTIFACT_BYTES = 2 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 20 * 1024 * 1024
 MAX_MANIFEST_BYTES = 64 * 1024
-_RESERVED_NAMES = frozenset({"run-state.json", "agent-instructions.json"})
+_RESERVED_NAMES = frozenset({
+    "run-state.json",
+    "agent-instructions.json",
+    ".task-research.json",
+    "Research.md",
+})
 _RESULT_DRAFT_RE = re.compile(r"result-[0-9a-f]{32}\.json")
 _GITHUB_RECORD_RE = re.compile(r"^github\.com/([^/]+)/([^/]+)$")
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)")

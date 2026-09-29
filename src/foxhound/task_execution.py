@@ -42,6 +42,7 @@ from .source_policy import (
     source_kinds_accepting,
 )
 from .task_ledger import TaskLedgerError, TaskStatus
+from .task_scheduling import evaluate_task_conditions
 
 
 # Stable callback tokens shared with GW. Their presentation and behavior are
@@ -1221,6 +1222,20 @@ class TaskExecutionService:
                 deferred: list[int] = []
                 for candidate in rows:
                     try:
+                        eligible = evaluate_task_conditions(
+                            connection,
+                            int(candidate["task_id"]),
+                            int(candidate["task_version"]),
+                            now,
+                        )
+                    except Exception:
+                        # Condition evaluation is part of the authority gate.
+                        # Corrupt or unavailable state must hold this task,
+                        # never turn into permission to execute it.
+                        continue
+                    if not eligible:
+                        continue
+                    try:
                         resolved = self._resolve_profile(candidate)
                         if candidate["phase"] not in resolved.allowed_phases:
                             raise TaskLedgerError(
@@ -1263,7 +1278,8 @@ class TaskExecutionService:
                     # The schema requires parked_at to exist exactly while
                     # the status is parked, so leaving it set here is a
                     # constraint failure rather than a stale field.
-                    "parked_at=NULL,next_attempt_at=NULL,queue_priority='normal' "
+                    "parked_at=NULL,next_attempt_at=NULL,queue_priority='normal',"
+                    "queue_priority_source=NULL "
                     "WHERE task_id=? AND version=? "
                     "AND status IN ('queued','parked')",
                     (
@@ -1394,16 +1410,18 @@ class TaskExecutionService:
                     connection.rollback()
                     return _refused(task_id, WorkflowRefusal.NOT_FOUND)
                 current = WorkflowPriority(row["queue_priority"])
-                if current is priority:
+                if current is priority and row["queue_priority_source"] is None:
                     connection.rollback()
                     return _operation(row, WorkflowDisposition.UNCHANGED)
                 version = expected_version + 1
+                source = "reader" if action in {"raise", "lower"} else None
                 updated = connection.execute(
                     "UPDATE task_execution_workflows SET queue_priority=?,"
+                    "queue_priority_source=?,"
                     "version=?,updated_at=? WHERE task_id=? AND version=? "
                     "AND status='queued' AND (next_attempt_at IS NULL OR "
                     "next_attempt_at<=?)",
-                    (priority, version, now, task_id, expected_version, now),
+                    (priority, source, version, now, task_id, expected_version, now),
                 )
                 if updated.rowcount != 1:
                     connection.rollback()

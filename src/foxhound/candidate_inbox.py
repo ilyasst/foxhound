@@ -51,7 +51,7 @@ from .contracts.task_candidate import (
 )
 
 
-SCHEMA_VERSION = 65
+SCHEMA_VERSION = 67
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 _CUMULATIVE_SCHEMA_VERSIONS = {
@@ -825,6 +825,64 @@ _SCHEMA_COLUMNS.update({
     ),
 })
 
+# V66 adds the bounded scheduling-condition ledger after every historical
+# schema map has been derived.  Older migration checkpoints must not expect
+# these tables before the final additive step creates them.
+_SCHEMA_COLUMNS["task_execution_workflows"] += ("queue_priority_source",)
+_SCHEMA_COLUMNS.update({
+    "task_scheduling_conditions": (
+        "id", "task_id", "task_version", "kind", "depends_on_task_id",
+        "not_before", "state", "change_set_id", "created_at", "updated_at",
+    ),
+    "task_scheduling_condition_events": (
+        "sequence", "condition_id", "task_id", "kind", "state",
+        "occurred_at",
+    ),
+    "task_scheduling_change_sets": (
+        "id", "target_task_id", "target_task_version", "expected_workflow_version",
+        "kind", "state", "research_receipt_id", "research_document_digest",
+        "recommendation_digest", "recommendation_json", "prior_priority",
+        "prior_priority_source",
+        "resulting_workflow_version", "created_task_id", "created_at", "updated_at",
+    ),
+    "task_scheduling_change_events": (
+        "sequence", "change_set_id", "task_id", "kind", "occurred_at",
+    ),
+    "task_scheduling_review_cards": (
+        "id", "change_set_id", "task_id", "status", "version", "resolution",
+        "claim_token_digest", "claim_expires_at", "consumer_digest",
+        "transport", "delivery_ref", "delivered_at", "created_at", "updated_at",
+        "resolved_at",
+    ),
+    "task_scheduling_review_card_events": (
+        "sequence", "card_id", "change_set_id", "task_id", "kind",
+        "card_version", "action", "occurred_at",
+    ),
+})
+
+# V67 adds the manually-triggered task-research ledger.  Keep it below every
+# historical schema map: predecessors must not be required to contain tables
+# that their migration has not created yet.
+_SCHEMA_COLUMNS.update({
+    "task_research_jobs": (
+        "job_id", "task_id", "task_version", "generation", "input_digest",
+        "input_json", "task_work_root", "task_folder", "state",
+        "research_status", "attempts", "max_attempts",
+        "requested_at", "updated_at", "completed_at", "failure_code",
+        "pending_json_digest", "pending_markdown_digest",
+    ),
+    "task_research_claims": (
+        "job_id", "token_digest", "worker_id", "claimed_at", "expires_at",
+    ),
+    "task_research_receipts": (
+        "job_id", "json_digest", "markdown_digest", "cas_digest",
+        "published_at",
+    ),
+    "task_research_events": (
+        "sequence", "job_id", "task_id", "kind", "from_state", "to_state",
+        "occurred_at",
+    ),
+})
 _SCHEMA_COLUMNS.update({
     "task_duplicate_verification_claims": (
         "candidate_id", "claimed_at", "attempts",
@@ -900,6 +958,13 @@ _SCHEMA_OBJECTS = {
     "task_duplicate_verification_claims_age": "index",
     "task_duplicate_verifications_no_update": "trigger",
     "task_duplicate_verifications_no_delete": "trigger",
+    "task_scheduling_conditions_active": "index",
+    "task_scheduling_condition_events_no_update": "trigger",
+    "task_scheduling_condition_events_no_delete": "trigger",
+    "task_scheduling_change_events_no_update": "trigger",
+    "task_scheduling_change_events_no_delete": "trigger",
+    "task_scheduling_review_card_events_no_update": "trigger",
+    "task_scheduling_review_card_events_no_delete": "trigger",
     "task_duplicate_assessments_pair": "index",
     "task_duplicate_assessments_no_update": "trigger",
     "task_duplicate_assessments_no_delete": "trigger",
@@ -3467,6 +3532,263 @@ _SCHEMA_V65 = (
     "ALTER TABLE tasks ADD COLUMN working_group TEXT;",
 )
 
+_SCHEMA_V67 = (
+    """
+CREATE TABLE IF NOT EXISTS task_research_jobs (
+    job_id          TEXT PRIMARY KEY,
+    task_id         INTEGER NOT NULL REFERENCES tasks(id),
+    task_version    INTEGER NOT NULL CHECK(task_version >= 1),
+    generation      INTEGER NOT NULL CHECK(generation >= 1),
+    input_digest    TEXT NOT NULL CHECK(length(input_digest)=64),
+    input_json      TEXT NOT NULL CHECK(length(input_json) BETWEEN 2 AND 262144),
+    task_work_root  TEXT NOT NULL CHECK(
+                        length(task_work_root) BETWEEN 2 AND 4096
+                        AND substr(task_work_root,1,1)='/'
+                    ),
+    task_folder     TEXT NOT NULL CHECK(
+                        length(task_folder) BETWEEN 2 AND 4096
+                        AND substr(task_folder,1,1)='/'
+                    ),
+    state           TEXT NOT NULL CHECK(state IN (
+                        'queued','running','publishing','completed','parked','canceled'
+                    )),
+    research_status TEXT CHECK(research_status IS NULL OR research_status IN (
+                        'sufficient','inconclusive','unreachable'
+                    )),
+    attempts        INTEGER NOT NULL DEFAULT 0 CHECK(attempts BETWEEN 0 AND 3),
+    max_attempts    INTEGER NOT NULL DEFAULT 3 CHECK(max_attempts BETWEEN 1 AND 3),
+    requested_at    TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    completed_at    TEXT,
+    failure_code    TEXT,
+    pending_json_digest TEXT CHECK(
+                        pending_json_digest IS NULL OR length(pending_json_digest)=64
+                    ),
+    pending_markdown_digest TEXT CHECK(
+                        pending_markdown_digest IS NULL OR length(pending_markdown_digest)=64
+                    ),
+    UNIQUE(task_id,task_version,generation)
+);
+""",
+    """
+CREATE UNIQUE INDEX IF NOT EXISTS task_research_jobs_one_active
+    ON task_research_jobs(task_id)
+    WHERE state IN ('queued','running','publishing');
+""",
+    """
+CREATE INDEX IF NOT EXISTS task_research_jobs_queue
+    ON task_research_jobs(state,requested_at,job_id);
+""",
+    """
+CREATE TABLE IF NOT EXISTS task_research_claims (
+    job_id       TEXT PRIMARY KEY REFERENCES task_research_jobs(job_id),
+    token_digest TEXT NOT NULL CHECK(length(token_digest)=64),
+    worker_id    TEXT NOT NULL CHECK(length(worker_id) BETWEEN 1 AND 200),
+    claimed_at   TEXT NOT NULL,
+    expires_at   TEXT NOT NULL
+);
+""",
+    """
+CREATE TABLE IF NOT EXISTS task_research_receipts (
+    job_id          TEXT PRIMARY KEY REFERENCES task_research_jobs(job_id),
+    json_digest     TEXT NOT NULL CHECK(length(json_digest)=64),
+    markdown_digest TEXT NOT NULL CHECK(length(markdown_digest)=64),
+    cas_digest      TEXT NOT NULL CHECK(length(cas_digest)=64),
+    published_at    TEXT NOT NULL
+);
+""",
+    """
+CREATE TABLE IF NOT EXISTS task_research_events (
+    sequence    INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id      TEXT NOT NULL REFERENCES task_research_jobs(job_id),
+    task_id     INTEGER NOT NULL REFERENCES tasks(id),
+    kind        TEXT NOT NULL CHECK(kind IN (
+                    'requested','claimed','publishing','completed','retried',
+                    'parked','canceled','recovered'
+                )),
+    from_state  TEXT,
+    to_state    TEXT NOT NULL,
+    occurred_at TEXT NOT NULL
+);
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS task_research_receipts_no_update
+BEFORE UPDATE ON task_research_receipts
+BEGIN
+    SELECT RAISE(ABORT, 'task research receipts are immutable');
+END;
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS task_research_receipts_no_delete
+BEFORE DELETE ON task_research_receipts
+BEGIN
+    SELECT RAISE(ABORT, 'task research receipts are immutable');
+END;
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS task_research_events_no_update
+BEFORE UPDATE ON task_research_events
+BEGIN
+    SELECT RAISE(ABORT, 'task research events are immutable');
+END;
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS task_research_events_no_delete
+BEFORE DELETE ON task_research_events
+BEGIN
+    SELECT RAISE(ABORT, 'task research events are immutable');
+END;
+""",
+)
+
+
+# A validated scheduling recommendation is applied as one reversible local
+# transaction.  Conditions are ordinary queue eligibility facts; change sets
+# remember the exact fence and inverse operation; cards expose Keep and Undo.
+_SCHEMA_V66 = (
+    "ALTER TABLE task_execution_workflows ADD COLUMN queue_priority_source "
+    "TEXT CHECK(queue_priority_source IS NULL OR queue_priority_source IN "
+    "('reader','automation'));",
+    """CREATE TABLE IF NOT EXISTS task_scheduling_change_sets (
+    id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_task_id             INTEGER NOT NULL REFERENCES tasks(id),
+    target_task_version        INTEGER NOT NULL CHECK(target_task_version >= 1),
+    expected_workflow_version  INTEGER NOT NULL CHECK(expected_workflow_version >= 1),
+    kind                       TEXT NOT NULL CHECK(kind IN (
+                                   'after_task_completed','not_before',
+                                   'raise_priority','create_prerequisite'
+                               )),
+    state                      TEXT NOT NULL CHECK(state IN (
+                                   'active','undone','superseded','undo_conflict'
+                               )),
+    research_receipt_id        TEXT NOT NULL CHECK(length(research_receipt_id) BETWEEN 1 AND 128),
+    research_document_digest   TEXT NOT NULL CHECK(length(research_document_digest)=64),
+    recommendation_digest      TEXT NOT NULL CHECK(length(recommendation_digest)=64),
+    recommendation_json        TEXT NOT NULL CHECK(length(recommendation_json)<=16384),
+    prior_priority             TEXT CHECK(prior_priority IS NULL OR prior_priority IN (
+                                   'raised','normal','lowered'
+                               )),
+    prior_priority_source      TEXT CHECK(prior_priority_source IS NULL OR prior_priority_source IN (
+                                   'reader','automation'
+                               )),
+    resulting_workflow_version INTEGER NOT NULL CHECK(resulting_workflow_version >= 1),
+    created_task_id            INTEGER REFERENCES tasks(id),
+    created_at                 TEXT NOT NULL,
+    updated_at                 TEXT NOT NULL
+);""",
+    """CREATE TABLE IF NOT EXISTS task_scheduling_conditions (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id            INTEGER NOT NULL REFERENCES tasks(id),
+    task_version       INTEGER NOT NULL CHECK(task_version >= 1),
+    kind               TEXT NOT NULL CHECK(kind IN (
+                           'after_task_completed','not_before'
+                       )),
+    depends_on_task_id INTEGER REFERENCES tasks(id),
+    not_before         TEXT,
+    state              TEXT NOT NULL CHECK(state IN (
+                           'active','satisfied','canceled','needs_review'
+                       )),
+    change_set_id      INTEGER NOT NULL REFERENCES task_scheduling_change_sets(id),
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL,
+    CHECK((kind='after_task_completed' AND depends_on_task_id IS NOT NULL
+           AND not_before IS NULL AND depends_on_task_id<>task_id)
+          OR (kind='not_before' AND depends_on_task_id IS NULL
+              AND not_before IS NOT NULL))
+);""",
+    "CREATE INDEX IF NOT EXISTS task_scheduling_conditions_active ON task_scheduling_conditions(task_id,state,kind);",
+    """CREATE TABLE IF NOT EXISTS task_scheduling_condition_events (
+    sequence     INTEGER PRIMARY KEY AUTOINCREMENT,
+    condition_id INTEGER NOT NULL REFERENCES task_scheduling_conditions(id),
+    task_id      INTEGER NOT NULL REFERENCES tasks(id),
+    kind         TEXT NOT NULL CHECK(kind IN ('created','satisfied','canceled','needs_review')),
+    state        TEXT NOT NULL CHECK(state IN ('active','satisfied','canceled','needs_review')),
+    occurred_at  TEXT NOT NULL
+);""",
+    """CREATE TRIGGER IF NOT EXISTS task_scheduling_condition_events_no_update
+BEFORE UPDATE ON task_scheduling_condition_events BEGIN
+ SELECT RAISE(ABORT, 'scheduling condition events are append-only'); END;""",
+    """CREATE TRIGGER IF NOT EXISTS task_scheduling_condition_events_no_delete
+BEFORE DELETE ON task_scheduling_condition_events BEGIN
+ SELECT RAISE(ABORT, 'scheduling condition events are append-only'); END;""",
+    """CREATE TABLE IF NOT EXISTS task_scheduling_change_events (
+    sequence      INTEGER PRIMARY KEY AUTOINCREMENT,
+    change_set_id INTEGER NOT NULL REFERENCES task_scheduling_change_sets(id),
+    task_id       INTEGER NOT NULL REFERENCES tasks(id),
+    kind          TEXT NOT NULL CHECK(kind IN ('applied','undone','undo_conflict')),
+    occurred_at   TEXT NOT NULL
+);""",
+    """CREATE TRIGGER IF NOT EXISTS task_scheduling_change_events_no_update
+BEFORE UPDATE ON task_scheduling_change_events BEGIN
+ SELECT RAISE(ABORT, 'scheduling change events are append-only'); END;""",
+    """CREATE TRIGGER IF NOT EXISTS task_scheduling_change_events_no_delete
+BEFORE DELETE ON task_scheduling_change_events BEGIN
+ SELECT RAISE(ABORT, 'scheduling change events are append-only'); END;""",
+    """CREATE TABLE IF NOT EXISTS task_scheduling_review_cards (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    change_set_id INTEGER NOT NULL UNIQUE REFERENCES task_scheduling_change_sets(id),
+    task_id       INTEGER NOT NULL REFERENCES tasks(id),
+    status        TEXT NOT NULL CHECK(status IN (
+                      'pending','delivering','delivered','resolved'
+                  )),
+    version       INTEGER NOT NULL CHECK(version >= 1),
+    resolution    TEXT CHECK(resolution IS NULL OR resolution IN ('undo','keep')),
+    claim_token_digest TEXT CHECK(
+                      claim_token_digest IS NULL OR length(claim_token_digest)=64
+                  ),
+    claim_expires_at TEXT,
+    consumer_digest TEXT CHECK(
+                      consumer_digest IS NULL OR length(consumer_digest)=64
+                  ),
+    transport     TEXT,
+    delivery_ref  TEXT,
+    delivered_at  TEXT,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    resolved_at   TEXT,
+    CHECK(
+      (status='pending' AND resolution IS NULL AND claim_token_digest IS NULL
+       AND claim_expires_at IS NULL AND consumer_digest IS NULL
+       AND transport IS NULL AND delivery_ref IS NULL AND delivered_at IS NULL
+       AND resolved_at IS NULL)
+      OR
+      (status='delivering' AND resolution IS NULL AND claim_token_digest IS NOT NULL
+       AND claim_expires_at IS NOT NULL AND consumer_digest IS NOT NULL
+       AND transport IS NULL AND delivery_ref IS NULL AND delivered_at IS NULL
+       AND resolved_at IS NULL)
+      OR
+      (status='delivered' AND resolution IS NULL AND claim_token_digest IS NULL
+       AND claim_expires_at IS NULL AND consumer_digest IS NOT NULL
+       AND transport IS NOT NULL AND delivery_ref IS NOT NULL
+       AND delivered_at IS NOT NULL AND resolved_at IS NULL)
+      OR
+      (status='resolved' AND resolution IS NOT NULL AND claim_token_digest IS NULL
+       AND claim_expires_at IS NULL AND consumer_digest IS NOT NULL
+       AND transport IS NOT NULL AND delivery_ref IS NOT NULL
+       AND delivered_at IS NOT NULL AND resolved_at IS NOT NULL)
+    )
+);""",
+    """CREATE TABLE IF NOT EXISTS task_scheduling_review_card_events (
+    sequence      INTEGER PRIMARY KEY AUTOINCREMENT,
+    card_id       INTEGER NOT NULL REFERENCES task_scheduling_review_cards(id),
+    change_set_id INTEGER NOT NULL REFERENCES task_scheduling_change_sets(id),
+    task_id       INTEGER NOT NULL REFERENCES tasks(id),
+    kind          TEXT NOT NULL CHECK(kind IN (
+                    'scheduled','delivery_claimed','delivery_expired','delivered',
+                    'delivery_failed','resolved','undo_conflict'
+                  )),
+    card_version  INTEGER NOT NULL CHECK(card_version >= 1),
+    action        TEXT CHECK(action IS NULL OR action IN ('undo','keep')),
+    occurred_at   TEXT NOT NULL
+);""",
+    """CREATE TRIGGER IF NOT EXISTS task_scheduling_review_card_events_no_update
+BEFORE UPDATE ON task_scheduling_review_card_events BEGIN
+ SELECT RAISE(ABORT, 'scheduling review card events are append-only'); END;""",
+    """CREATE TRIGGER IF NOT EXISTS task_scheduling_review_card_events_no_delete
+BEFORE DELETE ON task_scheduling_review_card_events BEGIN
+ SELECT RAISE(ABORT, 'scheduling review card events are append-only'); END;""",
+)
+
 
 # Context exhaustion is a separate terminal condition for one attempt. The
 # workflow table has a closed reason vocabulary, so admitting it requires a
@@ -5140,6 +5462,39 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 65
+            if version == 65:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    workflow_columns = {
+                        row["name"] for row in connection.execute(
+                            "PRAGMA table_info(task_execution_workflows)"
+                        )
+                    }
+                    statements = (
+                        _SCHEMA_V66 if "queue_priority_source" not in workflow_columns
+                        else _SCHEMA_V66[1:]
+                    )
+                    for statement in statements:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 66")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 66
+            if version == 66:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V67:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 67")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 67
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:
@@ -5799,12 +6154,21 @@ class CandidateInbox:
             ) and not (
                 # A synthetic historical-migration rehearsal can begin from
                 # a newer database and remove only the columns it is about to
-                # reintroduce. Steer columns arrived after every checkpoint
-                # below, so tolerate precisely those durable future suffixes.
+                # reintroduce. Steer and scheduling columns arrived after every
+                # checkpoint below, so tolerate precisely those durable future suffixes.
                 table == "task_execution_workflows"
-                and set(columns) == set(expected_columns) | {
-                    "steer_while_running", "current_run_id"}
-                and len(columns) == len(expected_columns) + 2
+                and (
+                    (
+                        set(columns) == set(expected_columns) | {
+                            "steer_while_running", "current_run_id"}
+                        and len(columns) == len(expected_columns) + 2
+                    ) or (
+                        set(columns) == set(expected_columns) | {
+                            "steer_while_running", "current_run_id",
+                            "queue_priority_source"}
+                        and len(columns) == len(expected_columns) + 3
+                    )
+                )
             ) and not (
                 table == "execution_review_cards"
                 and set(columns) == set(expected_columns) | {"steer_digest"}
