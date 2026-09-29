@@ -8,11 +8,12 @@ import json
 import math
 import sqlite3
 import urllib.request
+from collections import Counter
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Protocol, Sequence
+from typing import Mapping, Protocol, Sequence
 
 from .candidate_inbox import CandidateInbox, InboxError
 from . import task_duplicate_detection as lexical
@@ -29,13 +30,14 @@ CALIBRATION_PRECISION_FLOOR = 0.80
 #: Routes that only strengthen a pair another route found. An owner is shared
 #: by dozens of unrelated tasks, so on its own it would fill the stage-2 queue
 #: with "same person, different work" pairs.
-BOOST_ONLY_ROUTES = frozenset({"owner"})
+BOOST_ONLY_ROUTES = frozenset({"owner", "working_group"})
 
 ROUTE_WEIGHTS = {
     "words": 1.0,
     "participant": 0.2,
     "embedding": 0.8,
     "owner": 0.2,
+    "working_group": 0.2,
     "reread": 0.8,
 }
 
@@ -183,7 +185,7 @@ def comparable_digest(connection: sqlite3.Connection, task_id: int) -> str:
     row = connection.execute(
         "SELECT text,object,action,owner,owner_ref_version,owner_kind,"
         "owner_speaker_id,owner_canonical_speaker_id,owner_speaker_registry_id,"
-        "owner_provisional,owner_person_id FROM tasks WHERE id=?",
+        "owner_provisional,owner_person_id,working_group FROM tasks WHERE id=?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -392,6 +394,31 @@ def _owner_score(left: lexical.DuplicateCandidate, right: lexical.DuplicateCandi
     return None
 
 
+def _working_group_score(
+    left: lexical.DuplicateCandidate,
+    right: lexical.DuplicateCandidate,
+    *,
+    group_sizes: Mapping[str, int] | None = None,
+) -> float | None:
+    """How strongly two tasks agree on working group; None when either lacks a key.
+
+    Never a penalty: missing keys never match each other. Smaller groups provide
+    a stronger signal than large, broad groups.
+    """
+    if not left.working_group or not right.working_group:
+        return None
+    if left.working_group != right.working_group:
+        return None
+    if not group_sizes:
+        return 1.0
+    size = group_sizes.get(left.working_group, 1)
+    if size <= 5:
+        return 1.0
+    if size <= 15:
+        return 0.75
+    return 0.5
+
+
 def run(
     connection: sqlite3.Connection,
     *,
@@ -424,6 +451,7 @@ def run(
     by_id = {item.task_id: item for item in candidates}
     focus = {int(row["task_id"]) for row in queue if int(row["task_id"]) in by_id}
     weights = lexical._weights(candidates)
+    group_sizes = Counter(c.working_group for c in candidates if c.working_group)
     offers: dict[tuple[int, int], dict[str, float | None]] = {}
     considered = 0
 
@@ -463,6 +491,9 @@ def run(
             owner_score = _owner_score(left, right)
             if owner_score is not None:
                 offer(left, right, "owner", owner_score)
+            wg_score = _working_group_score(left, right, group_sizes=group_sizes)
+            if wg_score is not None:
+                offer(left, right, "working_group", wg_score)
 
     calibration: Calibration | None = None
     embedding_failed = False

@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 from foxhound import migrate_database
+from foxhound import task_duplicate_detection as lexical
 from foxhound import task_duplicate_proposals as proposals
 from foxhound import task_duplicate_stage1 as stage1
 
@@ -53,17 +54,18 @@ class StageOneTests(unittest.TestCase):
     def _task(self, task_id: int, text: str, *, kind: str = "email",
               speaker: str | None = "SPK_1",
               registry: str | None = "registry-synthetic",
-              provisional: bool = False) -> None:
+              provisional: bool = False,
+              working_group: str | None = None) -> None:
         candidate_id = f"candidate-{task_id}"
         revision = f"{task_id:064x}"
         self.connection.execute(
             "INSERT INTO tasks(id,status,text,version,created_at,updated_at,"
             "owner_ref_version,owner_kind,owner_speaker_id,"
             "owner_canonical_speaker_id,owner_speaker_registry_id,"
-            "owner_pinned,owner_provisional) VALUES(?, 'open', ?, 1, ?, ?,"
-            "1,'person',?,?,?,0,?)",
+            "owner_pinned,owner_provisional,working_group) VALUES(?, 'open', ?, 1, ?, ?,"
+            "1,'person',?,?,?,0,?,?)",
             (task_id, text, NOW, NOW, speaker, speaker, registry,
-             int(provisional)),
+             int(provisional), working_group),
         )
         self.connection.execute(
             "INSERT INTO candidate_inbox(candidate_id,source_system,source_kind,"
@@ -400,3 +402,81 @@ class OwnerSignalTests(StageOneTests):
         self.assertGreater(
             agreeing, stage1._combined_score({"words": 0.6, "embedding": 0.96})
         )
+
+
+class WorkingGroupSignalTests(StageOneTests):
+    """Working group strengthens a pair; it never creates one alone."""
+
+    def _routes(self) -> dict[tuple[int, int], dict[str, float]]:
+        found: dict[tuple[int, int], dict[str, float]] = {}
+        for row in self.connection.execute(
+            "SELECT c.left_task_id,c.right_task_id,r.route,r.score "
+            "FROM task_duplicate_candidates AS c "
+            "JOIN task_duplicate_candidate_routes AS r ON r.candidate_id=c.id"
+        ):
+            found.setdefault((row[0], row[1]), {})[row[2]] = row[3]
+        return found
+
+    def test_equal_keys_offer_working_group_route(self) -> None:
+        key = "wg_" + "a" * 32
+        self._task(1, "Prepare the synthetic rollout checklist", working_group=key)
+        self._task(2, "Draft the synthetic rollout checklist", kind="meeting", working_group=key)
+        stage1.enqueue(self.connection, 1, now=NOW)
+        stage1.run(self.connection, now=NOW, backend=FailingEmbeddings())
+        routes = self._routes()[(1, 2)]
+        self.assertIn("working_group", routes)
+        self.assertGreater(routes["working_group"], 0.0)
+
+    def test_missing_keys_never_match(self) -> None:
+        key = "wg_" + "a" * 32
+        self._task(1, "Prepare the synthetic rollout checklist", working_group=key)
+        self._task(2, "Draft the synthetic rollout checklist", kind="meeting", working_group=None)
+        stage1.enqueue(self.connection, 1, now=NOW)
+        stage1.run(self.connection, now=NOW, backend=FailingEmbeddings())
+        routes = self._routes()[(1, 2)]
+        self.assertNotIn("working_group", routes)
+
+    def test_distinct_keys_never_match(self) -> None:
+        key1 = "wg_" + "a" * 32
+        key2 = "wg_" + "b" * 32
+        self._task(1, "Prepare the synthetic rollout checklist", working_group=key1)
+        self._task(2, "Draft the synthetic rollout checklist", kind="meeting", working_group=key2)
+        stage1.enqueue(self.connection, 1, now=NOW)
+        stage1.run(self.connection, now=NOW, backend=FailingEmbeddings())
+        routes = self._routes()[(1, 2)]
+        self.assertNotIn("working_group", routes)
+
+    def test_a_shared_working_group_alone_queues_nothing(self) -> None:
+        key = "wg_" + "a" * 32
+        self._task(1, "Book the synthetic venue for the spring workshop",
+                   speaker=None, registry=None, working_group=key)
+        self._task(2, "Review the fictional grant budget spreadsheet",
+                   kind="meeting", speaker=None, registry=None, working_group=key)
+        stage1.enqueue(self.connection, 1, now=NOW)
+        stage1.run(self.connection, now=NOW, backend=FailingEmbeddings())
+        self.assertEqual(self._routes(), {})
+
+    def test_large_group_pair_does_not_outrank_independent_signals(self) -> None:
+        # A large group has score 0.5 with weight 0.2
+        large_group_score = stage1._combined_score(
+            {"words": 0.5, "working_group": 0.5}
+        )
+        independent_signals = stage1._combined_score(
+            {"words": 0.5, "owner": 1.0}
+        )
+        self.assertGreater(independent_signals, large_group_score)
+
+    def test_group_size_weighting_favors_smaller_groups(self) -> None:
+        small_score = stage1._working_group_score(
+            lexical.DuplicateCandidate(1, "text", 1, "open", None, "email", "2030-01-01", "rec", 1, "person", None, None, None, False, working_group="wg_small"),
+            lexical.DuplicateCandidate(2, "text", 1, "open", None, "email", "2030-01-01", "rec", 1, "person", None, None, None, False, working_group="wg_small"),
+            group_sizes={"wg_small": 3},
+        )
+        large_score = stage1._working_group_score(
+            lexical.DuplicateCandidate(3, "text", 1, "open", None, "email", "2030-01-01", "rec", 1, "person", None, None, None, False, working_group="wg_large"),
+            lexical.DuplicateCandidate(4, "text", 1, "open", None, "email", "2030-01-01", "rec", 1, "person", None, None, None, False, working_group="wg_large"),
+            group_sizes={"wg_large": 30},
+        )
+        self.assertEqual(small_score, 1.0)
+        self.assertEqual(large_score, 0.5)
+        self.assertGreater(small_score, large_score)

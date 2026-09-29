@@ -44,7 +44,10 @@ _SYSTEM = (
     "and a short exact excerpt from that document. Same means one piece of "
     "work represented twice; related work remains independently actionable. "
     "Owners are unreliable hints: agreement supports \"same\", disagreement is "
-    "weak evidence against. Keep the verdict grounded in cited knowledge."
+    "weak evidence against. Working group agreement (same_working_group: true, "
+    "false, or unknown) is supporting context: tasks in the same working group "
+    "often address related commitments, but it is not proof of duplication. "
+    "Keep the verdict grounded in cited knowledge."
 )
 
 
@@ -66,6 +69,7 @@ class TaskSnapshot:
     text: str = field(repr=False)
     owner: str | None = field(repr=False)
     owner_reliability: str = "unknown"
+    working_group: str | None = field(default=None, repr=False)
     due: str | None = None
     object: str | None = field(default=None, repr=False)
     action: str | None = None
@@ -79,6 +83,7 @@ class CandidatePair:
     left: TaskSnapshot
     right: TaskSnapshot
     routes: dict[str, float | None] = field(default_factory=dict)
+    same_working_group: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -181,6 +186,7 @@ class LocalVerificationAgent:
         payload = {
             "tasks": [_task_document(pair.left), _task_document(pair.right)],
             "routes": pair.routes,
+            "same_working_group": pair.same_working_group,
             "evidence": [
                 {
                     "document_id": item.id,
@@ -445,19 +451,33 @@ def _pair(connection: sqlite3.Connection, candidate_id: int) -> CandidatePair:
     ).fetchone()
     if row is None:
         raise VerificationError("candidate pair is unavailable")
+    left_id = int(row["left_task_id"] if isinstance(row, sqlite3.Row) else row[3])
+    left_version = int(row["left_task_version"] if isinstance(row, sqlite3.Row) else row[1])
+    right_id = int(row["right_task_id"] if isinstance(row, sqlite3.Row) else row[4])
+    right_version = int(row["right_task_version"] if isinstance(row, sqlite3.Row) else row[2])
     route_rows = connection.execute(
         "SELECT route,score FROM task_duplicate_candidate_routes WHERE candidate_id=?",
         (candidate_id,),
     ).fetchall()
     routes = {
-        r["route"]: None if r["score"] is None else float(r["score"])
+        (r["route"] if isinstance(r, sqlite3.Row) else r[0]): (
+            None if (r["score"] if isinstance(r, sqlite3.Row) else r[1]) is None
+            else float(r["score"] if isinstance(r, sqlite3.Row) else r[1])
+        )
         for r in route_rows
     }
+    left_task = _task(connection, left_id, left_version)
+    right_task = _task(connection, right_id, right_version)
+    if left_task.working_group and right_task.working_group:
+        same_wg = "true" if left_task.working_group == right_task.working_group else "false"
+    else:
+        same_wg = "unknown"
     return CandidatePair(
         candidate_id,
-        _task(connection, int(row["left_task_id"]), int(row["left_task_version"])),
-        _task(connection, int(row["right_task_id"]), int(row["right_task_version"])),
+        left_task,
+        right_task,
         routes=routes,
+        same_working_group=same_wg,
     )
 
 
@@ -469,7 +489,7 @@ def _task(
         "task.action,task.created_at,task.updated_at,inbox.source_kind,"
         "task.owner_ref_version,task.owner_kind,task.owner_provisional,"
         "task.owner_speaker_id,task.owner_canonical_speaker_id,"
-        "task.owner_person_id "
+        "task.owner_person_id,task.working_group "
         "FROM tasks AS task JOIN task_candidate_bindings AS binding "
         "ON binding.task_id=task.id AND binding.relation='accepted' "
         "JOIN candidate_inbox AS inbox ON inbox.candidate_id=binding.candidate_id "
@@ -501,6 +521,7 @@ def _task(
         text=str(row["text"]),
         owner=row["owner"],
         owner_reliability=reliability,
+        working_group=row["working_group"],
         due=row["due"],
         object=row["object"],
         action=row["action"],
