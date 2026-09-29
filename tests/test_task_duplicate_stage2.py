@@ -152,12 +152,100 @@ class StageTwoTests(unittest.TestCase):
         
         # Check system prompt
         self.assertIn("owners are unreliable hints", payload["messages"][0]["content"].lower())
+        self.assertIn("same_working_group", payload["messages"][0]["content"])
+        self.assertIn(
+            "not evidence against duplication",
+            payload["messages"][0]["content"].lower(),
+        )
         
         # Check user prompt
         user_msg = json.loads(payload["messages"][1]["content"])
         self.assertEqual(user_msg["routes"], {"words": 0.9, "owner": 0.5})
         self.assertEqual(user_msg["tasks"][0]["owner_reliability"], "confirmed")
         self.assertEqual(user_msg["tasks"][1]["owner_reliability"], "provisional")
+        self.assertEqual(user_msg["same_working_group"], "unknown")
+
+    def test_stage2_same_working_group_values_and_key_privacy(self) -> None:
+        key_alpha = "wg_" + "a" * 32
+        key_beta = "wg_" + "b" * 32
+
+        class Opener:
+            def __init__(self):
+                self.requests = []
+            def open(self, req, timeout=0):
+                self.requests.append(req)
+                import io
+                reply = json.dumps({"choices": [{"message": {"content": json.dumps({"verdict": "same", "confidence": 0.9, "citations": [{"document_id": "doc", "locator": "path", "excerpt": "excerpt"}]})}}], "usage": {"prompt_tokens": 10, "completion_tokens": 5}}).encode("utf-8")
+                return io.BytesIO(reply)
+
+        class Knowledge:
+            def search(self, *args, **kwargs):
+                return KnowledgeSearchResult((KnowledgeLayer("kb", 1, False, (KnowledgeDocument("doc", "path", "excerpt"),)),))
+
+        # 1. Matching keys -> same_working_group: "true"
+        pair_match = stage2.CandidatePair(
+            candidate_id=1,
+            left=stage2.TaskSnapshot(id=1, version=1, source_kind="email", text="A", owner="Person", working_group=key_alpha),
+            right=stage2.TaskSnapshot(id=2, version=1, source_kind="email", text="B", owner="Person", working_group=key_alpha),
+            same_working_group="true",
+        )
+        agent = stage2.LocalVerificationAgent(model="synthetic", opener=Opener())
+        agent.verify(pair_match, Knowledge(), timeout=10.0)
+        req_data = agent.opener.requests[0].data.decode("utf-8")
+        payload = json.loads(req_data)
+        user_msg = json.loads(payload["messages"][1]["content"])
+        self.assertEqual(user_msg["same_working_group"], "true")
+
+        # Must NEVER contain the key string or expose working_group on task cards
+        self.assertNotIn(key_alpha, req_data)
+        self.assertNotIn("working_group", user_msg["tasks"][0])
+        self.assertNotIn("working_group", user_msg["tasks"][1])
+
+        # 2. Distinct keys -> same_working_group: "false"
+        pair_diff = stage2.CandidatePair(
+            candidate_id=2,
+            left=stage2.TaskSnapshot(id=1, version=1, source_kind="email", text="A", owner="Person", working_group=key_alpha),
+            right=stage2.TaskSnapshot(id=2, version=1, source_kind="email", text="B", owner="Person", working_group=key_beta),
+            same_working_group="false",
+        )
+        agent2 = stage2.LocalVerificationAgent(model="synthetic", opener=Opener())
+        agent2.verify(pair_diff, Knowledge(), timeout=10.0)
+        payload2 = json.loads(agent2.opener.requests[0].data.decode("utf-8"))
+        user_msg2 = json.loads(payload2["messages"][1]["content"])
+        self.assertEqual(user_msg2["same_working_group"], "false")
+
+        # 3. Missing keys -> same_working_group: "unknown"
+        pair_unknown = stage2.CandidatePair(
+            candidate_id=3,
+            left=stage2.TaskSnapshot(id=1, version=1, source_kind="email", text="A", owner="Person", working_group=None),
+            right=stage2.TaskSnapshot(id=2, version=1, source_kind="email", text="B", owner="Person", working_group=key_alpha),
+            same_working_group="unknown",
+        )
+        agent3 = stage2.LocalVerificationAgent(model="synthetic", opener=Opener())
+        agent3.verify(pair_unknown, Knowledge(), timeout=10.0)
+        payload3 = json.loads(agent3.opener.requests[0].data.decode("utf-8"))
+        user_msg3 = json.loads(payload3["messages"][1]["content"])
+        self.assertEqual(user_msg3["same_working_group"], "unknown")
+
+    def test_pair_construction_determines_same_working_group(self) -> None:
+        candidate_id = self._basic_pair()
+        key_shared = "wg_" + "a" * 32
+        with sqlite3.connect(self.database) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("UPDATE tasks SET working_group=? WHERE id IN (1, 2)", (key_shared,))
+            conn.commit()
+            pair = stage2._pair(conn, candidate_id)
+            self.assertEqual(pair.same_working_group, "true")
+
+            conn.execute("UPDATE tasks SET working_group=? WHERE id=2", ("wg_" + "b" * 32,))
+            conn.commit()
+            pair = stage2._pair(conn, candidate_id)
+            self.assertEqual(pair.same_working_group, "false")
+
+            conn.execute("UPDATE tasks SET working_group=NULL WHERE id=2")
+            conn.commit()
+            pair = stage2._pair(conn, candidate_id)
+            self.assertEqual(pair.same_working_group, "unknown")
 
     def test_a_person_with_no_identity_is_not_a_confirmed_owner(self) -> None:
         """A bare name with no speaker or person id confirms nothing."""

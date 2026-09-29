@@ -8,11 +8,12 @@ import json
 import math
 import sqlite3
 import urllib.request
+from collections import Counter
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Protocol, Sequence
+from typing import Mapping, Protocol, Sequence
 
 from .candidate_inbox import CandidateInbox, InboxError
 from . import task_duplicate_detection as lexical
@@ -29,13 +30,14 @@ CALIBRATION_PRECISION_FLOOR = 0.80
 #: Routes that only strengthen a pair another route found. An owner is shared
 #: by dozens of unrelated tasks, so on its own it would fill the stage-2 queue
 #: with "same person, different work" pairs.
-BOOST_ONLY_ROUTES = frozenset({"owner"})
+BOOST_ONLY_ROUTES = frozenset({"owner", "working_group"})
 
 ROUTE_WEIGHTS = {
     "words": 1.0,
     "participant": 0.2,
     "embedding": 0.8,
     "owner": 0.2,
+    "working_group": 0.2,
     "reread": 0.8,
 }
 
@@ -183,7 +185,7 @@ def comparable_digest(connection: sqlite3.Connection, task_id: int) -> str:
     row = connection.execute(
         "SELECT text,object,action,owner,owner_ref_version,owner_kind,"
         "owner_speaker_id,owner_canonical_speaker_id,owner_speaker_registry_id,"
-        "owner_provisional,owner_person_id FROM tasks WHERE id=?",
+        "owner_provisional,owner_person_id,working_group FROM tasks WHERE id=?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -392,6 +394,31 @@ def _owner_score(left: lexical.DuplicateCandidate, right: lexical.DuplicateCandi
     return None
 
 
+def _working_group_score(
+    left: lexical.DuplicateCandidate,
+    right: lexical.DuplicateCandidate,
+    *,
+    group_sizes: Mapping[str, int] | None = None,
+) -> float | None:
+    """How strongly two tasks agree on working group; None when either lacks a key.
+
+    Never a penalty: missing keys never match each other. Smaller groups provide
+    a stronger signal than large, broad groups.
+    """
+    if not left.working_group or not right.working_group:
+        return None
+    if left.working_group != right.working_group:
+        return None
+    if not group_sizes:
+        return 1.0
+    size = group_sizes.get(left.working_group, 1)
+    if size <= 5:
+        return 1.0
+    if size <= 15:
+        return 0.75
+    return 0.5
+
+
 def run(
     connection: sqlite3.Connection,
     *,
@@ -424,6 +451,14 @@ def run(
     by_id = {item.task_id: item for item in candidates}
     focus = {int(row["task_id"]) for row in queue if int(row["task_id"]) in by_id}
     weights = lexical._weights(candidates)
+    # Size describes the active workload in a group. Historical closed tasks
+    # remain candidates briefly so an open task can be compared with a recent
+    # closure, but they must not permanently dilute a small active group.
+    group_sizes = Counter(
+        c.working_group
+        for c in candidates
+        if c.working_group and c.task_status == "open"
+    )
     offers: dict[tuple[int, int], dict[str, float | None]] = {}
     considered = 0
 
@@ -463,6 +498,9 @@ def run(
             owner_score = _owner_score(left, right)
             if owner_score is not None:
                 offer(left, right, "owner", owner_score)
+            wg_score = _working_group_score(left, right, group_sizes=group_sizes)
+            if wg_score is not None:
+                offer(left, right, "working_group", wg_score)
 
     calibration: Calibration | None = None
     embedding_failed = False
@@ -485,6 +523,47 @@ def run(
         key: routes for key, routes in offers.items()
         if set(routes) - BOOST_ONLY_ROUTES
     }
+    # Enrichment can change boost-only signals without advancing a task's
+    # reader-visible version. Re-evaluation must therefore replace, not only
+    # add to, an existing queued pair's routes and score. Otherwise a removed
+    # owner or working-group agreement boosts that pair forever.
+    existing_candidates: dict[tuple[int, int], int] = {}
+    settled_keys: set[tuple[int, int]] = set()
+    for key, routes in offers.items():
+        left, right = by_id[key[0]], by_id[key[1]]
+        row = connection.execute(
+            "SELECT candidate.id,(verification.candidate_id IS NOT NULL) AS verified "
+            "FROM task_duplicate_candidates AS candidate "
+            "LEFT JOIN task_duplicate_verifications AS verification "
+            "ON verification.candidate_id=candidate.id WHERE "
+            "candidate.left_task_id=? AND candidate.right_task_id=? "
+            "AND candidate.left_task_version=? AND candidate.right_task_version=?",
+            (left.task_id, right.task_id, left.task_version, right.task_version),
+        ).fetchone()
+        if row is None:
+            continue
+        candidate_id = int(row["id"])
+        existing_candidates[key] = candidate_id
+        # A verification is an immutable record of the context the agent saw.
+        # Do not rewrite its supporting routes after the fact.
+        if bool(row["verified"]):
+            settled_keys.add(key)
+            continue
+        connection.execute(
+            "UPDATE task_duplicate_candidates SET rank_score=?,updated_at=? "
+            "WHERE id=?",
+            (_combined_score(routes), now, candidate_id),
+        )
+        connection.execute(
+            "DELETE FROM task_duplicate_candidate_routes WHERE candidate_id=?",
+            (candidate_id,),
+        )
+        connection.executemany(
+            "INSERT INTO task_duplicate_candidate_routes(candidate_id,route,score) "
+            "VALUES(?,?,?)",
+            ((candidate_id, route, score) for route, score in sorted(routes.items())),
+        )
+    offers = {key: routes for key, routes in offers.items() if key not in settled_keys}
     offered = sorted(
         offers,
         key=lambda key: (
@@ -506,31 +585,24 @@ def run(
     for key in ranked:
         left, right = by_id[key[0]], by_id[key[1]]
         rank_score = _combined_score(offers[key])
-        existing = connection.execute(
-            "SELECT id FROM task_duplicate_candidates WHERE "
-            "left_task_id=? AND right_task_id=? AND left_task_version=? "
-            "AND right_task_version=?",
-            (left.task_id, right.task_id, left.task_version, right.task_version),
-        ).fetchone()
-        cursor = connection.execute(
-            "INSERT INTO task_duplicate_candidates("
-            "left_task_id,right_task_id,left_task_version,right_task_version,"
-            "rank_score,state,created_at,updated_at) VALUES(?,?,?,?,?,'queued',?,?) "
-            "ON CONFLICT(left_task_id,right_task_id,left_task_version,right_task_version) "
-            "DO UPDATE SET rank_score=MAX(rank_score,excluded.rank_score),"
-            "updated_at=excluded.updated_at RETURNING id",
-            (left.task_id, right.task_id, left.task_version, right.task_version,
-             rank_score, now, now),
-        )
-        candidate_id = int(cursor.fetchone()[0])
-        for route, score in sorted(offers[key].items()):
-            connection.execute(
-                "INSERT INTO task_duplicate_candidate_routes(candidate_id,route,score) "
-                "VALUES(?,?,?) ON CONFLICT(candidate_id,route) DO UPDATE SET "
-                "score=MAX(score,excluded.score)",
-                (candidate_id, route, score),
+        candidate_id = existing_candidates.get(key)
+        if candidate_id is None:
+            cursor = connection.execute(
+                "INSERT INTO task_duplicate_candidates("
+                "left_task_id,right_task_id,left_task_version,right_task_version,"
+                "rank_score,state,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,'queued',?,?) RETURNING id",
+                (left.task_id, right.task_id, left.task_version,
+                 right.task_version, rank_score, now, now),
             )
-        if existing is not None:
+            candidate_id = int(cursor.fetchone()[0])
+            for route, score in sorted(offers[key].items()):
+                connection.execute(
+                    "INSERT INTO task_duplicate_candidate_routes("
+                    "candidate_id,route,score) VALUES(?,?,?)",
+                    (candidate_id, route, score),
+                )
+        if key in existing_candidates:
             unchanged += 1
         else:
             queued += 1

@@ -111,6 +111,7 @@ class DuplicateCandidate:
     owner_provisional: bool
     owner_person_id: str | None = None
     object: str | None = None
+    working_group: str | None = None
     participants: tuple[
         tuple[str, str | None, str | None, str | None, str | None], ...
     ] = ()
@@ -371,7 +372,7 @@ def _candidates(connection: sqlite3.Connection) -> Iterable[DuplicateCandidate]:
         "c.source_record_id,"
         "t.owner_ref_version,t.owner_kind,t.owner_speaker_id,"
         "t.owner_canonical_speaker_id,t.owner_speaker_registry_id,"
-        "t.owner_provisional,t.owner_person_id "
+        "t.owner_provisional,t.owner_person_id,t.working_group "
         "FROM tasks AS t "
         "JOIN task_candidate_bindings AS b ON b.task_id=t.id "
         "JOIN candidate_inbox AS c ON c.candidate_id=b.candidate_id "
@@ -412,6 +413,7 @@ def _candidates(connection: sqlite3.Connection) -> Iterable[DuplicateCandidate]:
             owner_provisional=bool(row["owner_provisional"]),
             owner_person_id=row["owner_person_id"],
             object=row["object"],
+            working_group=row["working_group"],
             participants=tuple(participants.get(int(row["id"]), [])),
             terms=frozenset(_terms(text)),
             identifiers=_identifiers(text),
