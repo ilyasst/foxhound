@@ -19,14 +19,16 @@ signals. It writes versioned candidate pairs for Stage 2, with both a per-task
 top-K bound and a per-run pair bound. Only Stage 2 may turn a verified same-task
 verdict into a reader proposal.
 
-Source re-read is supporting-only, like owner and working-group agreement.
-Several independent actions routinely originate in one record, so a shared
-record may strengthen a pair found by words, embeddings, or participants but
-cannot create an eligible pair alone. Stage 2 also applies this rule while
-claiming so candidates written by an older release cannot bypass it. A bounded,
-dry-run-first reconciliation command recalculates stored scores and removes
-unverified candidates that carry only supporting routes; verified evidence and
-reader history are outside its write set.
+Source re-read, owner, working-group, and participant agreement are
+supporting-only signals. Several independent actions routinely originate in one
+record, involve the same participant or owner, or belong to the same working
+group. These shared contexts may strengthen an independently discovered pair
+found by words or embeddings, but cannot create or queue an eligible pair alone.
+Stage 2 also applies this rule while claiming so candidates written by an older
+release cannot bypass it. A bounded, dry-run-first reconciliation command
+recalculates stored scores and removes unverified candidates that carry only
+supporting routes; verified evidence and reader history are outside its write
+set.
 
 The embedding route uses `intfloat/multilingual-e5-base`, served by the
 fleet's loopback caproute gateway as the `embedding-multilingual` capability.

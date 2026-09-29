@@ -118,8 +118,25 @@ class ReconcileTests(unittest.TestCase):
             "SELECT 1 FROM task_duplicate_candidates WHERE id=?", (candidate_id,)
         ).fetchone())
 
+    def test_apply_removes_participant_only_candidate(self) -> None:
+        participant_only = self._candidate(1, 2, {"participant": 0.9})
+        words_and_participant = self._candidate(3, 4, {"words": 0.6, "participant": 0.9})
+
+        result = reconcile.run_database(self.database, apply=True)
+
+        self.assertEqual(result.supporting_only_removed, 1)
+        self.assertIsNone(self.connection.execute(
+            "SELECT 1 FROM task_duplicate_candidates WHERE id=?", (participant_only,)
+        ).fetchone())
+        self.assertIsNone(self.connection.execute(
+            "SELECT 1 FROM task_duplicate_candidate_routes WHERE candidate_id=?", (participant_only,)
+        ).fetchone())
+        self.assertIsNotNone(self.connection.execute(
+            "SELECT 1 FROM task_duplicate_candidates WHERE id=?", (words_and_participant,)
+        ).fetchone())
+
     def test_verified_history_is_outside_the_write_set(self) -> None:
-        candidate_id = self._candidate(1, 2, {"reread": 1.0})
+        candidate_id = self._candidate(1, 2, {"reread": 1.0, "participant": 0.9})
         self.connection.execute(
             "INSERT INTO task_duplicate_verifications("
             "candidate_id,verdict,confidence,citations_json,latency_ms,"

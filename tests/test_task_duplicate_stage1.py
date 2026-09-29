@@ -311,7 +311,7 @@ class StageOneTests(unittest.TestCase):
 
     def test_person_identity_matches_across_source_registries(self) -> None:
         self._task(1, "Coordinate the synthetic sample", kind="meeting")
-        self._task(2, "Discuss an unrelated fictional topic", kind="email")
+        self._task(2, "Coordinate the synthetic sample checklist", kind="email")
         person_id = "person_" + "c" * 32
         self.connection.executemany(
             "INSERT INTO task_participants(task_id,position,kind,speaker_id,"
@@ -332,6 +332,7 @@ class StageOneTests(unittest.TestCase):
             "SELECT route FROM task_duplicate_candidate_routes"
         ).fetchall()
         self.assertIn("participant", {row["route"] for row in routes})
+        self.assertIn("words", {row["route"] for row in routes})
         self.assertEqual(result.embedding_retries, 1)
 
 
@@ -587,3 +588,125 @@ class RereadSignalTests(StageOneTests):
         }
         self.assertIn("words", routes)
         self.assertIn("reread", routes)
+
+
+class ParticipantSignalTests(StageOneTests):
+    """Participant agreement strengthens a pair; it never creates one alone."""
+
+    def _participant(
+        self,
+        task_id: int,
+        *,
+        person_id: str | None = None,
+        speaker_id: str | None = "SPK_1",
+        registry: str | None = "registry-main",
+    ) -> None:
+        if speaker_id is None:
+            registry = None
+        self.connection.execute(
+            "INSERT INTO task_participants(task_id,position,kind,speaker_id,"
+            "canonical_speaker_id,speaker_registry_id,person_id) "
+            "VALUES(?,0,'person',?,?,?,?)",
+            (task_id, speaker_id, speaker_id, registry, person_id),
+        )
+
+    def test_participant_alone_queues_nothing(self) -> None:
+        self._task(1, "Book the synthetic workshop venue", kind="meeting")
+        self._task(2, "Order fictional laboratory supplies", kind="meeting")
+        self._participant(1, person_id="person_" + "a" * 32)
+        self._participant(2, person_id="person_" + "a" * 32)
+        stage1.enqueue(self.connection, 1, now=NOW)
+
+        stage1.run(self.connection, now=NOW, backend=FailingEmbeddings())
+
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT count(*) FROM task_duplicate_candidates"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_participant_strengthens_an_independent_route(self) -> None:
+        self._task(1, "Review the synthetic rollout checklist alpha", kind="meeting")
+        self._task(2, "Draft the synthetic rollout checklist beta", kind="meeting")
+        stage1.enqueue(self.connection, 1, now=NOW)
+        stage1.run(self.connection, now=NOW, backend=FailingEmbeddings())
+        score_without = self.connection.execute(
+            "SELECT rank_score FROM task_duplicate_candidates WHERE left_task_id=1 AND right_task_id=2"
+        ).fetchone()[0]
+
+        self._participant(1, person_id="person_" + "a" * 32)
+        self._participant(2, person_id="person_" + "a" * 32)
+        stage1.enqueue(self.connection, 1, now=NOW)
+        stage1.run(self.connection, now=NOW, backend=FailingEmbeddings())
+
+        routes = {
+            row[0] for row in self.connection.execute(
+                "SELECT route FROM task_duplicate_candidate_routes"
+            )
+        }
+        self.assertIn("words", routes)
+        self.assertIn("participant", routes)
+        score_with = self.connection.execute(
+            "SELECT rank_score FROM task_duplicate_candidates WHERE left_task_id=1 AND right_task_id=2"
+        ).fetchone()[0]
+        self.assertGreater(score_with, score_without)
+
+    def test_different_or_missing_participant_is_neutral(self) -> None:
+        # Task 1 & 2 have different participants; Task 3 & 4 have missing participants.
+        # Both pairs have identical wording overlap and should yield the exact same score.
+        self._task(1, "Review the synthetic weekly report checklist", kind="meeting")
+        self._task(2, "Draft the synthetic weekly report checklist", kind="meeting")
+        self._participant(1, person_id="person_" + "a" * 32)
+        self._participant(2, person_id="person_" + "b" * 32)
+
+        self._task(3, "Review the synthetic weekly report checklist", kind="teams")
+        self._task(4, "Draft the synthetic weekly report checklist", kind="teams")
+
+        stage1.enqueue(self.connection, 1, now=NOW)
+        stage1.enqueue(self.connection, 3, now=NOW)
+
+        stage1.run(self.connection, now=NOW, backend=FailingEmbeddings())
+
+        scores = dict(self.connection.execute(
+            "SELECT left_task_id||'-'||right_task_id, rank_score "
+            "FROM task_duplicate_candidates"
+        ).fetchall())
+        self.assertEqual(scores["1-2"], scores["3-4"])
+
+    def test_missing_or_different_owner_and_working_group_are_neutral(self) -> None:
+        # Task 1 & 2 have different owners and working groups.
+        # Task 3 & 4 have missing owners and working groups.
+        # Neither pair should be penalized or vetoed; both should have the exact same score.
+        self._task(
+            1, "Review the synthetic deployment guide", kind="meeting",
+            speaker="SPK_10", registry="reg-1",
+            working_group="wg_" + "1" * 32,
+        )
+        self._task(
+            2, "Draft the synthetic deployment guide", kind="meeting",
+            speaker="SPK_20", registry="reg-1",
+            working_group="wg_" + "2" * 32,
+        )
+
+        self._task(
+            3, "Review the synthetic deployment guide", kind="teams",
+            speaker=None, registry=None, working_group=None,
+        )
+        self._task(
+            4, "Draft the synthetic deployment guide", kind="teams",
+            speaker=None, registry=None, working_group=None,
+        )
+
+        stage1.enqueue(self.connection, 1, now=NOW)
+        stage1.enqueue(self.connection, 3, now=NOW)
+
+        stage1.run(self.connection, now=NOW, backend=FailingEmbeddings())
+
+        scores = dict(self.connection.execute(
+            "SELECT left_task_id||'-'||right_task_id, rank_score "
+            "FROM task_duplicate_candidates"
+        ).fetchall())
+        self.assertIn("1-2", scores)
+        self.assertIn("3-4", scores)
+        self.assertEqual(scores["1-2"], scores["3-4"])

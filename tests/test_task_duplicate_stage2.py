@@ -158,8 +158,7 @@ class StageTwoTests(unittest.TestCase):
         payload = json.loads(req.data.decode("utf-8"))
         
         # Check system prompt
-        self.assertIn("owners are unreliable hints", payload["messages"][0]["content"].lower())
-        self.assertIn("same_working_group", payload["messages"][0]["content"])
+        self.assertIn("supporting context only", payload["messages"][0]["content"].lower())
         self.assertIn(
             "not evidence against duplication",
             payload["messages"][0]["content"].lower(),
@@ -409,18 +408,22 @@ class StageTwoTests(unittest.TestCase):
         self._task(1, "Prepare the synthetic workshop notes", kind="meeting")
         self._task(2, "Order fictional laboratory supplies", kind="meeting")
         supporting_only = self._pair(1, 2, routes=("reread",))
-        self._task(3, "Prepare the synthetic workshop summary", kind="email")
-        independent = self._pair(1, 3, rank_score=0.4, routes=("words",))
+        self._task(3, "Synthesise laboratory equipment requests", kind="teams")
+        self._task(4, "Check equipment inventory records", kind="email")
+        participant_only = self._pair(3, 4, routes=("participant",))
+        self._task(5, "Prepare the synthetic workshop summary", kind="email")
+        independent = self._pair(1, 5, rank_score=0.4, routes=("words",))
         agent = FakeAgent("different")
 
         result = stage2.run_database(
             self.database, agent=agent, knowledge=FakeKnowledge(), now=NOW,
-            limit=2,
+            limit=3,
         )
 
         self.assertEqual(result.pairs_claimed, 1)
         self.assertEqual(agent.calls, [independent])
         self.assertNotEqual(supporting_only, independent)
+        self.assertNotEqual(participant_only, independent)
 
     def test_daily_budget_stops_the_pass(self) -> None:
         self._task(1, "Synthetic task one", kind="meeting")
