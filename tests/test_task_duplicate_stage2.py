@@ -106,7 +106,8 @@ class StageTwoTests(unittest.TestCase):
             (candidate_id, revision, task_id, NOW),
         )
 
-    def _pair(self, left: int, right: int, *, rank_score: float = 0.9) -> int:
+    def _pair(self, left: int, right: int, *, rank_score: float = 0.9,
+              routes: tuple[str, ...] = ("words",)) -> int:
         cursor = self.connection.execute(
             "INSERT INTO task_duplicate_candidates("
             "left_task_id,right_task_id,left_task_version,right_task_version,"
@@ -114,8 +115,14 @@ class StageTwoTests(unittest.TestCase):
             "VALUES(?,?,1,1,?,'queued',?,?)",
             (left, right, rank_score, NOW, NOW),
         )
+        candidate_id = int(cursor.lastrowid)
+        self.connection.executemany(
+            "INSERT INTO task_duplicate_candidate_routes(candidate_id,route,score) "
+            "VALUES(?,?,?)",
+            ((candidate_id, route, 1.0) for route in routes),
+        )
         self.connection.commit()
-        return int(cursor.lastrowid)
+        return candidate_id
 
     def _basic_pair(self) -> int:
         self._task(1, "Prepare the synthetic rollout checklist", kind="meeting")
@@ -398,6 +405,23 @@ class StageTwoTests(unittest.TestCase):
         self.assertLess(weak, strong)
         self.assertEqual(agent.calls, [strong])
 
+    def test_supporting_only_legacy_candidate_is_not_claimed(self) -> None:
+        self._task(1, "Prepare the synthetic workshop notes", kind="meeting")
+        self._task(2, "Order fictional laboratory supplies", kind="meeting")
+        supporting_only = self._pair(1, 2, routes=("reread",))
+        self._task(3, "Prepare the synthetic workshop summary", kind="email")
+        independent = self._pair(1, 3, rank_score=0.4, routes=("words",))
+        agent = FakeAgent("different")
+
+        result = stage2.run_database(
+            self.database, agent=agent, knowledge=FakeKnowledge(), now=NOW,
+            limit=2,
+        )
+
+        self.assertEqual(result.pairs_claimed, 1)
+        self.assertEqual(agent.calls, [independent])
+        self.assertNotEqual(supporting_only, independent)
+
     def test_daily_budget_stops_the_pass(self) -> None:
         self._task(1, "Synthetic task one", kind="meeting")
         self._task(2, "Synthetic task two", kind="email")
@@ -466,12 +490,17 @@ class StageTwoTests(unittest.TestCase):
                 "UPDATE tasks SET text=?,version=2,updated_at=? WHERE id=1",
                 ("Prepare the revised synthetic checklist", NOW),
             )
-            connection.execute(
+            revised_cursor = connection.execute(
                 "INSERT INTO task_duplicate_candidates("
                 "left_task_id,right_task_id,left_task_version,right_task_version,"
                 "rank_score,state,created_at,updated_at) "
                 "VALUES(1,2,2,1,0.95,'queued',?,?)",
                 (NOW, NOW),
+            )
+            connection.execute(
+                "INSERT INTO task_duplicate_candidate_routes("
+                "candidate_id,route,score) VALUES(?,'words',0.9)",
+                (int(revised_cursor.lastrowid),),
             )
         revised = stage2.run_database(
             self.database, agent=agent, knowledge=FakeKnowledge(), now=NOW,

@@ -541,3 +541,49 @@ class WorkingGroupSignalTests(StageOneTests):
         ).fetchone()[0]
         self.assertNotIn("working_group", self._routes()[(1, 2)])
         self.assertLess(after, before)
+
+
+class RereadSignalTests(StageOneTests):
+    """A shared record supports an independent lead but is not one itself."""
+
+    def _same_record(self, left: int, right: int) -> None:
+        self.connection.execute(
+            "UPDATE candidate_inbox SET source_record_id='record-shared' "
+            "WHERE candidate_id IN (?,?)",
+            (f"candidate-{left}", f"candidate-{right}"),
+        )
+        self.connection.execute(
+            "UPDATE candidate_inbox SET created_at=? WHERE candidate_id=?",
+            ("2030-03-01T13:00:00+00:00", f"candidate-{right}"),
+        )
+
+    def test_reread_alone_queues_nothing(self) -> None:
+        self._task(1, "Book the synthetic workshop venue", kind="meeting")
+        self._task(2, "Order fictional laboratory supplies", kind="meeting")
+        self._same_record(1, 2)
+        stage1.enqueue(self.connection, 1, now=NOW)
+
+        stage1.run(self.connection, now=NOW, backend=FailingEmbeddings())
+
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT count(*) FROM task_duplicate_candidates"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_reread_strengthens_an_independent_route(self) -> None:
+        self._task(1, "Prepare the synthetic rollout checklist", kind="meeting")
+        self._task(2, "Revise the synthetic rollout checklist", kind="meeting")
+        self._same_record(1, 2)
+        stage1.enqueue(self.connection, 1, now=NOW)
+
+        stage1.run(self.connection, now=NOW, backend=FailingEmbeddings())
+
+        routes = {
+            row[0] for row in self.connection.execute(
+                "SELECT route FROM task_duplicate_candidate_routes"
+            )
+        }
+        self.assertIn("words", routes)
+        self.assertIn("reread", routes)
