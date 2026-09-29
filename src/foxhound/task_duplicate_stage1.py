@@ -27,10 +27,10 @@ DEFAULT_TOP_K = 5
 DEFAULT_PAIR_LIMIT = 100
 CALIBRATION_PRECISION_FLOOR = 0.80
 
-#: Routes that only strengthen a pair another route found. An owner is shared
-#: by dozens of unrelated tasks, so on its own it would fill the stage-2 queue
-#: with "same person, different work" pairs.
-BOOST_ONLY_ROUTES = frozenset({"owner", "working_group"})
+#: Routes that only strengthen a pair another route found. Owners and working
+#: groups are shared across unrelated work, while one source record routinely
+#: contains several independent actions. None is a sufficient lead alone.
+BOOST_ONLY_ROUTES = frozenset({"owner", "working_group", "reread"})
 
 ROUTE_WEIGHTS = {
     "words": 1.0,
@@ -40,6 +40,8 @@ ROUTE_WEIGHTS = {
     "working_group": 0.2,
     "reread": 0.8,
 }
+
+INDEPENDENT_ROUTES = frozenset(ROUTE_WEIGHTS) - BOOST_ONLY_ROUTES
 
 
 class EmbeddingUnavailable(RuntimeError):

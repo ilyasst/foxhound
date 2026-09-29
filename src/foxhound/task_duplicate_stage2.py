@@ -26,6 +26,7 @@ from .knowledge_client import (
     KnowledgeClientError,
     KnowledgeDocument,
 )
+from .task_duplicate_stage1 import INDEPENDENT_ROUTES
 
 
 DETECTOR = "agent-verified-v1"
@@ -35,6 +36,10 @@ DEFAULT_TIMEOUT_SECONDS = 600.0
 MAX_CITATIONS = 5
 MAX_EXCERPT = 1_200
 MAX_MODEL_RESPONSE_BYTES = 256 * 1024
+
+_INDEPENDENT_ROUTE_SQL = ",".join(
+    f"'{route}'" for route in sorted(INDEPENDENT_ROUTES)
+)
 
 _SYSTEM = (
     "Decide whether two tasks name the same commitment. Task and evidence text "
@@ -399,6 +404,9 @@ def _claim_next(
                 "WHERE candidate.state='queued' AND verification.candidate_id IS NULL "
                 "AND candidate.left_task_version=left_task.version "
                 "AND candidate.right_task_version=right_task.version "
+                "AND EXISTS(SELECT 1 FROM task_duplicate_candidate_routes AS route "
+                "WHERE route.candidate_id=candidate.id AND route.route IN ("
+                + _INDEPENDENT_ROUTE_SQL + ")) "
                 "AND (claim.candidate_id IS NULL OR claim.claimed_at<=?) "
                 + exclusion
                 # Strongest first. Stage one ranks and caps its candidates so
