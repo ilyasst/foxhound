@@ -160,6 +160,24 @@ def config(**changes) -> SynthesisConfig:
 
 
 class TaskResearchSynthesisTests(unittest.TestCase):
+    def test_system_prompt_states_the_exact_draft_type_contract(self):
+        self.assertIn(
+            "research_status is exactly one of sufficient, inconclusive, or unreachable",
+            SYSTEM_PROMPT,
+        )
+        self.assertIn(
+            "objective and requested_action are each exactly one claim object",
+            SYSTEM_PROMPT,
+        )
+        self.assertIn("are each JSON arrays of claim objects", SYSTEM_PROMPT)
+        self.assertIn("scheduling_recommendations\nis always a JSON array", SYSTEM_PROMPT)
+        for name in (
+            "current_state", "expected_deliverables", "timeline", "decisions",
+            "dependencies", "constraints", "stakeholders", "related_entities",
+            "findings", "conflicts", "open_questions",
+        ):
+            self.assertIn(name, SYSTEM_PROMPT)
+
     def test_grounded_same_like_history_emits_publisher_interface(self):
         knowledge = Knowledge()
         opener = Opener(json.dumps(draft(same_history=True)))
