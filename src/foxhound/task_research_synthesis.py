@@ -98,6 +98,104 @@ them necessary; never invent a task ID, date, or prerequisite. You cannot change
 queues, create tasks, or act on any recommendation."""
 
 
+_CLAIM_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "text": {"type": "string", "minLength": 1, "maxLength": 8_000},
+        "status": {"type": "string", "enum": sorted(CLAIM_STATUSES)},
+        "source_refs": {
+            "type": "array",
+            "items": {"type": "string", "pattern": r"^src-[0-9]{3}$"},
+            "maxItems": 16,
+            "uniqueItems": True,
+        },
+    },
+    "required": ["text", "status", "source_refs"],
+    "additionalProperties": False,
+}
+
+
+def _recommendation_schema(
+    kind: str,
+    detail: tuple[str, dict[str, object]] | None = None,
+) -> dict[str, object]:
+    properties: dict[str, object] = {
+        "type": {"type": "string", "const": kind},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "rationale": {"$ref": "#/$defs/claim"},
+    }
+    required = ["type", "confidence", "rationale"]
+    if detail is not None:
+        name, schema = detail
+        properties[name] = schema
+        required.append(name)
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": False,
+    }
+
+
+_REPORT_SECTION_NAMES = (
+    "current_state", "expected_deliverables", "timeline", "decisions",
+    "dependencies", "constraints", "stakeholders", "related_entities",
+    "findings", "conflicts", "open_questions",
+)
+_RESEARCH_DRAFT_PROPERTIES: dict[str, object] = {
+    "schema_version": {"type": "string", "const": DRAFT_SCHEMA},
+    "research_status": {"type": "string", "enum": sorted(RESEARCH_STATUSES)},
+    "objective": {"$ref": "#/$defs/claim"},
+    "requested_action": {"$ref": "#/$defs/claim"},
+    **{
+        name: {
+            "type": "array", "items": {"$ref": "#/$defs/claim"},
+            "maxItems": 32,
+        }
+        for name in _REPORT_SECTION_NAMES
+    },
+    "scheduling_recommendations": {
+        "type": "array",
+        "maxItems": 3,
+        "items": {
+            "anyOf": [
+                _recommendation_schema(
+                    "after_task_completed",
+                    ("related_task_id", {"type": "integer", "minimum": 1}),
+                ),
+                _recommendation_schema(
+                    "not_before",
+                    ("not_before", {
+                        "type": "string", "minLength": 1, "maxLength": 500,
+                    }),
+                ),
+                _recommendation_schema("raise_priority"),
+                _recommendation_schema(
+                    "create_prerequisite",
+                    ("prerequisite_text", {
+                        "type": "string", "minLength": 1, "maxLength": 500,
+                    }),
+                ),
+            ]
+        },
+    },
+}
+RESEARCH_DRAFT_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "foxhound_task_research_draft_v1",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": _RESEARCH_DRAFT_PROPERTIES,
+            "required": list(_RESEARCH_DRAFT_PROPERTIES),
+            "additionalProperties": False,
+            "$defs": {"claim": _CLAIM_RESPONSE_SCHEMA},
+        },
+    },
+}
+
+
 class SynthesisError(RuntimeError):
     """A safe fixed-code refusal; message contains no task or evidence text."""
 
@@ -434,6 +532,7 @@ def _model(
     )
     if config.dialect == "openai":
         body["reasoning_effort"] = config.reasoning
+        body["response_format"] = RESEARCH_DRAFT_RESPONSE_FORMAT
     request = urllib.request.Request(
         config.endpoint.rstrip("/") + spoken.path,
         data=json.dumps(body, separators=(",", ":")).encode("utf-8"),
