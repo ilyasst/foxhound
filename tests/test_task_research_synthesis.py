@@ -486,6 +486,11 @@ class TaskResearchSynthesisTests(unittest.TestCase):
             config(max_documents=51)
         with self.assertRaisesRegex(SynthesisError, "^invalid_config$"):
             config(timeout_seconds=901)
+        with self.assertRaisesRegex(SynthesisError, "^invalid_config$"):
+            config(knowledge_timeout_seconds=0)
+        with self.assertRaisesRegex(SynthesisError, "^invalid_config$"):
+            config(knowledge_timeout_seconds=31)
+        self.assertEqual(config().knowledge_timeout_seconds, 30.0)
 
     def test_only_loopback_model_endpoint_is_accepted(self):
         with self.assertRaisesRegex(SynthesisError, "^invalid_config$"):

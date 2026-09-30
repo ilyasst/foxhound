@@ -32,6 +32,7 @@ from foxhound.execution_worker import (
     ExecutionWorkerClaimError,
     ExecutionWorkerConfigError,
     ExecutionWorkerDraftError,
+    load_knowledge_config,
     load_result_draft,
     load_run_state,
     main,
@@ -222,6 +223,27 @@ class ExecutionWorkerTests(unittest.TestCase):
         self.state_path = self.run_directory / "run-state.json"
         self._write_state()
         self._write_instructions()
+
+    def test_knowledge_timeout_override_is_explicit_and_bounded(self):
+        token = self.root / "knowledge.token"
+        token.write_text(TOKEN, encoding="utf-8")
+        token.chmod(0o600)
+
+        default = load_knowledge_config(
+            "http://127.0.0.1:8001", "synthetic", token
+        )
+        researcher = load_knowledge_config(
+            "http://127.0.0.1:8001", "synthetic", token,
+            timeout_seconds=30,
+        )
+
+        self.assertEqual(default.timeout_seconds, 5.0)
+        self.assertEqual(researcher.timeout_seconds, 30)
+        with self.assertRaises(ExecutionWorkerConfigError):
+            load_knowledge_config(
+                "http://127.0.0.1:8001", "synthetic", token,
+                timeout_seconds=31,
+            )
 
     def _write_state(
         self,

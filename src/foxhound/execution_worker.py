@@ -1451,7 +1451,11 @@ def _workflow_policy(value: object) -> WorkflowPolicy | None:
 
 
 def load_knowledge_config(
-    endpoint: str, alias: str, token_path: str | os.PathLike[str]
+    endpoint: str,
+    alias: str,
+    token_path: str | os.PathLike[str],
+    *,
+    timeout_seconds: float = 5.0,
 ) -> KnowledgeClientConfig:
     token = _read_private_text(
         Path(token_path), maximum=4_097, label="knowledge token"
@@ -1461,6 +1465,7 @@ def load_knowledge_config(
             endpoint=endpoint,
             alias=alias,
             token=token,
+            timeout_seconds=timeout_seconds,
         )
     except KnowledgeClientError as exc:
         raise ExecutionWorkerConfigError(
