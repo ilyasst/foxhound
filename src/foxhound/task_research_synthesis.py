@@ -403,6 +403,29 @@ def _context_task(value: object) -> dict[str, object]:
     return result
 
 
+_PART = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
+
+
+def _origin_repository_locator(origin: object) -> str | None:
+    if not isinstance(origin, Mapping):
+        return None
+    if origin.get("kind") not in {"issue", "review_request"}:
+        return None
+    if origin.get("system") != "gw":
+        return None
+    record_id = origin.get("record_id")
+    if not isinstance(record_id, str):
+        return None
+    parts = record_id.split("/")
+    if (
+        len(parts) != 3
+        or parts[0] != "github.com"
+        or not all(_PART.fullmatch(part) for part in parts[1:])
+    ):
+        return None
+    return record_id
+
+
 def _queries(task: Mapping[str, object], maximum: int) -> tuple[str, ...]:
     candidates: list[str] = []
     structured = task.get("structured")
@@ -411,6 +434,9 @@ def _queries(task: Mapping[str, object], maximum: int) -> tuple[str, ...]:
             str(structured.get(key, "")).strip() for key in ("action", "object")
         ))
     candidates.append(str(task.get("text", ""))[:1_200])
+    origin_locator = _origin_repository_locator(task.get("origin"))
+    if origin_locator is not None:
+        candidates.append(origin_locator)
     external = task.get("external_identifiers", [])
     if isinstance(external, list):
         for item in external:

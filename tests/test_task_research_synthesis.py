@@ -804,6 +804,152 @@ class TaskResearchSynthesisTests(unittest.TestCase):
             self.assertEqual(code, 70)
             self.assertEqual(json.loads(buf.getvalue()), {"accepted": False, "error_code": "invalid_output"})
 
+    def test_origin_repository_locator_queries(self):
+        # 1. Valid origin creates query
+        ctx = context("Work on task without mentioning repo.")
+        ctx["task_snapshot"]["origin"] = {
+            "system": "gw",
+            "kind": "issue",
+            "record_id": "github.com/example-org/project-alpha",
+            "item_id": "42",
+        }
+        knowledge = Knowledge()
+        synthesize(ctx, knowledge=knowledge, config=config(), opener=Opener(json.dumps(draft())))
+        queried = [c[0] for c in knowledge.calls]
+        self.assertIn("github.com/example-org/project-alpha", queried)
+
+        # Review request kind is also valid
+        ctx_pr = context("Work on PR task.")
+        ctx_pr["task_snapshot"]["origin"] = {
+            "system": "gw",
+            "kind": "review_request",
+            "record_id": "github.com/example-org/project-alpha",
+            "item_id": "42",
+        }
+        knowledge_pr = Knowledge()
+        synthesize(ctx_pr, knowledge=knowledge_pr, config=config(), opener=Opener(json.dumps(draft())))
+        self.assertIn("github.com/example-org/project-alpha", [c[0] for c in knowledge_pr.calls])
+
+        # 2. Absent, malformed, or unsupported origins do not create query
+        cases = [
+            None,
+            "not a mapping",
+            {"system": "email", "kind": "email"},
+            {"system": "gw", "kind": "commit", "record_id": "github.com/example-org/project-alpha"},
+            {"system": "forge", "kind": "issue", "record_id": "github.com/example-org/project-alpha"},
+            {"system": "gw", "kind": "issue", "record_id": "gitlab.com/example-org/project-alpha"},
+            {"system": "gw", "kind": "issue", "record_id": "github.com/example-org"},
+            {"system": "gw", "kind": "issue", "record_id": "github.com/example-org/project/extra"},
+            {"system": "gw", "kind": "issue", "record_id": "github.com/example-org/bad$repo"},
+            {"system": "gw", "kind": "issue", "record_id": 12345},
+        ]
+        for bad_origin in cases:
+            bad_ctx = context()
+            bad_ctx["task_snapshot"]["origin"] = bad_origin
+            k = Knowledge()
+            synthesize(bad_ctx, knowledge=k, config=config(), opener=Opener(json.dumps(draft())))
+            calls = [c[0] for c in k.calls]
+            self.assertFalse(any("github.com" in c or "gitlab.com" in c for c in calls))
+
+        # 3. Exact dedup through external identifier producing same query
+        ctx_dedup = context()
+        ctx_dedup["task_snapshot"]["origin"] = {
+            "system": "gw",
+            "kind": "issue",
+            "record_id": "github.com/example-org/project-alpha",
+            "item_id": "42",
+        }
+        # external identifier that produces the exact same query string
+        ctx_dedup["task_snapshot"]["external_identifiers"] = [
+            {"kind": "github.com/example-org/project-alpha", "value": ""},
+        ]
+        k_dedup = Knowledge()
+        synthesize(ctx_dedup, knowledge=k_dedup, config=config(), opener=Opener(json.dumps(draft())))
+        calls_dedup = [c[0] for c in k_dedup.calls]
+        self.assertEqual(calls_dedup.count("github.com/example-org/project-alpha"), 1)
+
+        # 4. Partial text containment does not deduplicate; only exact match deduplicates
+        ctx_containment = context()
+        ctx_containment["task_snapshot"]["text"] = "See github.com/example-org/project-alpha for details"
+        ctx_containment["task_snapshot"]["origin"] = {
+            "system": "gw",
+            "kind": "issue",
+            "record_id": "github.com/example-org/project-alpha",
+            "item_id": "42",
+        }
+        k_cont = Knowledge()
+        synthesize(ctx_containment, knowledge=k_cont, config=config(), opener=Opener(json.dumps(draft())))
+        calls_cont = [c[0] for c in k_cont.calls]
+        self.assertIn("github.com/example-org/project-alpha", calls_cont)
+        self.assertIn("See github.com/example-org/project-alpha for details", calls_cont)
+
+        # 5. Max-budget ordering: query order is structured, text, origin locator, external, working_group
+        ctx_order = context()
+        ctx_order["task_snapshot"]["structured"] = {"action": "review", "object": "pr"}
+        ctx_order["task_snapshot"]["text"] = "Please review this"
+        ctx_order["task_snapshot"]["origin"] = {
+            "system": "gw",
+            "kind": "issue",
+            "record_id": "github.com/example-org/project-alpha",
+            "item_id": "42",
+        }
+        ctx_order["task_snapshot"]["external_identifiers"] = [
+            {"kind": "ticket", "value": "123"},
+        ]
+        ctx_order["task_snapshot"]["working_group"] = {"id": "wg-test"}
+        # config with max_searches = 3: should take structured, text, origin locator only
+        k_order = Knowledge()
+        synthesize(ctx_order, knowledge=k_order, config=config(max_searches=3), opener=Opener(json.dumps(draft())))
+        calls_order = [c[0] for c in k_order.calls]
+        self.assertEqual(calls_order, [
+            "review pr",
+            "Please review this",
+            "github.com/example-org/project-alpha",
+        ])
+
+    def test_synthesized_gw_hit_at_project_folders_enters_evidence(self):
+        class ProjectFoldersKnowledge:
+            def search(self, query, **options):
+                documents = (
+                    KnowledgeDocument(
+                        id="kb:Projects/Project Folders.md",
+                        path="Projects/Project Folders.md",
+                        kb_path="Projects/Project Folders.md",
+                        section="registry",
+                        excerpt="github.com/example-org/project-alpha -> Projects/Alpha",
+                        date="2030-01-03",
+                    ),
+                )
+                layers = (KnowledgeLayer("kb", 1, False, documents),)
+                return KnowledgeSearchResult(layers)
+
+        ctx = context("Investigate repo context.")
+        ctx["task_snapshot"]["origin"] = {
+            "system": "gw",
+            "kind": "issue",
+            "record_id": "github.com/example-org/project-alpha",
+            "item_id": "42",
+        }
+        result = synthesize(
+            ctx,
+            knowledge=ProjectFoldersKnowledge(),
+            config=config(),
+            opener=Opener(json.dumps(draft())),
+        )
+        # Check that Projects/Project Folders.md entered evidence with its KB locator
+        kb_sources = [
+            s for s in result.sources
+            if isinstance(s["locator"], dict) and s["locator"].get("namespace") == "kb"
+        ]
+        self.assertTrue(any(isinstance(s["locator"], dict) and s["locator"].get("resource") == "Projects/Project Folders.md" for s in kb_sources))
+        project_source = next(s for s in kb_sources if isinstance(s["locator"], dict) and s["locator"].get("resource") == "Projects/Project Folders.md")
+        locator = project_source["locator"]
+        assert isinstance(locator, dict)
+        self.assertEqual(project_source["source_id"], "src-001")
+        self.assertEqual(locator["namespace"], "kb")
+        self.assertEqual(locator["resource"], "Projects/Project Folders.md")
+        self.assertEqual(locator["fragment"], "registry")
+
 
 if __name__ == "__main__":
     unittest.main()
