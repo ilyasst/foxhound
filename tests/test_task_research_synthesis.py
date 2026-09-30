@@ -20,6 +20,7 @@ from foxhound.task_research_synthesis import (
     CONTEXT_SCHEMA,
     DRAFT_SCHEMA,
     INPUT_SCHEMA,
+    RESEARCH_DRAFT_RESPONSE_FORMAT,
     SYSTEM_PROMPT,
     SynthesisConfig,
     SynthesisError,
@@ -177,6 +178,47 @@ class TaskResearchSynthesisTests(unittest.TestCase):
             "findings", "conflicts", "open_questions",
         ):
             self.assertIn(name, SYSTEM_PROMPT)
+
+    def test_openai_request_carries_the_strict_draft_schema(self):
+        opener = Opener(json.dumps(draft()))
+        synthesize(
+            context(), knowledge=Knowledge(), config=config(), opener=opener,
+        )
+        request = json.loads(opener.requests[0][0].data)
+        response_format = request["response_format"]
+        self.assertEqual(response_format, RESEARCH_DRAFT_RESPONSE_FORMAT)
+        self.assertEqual(response_format["type"], "json_schema")
+        declaration = response_format["json_schema"]
+        self.assertTrue(declaration["strict"])
+        schema = declaration["schema"]
+        self.assertFalse(schema["additionalProperties"])
+        self.assertEqual(set(schema["required"]), set(schema["properties"]))
+        self.assertEqual(
+            schema["properties"]["research_status"]["enum"],
+            ["inconclusive", "sufficient", "unreachable"],
+        )
+        self.assertEqual(
+            schema["properties"]["objective"], {"$ref": "#/$defs/claim"},
+        )
+        for name in (
+            "current_state", "expected_deliverables", "timeline", "decisions",
+            "dependencies", "constraints", "stakeholders", "related_entities",
+            "findings", "conflicts", "open_questions",
+        ):
+            self.assertEqual(schema["properties"][name]["type"], "array")
+            self.assertEqual(
+                schema["properties"][name]["items"], {"$ref": "#/$defs/claim"},
+            )
+        recommendation_variants = schema["properties"][
+            "scheduling_recommendations"
+        ]["items"]["anyOf"]
+        self.assertEqual(
+            {item["properties"]["type"]["const"] for item in recommendation_variants},
+            {
+                "after_task_completed", "not_before", "raise_priority",
+                "create_prerequisite",
+            },
+        )
 
     def test_grounded_same_like_history_emits_publisher_interface(self):
         knowledge = Knowledge()
@@ -522,6 +564,8 @@ class TaskResearchSynthesisTests(unittest.TestCase):
 
         sent_runner_body = json.loads(opener_runner.requests[0].data.decode("utf-8"))
         self.assertNotIn("reasoning_effort", sent_runner_body)
+        self.assertNotIn("response_format", sent_runner_body)
+        self.assertEqual(sent_runner_body["format"], "json")
         self.assertEqual(res_runner.provenance["reasoning_requested"], "medium")
         self.assertEqual(res_runner.provenance["reasoning_effective"], "unknown")
         self.assertEqual(res_runner.provenance["provider"], "ollama")

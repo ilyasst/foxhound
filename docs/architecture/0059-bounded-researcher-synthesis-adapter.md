@@ -46,6 +46,14 @@ of claim objects, including singleton sections; and
 `scheduling_recommendations` is an array. The validator remains authoritative
 and does not coerce strings or keyed objects into those shapes.
 
+For the OpenAI-compatible dialect, the request also carries that contract as a
+strict named JSON schema. The schema requires every top-level field, claim
+shape, report-section array, status enum, and scheduling-recommendation
+variant, with additional properties disabled throughout. Runner-dialect calls
+retain their native JSON mode. Model-side schema enforcement is an early
+quality gate only: strict parsing, receipt grounding, citation checks, and the
+draft validator remain authoritative after generation.
+
 The adapter scope is bounded host retrieval plus one-shot local model synthesis
 for tonight, not a completed multi-turn broker or OS sandbox. It has no
 database or queue mutation authority and no internet retrieval in v1.
