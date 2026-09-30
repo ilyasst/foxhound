@@ -76,7 +76,16 @@ current_state, expected_deliverables, timeline, decisions, dependencies,
 constraints, stakeholders, related_entities, findings, conflicts,
 open_questions, scheduling_recommendations. A claim is exactly {text, status,
 source_refs}; status is supported, inferred, conflicting, or unknown. Every
-claim except unknown needs at least one supplied source ID. Lists may be empty.
+claim except unknown needs at least one supplied source ID.
+
+research_status is exactly one of sufficient, inconclusive, or unreachable.
+objective and requested_action are each exactly one claim object, never a
+string or list. current_state, expected_deliverables, timeline, decisions,
+dependencies, constraints, stakeholders, related_entities, findings,
+conflicts, and open_questions are each JSON arrays of claim objects, even when
+there is only one claim; these arrays may be empty. scheduling_recommendations
+is always a JSON array. Do not replace any required claim object or array with
+a summary string, keyed object, or other shape.
 
 Scheduling recommendations are acceptable evidence-only outputs and are never
 applied by you. At most three may be proposed. Each has type, confidence, and a

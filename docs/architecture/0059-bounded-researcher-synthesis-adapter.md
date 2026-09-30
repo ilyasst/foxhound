@@ -39,6 +39,13 @@ extra target fields. The prompt explicitly says that the model cannot apply
 them. This adapter contains no queue, condition, task-creation, or notification
 tool.
 
+The prompt also states the validated draft type map explicitly:
+`research_status` uses the three contract values; `objective` and
+`requested_action` are single claim objects; every report section is an array
+of claim objects, including singleton sections; and
+`scheduling_recommendations` is an array. The validator remains authoritative
+and does not coerce strings or keyed objects into those shapes.
+
 The adapter scope is bounded host retrieval plus one-shot local model synthesis
 for tonight, not a completed multi-turn broker or OS sandbox. It has no
 database or queue mutation authority and no internet retrieval in v1.
