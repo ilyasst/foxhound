@@ -73,6 +73,11 @@ from .task_execution import (
     WorkflowBoardDetail,
     WorkflowOperationResult,
 )
+from .task_scheduling import (
+    SchedulingCardActionResult,
+    TaskSchedulingService,
+    render_scheduling_review_card,
+)
 
 
 log = logging.getLogger("foxhound.task_card_server")
@@ -126,6 +131,8 @@ WORKFLOW_DETAIL_SCHEMA = "foxhound.execution-workflow-service.detail"
 # has never changed shape. Version 2 added the recorded run body and gave it
 # its own constant; version 3 adds where the task came from.
 WORKFLOW_DETAIL_SCHEMA_VERSION = 3
+SCHEDULING_CLAIM_SCHEMA = "foxhound.scheduling-card-service.claim"
+SCHEDULING_OPERATION_SCHEMA = "foxhound.scheduling-card-service.operation"
 
 # ADR 0036 decision 1: every accepted bearer token is configured with
 # exactly one role from this closed set. A single legacy token with no
@@ -168,6 +175,10 @@ ROUTES = {
     "/v1/task-cards/delivery-failed": "delivery_failed",
     "/v1/task-cards/action": "action",
     "/v1/task-cards/view": "view",
+    "/v1/scheduling-cards/claim": "scheduling_claim",
+    "/v1/scheduling-cards/delivered": "scheduling_delivered",
+    "/v1/scheduling-cards/delivery-failed": "scheduling_delivery_failed",
+    "/v1/scheduling-cards/action": "scheduling_action",
     "/v1/execution-cards/stats": "execution_stats",
     "/v2/execution-cards/stats": "execution_stats_scoped",
     "/v1/execution-cards/schedule": "execution_schedule",
@@ -292,6 +303,7 @@ class TaskCardApplication:
         *,
         execution_cards: ExecutionCardService | None = None,
         execution_workflows: TaskExecutionService | None = None,
+        scheduling_cards: TaskSchedulingService | None = None,
         execution_tokens: str | Mapping[str, str] | None = None,
         limits: TaskCardServerLimits | None = None,
     ) -> None:
@@ -309,9 +321,16 @@ class TaskCardApplication:
             raise TaskCardServerConfigError(
                 "execution workflow service is invalid"
             )
+        if scheduling_cards is not None and not isinstance(
+            scheduling_cards, TaskSchedulingService
+        ):
+            raise TaskCardServerConfigError(
+                "scheduling card service is invalid"
+            )
         self.cards = cards
         self.execution_cards = execution_cards
         self.execution_workflows = execution_workflows
+        self.scheduling_cards = scheduling_cards
         # `tokens` maps role -> bearer token. A bare string is today's
         # single shared token, normalized to role `drip` -- this is what
         # keeps an existing single-token deployment behaving exactly as it
@@ -701,6 +720,101 @@ class TaskCardApplication:
                 expected_version=_integer(request["card_version"], minimum=1),
                 expanded=view == DUPLICATE_EXPAND,
             ))
+        if operation == "scheduling_claim":
+            request = _request(payload, required={"lease_seconds"})
+            identity = self.resolve_consumer(authorization)
+            if identity is None:
+                raise TaskCardServerRequestError(
+                    "consumer_unresolved",
+                    "scheduling card consumer role is unresolved",
+                    HTTPStatus.FORBIDDEN,
+                )
+            claim = self._scheduling_cards().claim_next(
+                lease_seconds=_integer(
+                    request["lease_seconds"], minimum=5, maximum=300
+                ),
+                consumer_digest=identity.digest,
+            )
+            if claim is None:
+                return {
+                    "schema": SCHEDULING_CLAIM_SCHEMA,
+                    "schema_version": SERVICE_VERSION,
+                    "ok": True,
+                    "status": "empty",
+                    "claim": None,
+                }
+            body, reply_markup = render_scheduling_review_card(claim.card)
+            return {
+                "schema": SCHEDULING_CLAIM_SCHEMA,
+                "schema_version": SERVICE_VERSION,
+                "ok": True,
+                "status": "claimed",
+                "claim": {
+                    "card_id": claim.card.card_id,
+                    "card_version": claim.card.version,
+                    "claim_token": claim.token,
+                    "expires_at": claim.expires_at,
+                    "delivery_key": (
+                        f"foxhound-scheduling-card-{claim.card.card_id}-"
+                        f"v{claim.card.version}"
+                    ),
+                    "body": body,
+                    "reply_markup": reply_markup,
+                },
+            }
+        if operation == "scheduling_delivered":
+            request = _request(
+                payload,
+                required={
+                    "card_id", "card_version", "claim_token", "transport",
+                    "delivery_ref",
+                },
+            )
+            return _scheduling_operation_document(
+                self._scheduling_cards().complete_delivery(
+                    _integer(request["card_id"], minimum=1),
+                    expected_version=_integer(
+                        request["card_version"], minimum=1
+                    ),
+                    claim_token=_secret(request["claim_token"]),
+                    transport=_opaque(request["transport"], maximum=64),
+                    delivery_ref=_opaque(
+                        request["delivery_ref"], maximum=200
+                    ),
+                )
+            )
+        if operation == "scheduling_delivery_failed":
+            request = _request(
+                payload,
+                required={"card_id", "card_version", "claim_token"},
+            )
+            return _scheduling_operation_document(
+                self._scheduling_cards().fail_delivery(
+                    _integer(request["card_id"], minimum=1),
+                    expected_version=_integer(
+                        request["card_version"], minimum=1
+                    ),
+                    claim_token=_secret(request["claim_token"]),
+                )
+            )
+        if operation == "scheduling_action":
+            request = _request(
+                payload, required={"card_id", "card_version", "action"}
+            )
+            action = request["action"]
+            if not isinstance(action, str) or action not in {"keep", "undo"}:
+                raise TaskCardServerRequestError(
+                    "invalid_request", "scheduling card action is invalid"
+                )
+            return _scheduling_operation_document(
+                self._scheduling_cards().act(
+                    _integer(request["card_id"], minimum=1),
+                    expected_version=_integer(
+                        request["card_version"], minimum=1
+                    ),
+                    action=action,
+                )
+            )
         if operation == "execution_stats":
             _request(payload, required=set())
             stats = self._execution_cards().stats()
@@ -1272,6 +1386,15 @@ class TaskCardApplication:
             )
         return self.execution_workflows
 
+    def _scheduling_cards(self) -> TaskSchedulingService:
+        if self.scheduling_cards is None:
+            raise TaskCardServerRequestError(
+                "service_unavailable",
+                "scheduling card service is unavailable",
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+        return self.scheduling_cards
+
 
 class _TaskCardHTTPServer(HTTPServer):
     allow_reuse_address = True
@@ -1828,6 +1951,20 @@ def _operation_document(result: CardOperationResult) -> dict[str, Any]:
     }
 
 
+def _scheduling_operation_document(
+    result: SchedulingCardActionResult,
+) -> dict[str, Any]:
+    return {
+        "schema": SCHEDULING_OPERATION_SCHEMA,
+        "schema_version": SERVICE_VERSION,
+        "ok": result.accepted,
+        "disposition": result.disposition.value,
+        "card_id": result.card_id,
+        "card_version": result.card_version,
+        "refusal": None if result.refusal is None else result.refusal.value,
+    }
+
+
 def _view_document(result: CardPresentation) -> dict[str, Any]:
     """The card as this surface would render it now, or a refusal.
 
@@ -2339,11 +2476,13 @@ def main(argv: list[str] | None = None) -> int:
             profile_registry=registry,
         )
         execution_workflows.readiness()
+        scheduling_cards = TaskSchedulingService(arguments.database)
         app = TaskCardApplication(
             cards,
             load_role_tokens(arguments.token_file),
             execution_cards=execution_cards,
             execution_workflows=execution_workflows,
+            scheduling_cards=scheduling_cards,
             execution_tokens=(
                 load_role_tokens(
                     arguments.execution_token_file,

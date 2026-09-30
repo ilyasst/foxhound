@@ -127,6 +127,19 @@ from .execution_runner import (
     run_once,
 )
 from .persistent_effects import PersistentEffectError, PersistentEffectExecutor
+from .task_scheduling import (
+    SchedulingApplyResult,
+    SchedulingCardActionResult,
+    SchedulingDeliveryClaim,
+    SchedulingDisposition,
+    SchedulingKind,
+    SchedulingRefusal,
+    SchedulingReviewCard,
+    TaskSchedulingService,
+    ValidatedSchedulingRecommendation,
+    parse_scheduling_review_callback,
+    render_scheduling_review_card,
+)
 
 __version__ = "0.1.0"
 
@@ -226,6 +239,17 @@ __all__ = (
     "ExecutionCardStats",
     "ExecutionCardStatus",
     "ExecutionReviewCard",
+    "SchedulingApplyResult",
+    "SchedulingCardActionResult",
+    "SchedulingDeliveryClaim",
+    "SchedulingDisposition",
+    "SchedulingKind",
+    "SchedulingRefusal",
+    "SchedulingReviewCard",
+    "TaskSchedulingService",
+    "ValidatedSchedulingRecommendation",
+    "parse_scheduling_review_callback",
+    "render_scheduling_review_card",
     "parse_execution_agent_callback",
     "parse_execution_review_callback",
     "render_execution_agent_selector",

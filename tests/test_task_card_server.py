@@ -78,6 +78,8 @@ from foxhound.task_card_server import (
     QUEUE_VIEW_ROLE,
     REQUEST_SCHEMA,
     SCHEDULE_SCHEMA,
+    SCHEDULING_CLAIM_SCHEMA,
+    SCHEDULING_OPERATION_SCHEMA,
     STATS_SCHEMA,
     STATS_SCHEMA_VERSION,
     VIEW_SCHEMA,
@@ -109,6 +111,12 @@ from foxhound.task_execution import (
     ExecutionResultEnvelope,
     TaskExecutionService,
     WorkflowStatus,
+)
+from foxhound.task_scheduling import (
+    SchedulingKind,
+    TaskSchedulingService,
+    ValidatedSchedulingRecommendation,
+    parse_scheduling_review_callback,
 )
 
 
@@ -230,6 +238,130 @@ class TaskCardServerTests(unittest.TestCase):
             TOKEN,
             execution_cards=self.execution_cards,
         )
+
+    def test_scheduling_card_http_delivery_keep_undo_and_requeue(self):
+        workflow = self.execution.schedule(1, expected_task_version=1)
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "UPDATE task_execution_workflows SET status='queued' WHERE task_id=1"
+            )
+        scheduling = TaskSchedulingService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: "h" * 43,
+            provenance_validator=lambda _connection, _value: True,
+        )
+        applied = scheduling.apply(ValidatedSchedulingRecommendation(
+            kind=SchedulingKind.RAISE_PRIORITY,
+            target_task_id=1,
+            target_task_version=1,
+            expected_workflow_version=workflow.version,
+            rationale="Synthetic evidence requires prompt handling.",
+            source_refs=("src-001",),
+            research_receipt_id="synthetic-receipt-001",
+            research_document_digest="a" * 64,
+        ))
+        self.assertTrue(applied.accepted, applied)
+        app = TaskCardApplication(
+            self.cards, TOKEN, scheduling_cards=scheduling,
+        )
+
+        with running_server(app) as endpoint:
+            status, _, unauthorized = request(
+                endpoint, "/v1/scheduling-cards/claim",
+                request_document(lease_seconds=60), token=None,
+            )
+            self.assertEqual((401, "unauthorized"), (
+                status, unauthorized["error"]["code"],
+            ))
+
+            status, _, first = request(
+                endpoint, "/v1/scheduling-cards/claim",
+                request_document(lease_seconds=60),
+            )
+            self.assertEqual((200, SCHEDULING_CLAIM_SCHEMA, "claimed"), (
+                status, first["schema"], first["status"],
+            ))
+            claim = first["claim"]
+            callbacks = [
+                button["callback_data"]
+                for row in claim["reply_markup"]["inline_keyboard"]
+                for button in row
+            ]
+            self.assertEqual(
+                {"keep", "undo"},
+                {parse_scheduling_review_callback(value)[2] for value in callbacks},
+            )
+            self.assertIn("already active", claim["body"])
+            self.assertNotIn(claim["claim_token"], claim["body"])
+
+            status, _, failed = request(
+                endpoint, "/v1/scheduling-cards/delivery-failed",
+                request_document(
+                    card_id=claim["card_id"],
+                    card_version=claim["card_version"],
+                    claim_token=claim["claim_token"],
+                ),
+            )
+            self.assertEqual((200, True, SCHEDULING_OPERATION_SCHEMA), (
+                status, failed["ok"], failed["schema"],
+            ))
+
+            _, _, second = request(
+                endpoint, "/v1/scheduling-cards/claim",
+                request_document(lease_seconds=60),
+            )
+            claim = second["claim"]
+            status, _, delivered = request(
+                endpoint, "/v1/scheduling-cards/delivered",
+                request_document(
+                    card_id=claim["card_id"],
+                    card_version=claim["card_version"],
+                    claim_token=claim["claim_token"],
+                    transport="synthetic",
+                    delivery_ref="scheduling-message-one",
+                ),
+            )
+            self.assertEqual((200, True), (status, delivered["ok"]))
+            _, _, delivered_again = request(
+                endpoint, "/v1/scheduling-cards/delivered",
+                request_document(
+                    card_id=claim["card_id"],
+                    card_version=claim["card_version"],
+                    claim_token=claim["claim_token"],
+                    transport="synthetic",
+                    delivery_ref="scheduling-message-one",
+                ),
+            )
+            self.assertEqual("unchanged", delivered_again["disposition"])
+
+            status, _, undone = request(
+                endpoint, "/v1/scheduling-cards/action",
+                request_document(
+                    card_id=claim["card_id"],
+                    card_version=claim["card_version"],
+                    action="undo",
+                ),
+            )
+            self.assertEqual((200, True, "applied"), (
+                status, undone["ok"], undone["disposition"],
+            ))
+            _, _, replay = request(
+                endpoint, "/v1/scheduling-cards/action",
+                request_document(
+                    card_id=claim["card_id"],
+                    card_version=claim["card_version"],
+                    action="undo",
+                ),
+            )
+            self.assertFalse(replay["ok"])
+
+        with closing(sqlite3.connect(self.database)) as connection:
+            row = connection.execute(
+                "SELECT queue_priority,status FROM task_execution_workflows "
+                "WHERE task_id=1"
+            ).fetchone()
+        self.assertEqual(("normal", "queued"), row)
 
     def test_execution_brief_route_is_a_versioned_read(self):
         self.execution.schedule(1, expected_task_version=1)
