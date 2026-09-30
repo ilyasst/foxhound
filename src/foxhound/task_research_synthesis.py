@@ -467,10 +467,34 @@ def _model(
 
 
 def _parse_json(value: str) -> object:
+    candidate = _unwrap_json_protocol(value)
     try:
-        return json.loads(value, object_pairs_hook=_strict_object)
+        return json.loads(candidate, object_pairs_hook=_strict_object)
     except (UnicodeError, ValueError, TypeError) as exc:
         raise SynthesisError("malformed_json") from exc
+
+
+def _unwrap_json_protocol(value: str) -> str:
+    """Remove at most one complete reasoning block and one whole JSON fence."""
+    candidate = value.strip()
+    think_open = "<think>"
+    think_close = "</think>"
+    if candidate.startswith(think_open):
+        closing = candidate.find(think_close, len(think_open))
+        if closing < 0:
+            return candidate
+        candidate = candidate[closing + len(think_close):].strip()
+
+    if candidate.startswith("```json"):
+        opening = "```json"
+    elif candidate.startswith("```"):
+        opening = "```"
+    else:
+        return candidate
+    remainder = candidate[len(opening):]
+    if not remainder.startswith("\n") or not candidate.endswith("\n```"):
+        return candidate
+    return remainder[1:-4].strip()
 
 
 def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:

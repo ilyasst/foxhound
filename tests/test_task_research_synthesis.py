@@ -242,6 +242,50 @@ class TaskResearchSynthesisTests(unittest.TestCase):
                 opener=Opener("not JSON"),
             )
 
+    def test_complete_protocol_wrappers_are_accepted_once(self):
+        document = json.dumps(draft())
+        wrappers = (
+            document,
+            f"```json\n{document}\n```",
+            f"```\n{document}\n```",
+            f"<think>synthetic reasoning</think>\n{document}",
+            f"<think>synthetic reasoning</think>\n```json\n{document}\n```",
+        )
+        for response in wrappers:
+            with self.subTest(response=response[:20]):
+                result = synthesize(
+                    context(), knowledge=Knowledge(), config=config(),
+                    opener=Opener(response),
+                )
+                self.assertEqual(result.draft["schema_version"], DRAFT_SCHEMA)
+
+    def test_incomplete_repeated_or_prose_wrappers_are_rejected(self):
+        document = json.dumps(draft())
+        responses = (
+            f"<think>unclosed\n{document}",
+            f"```json\n{document}",
+            f"```python\n{document}\n```",
+            f"prose\n{document}",
+            f"{document}\nprose",
+            f"<think>one</think><think>two</think>{document}",
+            f"```json\n```json\n{document}\n```\n```",
+        )
+        for response in responses:
+            with self.subTest(response=response[:20]):
+                with self.assertRaisesRegex(SynthesisError, "^malformed_json$"):
+                    synthesize(
+                        context(), knowledge=Knowledge(), config=config(),
+                        opener=Opener(response),
+                    )
+
+    def test_duplicate_keys_inside_protocol_wrapper_are_rejected(self):
+        response = '```json\n{"schema_version":"one","schema_version":"two"}\n```'
+        with self.assertRaisesRegex(SynthesisError, "^malformed_json$"):
+            synthesize(
+                context(), knowledge=Knowledge(), config=config(),
+                opener=Opener(response),
+            )
+
     def test_invented_citation_has_distinct_fixed_error_code(self):
         with self.assertRaisesRegex(SynthesisError, "^invented_citation$"):
             synthesize(

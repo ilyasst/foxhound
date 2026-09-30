@@ -91,6 +91,14 @@ Supported codes distinguish invalid configuration/context/output, retrieval
 failure or absence, elapsed budget, model timeout/failure, oversized response,
 malformed JSON, invented citations, and invalid draft shape.
 
+Before strict JSON parsing, the adapter may remove at most one complete leading
+`<think>...</think>` protocol block and at most one whole-response Markdown
+fence labelled `json` or left unlabelled. This accommodates bounded wrappers
+emitted by reasoning backends without extracting JSON from arbitrary prose.
+Unclosed, repeated, nested, mismatched, or prose-surrounded wrappers remain
+malformed. Duplicate-key, exact-schema, source-reference, and citation checks
+apply unchanged after unwrapping.
+
 There is no web search, public-network model endpoint, durable write, queue
 write, or task-folder write in this component.
 
