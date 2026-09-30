@@ -40,11 +40,18 @@ _MAX_THREAD_CHARS = 30_000
 #: Maximum number of comments returned before truncation.
 _MAX_COMMENTS = 100
 
+_MAX_TITLE_CHARS = 1_000
+_MAX_BODY_CHARS = 30_000
+
 _PING_TIMEOUT = 30
 
 
 class ForgeThreadError(RuntimeError):
     """The thread read is refused or the forge would not serve it."""
+
+
+def _bounded_field(value: object, maximum: int) -> str:
+    return value[:maximum] if isinstance(value, str) else ""
 
 
 @dataclass(frozen=True)
@@ -64,6 +71,10 @@ class ThreadResult:
     truncated: bool
     #: URL of the thread.
     url: str
+    #: Bounded forge-owned title and body for read-only research consumers.
+    title: str = ""
+    body: str = ""
+    state: str = ""
 
 
 def _run(*args: str, timeout: int = _PING_TIMEOUT) -> tuple[int, str, str]:
@@ -178,7 +189,7 @@ _ISSUE_QUERY = """
 query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     issue(number: $number) {
-      number url state
+      number url state title body
       comments(first: 100) { totalCount nodes { author { login } body createdAt } }
     }
   }
@@ -189,7 +200,7 @@ _PULL_REQUEST_QUERY = """
 query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
-      number url state
+      number url state title body
       comments(first: 100) { totalCount nodes { author { login } body createdAt } }
       reviews(first: 100) { totalCount nodes { author { login } state body createdAt } }
     }
@@ -226,6 +237,9 @@ def read_issue_thread(
         reviews=[],
         truncated=truncated,
         url=data.get("url", ""),
+        title=_bounded_field(data.get("title"), _MAX_TITLE_CHARS),
+        body=_bounded_field(data.get("body"), _MAX_BODY_CHARS),
+        state=_bounded_field(data.get("state"), 40),
     )
 
 
@@ -259,4 +273,7 @@ def read_pull_request_thread(
         reviews=reviews,
         truncated=truncated,
         url=data.get("url", ""),
+        title=_bounded_field(data.get("title"), _MAX_TITLE_CHARS),
+        body=_bounded_field(data.get("body"), _MAX_BODY_CHARS),
+        state=_bounded_field(data.get("state"), 40),
     )
