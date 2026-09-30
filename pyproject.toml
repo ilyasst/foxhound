@@ -42,6 +42,7 @@ foxhound-task-duplicate-stage1 = "foxhound.task_duplicate_stage1:main"
 foxhound-task-duplicate-stage2 = "foxhound.task_duplicate_stage2:main"
 foxhound-task-duplicate-reconcile = "foxhound.task_duplicate_reconcile:main"
 foxhound-task-research = "foxhound.task_research:main"
+foxhound-task-research-runner = "foxhound.task_research_runner:main"
 foxhound-agent-dispatch = "foxhound.agent_dispatch:main"
 
 [tool.setuptools.packages.find]

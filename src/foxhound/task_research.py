@@ -560,10 +560,21 @@ class ResearchStore:
             row = connection.execute("SELECT * FROM task_research_jobs WHERE job_id=?", (job_id,)).fetchone()
             return self._job(row)
 
-    def claim(self, worker_id: str, *, lease_seconds: int = 900) -> ResearchClaim | None:
+    def claim(
+        self,
+        worker_id: str,
+        *,
+        lease_seconds: int = 900,
+        task_work_root: Path | None = None,
+    ) -> ResearchClaim | None:
         worker_id = _identifier(worker_id, "worker id")
         if not isinstance(lease_seconds, int) or isinstance(lease_seconds, bool) or not 1 <= lease_seconds <= 1800:
             raise ResearchError("invalid claim lease")
+        bounded_root = (
+            None
+            if task_work_root is None
+            else str(self._safe_directory(Path(task_work_root), "task work root"))
+        )
         now_dt = self._now()
         now = now_dt.isoformat().replace("+00:00", "Z")
         expires = (now_dt + timedelta(seconds=lease_seconds)).isoformat().replace("+00:00", "Z")
@@ -571,10 +582,17 @@ class ResearchStore:
         token_digest = _digest(token.encode())
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                "SELECT * FROM task_research_jobs WHERE state='queued' "
-                "ORDER BY requested_at,job_id LIMIT 1"
-            ).fetchone()
+            if bounded_root is None:
+                row = connection.execute(
+                    "SELECT * FROM task_research_jobs WHERE state='queued' "
+                    "ORDER BY requested_at,job_id LIMIT 1"
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT * FROM task_research_jobs WHERE state='queued' "
+                    "AND task_work_root=? ORDER BY requested_at,job_id LIMIT 1",
+                    (bounded_root,),
+                ).fetchone()
             if row is None:
                 connection.commit()
                 return None
