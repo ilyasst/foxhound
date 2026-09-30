@@ -33,6 +33,8 @@ ISSUE_THREAD_DATA = {
     "number": 42,
     "url": "https://github.com/example-org/example-repo/issues/42",
     "state": "open",
+    "title": "Bounded detail view",
+    "body": "Keep the board face compact while exposing reviewable detail.",
     "comments": {
         "nodes": [
             {
@@ -55,6 +57,8 @@ PR_THREAD_DATA = {
     "number": 7,
     "url": "https://github.com/example-org/example-repo/pull/7",
     "state": "open",
+    "title": "Implement bounded detail view",
+    "body": "Synthetic implementation for review.",
     "reviews": {
         "nodes": [
             {
@@ -102,6 +106,9 @@ class IssueThreadReads(unittest.TestCase):
         self.assertEqual(result.number, 42)
         self.assertEqual(result.repository, "github.com/example-org/example-repo")
         self.assertEqual(result.url, ISSUE_THREAD_DATA["url"])
+        self.assertEqual(result.title, ISSUE_THREAD_DATA["title"])
+        self.assertEqual(result.body, ISSUE_THREAD_DATA["body"])
+        self.assertEqual(result.state, ISSUE_THREAD_DATA["state"])
         self.assertEqual(len(result.comments), 2)
         self.assertEqual(result.comments[0]["author"], "reviewer-a")
         self.assertFalse(result.truncated)
@@ -125,6 +132,20 @@ class IssueThreadReads(unittest.TestCase):
         self.assertIn("name=example-repo", call_text)
         self.assertIn("number=42", call_text)
 
+    def test_issue_title_and_body_are_bounded(self) -> None:
+        oversized = dict(ISSUE_THREAD_DATA)
+        oversized["title"] = "T" * 2_000
+        oversized["body"] = "B" * 40_000
+        runner = _gh([
+            (("gh", "api"), (0, json.dumps(_response("issue", oversized)), "")),
+        ])
+        with mock.patch.object(forge_thread, "_run", runner):
+            result = forge_thread.read_issue_thread(
+                repository="github.com/example-org/example-repo", number="42",
+            )
+        self.assertEqual(len(result.title), 1_000)
+        self.assertEqual(len(result.body), 30_000)
+
 
 class PullRequestThreadReads(unittest.TestCase):
     def test_returns_reviews_and_comments_on_the_task_pr(self) -> None:
@@ -140,6 +161,8 @@ class PullRequestThreadReads(unittest.TestCase):
         self.assertEqual(result.kind, "pull-request")
         self.assertEqual(result.number, 7)
         self.assertEqual(len(result.reviews), 2)
+        self.assertEqual(result.title, PR_THREAD_DATA["title"])
+        self.assertEqual(result.body, PR_THREAD_DATA["body"])
         self.assertEqual(result.reviews[0]["author"], "reviewer-a")
         self.assertEqual(result.reviews[0]["state"], "COMMENTED")
         self.assertEqual(len(result.comments), 1)

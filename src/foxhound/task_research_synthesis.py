@@ -2,7 +2,8 @@
 
 This adapter is deliberately outside the durable research lifecycle.  It reads
 one claimed research context, performs read-only searches, and returns scratch
-artifacts for the lifecycle publisher.  It has no database or queue handle.
+artifacts for the lifecycle publisher.  Its optional database handle resolves
+only the task's accepted source origin; it has no queue-write authority.
 """
 
 from __future__ import annotations
@@ -40,6 +41,11 @@ from .task_duplicate_semantic import (
     _dialect,
     _local_endpoint,
     _model_name,
+)
+from .task_research_sources import (
+    BoundResearchSources,
+    ResearchSourceError,
+    bound_research_sources,
 )
 
 
@@ -282,6 +288,7 @@ def synthesize(
     *,
     knowledge: KnowledgeSearch,
     config: SynthesisConfig,
+    bound_sources: BoundResearchSources | None = None,
     opener=None,
     validator: DraftValidator | None = None,
     monotonic: Callable[[], float] = time.monotonic,
@@ -293,6 +300,19 @@ def synthesize(
     documents, search_count, truncated_layers, unavailable = _retrieve(
         knowledge, queries, config=config, started=started, monotonic=monotonic
     )
+    supplied = bound_sources or BoundResearchSources(())
+    merged: list[tuple[str, KnowledgeDocument]] = []
+    seen: set[tuple[str, str]] = set()
+    for layer, document in (*supplied.documents, *documents):
+        identity = (document.id, document.path)
+        if identity in seen:
+            continue
+        merged.append((layer, document))
+        seen.add(identity)
+        if len(merged) == config.max_documents:
+            break
+    documents = merged
+    unavailable.update(supplied.unavailable_source_ids)
     if not documents:
         raise SynthesisError("retrieval_empty")
     sources, evidence = _evidence(documents)
@@ -320,15 +340,17 @@ def synthesize(
         raise SynthesisError("response_too_large")
     elapsed_ms = max(0, round((monotonic() - started) * 1000))
     # Emit the publisher's broker-owned coverage contract directly.  The
-    # synthesis adapter searches these three logical namespaces on every query;
-    # the digest binds the exact bounded retrieval snapshot supplied to the
-    # model without claiming a backend revision the gateway did not provide.
+    # The synthesis adapter searches three gateway namespaces on every query
+    # and may add the exact database-bound repo origin.  The digest binds the
+    # complete bounded retrieval snapshot supplied to the model.
     retrieval_revision = hashlib.sha256(_json_bytes({
         "sources": sources,
         "truncated_layers": sorted(truncated_layers),
     })).hexdigest()
+    searched_namespaces = {"attachment", "email", "kb"}
+    searched_namespaces.update(supplied.attempted_namespaces)
     coverage = {
-        "searched_namespaces": ["attachment", "email", "kb"],
+        "searched_namespaces": sorted(searched_namespaces),
         "queries": search_count,
         "documents_retrieved": len(sources),
         "unavailable_source_ids": sorted(unavailable),
@@ -479,7 +501,10 @@ def _evidence(
     sources: list[dict[str, object]] = []
     evidence: list[dict[str, object]] = []
     used = 0
-    namespaces = {"kb": "kb", "secondary": "attachment", "emails": "email"}
+    namespaces = {
+        "kb": "kb", "secondary": "attachment", "emails": "email",
+        "repo": "repo",
+    }
     for layer, document in documents:
         excerpt = document.excerpt[:MAX_EXCERPT_CHARS]
         size = len(excerpt.encode("utf-8"))
@@ -895,6 +920,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--gw-endpoint", required=True)
     parser.add_argument("--gw-alias", required=True)
     parser.add_argument("--gw-token-file", required=True, type=Path)
+    parser.add_argument(
+        "--database", type=Path,
+        help="resolve bounded forge evidence from the claimed task database",
+    )
     return parser
 
 
@@ -913,6 +942,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         output = arguments.output_directory
         context = _read_private_json_file(arguments.context, max_bytes=MAX_CONTEXT_BYTES, error_code="invalid_context")
+        supplied = BoundResearchSources(())
+        if arguments.database is not None:
+            task = _context_task(context)
+            try:
+                supplied = bound_research_sources(
+                    arguments.database,
+                    task_id=int(task["task_id"]),
+                    task_version=int(task["task_version"]),
+                )
+            except ResearchSourceError as exc:
+                raise SynthesisError("source_refused") from exc
         config = SynthesisConfig(
             model=arguments.model,
             endpoint=arguments.endpoint,
@@ -932,7 +972,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.gw_token_file,
             timeout_seconds=config.knowledge_timeout_seconds,
         ))
-        result = synthesize(context, knowledge=knowledge, config=config)
+        result = synthesize(
+            context, knowledge=knowledge, config=config,
+            bound_sources=supplied,
+        )
         _write_private(output / "draft-research.json", result.draft)
         _write_private(output / "source-receipts.json", list(result.sources))
         _write_private(output / "research-coverage.json", result.coverage)

@@ -27,6 +27,7 @@ from foxhound.task_research_synthesis import (
     main,
     synthesize,
 )
+from foxhound.task_research_sources import BoundResearchSources
 
 
 def context(text: str = "Prepare the Project Alpha launch brief.", task_id: int = 101) -> dict:
@@ -250,6 +251,34 @@ class TaskResearchSynthesisTests(unittest.TestCase):
             opener=Opener(json.dumps(draft(same_history=False))),
         )
         self.assertIn("separate review", result.draft["related_entities"][0]["text"])
+
+    def test_bound_repo_origin_leads_evidence_and_coverage(self):
+        supplied = BoundResearchSources(
+            documents=(("repo", KnowledgeDocument(
+                id="repo:bound-origin-live",
+                path="github.com/example-org/project-alpha/issues/42/live-thread.json",
+                excerpt="The source issue requires a bounded detail view.",
+            )),),
+            attempted_namespaces=("repo",),
+        )
+        opener = Opener(json.dumps(draft()))
+        result = synthesize(
+            context(), knowledge=Knowledge(), config=config(), opener=opener,
+            bound_sources=supplied,
+        )
+        self.assertEqual(result.sources[0]["locator"]["namespace"], "repo")
+        self.assertEqual(
+            result.sources[0]["locator"]["resource"],
+            "github.com/example-org/project-alpha/issues/42/live-thread.json",
+        )
+        self.assertEqual(
+            result.coverage["searched_namespaces"],
+            ["attachment", "email", "kb", "repo"],
+        )
+        request = json.loads(opener.requests[0][0].data)
+        payload = json.loads(request["messages"][1]["content"])
+        self.assertEqual(payload["evidence"][0]["source_id"], "src-001")
+        self.assertTrue(payload["evidence"][0]["untrusted"])
 
     def test_prompt_injection_is_framed_as_untrusted_evidence(self):
         malicious = (

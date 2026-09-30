@@ -27,6 +27,15 @@ V1 logical source namespaces are `kb`, `meeting`, `email`, `attachment`, and
 `repo`. There is no web namespace or enable-web flag. Source IDs are sequential
 and broker-owned.
 
+For an issue or review-request task, the synthesis adapter may populate `repo`
+from two bounded read-only records: the immutable accepted candidate payload
+and the current forge thread. The database binding supplies the repository and
+item number. Task prose, model output, and command-line target arguments cannot
+redirect the read. The current thread is optional when the forge is
+unavailable; its absence is recorded while the immutable snapshot remains
+usable. Unsupported hosts, malformed identifiers, and stale task versions are
+refused before synthesis.
+
 The current machine record is `.task-research.json`; `Research.md` is its sole
 deterministic rendering. Both names are reserved from ordinary task artifacts.
 The publisher first records the generation in a private content-addressed store,
