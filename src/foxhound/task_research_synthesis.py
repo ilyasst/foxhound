@@ -103,6 +103,7 @@ class SynthesisConfig:
     endpoint: str
     dialect: str = DEFAULT_DIALECT
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
+    knowledge_timeout_seconds: float = 30.0
     reasoning: str = "high"
     max_searches: int = DEFAULT_MAX_SEARCHES
     max_documents: int = DEFAULT_MAX_DOCUMENTS
@@ -125,6 +126,11 @@ class SynthesisConfig:
                 or not isinstance(self.timeout_seconds, (int, float))
                 or not math.isfinite(self.timeout_seconds)
                 or not 0 < self.timeout_seconds <= DEFAULT_TIMEOUT_SECONDS):
+            raise SynthesisError("invalid_config")
+        if (isinstance(self.knowledge_timeout_seconds, bool)
+                or not isinstance(self.knowledge_timeout_seconds, (int, float))
+                or not math.isfinite(self.knowledge_timeout_seconds)
+                or not 0 < self.knowledge_timeout_seconds <= 30):
             raise SynthesisError("invalid_config")
         for value, maximum in (
             (self.max_searches, DEFAULT_MAX_SEARCHES),
@@ -745,6 +751,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--dialect", choices=sorted(DIALECTS), default=DEFAULT_DIALECT)
     parser.add_argument("--reasoning", choices=("low", "medium", "high"), default="high")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
+    parser.add_argument(
+        "--knowledge-timeout", type=float, default=30.0,
+        help="deadline in seconds for each read-only GW search (default: 30)",
+    )
     parser.add_argument("--max-searches", type=int, default=DEFAULT_MAX_SEARCHES)
     parser.add_argument("--max-documents", type=int, default=DEFAULT_MAX_DOCUMENTS)
     parser.add_argument("--profile-id", required=True)
@@ -776,6 +786,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             endpoint=arguments.endpoint,
             dialect=arguments.dialect,
             timeout_seconds=arguments.timeout,
+            knowledge_timeout_seconds=arguments.knowledge_timeout,
             reasoning=arguments.reasoning,
             max_searches=arguments.max_searches,
             max_documents=arguments.max_documents,
@@ -784,7 +795,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             provider=arguments.provider,
         )
         knowledge = GwKnowledgeClient(load_knowledge_config(
-            arguments.gw_endpoint, arguments.gw_alias, arguments.gw_token_file
+            arguments.gw_endpoint,
+            arguments.gw_alias,
+            arguments.gw_token_file,
+            timeout_seconds=config.knowledge_timeout_seconds,
         ))
         result = synthesize(context, knowledge=knowledge, config=config)
         _write_private(output / "draft-research.json", result.draft)
