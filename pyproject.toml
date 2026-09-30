@@ -44,6 +44,7 @@ foxhound-task-duplicate-reconcile = "foxhound.task_duplicate_reconcile:main"
 foxhound-task-research = "foxhound.task_research:main"
 foxhound-task-research-runner = "foxhound.task_research_runner:main"
 foxhound-agent-dispatch = "foxhound.agent_dispatch:main"
+foxhound-task-bulk-drop = "foxhound.task_bulk_drop:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

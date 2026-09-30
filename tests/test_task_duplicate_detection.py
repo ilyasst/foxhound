@@ -122,6 +122,46 @@ class CrossSourceDetectionTests(DetectionFixture):
         result = detection.scan(self.connection, now=NOW)
         self.assertEqual((result.pairs_considered, result.proposals_recorded), (0, 0))
 
+    def test_same_source_dropped_pair_is_ineligible(self):
+        self._task(
+            1, kind="email", record="record-same", text="Prepare the synthetic rollout checklist",
+            status="dropped", closed_at="2030-02-28T12:00:00+00:00",
+            read_at="2030-02-28T10:00:00+00:00",
+        )
+        self._task(
+            2, kind="email", record="record-same", text="Draft the synthetic rollout checklist",
+            status="open",
+            read_at="2030-03-01T12:00:00+00:00",
+        )
+        result = detection.scan(self.connection, now=NOW)
+        self.assertEqual((result.pairs_considered, result.proposals_recorded), (0, 0))
+
+    def test_different_source_dropped_pair_is_still_eligible(self):
+        self._task(
+            1, kind="email", record="record-1", text="Prepare the synthetic rollout checklist",
+            status="dropped", closed_at="2030-02-28T12:00:00+00:00",
+        )
+        self._task(
+            2, kind="meeting", record="record-2", text="Draft the synthetic rollout checklist",
+            status="open",
+        )
+        result = detection.scan(self.connection, now=NOW)
+        self.assertEqual((result.pairs_considered, result.proposals_recorded), (1, 1))
+
+    def test_same_source_open_open_pair_is_still_eligible(self):
+        self._task(
+            1, kind="email", record="record-same", text="Prepare the synthetic rollout checklist",
+            status="open",
+            read_at="2030-02-28T10:00:00+00:00",
+        )
+        self._task(
+            2, kind="email", record="record-same", text="Draft the synthetic rollout checklist",
+            status="open",
+            read_at="2030-03-01T12:00:00+00:00",
+        )
+        result = detection.scan(self.connection, now=NOW)
+        self.assertEqual((result.pairs_considered, result.proposals_recorded), (1, 1))
+
     def test_repeat_scan_is_idempotent_and_preserves_reader_rejection(self):
         self._task(1, kind="email", text="Prepare the synthetic checklist")
         self._task(2, kind="meeting", text="Draft the synthetic checklist")

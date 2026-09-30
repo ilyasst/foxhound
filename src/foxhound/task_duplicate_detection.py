@@ -491,6 +491,10 @@ def _basis(
 
 def _eligible_status_pair(left: DuplicateCandidate, right: DuplicateCandidate,
                           *, now: str) -> bool:
+    if ("dropped" in (left.task_status, right.task_status)
+            and left.source_kind and left.source_record_id
+            and (left.source_kind, left.source_record_id) == (right.source_kind, right.source_record_id)):
+        return False
     statuses = (left.task_status, right.task_status)
     if statuses == ("open", "open"):
         return True
