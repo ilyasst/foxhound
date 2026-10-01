@@ -528,6 +528,18 @@ class DeploymentConfigTests(unittest.TestCase):
         ):
             load_deployment_config(self.config_path)
 
+    def test_ask_when_owned_by_others_overlapping_with_plan_without_asking_is_rejected(self) -> None:
+        document = self._document()
+        document["workflow"]["plan_without_asking"] = ["issue"]  # type: ignore[index]
+        document["workflow"]["ask_when_owned_by_others"] = ["issue"]  # type: ignore[index]
+        self._write_config(document)
+
+        with self.assertRaisesRegex(
+            DeploymentConfigError,
+            "ask-when-owned-by-others declarations overlap with planning grants: issue",
+        ):
+            load_deployment_config(self.config_path)
+
     def test_version_nine_configuration_retains_its_plan_phase(self) -> None:
         document = self._document()
         document["schema_version"] = 9

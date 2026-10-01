@@ -108,6 +108,7 @@ class WorkflowConfig:
     execution_slot_cap: int
     plan_ready_cap: int
     awaiting_reader_cap: int
+    ask_when_owned_by_others: tuple[str, ...] = ()
     steer_while_running: tuple[str, ...] = ()
     #: Kinds whose recorded plan runs without a card. Defaults to empty so a
     #: configuration written before this key existed keeps asking.
@@ -141,6 +142,8 @@ class WorkflowConfig:
             result.extend(("--profile-route", f"{source_kind}={profile_id}"))
         for kind in self.plan_without_asking:
             result.extend(("--plan-without-asking", kind))
+        for kind in self.ask_when_owned_by_others:
+            result.extend(("--ask-when-owned-by-others", kind))
         for kind in self.execute_without_asking:
             result.extend(("--execute-without-asking", kind))
         for kind in self.steer_while_running:
@@ -672,7 +675,10 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
     # Announcements are opt-in. Keep a current configuration that predates
     # this declaration valid and byte-for-byte equivalent to an empty list.
     # This also makes a controlled schema-version upgrade non-disruptive.
-    optional = {"steer_while_running"} if version >= 15 else set()
+    optional = set()
+    if version >= 15:
+        optional.add("steer_while_running")
+    optional.add("ask_when_owned_by_others")
     document = _object(value, fields, optional)
     profile = document["default_agent_profile"]
     grants = document["plan_without_asking"]
@@ -686,6 +692,7 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
         document["agent_profile_routes"] if version >= 11 else []
     )
     steer = document.get("steer_while_running", []) if version >= 15 else []
+    ask_others = document.get("ask_when_owned_by_others", [])
     caps = tuple(document[key] for key in (
         "execution_slot_cap", "plan_ready_cap", "awaiting_reader_cap"
     ))
@@ -697,14 +704,23 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
         or not _grant_list(aliases)
         or not _grant_list(skipped)
         or not _grant_list(steer)
+        or not _grant_list(ask_others)
         or any(isinstance(cap, bool) or not isinstance(cap, int) for cap in caps)
     ):
         raise DeploymentConfigError("workflow configuration is invalid")
+    assert isinstance(grants, list)
+    assert isinstance(execute_grants, list)
+    assert isinstance(act_grants, list)
+    assert isinstance(aliases, list)
+    assert isinstance(skipped, list)
+    assert isinstance(steer, list)
+    assert isinstance(ask_others, list)
     return WorkflowConfig(
         profile,
         routes,
         tuple(grants),
         *caps,
+        ask_when_owned_by_others=tuple(ask_others),
         steer_while_running=tuple(steer),
         execute_without_asking=tuple(execute_grants),
         act_without_asking=tuple(act_grants),
@@ -1171,6 +1187,16 @@ def _validate_runtime(config: DeploymentConfig) -> None:
     _private_database(config.database)
     registry = load_registry(config.agent_profile_directory)
     plans = planning_grants(config.workflow.plan_without_asking)
+    ask_when_owned_by_others = planning_grants(
+        config.workflow.ask_when_owned_by_others,
+        label="ask-when-owned-by-others declarations",
+    )
+    overlap = plans & ask_when_owned_by_others
+    if overlap:
+        raise DeploymentConfigError(
+            "ask-when-owned-by-others declarations overlap with planning grants: "
+            + ", ".join(sorted(overlap))
+        )
     executions = execution_grants(config.workflow.execute_without_asking)
     skipped = execution_grants(
         config.workflow.skip_planning_for,
@@ -1203,6 +1229,7 @@ def _validate_runtime(config: DeploymentConfig) -> None:
         profile_registry=registry,
         default_profile_id=config.workflow.default_agent_profile,
         planning_grants=config.workflow.plan_without_asking,
+        ask_when_owned_by_others=config.workflow.ask_when_owned_by_others,
         steer_while_running=config.workflow.steer_while_running,
         execution_grants=config.workflow.execute_without_asking,
         skip_planning_for=config.workflow.skip_planning_for,

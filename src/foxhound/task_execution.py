@@ -27,7 +27,11 @@ from .card_provenance import (
     origin_payload_subquery,
     stored_origin_sources,
 )
-from .task_owner import normalized_aliases, reader_owned
+from .task_owner import (
+    confidently_other_owned,
+    normalized_aliases,
+    reader_owned,
+)
 from .agent_profiles import (
     AgentProfile,
     AgentProfileError,
@@ -506,6 +510,7 @@ class TaskExecutionService:
         profile_registry: AgentProfileRegistry | None = None,
         default_profile_id: str = "general",
         planning_grants: object = None,
+        ask_when_owned_by_others: object = None,
         steer_while_running: object = None,
         execution_grants: object = None,
         skip_planning_for: object = None,
@@ -584,6 +589,16 @@ class TaskExecutionService:
         # decided is asked, rather than having the decision made for them
         # by whichever machine edited a shared file first.
         self._planning_grants = _planning_grants(planning_grants)
+        self._ask_when_owned_by_others = _planning_grants(
+            ask_when_owned_by_others,
+            label="ask-when-owned-by-others declarations",
+        )
+        overlap = self._planning_grants & self._ask_when_owned_by_others
+        if overlap:
+            raise ValueError(
+                "ask-when-owned-by-others declarations overlap with planning grants: "
+                + ", ".join(sorted(overlap))
+            )
         # This is a notification policy, not an execution authority.  It is
         # still validated against the closed source-kind vocabulary so a typo
         # cannot silently make a run invisible.
@@ -752,6 +767,7 @@ class TaskExecutionService:
                     if _initial_status(
                         origin_kind, self._planning_grants, row,
                         self._reader_aliases,
+                        self._ask_when_owned_by_others,
                     ) is not WorkflowStatus.QUEUED:
                         continue
                     version = int(row["version"]) + 1
@@ -843,6 +859,7 @@ class TaskExecutionService:
                     status = _initial_status(
                         row["origin_kind"], self._planning_grants, row,
                         self._reader_aliases,
+                        self._ask_when_owned_by_others,
                     )
                     if (
                         phase is WorkflowPhase.PLAN
@@ -981,6 +998,7 @@ class TaskExecutionService:
                     status = _initial_status(
                         task["origin_kind"], self._planning_grants, task,
                         self._reader_aliases,
+                        self._ask_when_owned_by_others,
                     )
                     profile = self._profile_for(task["origin_kind"])
                     connection.execute(
@@ -1004,6 +1022,7 @@ class TaskExecutionService:
                     status = _initial_status(
                         task["origin_kind"], self._planning_grants, task,
                         self._reader_aliases,
+                        self._ask_when_owned_by_others,
                     )
                     profile = self._profile_for(task["origin_kind"])
                     connection.execute(
@@ -3819,6 +3838,7 @@ def _initial_status(
     granted: frozenset[str],
     row: Mapping[str, object] | None = None,
     reader_aliases: frozenset[str] = frozenset(),
+    ask_when_owned_by_others: frozenset[str] = frozenset(),
 ) -> WorkflowStatus:
     """Whether this task must be asked about before it is planned.
 
@@ -3838,6 +3858,10 @@ def _initial_status(
     Everything after the plan is still gated.
     """
     if isinstance(origin_kind, str) and origin_kind in granted:
+        return WorkflowStatus.QUEUED
+    if isinstance(origin_kind, str) and origin_kind in ask_when_owned_by_others:
+        if row is not None and confidently_other_owned(row, reader_aliases):
+            return WorkflowStatus.AWAITING_START
         return WorkflowStatus.QUEUED
     if row is not None and reader_owned(row, reader_aliases):
         return WorkflowStatus.QUEUED
