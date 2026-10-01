@@ -15,7 +15,7 @@ import shutil
 import stat
 import sys
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -69,10 +69,10 @@ from .task_archive import (
 
 
 RUN_STATE_SCHEMA = "foxhound.execution-run-state"
-RUN_STATE_SCHEMA_VERSION = 6
+RUN_STATE_SCHEMA_VERSION = 7
 INSTRUCTIONS_NAME = "agent-instructions.json"
 WORK_CONTEXT_SCHEMA = "foxhound.execution-work-context"
-WORK_CONTEXT_SCHEMA_VERSION = 8
+WORK_CONTEXT_SCHEMA_VERSION = 9
 WORKER_SEARCH_SCHEMA = "foxhound.execution-worker-search"
 RESULT_DRAFT_SCHEMA = "foxhound.execution-result-draft"
 RESULT_DRAFT_READY_SCHEMA = "foxhound.execution-result-draft-ready"
@@ -132,6 +132,30 @@ def _read_handoff(task_work_directory: str | None, phase: str) -> str | None:
         return raw.decode("utf-8", errors="replace")
     except Exception:
         return None
+
+
+def _pass_budget(state: "ExecutionRunState") -> dict[str, object]:
+    """How long this pass has, as the supervisor will enforce it.
+
+    The profile asks an agent to record complete or partial evidence before
+    its budget runs out; without this the agent has no way to know when that
+    is. Remaining time is computed at each call, so an agent can ask again.
+    A run state written before the deadline existed answers ``None``.
+    """
+    if state.pass_deadline is None:
+        return {
+            "pass_budget_seconds": None,
+            "pass_deadline": None,
+            "pass_remaining_seconds": None,
+        }
+    remaining = (
+        state.pass_deadline - datetime.now(timezone.utc)
+    ).total_seconds()
+    return {
+        "pass_budget_seconds": state.pass_budget_seconds,
+        "pass_deadline": state.pass_deadline.isoformat(timespec="seconds"),
+        "pass_remaining_seconds": max(0, int(remaining)),
+    }
 
 
 def _local_calendar() -> dict[str, object]:
@@ -261,6 +285,8 @@ class ExecutionRunState:
     task_work_directory: str | None = None
     task_kb_file: str | None = None
     task_run_directory: str | None = None
+    pass_budget_seconds: int | None = None
+    pass_deadline: datetime | None = None
 
 
 class ExecutionWorker:
@@ -334,6 +360,10 @@ class ExecutionWorker:
                 # environment variable could not answer that.
                 "policy_id": self._policy.policy_id,
                 "policy_revision": self._policy.revision,
+                # The pass deadline the supervisor enforces. Past it the
+                # agent is stopped and the reader is handed what it left;
+                # recording before it is the only way to be the result.
+                **_pass_budget(state),
             },
             "capabilities": {
                 # This is descriptive evidence from the worker, not authority
@@ -1219,17 +1249,23 @@ def load_run_state(path: str | os.PathLike[str]) -> ExecutionRunState:
     }
     grant_fields = {"execution_grants", "action_grants"}
     root_fields = {"deployment_roots"}
+    deadline_fields = {"pass_budget_seconds", "pass_deadline"}
     _exact_fields(
         document,
         base_fields | (
-            archive_fields if version in {4, 5, RUN_STATE_SCHEMA_VERSION} else set()
-        ) | (grant_fields if version in {5, RUN_STATE_SCHEMA_VERSION} else set())
-        | (root_fields if version == RUN_STATE_SCHEMA_VERSION else set()),
+            archive_fields if version in {4, 5, 6, RUN_STATE_SCHEMA_VERSION}
+            else set()
+        ) | (
+            grant_fields if version in {5, 6, RUN_STATE_SCHEMA_VERSION}
+            else set()
+        )
+        | (root_fields if version in {6, RUN_STATE_SCHEMA_VERSION} else set())
+        | (deadline_fields if version == RUN_STATE_SCHEMA_VERSION else set()),
         "execution run state",
     )
     if (
         document["schema"] != RUN_STATE_SCHEMA
-        or document["schema_version"] not in {3, 4, 5, RUN_STATE_SCHEMA_VERSION}
+        or document["schema_version"] not in {3, 4, 5, 6, RUN_STATE_SCHEMA_VERSION}
         or isinstance(document["schema_version"], bool)
         or not isinstance(document["run_id"], str)
         or not _RUN_ID_RE.fullmatch(document["run_id"])
@@ -1285,6 +1321,25 @@ def load_run_state(path: str | os.PathLike[str]) -> ExecutionRunState:
         task_work_directory, task_kb_file, task_run_directory
     )}) != 1:
         raise ExecutionWorkerConfigError("execution run state is invalid")
+    pass_budget = None
+    pass_deadline = None
+    if version == RUN_STATE_SCHEMA_VERSION:
+        pass_budget = document["pass_budget_seconds"]
+        if (
+            isinstance(pass_budget, bool)
+            or not isinstance(pass_budget, int)
+            or not 1 <= pass_budget <= 86_400
+            or not isinstance(document["pass_deadline"], str)
+        ):
+            raise ExecutionWorkerConfigError("execution run state is invalid")
+        try:
+            pass_deadline = datetime.fromisoformat(document["pass_deadline"])
+        except ValueError:
+            raise ExecutionWorkerConfigError(
+                "execution run state is invalid"
+            ) from None
+        if pass_deadline.tzinfo is None:
+            raise ExecutionWorkerConfigError("execution run state is invalid")
     try:
         execution_grants = _execution_grants(document.get("execution_grants"))
         action_grants = _action_grants(document.get("action_grants"))
@@ -1306,11 +1361,14 @@ def load_run_state(path: str | os.PathLike[str]) -> ExecutionRunState:
         action_grants=action_grants,
         knowledge_root=_knowledge_root(document["knowledge_root"]),
         deployment_roots=_deployment_roots(
-            document.get("deployment_roots") if version == RUN_STATE_SCHEMA_VERSION else {}
+            document.get("deployment_roots")
+            if version in {6, RUN_STATE_SCHEMA_VERSION} else {}
         ),
         task_work_directory=task_work_directory,
         task_kb_file=task_kb_file,
         task_run_directory=task_run_directory,
+        pass_budget_seconds=pass_budget,
+        pass_deadline=pass_deadline,
     )
 
 

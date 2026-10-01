@@ -661,11 +661,19 @@ class ResearchStore:
                     )):
                 connection.rollback()
                 raise ResearchError("research claim is unavailable")
-            target = "parked" if row["attempts"] >= row["max_attempts"] else "queued"
+            if "timeout" in failure_code:
+                target = "queued"
+                attempts = max(0, row["attempts"] - 1)
+            elif row["attempts"] >= row["max_attempts"]:
+                target = "parked"
+                attempts = row["attempts"]
+            else:
+                target = "queued"
+                attempts = row["attempts"]
             kind = "parked" if target == "parked" else "retried"
             connection.execute(
-                "UPDATE task_research_jobs SET state=?,failure_code=?,updated_at=? WHERE job_id=?",
-                (target, failure_code, now, job_id),
+                "UPDATE task_research_jobs SET state=?,attempts=?,failure_code=?,updated_at=? WHERE job_id=?",
+                (target, attempts, failure_code, now, job_id),
             )
             connection.execute("DELETE FROM task_research_claims WHERE job_id=?", (job_id,))
             connection.execute(

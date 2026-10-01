@@ -122,5 +122,18 @@ class FusedTaskTitleTests(unittest.TestCase):
         )
 
 
+    def test_timeout_requeues_to_pending_without_consuming_attempts(self) -> None:
+        opener, _ = _opener(TimeoutError("gateway timed out"))
+        result = titles.run_once(
+            self.database, opener=opener, clock=lambda: NOW,
+        )
+        self.assertEqual((result.attempted, result.completed, result.retryable),
+                         (1, 0, 1))
+        row = self.connection.execute(
+            "SELECT state,title,attempts FROM task_fused_title_jobs WHERE task_id=1"
+        ).fetchone()
+        self.assertEqual(tuple(row), ("pending", None, 0))
+
+
 if __name__ == "__main__":
     unittest.main()

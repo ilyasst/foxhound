@@ -249,6 +249,38 @@ class FailureDigestPassTests(unittest.TestCase):
             self.service.failure_digest(1), "It stopped at its turn limit."
         )
 
+    def test_evidence_inserted_with_failure_is_not_overwritten_by_digest_pass(self):
+        # A failed workflow at version 4 failed its attempt at version 3
+        self._failed_workflow(version=4)
+        self._transcript("transcript content from timed out run\n")
+
+        # Directly insert failure digest evidence for the attempt that failed (version 3)
+        inserted = self.service.record_failure_digest(
+            1,
+            workflow_version=3,
+            phase="execute",
+            run_id=RUN_ID,
+            digest="Original bounded timeout evidence from runner",
+        )
+        self.assertTrue(inserted)
+        self.assertEqual(
+            self.service.failure_digest(1),
+            "Original bounded timeout evidence from runner",
+        )
+
+        # Background digest pass runs
+        result = run_pass(
+            database_path=self.database,
+            run_root=self.runs,
+            digester=lambda _text: "Overwritten digest from model",
+        )
+        self.assertEqual(result.recorded, 0)
+        self.assertEqual(result.considered, 0)
+        self.assertEqual(
+            self.service.failure_digest(1),
+            "Original bounded timeout evidence from runner",
+        )
+
     def test_the_digest_is_keyed_to_the_attempt_that_failed(self):
         """Not to the version its failure created.
 
