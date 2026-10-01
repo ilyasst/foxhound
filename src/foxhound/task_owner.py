@@ -91,6 +91,39 @@ def reader_owned(
     return normalized_owner(display) in reader_aliases
 
 
+def confidently_other_owned(
+    row: Mapping[str, object], reader_aliases: frozenset[str]
+) -> bool:
+    """Whether this task is confidently owned by another person.
+
+    Returns False when reader_aliases is empty: without knowing the reader's
+    aliases, this machine cannot distinguish its reader from others, so it
+    must not gate.
+
+    Otherwise returns True when:
+    - owner_kind is in {"person", "external"}
+    - owner_ref_version == 1
+    - owner_provisional == 0
+    - canonical_owner_display is not None and not UNRESOLVED_DISPLAY
+    - normalized_owner(display) not in reader_aliases
+    """
+    if not reader_aliases:
+        return False
+    kind = _column(row, "owner_kind")
+    display = canonical_owner_display(
+        _text_or_none(_column(row, "owner")), _text_or_none(kind)
+    )
+    if display is None or display == UNRESOLVED_DISPLAY:
+        return False
+    if kind not in {"person", "external"}:
+        return False
+    if _as_int(_column(row, "owner_ref_version")) != 1:
+        return False
+    if _as_int(_column(row, "owner_provisional")) != 0:
+        return False
+    return normalized_owner(display) not in reader_aliases
+
+
 def _column(row: Mapping[str, object], name: str) -> object:
     """One column, whether the row is a mapping or a `sqlite3.Row`.
 

@@ -17,7 +17,11 @@ from foxhound.deployment_config import (
     _parse_workflow,
 )
 from foxhound.task_execution import TaskExecutionService, WorkflowStatus
-from foxhound.task_owner import normalized_aliases, reader_owned
+from foxhound.task_owner import (
+    confidently_other_owned,
+    normalized_aliases,
+    reader_owned,
+)
 
 
 READER = "Person A"
@@ -74,6 +78,46 @@ class ReaderOwnedPredicateTests(unittest.TestCase):
     def test_a_missing_owner_is_not_the_reader(self):
         row = _confirmed(READER) | {"owner": None}
         self.assertFalse(reader_owned(row, self.aliases))
+
+
+class ConfidentlyOtherOwnedPredicateTests(unittest.TestCase):
+    """The confidently_other_owned predicate."""
+
+    def setUp(self) -> None:
+        self.aliases = normalized_aliases([READER])
+
+    def test_another_confirmed_owner_matches(self):
+        self.assertTrue(confidently_other_owned(_confirmed(OTHER), self.aliases))
+
+    def test_the_reader_does_not_match(self):
+        self.assertFalse(confidently_other_owned(_confirmed(READER), self.aliases))
+
+    def test_without_aliases_returns_false(self):
+        self.assertFalse(confidently_other_owned(_confirmed(OTHER), frozenset()))
+
+    def test_provisional_owner_does_not_match(self):
+        row = _confirmed(OTHER) | {"owner_provisional": 1}
+        self.assertFalse(confidently_other_owned(row, self.aliases))
+
+    def test_version_zero_reference_does_not_match(self):
+        row = _confirmed(OTHER) | {"owner_ref_version": 0}
+        self.assertFalse(confidently_other_owned(row, self.aliases))
+
+    def test_group_owner_does_not_match(self):
+        row = _confirmed(OTHER) | {"owner_kind": "group"}
+        self.assertFalse(confidently_other_owned(row, self.aliases))
+
+    def test_unresolved_owner_does_not_match(self):
+        row = _confirmed(OTHER) | {"owner_kind": "unresolved"}
+        self.assertFalse(confidently_other_owned(row, self.aliases))
+
+    def test_missing_owner_does_not_match(self):
+        row = _confirmed(OTHER) | {"owner": None}
+        self.assertFalse(confidently_other_owned(row, self.aliases))
+
+    def test_external_owner_matches_when_not_reader(self):
+        row = _confirmed(OTHER) | {"owner_kind": "external"}
+        self.assertTrue(confidently_other_owned(row, self.aliases))
 
 
 class OwnerConditionedAdmissionTests(unittest.TestCase):
@@ -268,6 +312,194 @@ class DeploymentConfigAliasTests(unittest.TestCase):
              if value == "--reader-alias"],
             [READER, OTHER],
         )
+
+
+class AskWhenOwnedByOthersTests(unittest.TestCase):
+    """Synthetic tests for workflow.ask_when_owned_by_others."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.root.chmod(0o700)
+        self.database = self.root / "foxhound.sqlite3"
+        migrate_database(self.database)
+
+    def _now(self) -> str:
+        return datetime(2030, 1, 5, tzinfo=timezone.utc).isoformat(
+            timespec="seconds")
+
+    def _task(
+        self,
+        task_id: int,
+        owner: str | None,
+        origin_kind: str = "meeting",
+        **owner_columns: object,
+    ) -> None:
+        columns = {
+            "owner_kind": "person",
+            "owner_ref_version": 1,
+            "owner_provisional": 0,
+        } | owner_columns
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "INSERT INTO tasks(id,status,text,owner,due,version,"
+                "created_at,updated_at,closed_at,owner_kind,"
+                "owner_ref_version,owner_provisional) "
+                "VALUES(?,'open',?,?,NULL,1,?,?,NULL,?,?,?)",
+                (
+                    task_id, f"Synthetic task {task_id}", owner,
+                    self._now(), self._now(), columns["owner_kind"],
+                    columns["owner_ref_version"],
+                    columns["owner_provisional"],
+                ),
+            )
+            connection.execute(
+                "INSERT INTO task_events(task_id,kind,task_version,"
+                "candidate_id,source_revision,from_status,to_status,"
+                "occurred_at) VALUES(?,'created',1,NULL,NULL,NULL,'open',?)",
+                (task_id, self._now()),
+            )
+            connection.execute(
+                "INSERT INTO candidate_inbox(candidate_id,source_system,"
+                "source_kind,source_record_id,source_item_id,"
+                "source_revision,payload_json,created_at,"
+                "first_imported_at,updated_at) "
+                "VALUES(?,'gw',?,'record-synthetic',?,?,'{}',?,?,?)",
+                (
+                    f"origin-{task_id}", origin_kind, str(task_id), "b" * 64,
+                    self._now(), self._now(), self._now(),
+                ),
+            )
+            connection.execute(
+                "INSERT INTO task_candidate_bindings(candidate_id,"
+                "source_revision,task_id,relation,decided_at) "
+                "VALUES(?,?,?,'accepted',?)",
+                (f"origin-{task_id}", "b" * 64, task_id, self._now()),
+            )
+            connection.commit()
+
+    def _service(
+        self,
+        *,
+        ask_when_owned_by_others: object = ("meeting",),
+        planning_grants: object = (),
+        reader_aliases: object = [READER],
+    ) -> TaskExecutionService:
+        return TaskExecutionService(
+            self.database,
+            planning_grants=planning_grants,
+            ask_when_owned_by_others=ask_when_owned_by_others,
+            reader_aliases=reader_aliases,
+        )
+
+    def test_listed_kind_reader_owned_is_queued(self):
+        self._task(1, READER)
+        service = self._service()
+        service.schedule_new(limit=10)
+        workflow = service.get(1)
+        self.assertIsNotNone(workflow)
+        assert workflow is not None
+        self.assertEqual(workflow.status, WorkflowStatus.QUEUED)
+
+    def test_listed_kind_unresolved_owner_is_queued(self):
+        self._task(1, "(unassigned)", owner_kind="unresolved")
+        service = self._service()
+        service.schedule_new(limit=10)
+        workflow = service.get(1)
+        self.assertIsNotNone(workflow)
+        assert workflow is not None
+        self.assertEqual(workflow.status, WorkflowStatus.QUEUED)
+
+    def test_listed_kind_provisional_owner_is_queued(self):
+        self._task(1, OTHER, owner_provisional=1)
+        service = self._service()
+        service.schedule_new(limit=10)
+        workflow = service.get(1)
+        self.assertIsNotNone(workflow)
+        assert workflow is not None
+        self.assertEqual(workflow.status, WorkflowStatus.QUEUED)
+
+    def test_listed_kind_other_named_owner_waits_at_start(self):
+        self._task(1, OTHER)
+        service = self._service()
+        service.schedule_new(limit=10)
+        workflow = service.get(1)
+        self.assertIsNotNone(workflow)
+        assert workflow is not None
+        self.assertEqual(workflow.status, WorkflowStatus.AWAITING_START)
+
+    def test_listed_kind_empty_reader_aliases_is_queued(self):
+        self._task(1, OTHER)
+        service = self._service(reader_aliases=[])
+        service.schedule_new(limit=10)
+        workflow = service.get(1)
+        self.assertIsNotNone(workflow)
+        assert workflow is not None
+        self.assertEqual(workflow.status, WorkflowStatus.QUEUED)
+
+    def test_unlisted_kind_unchanged_waits_at_start(self):
+        self._task(1, OTHER, origin_kind="email")
+        service = self._service(ask_when_owned_by_others=["meeting"])
+        service.schedule_new(limit=10)
+        workflow = service.get(1)
+        self.assertIsNotNone(workflow)
+        assert workflow is not None
+        self.assertEqual(workflow.status, WorkflowStatus.AWAITING_START)
+
+    def test_overlap_with_planning_grants_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "overlap"):
+            self._service(
+                planning_grants=["meeting"],
+                ask_when_owned_by_others=["meeting"],
+            )
+
+    def test_deployment_config_render_includes_the_list(self):
+        workflow = _parse_workflow(
+            {
+                "default_agent_profile": "general",
+                "plan_without_asking": ["issue"],
+                "ask_when_owned_by_others": ["meeting"],
+                "execution_slot_cap": 1,
+                "plan_ready_cap": 1,
+                "awaiting_reader_cap": 1,
+                "execute_without_asking": [],
+                "act_without_asking": [],
+                "reader_aliases": [READER],
+                "skip_planning_for": [],
+                "agent_profile_routes": [],
+            },
+            version=DEPLOYMENT_SCHEMA_VERSION,
+        )
+        self.assertEqual(workflow.ask_when_owned_by_others, ("meeting",))
+        argv = workflow.schedule_argv(Path("/srv/example/db.sqlite3"), None)
+        self.assertIn("--ask-when-owned-by-others", argv)
+        self.assertEqual(
+            argv[argv.index("--ask-when-owned-by-others") + 1], "meeting"
+        )
+
+    def test_waiting_other_owned_task_released_when_owner_becomes_unresolved(self):
+        self._task(1, OTHER)
+        service = self._service()
+        service.schedule_new(limit=10)
+        workflow = service.get(1)
+        self.assertIsNotNone(workflow)
+        assert workflow is not None
+        self.assertEqual(workflow.status, WorkflowStatus.AWAITING_START)
+
+        # Update owner to unresolved
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "UPDATE tasks SET owner='(unassigned)', owner_kind='unresolved' WHERE id=1"
+            )
+            connection.commit()
+
+        # Run admission pass again
+        service.schedule_new(limit=10)
+        workflow_after = service.get(1)
+        self.assertIsNotNone(workflow_after)
+        assert workflow_after is not None
+        self.assertEqual(workflow_after.status, WorkflowStatus.QUEUED)
 
 
 if __name__ == "__main__":

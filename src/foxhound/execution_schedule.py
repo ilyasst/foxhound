@@ -26,6 +26,7 @@ def run_schedule(
     default_agent_profile: str = "general",
     profile_routes: Mapping[str, str] | None = None,
     plan_without_asking: Sequence[str] | None = None,
+    ask_when_owned_by_others: Sequence[str] | None = None,
     execute_without_asking: Sequence[str] | None = None,
     steer_while_running: Sequence[str] | None = None,
     skip_planning_for: Sequence[str] | None = None,
@@ -41,6 +42,7 @@ def run_schedule(
         default_profile_id=default_agent_profile,
         profile_routes=profile_routes,
         planning_grants=plan_without_asking,
+        ask_when_owned_by_others=ask_when_owned_by_others,
         execution_grants=execute_without_asking,
         steer_while_running=steer_while_running,
         skip_planning_for=skip_planning_for,
@@ -71,6 +73,15 @@ def _parser() -> argparse.ArgumentParser:
             "let this machine plan tasks from SOURCE_KIND without asking "
             "first; repeat for each kind. Omitted means every task is "
             "asked about, which is the default and the cautious answer."
+        ),
+    )
+    parser.add_argument(
+        "--ask-when-owned-by-others",
+        action="append",
+        metavar="SOURCE_KIND",
+        help=(
+            "plan tasks from SOURCE_KIND without asking unless the task is "
+            "confidently owned by another person; repeat for each kind."
         ),
     )
     parser.add_argument(
@@ -144,6 +155,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             default_agent_profile=args.default_agent_profile,
             profile_routes=_profile_routes(args.profile_route),
             plan_without_asking=args.plan_without_asking,
+            ask_when_owned_by_others=args.ask_when_owned_by_others,
             execute_without_asking=args.execute_without_asking,
             steer_while_running=args.steer_while_running,
             skip_planning_for=args.skip_planning_for,

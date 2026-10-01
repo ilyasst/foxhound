@@ -342,6 +342,16 @@ permission to plan its tasks, so the card that would ask again can only show
 a title — nothing has looked at the work yet. Planning is read-only and
 produces no external effect.
 
+`ask_when_owned_by_others` qualifies planning authority for sources where some
+tasks belong to other people. For a listed source kind, a new task is queued
+for planning as if the kind were in `plan_without_asking` unless the task is
+confidently owned by another person (individual person or external owner,
+version 1, not provisional, display resolved, and not matching any declared
+reader alias). If it is confidently owned by another person, it waits at the
+Start card. Unresolved, provisional, group, or version-zero owners do not wait.
+A source kind cannot appear in both `plan_without_asking` and
+`ask_when_owned_by_others`.
+
 `execute_without_asking` skips the plan-approval gate. A recorded plan runs
 instead of waiting for a card. Grant it for a source where the decision to
 work every task was already made when the source was enrolled, and where a
