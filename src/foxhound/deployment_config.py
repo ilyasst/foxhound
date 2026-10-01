@@ -125,6 +125,8 @@ class WorkflowConfig:
     #: means ownership never admits a task, which is the behaviour of every
     #: configuration written before this key existed.
     reader_aliases: tuple[str, ...] = ()
+    #: Whether the task worker generates voice summaries and synthesizes speech.
+    voice_summaries: bool = True
 
     def schedule_argv(
         self, database: Path, profile_directory: Path | None
@@ -465,6 +467,11 @@ def execute_component(config: DeploymentConfig, component: str) -> None:
     from a different checkout or release.
     """
     argv = config.argv(component)
+    if (component.startswith("execution-runner")
+            and not config.workflow.voice_summaries):
+        # Inherited by the agent and its task worker: no summary model call
+        # and no speech synthesis for this host's results.
+        os.environ["FOXHOUND_VOICE_SUMMARIES"] = "0"
     try:
         executable = Path(sys.argv[0]).resolve().parent / argv[0]
         if not executable.is_file():
@@ -679,6 +686,7 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
     if version >= 15:
         optional.add("steer_while_running")
     optional.add("ask_when_owned_by_others")
+    optional.add("voice_summaries")
     document = _object(value, fields, optional)
     profile = document["default_agent_profile"]
     grants = document["plan_without_asking"]
@@ -693,6 +701,9 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
     )
     steer = document.get("steer_while_running", []) if version >= 15 else []
     ask_others = document.get("ask_when_owned_by_others", [])
+    voice = document.get("voice_summaries", True)
+    if not isinstance(voice, bool):
+        raise DeploymentConfigError("workflow configuration is invalid")
     caps = tuple(document[key] for key in (
         "execution_slot_cap", "plan_ready_cap", "awaiting_reader_cap"
     ))
@@ -726,6 +737,7 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
         act_without_asking=tuple(act_grants),
         reader_aliases=tuple(aliases),
         skip_planning_for=tuple(skipped),
+        voice_summaries=voice,
     )
 
 

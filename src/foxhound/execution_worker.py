@@ -885,6 +885,13 @@ class ExecutionWorker:
             self._state_path.parent, draft_name
         )
         draft = _repository_result(state, draft, self._state_path.parent)
+        voice_summary_text = ""
+        if os.environ.get("FOXHOUND_VOICE_SUMMARIES", "1") != "0":
+            voice_summary_text = draft.get("voice_summary", "") or voice_summary.generate(
+                draft["work_markdown"],
+                summary=draft["summary"],
+                deliverables=draft["deliverables"],
+            )
         envelope = ExecutionResultEnvelope(
             result_id=draft["result_id"],
             task_id=state.task_id,
@@ -901,11 +908,7 @@ class ExecutionWorker:
             # the transaction a card claim is waiting on. Returns "" on
             # any failure; the card then shows an excerpt instead.
             work_digest=work_digest.digest(draft["work_markdown"]),
-            voice_summary=draft.get("voice_summary", "") or voice_summary.generate(
-                draft["work_markdown"],
-                summary=draft["summary"],
-                deliverables=draft["deliverables"],
-            ),
+            voice_summary=voice_summary_text,
             questions=draft["questions"],
             external_actions=draft["external_actions"],
             deliverables=draft["deliverables"],
@@ -921,7 +924,7 @@ class ExecutionWorker:
                     state.task_id, expected_version=state.workflow_version)),
         )
         if state.task_run_directory is not None:
-            if envelope.voice_summary:
+            if os.environ.get("FOXHOUND_VOICE_SUMMARIES", "1") != "0" and envelope.voice_summary:
                 try:
                     audio = tts_client.synthesize(envelope.voice_summary)
                     if audio:
