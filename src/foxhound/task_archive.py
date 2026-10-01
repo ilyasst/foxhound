@@ -156,6 +156,32 @@ def record_runtime_log(paths: TaskArchivePaths, log_name: str) -> None:
     raise TaskArchiveError("task runtime log is unavailable")
 
 
+#: A short phrase, not an explanation. The card carries the explanation; the
+#: history line only has to stop saying nothing.
+MAX_RUN_STOPPED_CHARS = 80
+
+
+def record_run_stopped(paths: TaskArchivePaths, stopped: str) -> None:
+    """Note on this run's history line how it ended without a result.
+
+    Deliberately not an ``outcome``: an outcome is what makes a run the
+    task's current result, and a pass that stopped has none. Without this
+    the history showed a timed-out pass exactly like one still running.
+    """
+    text = " ".join(str(stopped).split()) if isinstance(stopped, str) else ""
+    if not text or len(text) > MAX_RUN_STOPPED_CHARS:
+        raise TaskArchiveError("task run ending is invalid")
+    log = _read_log(paths.working_directory)
+    for entry in reversed(log.get("runs", [])):
+        if isinstance(entry, dict) and entry.get("run") == paths.run_directory.name:
+            if entry.get("outcome"):
+                return
+            entry["stopped"] = text
+            _publish_log(paths, log)
+            return
+    raise TaskArchiveError("task run ending is unavailable")
+
+
 def clear_missing_runtime_logs(paths: TaskArchivePaths) -> None:
     """Do not leave the task ledger pointing at a rotated runtime record."""
     log = _read_log(paths.working_directory)
@@ -532,7 +558,10 @@ def _render_task_document(log: Mapping[str, object]) -> str:
     if runs:
         lines.extend(("## History", ""))
         for entry in runs[-MAX_HISTORY_RUNS:]:
-            outcome = entry.get("outcome") or "no result recorded"
+            outcome = entry.get("outcome") or (
+                f"no result recorded ({entry['stopped']})"
+                if entry.get("stopped") else "no result recorded"
+            )
             note = _single_line(
                 str(entry.get("summary") or ""), MAX_HISTORY_SUMMARY_CHARS
             )

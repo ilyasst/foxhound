@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import socket
 import sqlite3
 import sys
 import urllib.request
@@ -88,6 +89,13 @@ def refresh_after_withdrawal(
         enqueue(connection, task_id=task_id, now=now)
 
 
+def _is_timeout(exc: BaseException) -> bool:
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return True
+    reason = getattr(exc, "reason", None)
+    return isinstance(reason, (TimeoutError, socket.timeout))
+
+
 def run_once(
     database_path: str | os.PathLike[str], *, endpoint_url: str | None = None,
     opener=None,
@@ -124,7 +132,12 @@ def run_once(
             connection.rollback()
             raise
 
-    title = generate_title(texts, endpoint_url=endpoint_url, opener=opener)
+    timed_out = False
+    try:
+        title = generate_title(texts, endpoint_url=endpoint_url, opener=opener)
+    except Exception as exc:  # noqa: BLE001 - model and transport failure are retryable
+        timed_out = _is_timeout(exc)
+        title = ""
     with closing(_connect(path)) as connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
@@ -136,6 +149,15 @@ def run_once(
                 )
                 completed = int(cursor.rowcount == 1)
                 retryable = 0
+            elif timed_out:
+                cursor = connection.execute(
+                    "UPDATE task_fused_title_jobs SET state='pending',title=NULL,"
+                    "attempts=MAX(0, attempts - 1),"
+                    "updated_at=? WHERE task_id=? AND state='running'",
+                    (now, task_id),
+                )
+                completed = 0
+                retryable = int(cursor.rowcount == 1)
             else:
                 cursor = connection.execute(
                     "UPDATE task_fused_title_jobs SET state='pending',title=NULL,"
@@ -176,13 +198,10 @@ def generate_title(
         method="POST",
     )
     open_request = (opener or urllib.request).urlopen
-    try:
-        with open_request(request, timeout=TIMEOUT_SECONDS) as response:
-            raw = response.read(64 * 1024)
-        reply = json.loads(raw.decode("utf-8"))
-        return _clean(reply["choices"][0]["message"]["content"])
-    except Exception:  # noqa: BLE001 - model and transport failure are retryable
-        return ""
+    with open_request(request, timeout=TIMEOUT_SECONDS) as response:
+        raw = response.read(64 * 1024)
+    reply = json.loads(raw.decode("utf-8"))
+    return _clean(reply["choices"][0]["message"]["content"])
 
 
 def _source_texts(connection: sqlite3.Connection, task_id: int) -> tuple[str, ...]:

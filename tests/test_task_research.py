@@ -168,6 +168,27 @@ class TaskResearchTests(unittest.TestCase):
             self.assertEqual(state, "parked" if attempt == 3 else "queued")
         self.assertIsNone(self.store.claim("worker-synthetic"))
 
+    def test_model_timeout_requeues_without_consuming_attempts(self):
+        job = self._request()
+        for _ in range(5):
+            research_claim = self.store.claim("worker-synthetic")
+            self.assertIsNotNone(research_claim)
+            state = self.store.fail(
+                research_claim.job.job_id, research_claim.token, "model_timeout"  # type: ignore[union-attr]
+            )
+            self.assertEqual(state, "queued")
+            row = self.store._connect().execute(
+                "SELECT attempts FROM task_research_jobs WHERE job_id=?", (job.job_id,)
+            ).fetchone()
+            self.assertEqual(row[0], 0)
+        # Next claim should still succeed and not be parked
+        claim_after_timeouts = self.store.claim("worker-synthetic")
+        self.assertIsNotNone(claim_after_timeouts)
+        row = self.store._connect().execute(
+            "SELECT attempts FROM task_research_jobs WHERE job_id=?", (job.job_id,)
+        ).fetchone()
+        self.assertEqual(row[0], 1)
+
     def test_agent_cannot_author_owned_fields_or_web_sources(self):
         bad = draft()
         bad["provenance"] = {"model": "agent-selected"}

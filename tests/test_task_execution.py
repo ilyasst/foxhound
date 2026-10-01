@@ -2390,7 +2390,7 @@ class TaskExecutionTests(unittest.TestCase):
             1,
             expected_version=final_claim.workflow_version,
             claim_token=final_claim.token,
-            reason="timeout",
+            reason="process_exit",
         )
         self.assertEqual(parked.status, WorkflowStatus.PARKED)
         health = self.service.readiness()
@@ -2400,6 +2400,61 @@ class TaskExecutionTests(unittest.TestCase):
         )
         self.assertEqual(retried.status, WorkflowStatus.QUEUED)
         self.assertEqual(self.service.get(1).failure_count, 0)
+
+    def test_timeout_retries_on_capped_schedule_without_incrementing_failure_count(self):
+        self._schedule_and_start()
+        expected_delays = [120, 600, 1800, 3600, 3600, 3600]
+        for idx, expected_delay in enumerate(expected_delays):
+            claim = self._claim()
+            self.assertIsNotNone(claim)
+            now_dt = self.clock()
+            res = self.service.fail(
+                1,
+                expected_version=claim.workflow_version,  # type: ignore[union-attr]
+                claim_token=claim.token,  # type: ignore[union-attr]
+                reason="timeout",
+                exit_code=124,
+                run_id=f"{idx:032x}",
+                evidence=f"Timed out after 45 min. Synthetic note {idx}",
+            )
+            self.assertEqual(res.status, WorkflowStatus.QUEUED)
+            expected_next = (now_dt + timedelta(seconds=expected_delay)).isoformat(timespec="seconds")
+            self.assertEqual(res.next_attempt_at, expected_next)
+            state = self.service.get(1)
+            self.assertIsNotNone(state)
+            self.assertEqual(state.status, WorkflowStatus.QUEUED)  # type: ignore[union-attr]
+            self.assertEqual(state.failure_count, 0)  # type: ignore[union-attr]
+            self.assertEqual(state.last_failure_reason, "timeout")  # type: ignore[union-attr]
+            self.assertEqual(state.last_failure_exit_code, 124)  # type: ignore[union-attr]
+            self.assertEqual(state.last_failure_run_id, f"{idx:032x}")  # type: ignore[union-attr]
+            # Advance clock past next_attempt_at for the next claim
+            self.clock.advance(seconds=expected_delay + 1)
+
+    def test_durable_result_recorded_before_timeout_processed_wins_over_timeout(self):
+        self._schedule_and_start()
+        claim = self._claim()
+
+        # Durable result recorded first
+        result_recorded = self.service.record_result(self._result(claim))
+        self.assertTrue(result_recorded.accepted)
+        self.assertEqual(self.service.get(1).status, WorkflowStatus.AWAITING_REVIEW)
+
+        # Stale timeout arrives with older expected_version
+        refused = self.service.fail(
+            1,
+            expected_version=claim.workflow_version,
+            claim_token=claim.token,
+            reason="timeout",
+            exit_code=124,
+            run_id="b" * 32,
+            evidence="Synthetic timeout evidence",
+        )
+        self.assertEqual(refused.disposition, WorkflowDisposition.REFUSED)
+        self.assertEqual(refused.refusal, WorkflowRefusal.STALE_WORKFLOW)
+
+        # Workflow status remains AWAITING_REVIEW
+        state = self.service.get(1)
+        self.assertEqual(state.status, WorkflowStatus.AWAITING_REVIEW)
 
     def test_context_exhaustion_parks_immediately_and_is_countable(self):
         self._schedule_and_start()

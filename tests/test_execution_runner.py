@@ -1068,20 +1068,96 @@ class ExecutionRunnerTests(unittest.TestCase):
 
     def test_timeout_terminates_and_records_failure(self):
         self._ready()
+        work_root = self.root / "Project Alpha" / "Tasks"
+        kb_root = self.root / "Project Alpha KB" / "Tasks"
         monotonic = MutableMonotonic()
-        process = FakeProcess()
+        run_id = "d" * 32
+
+        def popen(_argv, **kwargs):
+            state = load_run_state(kwargs["env"]["FOXHOUND_EXECUTION_STATE"])
+            run_dir = self.run_root / f"run-{run_id}"
+            (run_dir / "result-summary.txt").write_text(
+                "Synthetic summary of the unfinished work.\n"
+                "Second line of summary.\n",
+                encoding="utf-8",
+            )
+            (run_dir / "draft-output.txt").write_text(
+                "Draft content", encoding="utf-8"
+            )
+            # Create a file in task work directory
+            task_dir = work_root / "T1-synthetic-task"
+            (task_dir / "report.md").write_text(
+                "Synthetic report", encoding="utf-8"
+            )
+            return FakeProcess()
+
         result = run_once(
-            self._config(),
-            popen=lambda *_args, **_kwargs: process,
+            self._config(task_work_root=work_root, task_kb_root=kb_root),
+            popen=popen,
             clock=monotonic,
             sleep=monotonic.sleep,
-            run_id_factory=lambda: "d" * 32,
+            run_id_factory=lambda: run_id,
             terminate=self._terminator,
         )
         self.assertEqual((result.outcome, result.exit_code), ("timeout", 124))
         self.assertEqual(monotonic.value, general_profile().timeout_seconds)
-        self.assertTrue(process.terminated)
-        self.assertEqual(self.service.get(1).last_failure_reason, "timeout")
+        state = self.service.get(1)
+        self.assertEqual(state.last_failure_reason, "timeout")
+        self.assertEqual(state.last_failure_exit_code, 124)
+        self.assertEqual(state.last_failure_run_id, run_id)
+
+        digest = self.service.failure_digest(1)
+        self.assertIsNotNone(digest)
+        self.assertIn("Timed out after 45 min without recording a result.", digest)
+        self.assertIn(
+            "Its result-summary.txt begins: Synthetic summary of the unfinished work. Second line of summary.",
+            digest,
+        )
+        self.assertIn(f"Transcript: runs/plan-{run_id}/agent-output.log in the task folder.", digest)
+        self.assertIn("report.md", digest)
+        self.assertIn("draft-output.txt", digest)
+
+        task_dir = work_root / "T1-synthetic-task"
+        readme = (task_dir / "README.md").read_text(encoding="utf-8")
+        self.assertIn("timed out after 45 min", readme)
+
+    def test_timeout_evidence_stays_bounded_for_large_summary_and_many_files(self):
+        self._ready()
+        work_root = self.root / "Project Alpha" / "Tasks"
+        kb_root = self.root / "Project Alpha KB" / "Tasks"
+        monotonic = MutableMonotonic()
+        run_id = "f" * 32
+
+        def popen(_argv, **kwargs):
+            state = load_run_state(kwargs["env"]["FOXHOUND_EXECUTION_STATE"])
+            run_dir = self.run_root / f"run-{run_id}"
+            # Write a very large summary file
+            (run_dir / "result-summary.txt").write_text(
+                "Synthetic word " * 2000,
+                encoding="utf-8",
+            )
+            # Write many files in the run directory and task work directory
+            for i in range(20):
+                (run_dir / f"extra-file-{i:02d}.txt").write_text("x", encoding="utf-8")
+            task_dir = work_root / "T1-synthetic-task"
+            for i in range(20):
+                (task_dir / f"work-file-{i:02d}.txt").write_text("y", encoding="utf-8")
+            return FakeProcess()
+
+        result = run_once(
+            self._config(task_work_root=work_root, task_kb_root=kb_root),
+            popen=popen,
+            clock=monotonic,
+            sleep=monotonic.sleep,
+            run_id_factory=lambda: run_id,
+            terminate=self._terminator,
+        )
+        self.assertEqual((result.outcome, result.exit_code), ("timeout", 124))
+        digest = self.service.failure_digest(1)
+        self.assertIsNotNone(digest)
+        self.assertLessEqual(len(digest), 800)
+        self.assertIn("(+", digest)
+        self.assertIn("more)", digest)
 
     def test_measured_context_refusal_parks_without_an_automatic_retry(self):
         self._ready()

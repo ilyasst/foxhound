@@ -17,6 +17,7 @@ import subprocess
 import shutil
 import sys
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
@@ -52,11 +53,13 @@ from .task_execution import (
     WorkflowStatus,
 )
 from .task_archive import (
+    TASK_LOG_NAME,
     TaskArchiveError,
     TaskArchivePaths,
     TRANSCRIPT_NAME,
     clear_missing_runtime_logs,
     prepare_task_archive,
+    record_run_stopped,
     record_runtime_log,
     preserve_run_files,
     publish_deliverables,
@@ -116,6 +119,20 @@ _SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 #: boundary.  Deliberately narrower than what some catalog might accept --
 #: this value is chosen by the deployment, not discovered.
 _AGENT_SELECTION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,127}$")
+#: The runner's note of what a timed-out pass left behind. It becomes that
+#: attempt's failure digest, so it is bounded by the same column.
+_TIMEOUT_EVIDENCE_CHARS = 800
+_TIMEOUT_SUMMARY_CHARS = 300
+_TIMEOUT_LISTED_FILES = 8
+_TIMEOUT_NAME_CHARS = 48
+#: Read only this much of the agent's own summary file: the note quotes its
+#: opening, not the whole thing.
+_TIMEOUT_SUMMARY_READ_BYTES = 4 * 1024
+_RESULT_SUMMARY_NAME = "result-summary.txt"
+#: Wall clock, separately injectable from the monotonic supervision clock.
+#: The deadline is a statement to the agent about the time of day; the
+#: timeout itself is still enforced on the monotonic clock.
+_wall_clock: Callable[[], float] = time.time
 _CORRECTIVE_TURN_PROMPT = (
     "The preceding execution turn ended without recording a result. "
     "Do not do new work. Use exactly one worker operation now: record the "
@@ -624,7 +641,13 @@ def _run_claim(
             )
         state_path = directory / "run-state.json"
         instructions_path = directory / INSTRUCTIONS_NAME
-        _write_state(state_path, config, claim, profile, run_id, archive)
+        # Taken before the agent exists, so the deadline it is told can only
+        # be earlier than the one the supervisor enforces, never later.
+        started_wall = _wall_clock()
+        _write_state(
+            state_path, config, claim, profile, run_id, archive,
+            started_wall=started_wall,
+        )
         _write_instructions(instructions_path, profile)
     except (OSError, TaskArchiveError, TaskLedgerError):
         _fail_claim(service, claim, "startup_failed")
@@ -855,15 +878,38 @@ def _run_claim(
                         directory / TRANSCRIPT_NAME, transcript
                     ) else "timeout"
                 )
-                return _failure_result(
+                evidence = None
+                if reason == "timeout":
+                    # What the pass left is read once, here, while the run
+                    # directory is still intact. A pass a few calls short
+                    # of recording has usually written most of its result;
+                    # the reader is told what exists and where, never left
+                    # with a bare "timeout".
+                    evidence = _timeout_evidence(
+                        directory,
+                        archive,
+                        elapsed_seconds=clock() - started,
+                        started_wall=started_wall,
+                    )
+                outcome = _failure_result(
                     service,
                     claim,
                     initial,
                     reason=reason,
                     outcome=reason,
                     exit_code=TIMEOUT_EXIT_CODE,
+                    run_id=run_id,
                     forced=forced,
+                    evidence=evidence,
                 )
+                if outcome.outcome == "timeout" and archive is not None:
+                    with contextlib.suppress(TaskArchiveError):
+                        record_run_stopped(
+                            archive,
+                            "timed out after "
+                            + _minutes(clock() - started),
+                        )
+                return outcome
             sleep(config.poll_seconds)
     except _TerminationRequested as exc:
         if process is not None:
@@ -1167,6 +1213,127 @@ def _context_window_exhausted(path: Path, transcript: object) -> bool:
     return _CONTEXT_FILTER_REFUSAL.search(evidence) is not None
 
 
+def _minutes(seconds: float) -> str:
+    minutes = max(1, int(round(max(0.0, seconds) / 60)))
+    return f"{minutes} min"
+
+
+def _single_line(value: str, maximum: int) -> str:
+    text = " ".join(value.split())
+    if len(text) > maximum:
+        text = text[: max(0, maximum - 1)].rstrip() + "…"
+    return text
+
+
+#: Machinery in the run directory, not anything the agent produced.
+_RUN_MACHINERY = frozenset({
+    "run-state.json", INSTRUCTIONS_NAME, TRANSCRIPT_NAME,
+})
+#: Machinery in the task folder: the reader document, its log, and the run
+#: archive, all of which Foxhound writes at the start of every pass.
+_TASK_FOLDER_MACHINERY = frozenset({"README.md", TASK_LOG_NAME, "runs"})
+
+
+def _written_names(
+    directory: Path, *, exclude: frozenset[str], not_before: float | None
+) -> list[str]:
+    """Top-level names in one directory, newest first, without following links.
+
+    Names only, never contents: this goes on a private card, and a name is
+    enough to tell a reader where to look.
+    """
+    found: list[tuple[float, str]] = []
+    try:
+        entries = list(directory.iterdir())
+    except OSError:
+        return []
+    for entry in entries:
+        name = entry.name
+        if name in exclude or name.startswith("."):
+            continue
+        try:
+            info = entry.lstat()
+        except OSError:
+            continue
+        if stat.S_ISLNK(info.st_mode):
+            continue
+        if not_before is not None and info.st_mtime < not_before:
+            continue
+        found.append((
+            info.st_mtime,
+            name + ("/" if stat.S_ISDIR(info.st_mode) else ""),
+        ))
+    found.sort(key=lambda item: (-item[0], item[1]))
+    return [name for _mtime, name in found]
+
+
+def _timeout_evidence(
+    directory: Path,
+    archive: TaskArchivePaths | None,
+    *,
+    elapsed_seconds: float,
+    started_wall: float,
+) -> str:
+    """A bounded, deterministic note of what a timed-out pass left behind.
+
+    Stored as that attempt's failure digest, so it reaches the reader's card
+    and the next pass's ``prior_failures`` through channels that already
+    exist. Nothing here is a result: it says what files exist, not that any
+    of them is finished, and it opens no gate.
+
+    Never logged. Failing to read any part of it costs that part only.
+    """
+    parts = [
+        f"Timed out after {_minutes(elapsed_seconds)} without recording a "
+        "result."
+    ]
+    summary_path = directory / _RESULT_SUMMARY_NAME
+    try:
+        info = summary_path.lstat()
+        if stat.S_ISREG(info.st_mode):
+            with summary_path.open("rb") as handle:
+                raw = handle.read(_TIMEOUT_SUMMARY_READ_BYTES)
+            summary = _single_line(
+                raw.decode("utf-8", errors="replace"), _TIMEOUT_SUMMARY_CHARS
+            )
+            if summary:
+                parts.append(f"Its {_RESULT_SUMMARY_NAME} begins: {summary}")
+    except OSError:
+        pass
+    if archive is not None:
+        # Before the file list, so the bound below can only ever shorten
+        # the list and never cost the reader the pointer.
+        parts.append(
+            "Transcript: runs/" + archive.run_directory.name + "/"
+            + TRANSCRIPT_NAME + " in the task folder."
+        )
+    names = _written_names(
+        directory, exclude=_RUN_MACHINERY, not_before=None
+    )
+    if archive is not None:
+        names += _written_names(
+            archive.working_directory,
+            exclude=_TASK_FOLDER_MACHINERY,
+            not_before=started_wall,
+        )
+    if names:
+        shown = [
+            _single_line(name, _TIMEOUT_NAME_CHARS)
+            for name in names[:_TIMEOUT_LISTED_FILES]
+        ]
+        more = len(names) - len(shown)
+        parts.append(
+            "Files written: " + ", ".join(shown)
+            + (f" (+{more} more)" if more else "") + "."
+        )
+    else:
+        parts.append("It wrote no files.")
+    text = " ".join(parts)
+    if len(text) > _TIMEOUT_EVIDENCE_CHARS:
+        text = text[: _TIMEOUT_EVIDENCE_CHARS - 1].rstrip() + "…"
+    return text
+
+
 def _fail_claim(
     service: TaskExecutionService,
     claim: ExecutionClaim,
@@ -1174,12 +1341,15 @@ def _fail_claim(
     *,
     exit_code: int | None = None,
     run_id: str | None = None,
+    evidence: str | None = None,
 ) -> WorkflowOperationResult | None:
     try:
         diagnostics: dict[str, object] = {}
         if exit_code is not None:
             diagnostics["exit_code"] = exit_code
             diagnostics["run_id"] = run_id
+        if evidence is not None:
+            diagnostics["evidence"] = evidence
         return service.fail(
             claim.task_id,
             expected_version=claim.workflow_version,
@@ -1201,13 +1371,16 @@ def _failure_result(
     exit_code: int,
     run_id: str | None = None,
     forced: bool = False,
+    evidence: str | None = None,
 ) -> ExecutionRunResult:
+    named = reason in {"process_exit", "timeout"} and run_id is not None
     failed = _fail_claim(
         service,
         claim,
         reason,
-        exit_code=exit_code if reason == "process_exit" else None,
-        run_id=run_id if reason == "process_exit" else None,
+        exit_code=exit_code if named else None,
+        run_id=run_id if named else None,
+        evidence=evidence if named else None,
     )
     if (
         failed is not None
@@ -1300,7 +1473,12 @@ def _write_state(
     profile: AgentProfile,
     run_id: str,
     archive: TaskArchivePaths | None,
+    *,
+    started_wall: float,
 ) -> None:
+    deadline = datetime.fromtimestamp(
+        started_wall + profile.timeout_seconds, tz=timezone.utc
+    )
     document = {
         "schema": RUN_STATE_SCHEMA,
         "schema_version": RUN_STATE_SCHEMA_VERSION,
@@ -1334,6 +1512,12 @@ def _write_state(
         # advances without a reader card.
         "execution_grants": list(config.execution_grants),
         "action_grants": list(config.action_grants),
+        # The profile's guidance asks an agent to record what it has before
+        # its budget runs out. That is not actionable unless the agent can
+        # see when that is, and only the supervisor knows. The kill grace is
+        # deliberately not included: it is shutdown time, not working time.
+        "pass_budget_seconds": profile.timeout_seconds,
+        "pass_deadline": deadline.isoformat(timespec="seconds"),
     }
     payload = (
         json.dumps(

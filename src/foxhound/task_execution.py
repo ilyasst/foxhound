@@ -83,6 +83,7 @@ PARK_RETRY_INTERVAL = timedelta(hours=6)
 
 RETRY_BASE_SECONDS = 60
 RETRY_MAX_SECONDS = 3_600
+TIMEOUT_BACKOFF_SECONDS = (120, 600, 1800, 3600)
 MAX_RESULT_BYTES = 256 * 1024
 MAX_SUMMARY_CHARS = 1_200
 MAX_WORK_MARKDOWN_CHARS = 131_072
@@ -162,6 +163,11 @@ FAILURE_REASONS = frozenset({
     #: fit any served window. Retrying unchanged cannot make it fit.
     "context_exhausted",
 })
+#: Failures that can name the run they came from. Both end a process the
+#: runner started, so the run directory exists and its transcript is the
+#: evidence; every other reason (a lost lease, a startup refusal) may have
+#: no run to point at.
+_RUN_NAMED_FAILURES = frozenset({"process_exit", "timeout"})
 
 
 class WorkflowStatus(StrEnum):
@@ -1552,10 +1558,20 @@ class TaskExecutionService:
         reason: str,
         exit_code: int | None = None,
         run_id: str | None = None,
+        evidence: str | None = None,
     ) -> WorkflowOperationResult:
+        """Give up a claim because its pass failed.
+
+        ``evidence`` is the runner's bounded, deterministic note of what a
+        timed-out pass left behind. It is stored as that attempt's failure
+        digest in the same transaction as the failure, so the card raised
+        for the park can never be rendered without it, and the background
+        digest pass -- which only fills attempts that have none -- cannot
+        replace a statement of fact with a model's paraphrase of it.
+        """
         if reason not in FAILURE_REASONS or reason == "claim_expired":
             return _refused(task_id, WorkflowRefusal.INVALID_ARGUMENT)
-        if reason == "process_exit":
+        if reason in _RUN_NAMED_FAILURES:
             if (exit_code is None) != (run_id is None):
                 return _refused(task_id, WorkflowRefusal.INVALID_ARGUMENT)
             if exit_code is not None and (
@@ -1566,6 +1582,16 @@ class TaskExecutionService:
                 return _refused(task_id, WorkflowRefusal.INVALID_ARGUMENT)
         elif exit_code is not None or run_id is not None:
             return _refused(task_id, WorkflowRefusal.INVALID_ARGUMENT)
+        if evidence is not None:
+            text = evidence.strip() if isinstance(evidence, str) else ""
+            if (
+                reason != "timeout"
+                or run_id is None
+                or not text
+                or len(text) > MAX_FAILURE_DIGEST_CHARS
+            ):
+                return _refused(task_id, WorkflowRefusal.INVALID_ARGUMENT)
+            evidence = text
         return self._finish_claim(
             task_id,
             expected_version=expected_version,
@@ -1573,6 +1599,7 @@ class TaskExecutionService:
             failure_reason=reason,
             failure_exit_code=exit_code,
             failure_run_id=run_id,
+            failure_evidence=evidence,
         )
 
     def _finish_claim(
@@ -1584,6 +1611,7 @@ class TaskExecutionService:
         failure_reason: str | None,
         failure_exit_code: int | None = None,
         failure_run_id: str | None = None,
+        failure_evidence: str | None = None,
     ) -> WorkflowOperationResult:
         if (not _valid_identity(task_id, expected_version)
                 or not _valid_secret(claim_token)):
@@ -1601,6 +1629,7 @@ class TaskExecutionService:
                 if refusal is not None:
                     connection.rollback()
                     return _refused_row(task_id, row, refusal)
+                assert row is not None
                 if failure_reason is None:
                     version = expected_version + 1
                     connection.execute(
@@ -1633,6 +1662,19 @@ class TaskExecutionService:
                         exit_code=failure_exit_code,
                         run_id=failure_run_id,
                     )
+                    if failure_evidence is not None:
+                        # Keyed on the attempt that failed, exactly as the
+                        # background digest pass keys it, so the two can
+                        # never both describe one attempt.
+                        connection.execute(
+                            "INSERT OR IGNORE INTO execution_failure_digests("
+                            "task_id,workflow_version,phase,run_id,digest,"
+                            "created_at) VALUES(?,?,?,?,?,?)",
+                            (
+                                task_id, expected_version, str(row["phase"]),
+                                failure_run_id, failure_evidence, now,
+                            ),
+                        )
                 connection.commit()
                 return result
             except Exception:
@@ -2683,7 +2725,25 @@ class TaskExecutionService:
         now = stamp.isoformat(timespec="seconds")
         failures = int(row["failure_count"]) + 1
         version = int(row["version"]) + 1
-        if reason == "context_exhausted":
+        is_timeout = (reason == "timeout" or exit_code == 124)
+        if is_timeout:
+            status = WorkflowStatus.QUEUED
+            failures = int(row["failure_count"])
+            # Derive previous timeout count for this workflow
+            count_row = connection.execute(
+                "SELECT COUNT(*) FROM execution_failure_digests "
+                "WHERE task_id=? AND digest LIKE 'Timed out after %'",
+                (int(row["task_id"]),),
+            ).fetchone()
+            timeout_count = int(count_row[0]) if count_row is not None else 0
+            backoff_index = min(timeout_count, len(TIMEOUT_BACKOFF_SECONDS) - 1)
+            delay = TIMEOUT_BACKOFF_SECONDS[backoff_index]
+            next_attempt = (stamp + timedelta(seconds=delay)).isoformat(
+                timespec="seconds"
+            )
+            parked = None
+            kind = event_kind or "retry_scheduled"
+        elif reason == "context_exhausted":
             # This is an explicit refusal from the runtime's context filter,
             # not a slow run. The next attempt would re-read the same material
             # and exceed the same measured ceiling, so it must wait for a

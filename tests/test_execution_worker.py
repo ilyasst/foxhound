@@ -14,6 +14,7 @@ import tempfile
 import types
 import threading
 import unittest
+from datetime import datetime, timezone
 from contextlib import closing, contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -252,6 +253,8 @@ class ExecutionWorkerTests(unittest.TestCase):
         execution_grants: tuple[str, ...] = (),
         action_grants: tuple[str, ...] = (),
         deployment_roots: dict[str, str] | None = None,
+        pass_budget_seconds: int = 2700,
+        pass_deadline: str = "2030-01-02T03:49:05+00:00",
     ) -> None:
         document = {
             "schema": "foxhound.execution-run-state",
@@ -282,6 +285,9 @@ class ExecutionWorkerTests(unittest.TestCase):
             })
         if schema_version >= 6:
             document["deployment_roots"] = deployment_roots or {}
+        if schema_version >= 7:
+            document["pass_budget_seconds"] = pass_budget_seconds
+            document["pass_deadline"] = pass_deadline
         self.state_path.write_text(json.dumps(document), encoding="utf-8")
         self.state_path.chmod(0o600)
 
@@ -454,7 +460,7 @@ class ExecutionWorkerTests(unittest.TestCase):
                 "keywords": ["composite", "testing"],
             },
         )
-        self.assertEqual(context["schema_version"], 8)
+        self.assertEqual(context["schema_version"], 9)
         self.assertEqual(context["runtime"]["today"], "2030-01-02")
         self.assertEqual(context["runtime"]["today_weekday"], "Wednesday")
         self.assertEqual(
@@ -1096,6 +1102,58 @@ class ExecutionWorkerTests(unittest.TestCase):
         state = load_run_state(self.state_path)
 
         self.assertEqual(state.deployment_roots, {"shared_state": str(shared)})
+        self.assertIsNone(state.pass_budget_seconds)
+        self.assertIsNone(state.pass_deadline)
+
+    def test_schema_previous_version_six_loads_successfully_without_deadline(self):
+        self._write_state(schema_version=6)
+        state = load_run_state(self.state_path)
+        self.assertIsNone(state.pass_budget_seconds)
+        self.assertIsNone(state.pass_deadline)
+
+    def test_schema_seven_state_carries_pass_budget_and_deadline(self):
+        self._write_state(
+            schema_version=7,
+            pass_budget_seconds=1800,
+            pass_deadline="2030-01-02T04:00:00+00:00",
+        )
+        state = load_run_state(self.state_path)
+        self.assertEqual(state.pass_budget_seconds, 1800)
+        self.assertIsNotNone(state.pass_deadline)
+        self.assertEqual(
+            state.pass_deadline.isoformat(),
+            "2030-01-02T04:00:00+00:00",
+        )
+
+    def test_worker_context_pass_budget_deadline_and_remaining_with_fixed_clock(self):
+        self._write_state(
+            schema_version=7,
+            pass_budget_seconds=1800,
+            pass_deadline="2030-01-02T04:00:00+00:00",
+        )
+        with (
+            mock.patch(
+                "foxhound.execution_worker._local_today",
+                return_value="2030-01-02",
+            ),
+            mock.patch(
+                "foxhound.execution_worker.datetime"
+            ) as mock_dt,
+            knowledge_server() as endpoint,
+        ):
+            # datetime.now(timezone.utc) is called by _pass_budget
+            fixed_now = datetime(2030, 1, 2, 3, 40, 0, tzinfo=timezone.utc)
+            mock_dt.now.return_value = fixed_now
+            mock_dt.fromisoformat = datetime.fromisoformat
+
+            worker = self._worker(endpoint)
+            context = worker.context()
+
+        runtime = context["runtime"]
+        self.assertEqual(runtime["pass_budget_seconds"], 1800)
+        self.assertEqual(runtime["pass_deadline"], "2030-01-02T04:00:00+00:00")
+        # From 03:40:00 to 04:00:00 is exactly 20 minutes = 1200 seconds
+        self.assertEqual(runtime["pass_remaining_seconds"], 1200)
 
     def test_context_includes_configured_deployment_roots(self):
         drive = self.root / "drive"
