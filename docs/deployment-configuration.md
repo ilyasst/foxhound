@@ -352,6 +352,11 @@ Start card. Unresolved, provisional, group, or version-zero owners do not wait.
 A source kind cannot appear in both `plan_without_asking` and
 `ask_when_owned_by_others`.
 
+`workflow.voice_summaries` (optional boolean, default `true`): when `false`,
+the execution runner starts with `FOXHOUND_VOICE_SUMMARIES=0`, so recorded
+results carry no voice summary and no speech is synthesized (no model call
+for it). Dispatched agent jobs always run with voice summaries off.
+
 `execute_without_asking` skips the plan-approval gate. A recorded plan runs
 instead of waiting for a card. Grant it for a source where the decision to
 work every task was already made when the source was enrolled, and where a

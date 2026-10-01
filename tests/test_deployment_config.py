@@ -540,6 +540,35 @@ class DeploymentConfigTests(unittest.TestCase):
         ):
             load_deployment_config(self.config_path)
 
+    def test_voice_summaries_default_on_and_configurable(self) -> None:
+        document = self._document()
+        self._write_config(document)
+        self.assertTrue(load_deployment_config(self.config_path).workflow.voice_summaries)
+        document["workflow"]["voice_summaries"] = False  # type: ignore[index]
+        self._write_config(document)
+        self.assertFalse(load_deployment_config(self.config_path).workflow.voice_summaries)
+        document["workflow"]["voice_summaries"] = "no"  # type: ignore[index]
+        self._write_config(document)
+        with self.assertRaises(DeploymentConfigError):
+            load_deployment_config(self.config_path)
+
+    def test_disabled_voice_summaries_reach_the_execution_runner(self) -> None:
+        document = self._document()
+        document["workflow"]["voice_summaries"] = False  # type: ignore[index]
+        self._write_config(document)
+        config = load_deployment_config(self.config_path)
+        runner = (
+            "execution-runner" if len(config.execution_runners) == 1
+            else f"execution-runner:{config.execution_runners[0].runner_slot}"
+        )
+        with mock.patch.dict("os.environ", {}, clear=False), \
+                mock.patch("os.execv") as execv, \
+                mock.patch("pathlib.Path.is_file", return_value=True):
+            deployment_config.execute_component(config, runner)
+            import os as _os
+            self.assertEqual(_os.environ.get("FOXHOUND_VOICE_SUMMARIES"), "0")
+            execv.assert_called_once()
+
     def test_version_nine_configuration_retains_its_plan_phase(self) -> None:
         document = self._document()
         document["schema_version"] = 9

@@ -417,6 +417,7 @@ def _run(root: Path, job_id: str, runtime: Path, credential_file: Path, credenti
         "NO_COLOR": "1", "TERM": "dumb", "PYTHONUNBUFFERED": "1",
         "CAPROUTE_APP": "foxhound", "CAPROUTE_OPERATION": "agent_dispatch",
         "CAPROUTE_JOB": job_id, "CAPROUTE_RUN_ID": job_id,
+        "FOXHOUND_VOICE_SUMMARIES": "0",
     })
     document.update(state="running", started_at=_utc_now(), heartbeat_at=_utc_now())
     _write_private(state_path, _json_bytes(document))
