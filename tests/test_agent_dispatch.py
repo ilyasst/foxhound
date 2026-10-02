@@ -368,6 +368,49 @@ class AgentDispatchTests(unittest.TestCase):
             self.assertFalse(final_doc["edited"])
             self.assertEqual(final_doc["tool_calls"], 50)
 
+    def test_bootstrap_query_includes_first_edit_deadline_when_set(self) -> None:
+        result = self._start()
+        job_id = str(result["job_id"])
+        completed = wait(self.state_root, job_id, 10)
+        self.assertEqual(completed["state"], "completed")
+        transcript = log(self.state_root, job_id, 128 * 1024).decode()
+        first_line = json.loads(transcript.splitlines()[0])
+        argv = first_line["argv"]
+        query_idx = argv.index("--query")
+        query_text = argv[query_idx + 1]
+        expected_warning = (
+            "This run is stopped if it makes 40 tool calls without changing a file in the working tree: "
+            "make a first concrete edit early, and keep notes in a file in the tree if you are still investigating."
+        )
+        self.assertIn(expected_warning, query_text)
+
+    def test_bootstrap_query_omits_first_edit_deadline_when_disabled(self) -> None:
+        result = start(
+            prompt=self.prompt,
+            working_directory=self.work,
+            state_root=self.state_root,
+            runtime_command=self.runtime,
+            credential_file=self.credentials,
+            credential_name="SYNTHETIC_KEY",
+            model="synthetic-model",
+            provider="synthetic-provider",
+            reasoning="low",
+            toolsets="terminal,file",
+            max_turns=8,
+            timeout_seconds=30,
+            max_concurrency=2,
+            first_edit_within=None,
+        )
+        job_id = str(result["job_id"])
+        completed = wait(self.state_root, job_id, 10)
+        self.assertEqual(completed["state"], "completed")
+        transcript = log(self.state_root, job_id, 128 * 1024).decode()
+        first_line = json.loads(transcript.splitlines()[0])
+        argv = first_line["argv"]
+        query_idx = argv.index("--query")
+        query_text = argv[query_idx + 1]
+        self.assertNotIn("This run is stopped if it makes", query_text)
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -379,7 +422,7 @@ class WorktreeBaselineTests(unittest.TestCase):
         from foxhound.agent_dispatch import _worktree_status
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
-            sp.run(["git", "init", "-q", str(repo)], check=True)
+            sp.run(["git", "-c", "core.hooksPath=/dev/null", "init", "-q", str(repo)], check=True)
             (repo / "earlier_lane.py").write_text("x = 1\n")
             baseline = _worktree_status(repo)
             self.assertFalse(_probe_edited(repo, baseline))

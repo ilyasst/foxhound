@@ -476,10 +476,19 @@ def _run(root: Path, job_id: str, runtime: Path, credential_file: Path, credenti
         _write_private(state_path, _json_bytes(document))
         return 70
 
+    first_edit_within = document.get("first_edit_within")
+    first_edit_limit: int | None = first_edit_within if isinstance(first_edit_within, int) else None
     prompt_path = directory / "prompt.txt"
+    bootstrap_query = _BOOTSTRAP.format(prompt=prompt_path)
+    if first_edit_limit is not None:
+        bootstrap_query += (
+            f" This run is stopped if it makes {first_edit_limit} tool calls without changing a file "
+            "in the working tree: make a first concrete edit early, and keep notes in a file "
+            "in the tree if you are still investigating."
+        )
     command = [
         str(runtime), "--model", str(document["model"]), "--provider", str(document["provider"]),
-        "chat", "--query", _BOOTSTRAP.format(prompt=prompt_path),
+        "chat", "--query", bootstrap_query,
         "--max-turns", str(document["max_turns"]), "--source", "foxhound-dispatch-" + job_id,
         "--ignore-rules", "--toolsets", ",".join(document["toolsets"]), "--quiet",
     ]
@@ -504,8 +513,6 @@ def _run(root: Path, job_id: str, runtime: Path, credential_file: Path, credenti
     edited: bool = bool(document.get("edited", False))
     raw_tc = document.get("tool_calls", 0)
     tool_calls: int = int(raw_tc) if isinstance(raw_tc, (int, str)) else 0
-    first_edit_within = document.get("first_edit_within")
-    first_edit_limit: int | None = first_edit_within if isinstance(first_edit_within, int) else None
     last_edit_seen_at = document.get("last_edit_seen_at")
 
     def request_termination(_signum: int, _frame: object) -> None:
