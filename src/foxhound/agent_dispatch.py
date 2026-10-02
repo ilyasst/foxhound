@@ -17,6 +17,7 @@ import os
 import re
 import secrets
 import signal
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -29,7 +30,7 @@ from typing import Iterator, Mapping, Sequence
 
 
 SCHEMA = "foxhound.agent-dispatch-job.v1"
-TERMINAL_STATES = frozenset({"completed", "failed", "cancelled", "timed_out", "orphaned"})
+TERMINAL_STATES = frozenset({"completed", "failed", "cancelled", "timed_out", "orphaned", "stalled_no_edit"})
 ACTIVE_STATES = frozenset({"starting", "running", "cancelling"})
 DEFAULT_MODEL = "gemini-3.8-flash"
 DEFAULT_PROVIDER = "gemini"
@@ -38,6 +39,9 @@ DEFAULT_MAX_CONCURRENCY = 2
 DEFAULT_MAX_TURNS = 120
 DEFAULT_TIMEOUT_SECONDS = 2 * 60 * 60
 HEARTBEAT_SECONDS = 5
+# Worktree and transcript probes cost a subprocess and a database read;
+# a stall is measured in tens of tool calls, so a slower cadence suffices.
+EDIT_PROBE_SECONDS = 30
 HEARTBEAT_STALE_SECONDS = 30
 MAX_PROMPT_BYTES = 1024 * 1024
 MAX_LOG_BYTES = 8 * 1024 * 1024
@@ -243,6 +247,7 @@ def start(
     runtime_command: Path, credential_file: Path, credential_name: str,
     model: str, provider: str, reasoning: str, toolsets: str,
     max_turns: int, timeout_seconds: int, max_concurrency: int,
+    first_edit_within: int | None = 40,
 ) -> dict[str, object]:
     prompt_payload = _regular_private_input(prompt, maximum=MAX_PROMPT_BYTES)
     working_directory = _existing_directory(working_directory)
@@ -259,6 +264,9 @@ def start(
         raise DispatchError("invalid_limits")
     if not 1 <= max_turns <= 500 or not 1 <= timeout_seconds <= 24 * 60 * 60 or not 1 <= max_concurrency <= 16:
         raise DispatchError("invalid_limits")
+    if first_edit_within is not None:
+        if isinstance(first_edit_within, bool) or not isinstance(first_edit_within, int) or not 5 <= first_edit_within <= 500:
+            raise DispatchError("invalid_limits")
     if not isinstance(credential_name, str) or re.fullmatch(r"[A-Z][A-Z0-9_]{0,127}", credential_name) is None:
         raise DispatchError("invalid_credential")
 
@@ -294,6 +302,10 @@ def start(
             "toolsets": toolsets.split(","),
             "max_turns": max_turns,
             "timeout_seconds": timeout_seconds,
+            "first_edit_within": first_edit_within,
+            "tool_calls": 0,
+            "edited": False,
+            "last_edit_seen_at": None,
             "supervisor_pid": None,
             "supervisor_start": None,
             "heartbeat_at": None,
@@ -378,6 +390,66 @@ def _runtime_config(document: Mapping[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+# Files the runtime itself may leave in a worktree; never evidence of an edit.
+_NON_EDIT_PATHS = frozenset({"agent-guard-rejection.log"})
+
+
+def _worktree_status(working_directory: str | Path) -> frozenset[str] | None:
+    """Porcelain status lines of the worktree, or None when git cannot say."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(working_directory), "status", "--porcelain"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+            text=True,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return frozenset(
+        line for line in result.stdout.splitlines()
+        if line.strip() and line[3:].strip() not in _NON_EDIT_PATHS
+    )
+
+
+def _probe_edited(working_directory: str | Path, baseline: frozenset[str] | None = None) -> bool:
+    """True once the worktree differs from how the lane found it.
+
+    A lane is often re-dispatched onto a worktree that already holds an
+    earlier lane's changes; comparing against that starting state is what
+    makes "has this lane edited anything" answerable at all.
+    """
+    current = _worktree_status(working_directory)
+    if current is None:
+        return False
+    return current != (baseline or frozenset())
+
+
+def _probe_tool_calls(runtime_home: str | Path) -> int:
+    db_path = Path(runtime_home) / "state.db"
+    if not db_path.exists():
+        return 0
+    try:
+        uri = f"file:{db_path.resolve()}?mode=ro"
+        with sqlite3.connect(uri, uri=True) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT tool_calls FROM messages WHERE tool_calls IS NOT NULL")
+            total = 0
+            for (row,) in cursor.fetchall():
+                try:
+                    calls = json.loads(row) if isinstance(row, str) else row
+                    if isinstance(calls, list):
+                        total += len(calls)
+                except Exception:
+                    pass
+            return total
+    except Exception:
+        return 0
+
+
 def _run(root: Path, job_id: str, runtime: Path, credential_file: Path, credential_name: str) -> int:
     directory = _job_path(root, job_id)
     state_path = directory / "state.json"
@@ -419,6 +491,9 @@ def _run(root: Path, job_id: str, runtime: Path, credential_file: Path, credenti
         "CAPROUTE_JOB": job_id, "CAPROUTE_RUN_ID": job_id,
         "FOXHOUND_VOICE_SUMMARIES": "0",
     })
+    # Before the lane is visible as running: a cancel may arrive the moment
+    # it is, and the SIGTERM handler is only installed further down.
+    baseline_status = _worktree_status(str(document["working_directory"]))
     document.update(state="running", started_at=_utc_now(), heartbeat_at=_utc_now())
     _write_private(state_path, _json_bytes(document))
     transcript_path = directory / "transcript.log"
@@ -426,6 +501,12 @@ def _run(root: Path, job_id: str, runtime: Path, credential_file: Path, credenti
     exit_code = 70
     state = "failed"
     termination_requested = False
+    edited: bool = bool(document.get("edited", False))
+    raw_tc = document.get("tool_calls", 0)
+    tool_calls: int = int(raw_tc) if isinstance(raw_tc, (int, str)) else 0
+    first_edit_within = document.get("first_edit_within")
+    first_edit_limit: int | None = first_edit_within if isinstance(first_edit_within, int) else None
+    last_edit_seen_at = document.get("last_edit_seen_at")
 
     def request_termination(_signum: int, _frame: object) -> None:
         nonlocal termination_requested
@@ -441,6 +522,7 @@ def _run(root: Path, job_id: str, runtime: Path, credential_file: Path, credenti
             )
             deadline = time.monotonic() + int(document["timeout_seconds"])
             next_heartbeat = time.monotonic() + HEARTBEAT_SECONDS
+            next_edit_probe = time.monotonic()
             terminating_at: float | None = None
             terminal_reason: str | None = None
             while True:
@@ -454,6 +536,15 @@ def _run(root: Path, job_id: str, runtime: Path, credential_file: Path, credenti
                     break
                 now = time.monotonic()
                 if now >= next_heartbeat:
+                    if now >= next_edit_probe:
+                        next_edit_probe = now + EDIT_PROBE_SECONDS
+                        if not edited:
+                            working_dir = str(document["working_directory"])
+                            if _probe_edited(working_dir, baseline_status):
+                                edited = True
+                                if last_edit_seen_at is None:
+                                    last_edit_seen_at = _utc_now()
+                        tool_calls = _probe_tool_calls(hermes_home)
                     with _state_lock(root):
                         latest = _read_document(state_path)
                         if (
@@ -461,7 +552,14 @@ def _run(root: Path, job_id: str, runtime: Path, credential_file: Path, credenti
                             and latest.get("supervisor_start") == _process_start(os.getpid())
                             and latest.get("state") in {"running", "orphaned"}
                         ):
-                            latest.update(state="running", heartbeat_at=_utc_now())
+                            update_kwargs: dict[str, object] = {
+                                "state": "running",
+                                "heartbeat_at": _utc_now(),
+                                "edited": edited,
+                                "tool_calls": tool_calls,
+                                "last_edit_seen_at": last_edit_seen_at,
+                            }
+                            latest.update(**update_kwargs)
                             _write_private(state_path, _json_bytes(latest))
                     next_heartbeat = now + HEARTBEAT_SECONDS
                 if termination_requested and terminal_reason is None:
@@ -470,6 +568,15 @@ def _run(root: Path, job_id: str, runtime: Path, credential_file: Path, credenti
                     os.killpg(process.pid, signal.SIGTERM)
                 elif now >= deadline and terminal_reason is None:
                     terminal_reason = "timed_out"
+                    terminating_at = now
+                    os.killpg(process.pid, signal.SIGTERM)
+                elif (
+                    first_edit_limit is not None
+                    and not edited
+                    and tool_calls >= first_edit_limit
+                    and terminal_reason is None
+                ):
+                    terminal_reason = "stalled_no_edit"
                     terminating_at = now
                     os.killpg(process.pid, signal.SIGTERM)
                 elif (
@@ -486,6 +593,8 @@ def _run(root: Path, job_id: str, runtime: Path, credential_file: Path, credenti
                 time.sleep(0.1)
             if state == "timed_out":
                 exit_code = 124
+            elif state == "stalled_no_edit":
+                exit_code = 125
             elif state == "cancelled" and exit_code == 0:
                 exit_code = 128 + signal.SIGTERM
     except OSError:
@@ -496,7 +605,14 @@ def _run(root: Path, job_id: str, runtime: Path, credential_file: Path, credenti
         latest = _read_document(state_path)
         if latest.get("state") == "cancelling":
             state = "cancelled"
-        latest.update(state=state, finished_at=_utc_now(), exit_code=exit_code)
+        latest.update(
+            state=state,
+            finished_at=_utc_now(),
+            exit_code=exit_code,
+            edited=edited,
+            tool_calls=tool_calls,
+            last_edit_seen_at=last_edit_seen_at,
+        )
         _write_private(state_path, _json_bytes(latest))
     return exit_code
 
@@ -506,6 +622,7 @@ def _public(document: Mapping[str, object]) -> dict[str, object]:
         "schema", "job_id", "state", "created_at", "started_at", "finished_at",
         "working_directory", "prompt_sha256", "model", "provider", "reasoning",
         "toolsets", "max_turns", "timeout_seconds", "heartbeat_at", "exit_code",
+        "tool_calls", "edited", "first_edit_within",
     )
     return {key: document.get(key) for key in keys}
 
@@ -586,6 +703,7 @@ def _parser() -> argparse.ArgumentParser:
     start_parser.add_argument("--max-turns", type=int, default=DEFAULT_MAX_TURNS)
     start_parser.add_argument("--timeout-seconds", type=int, default=DEFAULT_TIMEOUT_SECONDS)
     start_parser.add_argument("--max-concurrency", type=int, default=DEFAULT_MAX_CONCURRENCY)
+    start_parser.add_argument("--first-edit-within", type=int, default=40)
     status_parser = subparsers.add_parser("status")
     status_parser.add_argument("job_id", nargs="?")
     wait_parser = subparsers.add_parser("wait")
@@ -608,6 +726,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     try:
         if arguments.command == "start":
+            first_edit_within = arguments.first_edit_within
+            if first_edit_within == 0:
+                first_edit_within = None
             result = start(
                 prompt=arguments.prompt_file, working_directory=arguments.working_directory,
                 state_root=arguments.state_root, runtime_command=arguments.runtime_command,
@@ -615,6 +736,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 model=arguments.model, provider=arguments.provider, reasoning=arguments.reasoning,
                 toolsets=arguments.toolsets, max_turns=arguments.max_turns,
                 timeout_seconds=arguments.timeout_seconds, max_concurrency=arguments.max_concurrency,
+                first_edit_within=first_edit_within,
             )
         elif arguments.command == "status":
             result = status(arguments.state_root, arguments.job_id)
