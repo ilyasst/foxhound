@@ -743,6 +743,15 @@ class TaskCandidateContractTests(unittest.TestCase):
                 with self.assertRaises(ContractError):
                     parse_task_candidate(invalid)
 
+        # v11 with null person_id is accepted
+        document_null_person = copy.deepcopy(document)
+        document_null_person["task"]["owner_ref"]["person_id"] = None
+        document_null_person["task"]["participants"][0]["person_id"] = None
+        candidate_null = parse_task_candidate(document_null_person)
+        self.assertIsNone(candidate_null.task.owner_ref.person_id)
+        self.assertIsNone(candidate_null.task.participants[0].person_id)
+        self.assertEqual(task_candidate_document(candidate_null), document_null_person)
+
         schema = json.loads(
             (Path(__file__).parents[1] / "src" / "foxhound" / "contracts" /
              "schemas" / "task-candidate-v11.schema.json").read_text(

@@ -835,6 +835,43 @@ class NativeCandidateIntakeTests(unittest.TestCase):
                     )
         self.assertEqual(self.intake().tasks_created, 0)
 
+    def test_v9_to_v11_revision_applies_as_normal_revision(self):
+        self.activate()
+        # 1. Import v9 candidate
+        item_v9 = history_candidate(1)
+        self.assertEqual(item_v9["schema_version"], 9)
+        self.assertTrue(self.inbox.import_feed(feed(0, item_v9)).accepted)
+        self.assertEqual(self.intake().tasks_created, 1)
+
+        task = self.ledger.get(1)
+        self.assertEqual(task.version, 1)
+        self.assertIsNone(task.owner_person_id)
+
+        # 2. Revise with v11 carrying person_id
+        item_v11 = copy.deepcopy(item_v9)
+        item_v11["schema_version"] = 11
+        person_id = "person_" + "a" * 32
+        item_v11["task"]["owner_ref"]["person_id"] = person_id
+        item_v11["task"]["participants"] = [{
+            "kind": "person", "speaker_id": None,
+            "canonical_speaker_id": None, "speaker_registry_id": None,
+            "person_id": person_id,
+        }]
+        item_v11["lifecycle"]["generation"] = 2
+        item_v11["lifecycle"]["changed_at"] = "2030-01-02T00:00:00Z"
+        item_v11["source"]["history"]["position"] = 2
+        item_v11["source"]["revision"] = hashlib.sha256(
+            json.dumps(item_v11, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+
+        self.assertTrue(self.inbox.import_feed(feed(1, item_v11)).accepted)
+        outcome = self.intake()
+        self.assertEqual(outcome.tasks_revised, 1)
+
+        task = self.ledger.get(1)
+        self.assertEqual(task.version, 2)
+        self.assertEqual(task.owner_person_id, person_id)
+
     def test_older_version_candidate_still_imports(self):
         self.activate()
         item = person_identity_candidate(1)  # v11 candidate
