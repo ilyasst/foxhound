@@ -660,6 +660,24 @@ class TaskResearchTests(unittest.TestCase):
             _write_claim(self.folder / "another.claim", claim)
         self.folder.chmod(0o700)
 
+    def test_render_markdown_omits_open_questions(self):
+        from foxhound.task_research import render_markdown
+        doc = {
+            "task_identity": {"task_id": 42, "task_version": 1},
+            "research_status": "sufficient",
+            "report": {
+                "objective": {"text": "Synthetic objective", "status": "supported", "source_refs": []},
+                "requested_action": {"text": "Synthetic action", "status": "supported", "source_refs": []},
+                "findings": [{"text": "Synthetic finding", "status": "supported", "source_refs": []}],
+                "open_questions": [{"text": "Synthetic open question?", "status": "supported", "source_refs": []}],
+            },
+            "scheduling_recommendations": [],
+            "sources": [],
+        }
+        rendered = render_markdown(doc)
+        self.assertIn("## Findings", rendered)
+        self.assertNotIn("Open Questions", rendered)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -353,7 +353,7 @@ def render_markdown(document: Mapping[str, object]) -> str:
     for key in (
         "current_state", "expected_deliverables", "timeline", "decisions",
         "dependencies", "constraints", "stakeholders", "related_entities",
-        "findings", "recommendation", "conflicts", "open_questions",
+        "findings", "recommendation", "conflicts",
     ):
         claims = report.get(key)
         if not claims:
