@@ -125,9 +125,10 @@ _RESULT_SUMMARY_NAME = "result-summary.txt"
 #: timeout itself is still enforced on the monotonic clock.
 _wall_clock: Callable[[], float] = time.time
 _CORRECTIVE_TURN_PROMPT = (
-    "The preceding execution turn ended without recording a result. "
-    "Do not do new work. Use exactly one worker operation now: record the "
-    "result already prepared, or release the claim if no result is ready."
+    "The previous turn ended without recording a result. "
+    "Do no new work. Call the worker tool now to record the result already "
+    "prepared (if a plan or result file was already written in the task folder, "
+    "record that) or release the claim. Call the tool; do not write the call as text."
 )
 
 
@@ -468,6 +469,7 @@ def corrective_argv(
     source: str,
     model: str | None = None,
     provider: str | None = None,
+    prompt: str = _CORRECTIVE_TURN_PROMPT,
 ) -> tuple[str, ...]:
     """Resume one lost turn solely to finish its worker lifecycle action.
 
@@ -494,9 +496,9 @@ def corrective_argv(
         *agent_selection_argv(model, provider),
         "chat",
         "--query",
-        _CORRECTIVE_TURN_PROMPT,
+        prompt,
         "--max-turns",
-        "1",
+        "3",
         "--source",
         source,
         "--ignore-rules",
@@ -776,7 +778,8 @@ def _run_claim(
 
         started = clock()
         next_heartbeat = started + profile.heartbeat_seconds
-        corrective_attempted = False
+        corrective_attempts = 0
+        last_attempt_had_text_tool_call = False
         while True:
             current = service.get(claim.task_id)
             terminal = _terminal_result(initial, current, claim.task_id)
@@ -835,7 +838,18 @@ def _run_claim(
                         else NO_PROGRESS_EXIT_CODE,
                         claim.task_id,
                     )
-                if not corrective_attempted:
+                should_attempt_corrective = False
+                corrective_prompt = _CORRECTIVE_TURN_PROMPT
+                if corrective_attempts == 0:
+                    should_attempt_corrective = True
+                elif corrective_attempts == 1 and last_attempt_had_text_tool_call:
+                    should_attempt_corrective = True
+                    corrective_prompt = (
+                        "Your last reply wrote the tool call as text instead of calling the tool. "
+                        + _CORRECTIVE_TURN_PROMPT
+                    )
+
+                if should_attempt_corrective:
                     session_id = _transcript_session_id(
                         directory / TRANSCRIPT_NAME, transcript
                     )
@@ -848,6 +862,7 @@ def _run_claim(
                                 source="foxhound-" + run_id,
                                 model=config.agent_model,
                                 provider=config.agent_provider,
+                                prompt=corrective_prompt,
                             )
                             process = popen(
                                 list(corrective),
@@ -865,7 +880,20 @@ def _run_claim(
                         except (OSError, ValueError):
                             pass
                         else:
-                            corrective_attempted = True
+                            corrective_attempts += 1
+                            if transcript is not None:
+                                try:
+                                    transcript.flush()
+                                except (AttributeError, OSError):
+                                    pass
+                            try:
+                                output_data = (directory / TRANSCRIPT_NAME).read_bytes()
+                                last_attempt_had_text_tool_call = (
+                                    b"<tool_call>" in output_data
+                                    or b"<function=" in output_data
+                                )
+                            except OSError:
+                                last_attempt_had_text_tool_call = False
                             continue
                 normalized = (
                     128 + abs(child_exit) if child_exit < 0 else child_exit

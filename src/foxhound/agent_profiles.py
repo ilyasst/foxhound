@@ -120,7 +120,11 @@ class AgentProfile:
             or not is_worker_command(worker_command)
         ):
             raise AgentProfileError("agent worker command is invalid")
-        return PHASE_CONTRACT_PRECEDENCE + self.prompt_template.replace(
+        budget_sentence = (
+            f"You have a budget of {self.max_turns} turns; record your result "
+            "no later than 10 turns before the budget ends, then stop.\n\n"
+        )
+        return PHASE_CONTRACT_PRECEDENCE + budget_sentence + self.prompt_template.replace(
             WORKER_COMMAND_TOKEN, worker_command)
 
     def public_summary(self, *, include_policy: bool = False) -> dict[str, Any]:
@@ -524,6 +528,19 @@ def _historical_general_profiles() -> tuple[AgentProfile, ...]:
             display_name="General",
             runtime="hermes",
             prompt_template=_GENERAL_PROMPT_TEMPLATE_V14,
+            toolsets=("terminal", "file", "web"),
+            max_turns=80,
+            timeout_seconds=2_700,
+            claim_lease_seconds=3_300,
+            heartbeat_seconds=60,
+            kill_grace_seconds=30,
+            allowed_phases=_PHASES,
+        ),
+        AgentProfile(
+            profile_id="general",
+            display_name="General",
+            runtime="hermes",
+            prompt_template=_GENERAL_PROMPT_TEMPLATE_V15,
             toolsets=("terminal", "file", "web"),
             max_turns=80,
             timeout_seconds=2_700,
@@ -1212,17 +1229,22 @@ _GENERAL_PROMPT_TEMPLATE_V15 = _GENERAL_PROMPT_TEMPLATE_V14.replace(
     "Prepare the reviewable result early enough that useful work cannot be lost to the turn limit.\nIf the work is long, write an owner-only `handoff-<phase>.md` (e.g. `handoff-execute.md`) in `workspace.task_folder` early and update it as work proceeds. It is an unreviewed note to the next attempt if this one is killed by the budget; describe what was established, what was changed and where, and what to do next. It is not a result and does not replace one."
 )
 
-_GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V15
+_GENERAL_PROMPT_TEMPLATE_V16 = _GENERAL_PROMPT_TEMPLATE_V15.replace(
+    "In `plan`, research and prepare a reviewable plan. Do not cause an external effect.",
+    "In `plan`, research and prepare a reviewable plan. Planning prepares the plan: read and inspect what you need, but do not perform the task's work (downloads, conversions, sending, editing deliverables); those are execution steps. Do not cause an external effect.",
+)
+
+_GENERAL_PROMPT_TEMPLATE = _GENERAL_PROMPT_TEMPLATE_V16
 
 # A built-in profile is a release artifact.  Keep its fingerprints beside the
 # prompt so changing the prompt or policy without publishing a new profile
 # revision fails at every runner and scheduler startup, rather than leaving a
 # stale test in a different file to discover the mismatch later.
 GENERAL_PROFILE_RELEASE_REVISION = (
-    "f96650db7a90b6fcf84954fdc3698b75e6147949410bcd7d502a25d31636fced"
+    "e872e60cd96be5dc6e3b092d7e077e10f6bc67e3925552a7fd640154f1373bfc"
 )
 GENERAL_PROFILE_RELEASE_PROMPT_SHA256 = (
-    "62d2a3d67e5641bea2fa0aa57b30c7f3707583ee54d104d32a20fed8ba452fbe"
+    "3ed2096306ebf2b3a443fe8c959763267c70a2fbeecceccbd7e39409ee5ad3d3"
 )
 
 

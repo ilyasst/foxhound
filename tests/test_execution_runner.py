@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from foxhound import migrate_database
+from foxhound.execution_runner import _CORRECTIVE_TURN_PROMPT
 
 import json
 import os
@@ -670,14 +671,11 @@ class ExecutionRunnerTests(unittest.TestCase):
         )
         self.assertIn("--no-restore-cwd", corrective)
         self.assertEqual(
-            corrective[corrective.index("--max-turns") + 1], "1"
+            corrective[corrective.index("--max-turns") + 1], "3"
         )
         self.assertEqual(
             corrective[corrective.index("--query") + 1],
-            "The preceding execution turn ended without recording a result. "
-            "Do not do new work. Use exactly one worker operation now: record "
-            "the result already prepared, or release the claim if no result is "
-            "ready.",
+            _CORRECTIVE_TURN_PROMPT,
         )
 
     def test_a_missing_or_malformed_session_id_does_not_retry(self):
@@ -763,7 +761,7 @@ class ExecutionRunnerTests(unittest.TestCase):
             "synthetic-session-3",
         )
         self.assertEqual(
-            corrective[corrective.index("--max-turns") + 1], "1"
+            corrective[corrective.index("--max-turns") + 1], "3"
         )
         self.assertEqual(result.outcome, "process_exit")
 

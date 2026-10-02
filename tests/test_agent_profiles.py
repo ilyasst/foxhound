@@ -30,6 +30,9 @@ from foxhound.agent_profiles import (
 )
 
 
+HANDOFF_NOTE_GENERAL_REVISION = (
+    "f96650db7a90b6fcf84954fdc3698b75e6147949410bcd7d502a25d31636fced"
+)
 IMMEDIATE_PREVIOUS_GENERAL_REVISION = (
     "02a2f7807d3fd05c99d5e807c1153fd3acdd852c940466b58e97a5a9c2f8783e"
 )
@@ -277,10 +280,11 @@ class AgentProfileTests(unittest.TestCase):
             "general", DATE_SEMANTICS_GENERAL_REVISION
         )
         earlier = registry.resolve("general", EARLIER_GENERAL_REVISION)
+        handoff_note = registry.resolve("general", HANDOFF_NOTE_GENERAL_REVISION)
 
         for retained in (
             legacy, superseded, previous, earlier, date_semantics,
-            immediate_previous,
+            immediate_previous, handoff_note,
         ):
             with self.subTest(revision=retained.revision):
                 with self.assertRaises(AgentProfileError):
