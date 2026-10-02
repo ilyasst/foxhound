@@ -236,6 +236,8 @@ def test_agent_synthesize_argv_env_cwd(tmp_path: Path) -> None:
     assert recorded_args["cwd"] == run_dir
     assert recorded_args["env"]["TERMINAL_CWD"] == str(run_dir.resolve())
     assert recorded_args["env"]["FOXHOUND_VOICE_SUMMARIES"] == "0"
+    assert recorded_args["env"]["RIPGREP_CONFIG_PATH"] == str((run_dir / ".ripgreprc").resolve())
+    assert (run_dir / ".ripgreprc").read_text(encoding="utf-8") == "--follow\n"
     assert recorded_args["timeout"] == 1200
 
 
@@ -621,3 +623,200 @@ def test_agent_synthesize_two_failed_repairs_raises_original_error(tmp_path: Pat
         agent_synthesize({"task_snapshot": {}}, config=config, bound_sources=None, run_dir=run_dir, runner=fake_runner)
     assert exc_info.value.code == "invalid_draft"
     assert len(calls) == 3  # 1 initial + 2 repair turns
+
+
+def test_agent_synthesize_repair_timeout_rechecks_and_publishes(tmp_path: Path) -> None:
+    calls = []
+
+    kb_dir = tmp_path / "sync_kb"
+    kb_dir.mkdir()
+    kb_file = kb_dir / "doc.txt"
+    kb_file.write_text("valid content")
+
+    valid_json = {
+        "ownership": {"verdict": "reader", "evidence": [str(kb_file)]},
+        "requested_deliverable": {"text": "Deliverable", "evidence": []},
+        "constraints": [],
+        "entities": [],
+        "facts": [],
+        "open_questions": [],
+    }
+
+    def fake_runner(argv, cwd, env, timeout, capture_output, text):
+        calls.append(list(argv))
+        if len(calls) == 1:
+            res = MagicMock()
+            res.returncode = 0
+            res.stdout = "session_id: sess-123"
+            res.stderr = ""
+            # Invalid json on turn 1
+            (cwd / "research.json").write_text(json.dumps({
+                "ownership": {"verdict": "reader", "evidence": ["unmappable/locator"]},
+            }))
+            return res
+        else:
+            # Repair turn writes valid json but times out
+            (cwd / "research.json").write_text(json.dumps(valid_json))
+            assert timeout == 600
+            raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout)
+
+    config = AgentResearchConfig(
+        hermes_command="hermes",
+        model="test-model",
+        knowledge_roots=(("kb", str(kb_dir)),),
+    )
+    run_dir = tmp_path / "run_repair_timeout"
+    result = agent_synthesize({"task_snapshot": {}}, config=config, bound_sources=None, run_dir=run_dir, runner=fake_runner)
+
+    assert result.draft["research_status"] == "sufficient"
+    assert len(calls) == 2
+
+
+def test_agent_synthesize_knowledge_roots_symlinks_and_ripgreprc(tmp_path: Path) -> None:
+    kb_dir = tmp_path / "kb_dir"
+    kb_dir.mkdir()
+    att_dir = tmp_path / "att_dir"
+    att_dir.mkdir()
+
+    calls = []
+
+    def fake_runner(argv, cwd, env, timeout, capture_output, text):
+        calls.append((argv, env))
+        res = MagicMock()
+        res.returncode = 0
+        res.stdout = ""
+        res.stderr = ""
+        (cwd / "research.json").write_text(json.dumps({
+            "ownership": {"verdict": "reader", "evidence": []},
+            "requested_deliverable": {"text": "Goal", "evidence": []},
+            "constraints": [],
+            "entities": [],
+            "facts": [],
+            "open_questions": [],
+        }))
+        return res
+
+    config = AgentResearchConfig(
+        hermes_command="hermes",
+        knowledge_roots=(("kb", str(kb_dir)), ("attachments", str(att_dir))),
+    )
+    run_dir = tmp_path / "run_symlinks"
+    agent_synthesize({"task_snapshot": {}}, config=config, bound_sources=None, run_dir=run_dir, runner=fake_runner)
+
+    assert (run_dir / "kb").is_symlink()
+    assert (run_dir / "kb").resolve() == kb_dir.resolve()
+    assert (run_dir / "attachments").is_symlink()
+    assert (run_dir / "attachments").resolve() == att_dir.resolve()
+    assert (run_dir / ".ripgreprc").exists()
+    assert (run_dir / ".ripgreprc").read_text(encoding="utf-8") == "--follow\n"
+    assert calls[0][1]["RIPGREP_CONFIG_PATH"] == str((run_dir / ".ripgreprc").resolve())
+
+
+def test_agent_map_locator_run_dir_and_symlink_paths(tmp_path: Path) -> None:
+    from foxhound.task_research_agent import _map_locator
+
+    kb_dir = tmp_path / "kb_dir"
+    kb_dir.mkdir()
+    doc_file = kb_dir / "Meetings" / "doc.md"
+    doc_file.parent.mkdir(parents=True, exist_ok=True)
+    doc_file.write_text("hello")
+
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    secret = outside_dir / "secret.txt"
+    secret.write_text("secret")
+
+    run_dir = tmp_path / "run_map"
+    run_dir.mkdir()
+    (run_dir / "kb").symlink_to(kb_dir)
+    (run_dir / "outside_sym").symlink_to(outside_dir)
+
+    k_roots = (("kb", str(kb_dir)),)
+
+    # run_dir relative path through symlink: kb/Meetings/doc.md
+    mapped = _map_locator("kb/Meetings/doc.md#L10", k_roots, run_dir=run_dir)
+    assert mapped == ("kb", "Meetings/doc.md", "L10")
+
+    # absolute path through symlink: run_dir / kb / Meetings / doc.md
+    sym_abs = str(run_dir / "kb" / "Meetings" / "doc.md")
+    mapped_abs = _map_locator(sym_abs, k_roots, run_dir=run_dir)
+    assert mapped_abs == ("kb", "Meetings/doc.md", None)
+
+    # symlink escape still refused
+    sym_escape = str(run_dir / "outside_sym" / "secret.txt")
+    assert _map_locator(sym_escape, k_roots, run_dir=run_dir) is None
+    assert _map_locator("outside_sym/secret.txt", k_roots, run_dir=run_dir) is None
+
+
+def test_agent_locator_basename_resolution(tmp_path: Path) -> None:
+    from foxhound.task_research_agent import _map_locator
+
+    kb_dir = tmp_path / "kb_dir"
+    kb_dir.mkdir()
+    admin_dir = kb_dir / "Admin"
+    admin_dir.mkdir()
+    students_file = admin_dir / "Students.md"
+    students_file.write_text("students content")
+
+    # Ambiguous file in two places
+    dup1 = kb_dir / "Folder1" / "Dup.md"
+    dup1.parent.mkdir(parents=True, exist_ok=True)
+    dup1.write_text("dup1")
+    dup2 = kb_dir / "Folder2" / "Dup.md"
+    dup2.parent.mkdir(parents=True, exist_ok=True)
+    dup2.write_text("dup2")
+
+    k_roots = (("kb", str(kb_dir)),)
+
+    # Unique basename match: kb:Students.md -> Admin/Students.md
+    mapped = _map_locator("kb:Students.md#L5", k_roots)
+    assert mapped == ("kb", "Admin/Students.md", "L5")
+
+    # Ambiguous match -> None
+    assert _map_locator("kb:Dup.md", k_roots) is None
+
+    # Absent match -> None
+    assert _map_locator("kb:Absent.md", k_roots) is None
+
+
+def test_agent_locator_single_command_prefix_normalization(tmp_path: Path) -> None:
+    from foxhound.task_research_agent import _map_locator
+
+    ro_one = [{"name": "outlook", "command": "outlook-tool", "description": "mail/cal"}]
+    ro_two = [
+        {"name": "outlook", "command": "outlook-tool", "description": "mail/cal"},
+        {"name": "jira", "command": "jira-tool", "description": "tickets"},
+    ]
+
+    # Exactly one declared command: read_only_command: and tool: normalize to outlook:
+    mapped1 = _map_locator("read_only_command:cal list --days 14", (), ro_one)
+    assert mapped1 == ("tool", "outlook:cal list --days 14", None)
+
+    mapped2 = _map_locator("tool:cal list --days 14", (), ro_one)
+    assert mapped2 == ("tool", "outlook:cal list --days 14", None)
+
+    # More than one declared command: read_only_command: and tool: are not normalized
+    assert _map_locator("read_only_command:cal list --days 14", (), ro_two) is None
+    assert _map_locator("tool:cal list --days 14", (), ro_two) is None
+
+
+def test_agent_task_json_locator_problem_message(tmp_path: Path) -> None:
+    from foxhound.task_research_agent import check_research_output
+
+    run_dir = tmp_path / "run_task_json"
+    run_dir.mkdir()
+
+    for item in ("task.json", "./task.json", "task.json#L11", "./task.json#L5"):
+        (run_dir / "research.json").write_text(json.dumps({
+            "ownership": {"verdict": "reader", "evidence": [item]},
+            "requested_deliverable": {"text": "Goal", "evidence": []},
+            "constraints": [],
+            "entities": [],
+            "facts": [],
+            "open_questions": [],
+        }))
+        _, _, problems = check_research_output(run_dir, ())
+        assert any(
+            "task.json is the task itself, not evidence; cite the origin record (meeting protocol, transcript, email) instead" in p
+            for p in problems
+        )

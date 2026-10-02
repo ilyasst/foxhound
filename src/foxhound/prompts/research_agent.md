@@ -63,6 +63,8 @@ Write exactly two files in the current working directory:
    Every item in `evidence` is a source locator in one of the following formats:
    - `<root-name>:<path relative to that root>` optionally followed by `#L<n>` or `#L<n>-L<m>` (for example: `kb:Meetings/20300101_mix.md#L29` or `attachments:Meetings/transcript.txt#L120-L140`).
    - A bare `http://` or `https://` URL for external facts.
+   - Cite read-only command results as "<name from read_only_commands>:<subcommand and arguments>", e.g. "outlook:cal list --days 14".
+   Never cite task.json.
    Notes never go inside the locator (put them in the claim text). A claim with no evidence must have status `inferred` or be listed in `open_questions`.
 
 2. `research.md`: the same findings structured as a concise, readable brief.
