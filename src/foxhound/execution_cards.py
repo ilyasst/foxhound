@@ -19,6 +19,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
+from .legacy_roots import RootTranslations
 from .task_owner import normalized_owner
 from .task_research_gate import record_ownership_decision
 from . import task_relations
@@ -548,8 +549,13 @@ class ExecutionCardService:
         artifact_root: str | os.PathLike[str] | None = None,
         steer_plan_threshold: timedelta = timedelta(minutes=20),
         steer_execute_threshold: timedelta = timedelta(minutes=20),
+        legacy_roots: Sequence[tuple[str, str]] = (),
     ) -> None:
         self.database_path = Path(database_path)
+        # Display-only: results keep the paths they were recorded with.
+        self._legacy_roots = (
+            RootTranslations(tuple(legacy_roots)) if legacy_roots else None
+        )
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._token_factory = token_factory or (
             lambda: secrets.token_urlsafe(32)
@@ -2121,6 +2127,7 @@ class ExecutionCardService:
             if refusal is not None:
                 return refused(refusal)
             outcome = row["result_outcome"]
+            row = self._translated(row)
             return ExecutionCardDetail(
                 ExecutionCardDisposition.UNCHANGED,
                 card_id,
@@ -3187,11 +3194,21 @@ class ExecutionCardService:
             ) from exc
         return connection
 
+    def _translated(self, row: Mapping[str, object]) -> Mapping[str, object]:
+        """The row with result text naming moved KB roots by their new path."""
+        if self._legacy_roots is None:
+            return row
+        values = dict(row)
+        for key in _TRANSLATED_RESULT_FIELDS:
+            if isinstance(values.get(key), str):
+                values[key] = self._legacy_roots.translate_text(values[key])
+        return values
+
     def _render_card(
         self, row: Mapping[str, object]
     ) -> ExecutionReviewCard:
         return _card(
-            row,
+            self._translated(row),
             self._profile_registry,
             reader_aliases=self._reader_aliases,
             condition_available=self._owner_condition is not None,
@@ -3812,6 +3829,14 @@ class RepositoryReference:
 def _stored_lines(value: object) -> tuple[str, ...]:
     """Questions are prose, so a record is flattened back to its sentence."""
     return tuple(record.text for record in _stored_collection(value))
+
+
+#: Result text a card shows that may name a knowledge-base root. JSON
+#: collections are translated as text: a path carries no character JSON
+#: escapes, so a prefix swap leaves the document valid.
+_TRANSLATED_RESULT_FIELDS = (
+    "summary", "work_markdown", "deliverables_json", "external_actions_json",
+)
 
 
 def _stored_collection(value: object) -> tuple[CardRecord, ...]:

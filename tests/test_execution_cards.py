@@ -613,6 +613,31 @@ class ExecutionCardTests(unittest.TestCase):
         )
         self.assertEqual(finished.workflow_status, WorkflowStatus.COMPLETED)
 
+    def test_cards_show_moved_knowledge_base_roots_at_their_new_path(self):
+        old = "/srv/vault-old/KB/Processes/guide.md"
+        self._plan_review(1, "moved-root-plan", work_markdown=f"Read {old} first.")
+        cards = ExecutionCardService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: DELIVERY_TOKEN,
+            legacy_roots=(("/srv/vault-old/KB", "/srv/vault/KB"),),
+        )
+        cards.schedule(limit=6)
+        claim = cards.claim_next(lease_seconds=60)
+        self.assertIsNotNone(claim)
+        self.assertIn("/srv/vault/KB/Processes/guide.md", claim.card.work_markdown)
+        self.assertNotIn("/srv/vault-old/", claim.card.work_markdown)
+        # The record keeps the path it was written with.
+        with closing(sqlite3.connect(self.database)) as connection:
+            stored = connection.execute(
+                "SELECT work_markdown FROM task_execution_results "
+                "WHERE result_id='moved-root-plan'").fetchone()[0]
+        self.assertIn(old, stored)
+        # Without translations the card is unchanged.
+        plain = self.cards.claim_next(lease_seconds=60)
+        if plain is not None:
+            self.assertIn(old, plain.card.work_markdown)
+
     def test_cards_deliver_results_then_review_work_then_start_by_age(self):
         """A later result must overtake an older Start gate.
 

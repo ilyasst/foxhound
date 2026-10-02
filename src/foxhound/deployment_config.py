@@ -64,6 +64,9 @@ class CardServiceConfig:
     gw_alias: str | None = None
     gw_token_file: Path | None = None
     task_work_root: Path | None = None
+    #: (old, new) knowledge-base roots. Results recorded before a root moved
+    #: still name the old one; cards show the new one (#735).
+    legacy_root_translations: tuple[tuple[str, str], ...] = ()
 
     def argv(self, database: Path, profile_directory: Path | None) -> list[str]:
         if not self.enabled:
@@ -97,6 +100,8 @@ class CardServiceConfig:
             ))
         if self.task_work_root is not None:
             result.extend(("--task-work-root", str(self.task_work_root)))
+        for old, new in self.legacy_root_translations:
+            result.extend(("--legacy-root", f"{old}={new}"))
         return result
 
 
@@ -736,7 +741,9 @@ def _parse_card_service(value: object, *, version: int) -> CardServiceConfig:
         fields.update({"gw_endpoint", "gw_alias", "gw_token_file"})
     if version >= 8:
         fields.add("task_work_root")
-    document = _object(value, fields)
+    # Optional at every version: absent means no translation, exactly as
+    # before the key existed.
+    document = _object(value, fields, {"legacy_root_translations"})
     bind = document["bind"]
     port = document["port"]
     timeout = document["request_timeout_seconds"]
@@ -782,7 +789,26 @@ def _parse_card_service(value: object, *, version: int) -> CardServiceConfig:
             _absolute_path(gw_values[2]) if gw_values[2] is not None else None
         ),
         task_work_root=task_work_root,
+        legacy_root_translations=_legacy_roots(
+            document.get("legacy_root_translations", [])),
     )
+
+
+def _legacy_roots(value: object) -> tuple[tuple[str, str], ...]:
+    """Validate [[old, new], ...] through the same rules the renderer uses."""
+    from .legacy_roots import RootTranslations
+    if not isinstance(value, list) or not all(
+        isinstance(pair, list) and len(pair) == 2
+        and all(isinstance(part, str) for part in pair)
+        for pair in value
+    ):
+        raise DeploymentConfigError("card service configuration is invalid")
+    pairs = tuple((pair[0], pair[1]) for pair in value)
+    try:
+        RootTranslations(pairs)
+    except ValueError as exc:
+        raise DeploymentConfigError("card service configuration is invalid") from exc
+    return pairs
 
 
 def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
