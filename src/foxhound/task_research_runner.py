@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime
@@ -33,6 +34,10 @@ from .task_duplicate_semantic import (
 from .task_research import (
     ResearchError,
     ResearchStore,
+)
+from .task_research_agent import (
+    AgentResearchConfig,
+    agent_synthesize,
 )
 from .task_research_sources import ResearchSourceError, bound_research_sources
 from .task_research_synthesis import (
@@ -118,8 +123,19 @@ def run_once(
     knowledge_override: KnowledgeSearch | None = None,
     opener=None,
     clock: Callable[[], datetime] | None = None,
+    synthesizer: str = "single",
+    hermes_command: str | None = None,
+    agent_toolsets: str = "terminal,file,web,browser",
+    agent_max_turns: int = 120,
+    agent_timeout: int = 3600,
+    knowledge_roots: tuple[tuple[str, str], ...] = (),
+    agent_runner=None,
 ) -> ResearchRunResult:
     """Claim at most one queued research job and execute it through publication."""
+    if synthesizer not in ("single", "agent"):
+        raise ValueError(f"unknown synthesizer: {synthesizer}")
+    if synthesizer == "agent" and not hermes_command:
+        raise ValueError("hermes_command is required when synthesizer is 'agent'")
     db_path = Path(database).resolve()
     cas_path = Path(cas_root).resolve()
     work_root_path = _validate_owner_private_dir(Path(task_work_root))
@@ -175,34 +191,6 @@ def run_once(
         task_id = int(task_snapshot["task_id"])
         task_version = int(task_snapshot["task_version"])
 
-        # Prepare synthesis dependencies
-        if knowledge_override is not None:
-            knowledge = knowledge_override
-        else:
-            if not gw_endpoint or not gw_alias or not gw_token_file:
-                raise SynthesisError("invalid_config")
-            k_cfg = load_knowledge_config(
-                gw_endpoint,
-                gw_alias,
-                gw_token_file,
-                timeout_seconds=knowledge_timeout,
-            )
-            knowledge = GwKnowledgeClient(k_cfg)
-
-        synthesis_config = SynthesisConfig(
-            model=model,
-            endpoint=endpoint,
-            dialect=dialect,
-            timeout_seconds=timeout,
-            knowledge_timeout_seconds=knowledge_timeout,
-            reasoning=reasoning,
-            max_searches=max_searches,
-            max_documents=max_documents,
-            profile_id=profile_id,
-            profile_revision=profile_revision,
-            provider=provider,
-        )
-
         try:
             supplied = bound_research_sources(
                 db_path,
@@ -212,13 +200,64 @@ def run_once(
         except ResearchSourceError as exc:
             raise SynthesisError("source_refused") from exc
 
-        synthesis_result = synthesize(
-            ctx,
-            knowledge=knowledge,  # type: ignore[arg-type]
-            config=synthesis_config,
-            bound_sources=supplied,
-            opener=opener,
-        )
+        if synthesizer == "agent":
+            agent_run_dir = Path(tempfile.mkdtemp(prefix="agent-", dir=str(run_scratch)))
+            os.chmod(agent_run_dir, 0o700)
+            _validate_owner_private_dir(agent_run_dir)
+            agent_config = AgentResearchConfig(
+                hermes_command=hermes_command,  # type: ignore[arg-type]
+                model=model,
+                provider=(provider if provider != "local" else None),
+                toolsets=agent_toolsets,
+                max_turns=agent_max_turns,
+                timeout_seconds=agent_timeout,
+                knowledge_roots=knowledge_roots,
+                profile_id=profile_id,
+                profile_revision=profile_revision,
+            )
+            synthesis_result = agent_synthesize(
+                ctx,
+                config=agent_config,
+                bound_sources=supplied,
+                run_dir=agent_run_dir,
+                runner=agent_runner or subprocess.run,
+            )
+        else:
+            # Prepare synthesis dependencies
+            if knowledge_override is not None:
+                knowledge = knowledge_override
+            else:
+                if not gw_endpoint or not gw_alias or not gw_token_file:
+                    raise SynthesisError("invalid_config")
+                k_cfg = load_knowledge_config(
+                    gw_endpoint,
+                    gw_alias,
+                    gw_token_file,
+                    timeout_seconds=knowledge_timeout,
+                )
+                knowledge = GwKnowledgeClient(k_cfg)
+
+            synthesis_config = SynthesisConfig(
+                model=model,
+                endpoint=endpoint,
+                dialect=dialect,
+                timeout_seconds=timeout,
+                knowledge_timeout_seconds=knowledge_timeout,
+                reasoning=reasoning,
+                max_searches=max_searches,
+                max_documents=max_documents,
+                profile_id=profile_id,
+                profile_revision=profile_revision,
+                provider=provider,
+            )
+
+            synthesis_result = synthesize(
+                ctx,
+                knowledge=knowledge,  # type: ignore[arg-type]
+                config=synthesis_config,
+                bound_sources=supplied,
+                opener=opener,
+            )
 
         # Publish synthesized report using the existing receipt boundary
         store.publish(
@@ -278,11 +317,61 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--gw-token-file", default=None, type=Path)
     parser.add_argument("--worker-id", default="foxhound-research-runner")
     parser.add_argument("--lease-seconds", type=int, default=1800)
+    parser.add_argument(
+        "--synthesizer",
+        choices=("single", "agent"),
+        default="single",
+        help="synthesis implementation: single model call or Hermes agent",
+    )
+    parser.add_argument(
+        "--hermes-command",
+        default=None,
+        help="path to hermes CLI or executable; required when --synthesizer is agent",
+    )
+    parser.add_argument(
+        "--agent-toolsets",
+        default="terminal,file,web,browser",
+        help="comma-separated toolsets permitted to the agent researcher",
+    )
+    parser.add_argument(
+        "--agent-max-turns",
+        type=int,
+        default=120,
+        help="maximum agent turns before giving up (default: 120)",
+    )
+    parser.add_argument(
+        "--agent-timeout",
+        type=int,
+        default=3600,
+        help="total timeout in seconds for agent research execution (default: 3600)",
+    )
+    parser.add_argument(
+        "--knowledge-root",
+        action="append",
+        default=[],
+        metavar="NAME=PATH",
+        help="named knowledge root exposed to the agent researcher (repeatable)",
+    )
     return parser
 
 
+def _parse_knowledge_roots(parser: argparse.ArgumentParser, entries: Sequence[str]) -> tuple[tuple[str, str], ...]:
+    roots: list[tuple[str, str]] = []
+    for entry in entries:
+        name, separator, raw_path = entry.partition("=")
+        if not separator or not name:
+            parser.error(f"invalid --knowledge-root '{entry}': must be NAME=PATH")
+        path = Path(raw_path)
+        if not path.is_absolute():
+            parser.error(f"invalid --knowledge-root '{entry}': PATH must be absolute")
+        roots.append((name, str(path)))
+    return tuple(roots)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    arguments = _parser().parse_args(argv)
+    parser = _parser()
+    arguments = parser.parse_args(argv)
+    knowledge_roots = _parse_knowledge_roots(parser, arguments.knowledge_root)
     try:
         result = run_once(
             database=arguments.database,
@@ -305,6 +394,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             gw_token_file=arguments.gw_token_file,
             worker_id=arguments.worker_id,
             lease_seconds=arguments.lease_seconds,
+            synthesizer=arguments.synthesizer,
+            hermes_command=arguments.hermes_command,
+            agent_toolsets=arguments.agent_toolsets,
+            agent_max_turns=arguments.agent_max_turns,
+            agent_timeout=arguments.agent_timeout,
+            knowledge_roots=knowledge_roots,
         )
     except (ResearchError, ValueError, OSError):
         print(json.dumps({"accepted": False, "error_code": "configuration_unavailable"}, sort_keys=True))
