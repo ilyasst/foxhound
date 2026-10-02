@@ -778,6 +778,197 @@ class ExecutionWorkerTests(unittest.TestCase):
              "record_id": "forge.example/acme/widget", "item_id": "42"},
         )
 
+    def test_context_includes_guide_in_plan_and_execute_phases_when_present(self):
+        from foxhound.task_research import ResearchStore, INPUT_SCHEMA, DRAFT_SCHEMA
+
+        cas_root = self.root / "cas"
+        cas_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        store = ResearchStore(self.database, cas_root)
+        task_folder = self.root / "T1-folder"
+        task_folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+        store.request(
+            {
+                "schema_version": INPUT_SCHEMA,
+                "task_id": 1,
+                "task_version": 1,
+                "workflow_version": 1,
+                "text": "Synthetic task",
+                "structured": {"action": "prepare", "object": "brief", "confidence": 0.9},
+                "due": "2030-01-10",
+                "owner": {"person_id": "person-a", "reliability": "resolved"},
+                "participants": [],
+                "working_group": {"id": "group-alpha", "evidence": "explicit"},
+                "external_identifiers": [{"kind": "issue", "value": "example-12"}],
+                "origin": {"kind": "meeting", "source_digest": "1" * 64},
+                "structured_schema_revisions": {"task": 12, "identity": 1},
+            },
+            task_work_root=self.root,
+            task_folder=task_folder,
+        )
+        research_claim = store.claim("worker-synthetic")
+        assert research_claim is not None
+
+        empty_claim = {"text": "Synthetic claim.", "status": "unsourced", "source_refs": []}
+        guide_claim = {
+            "text": "Synthetic procedure applies.",
+            "status": "supported",
+            "source_refs": ["src-001"],
+        }
+        draft = {
+            "schema_version": DRAFT_SCHEMA,
+            "research_status": "sufficient",
+            "objective": empty_claim,
+            "requested_action": empty_claim,
+            "guide": guide_claim,
+            "current_state": [],
+            "expected_deliverables": [],
+            "timeline": [],
+            "decisions": [],
+            "dependencies": [],
+            "constraints": [],
+            "stakeholders": [],
+            "related_entities": [],
+            "findings": [],
+            "conflicts": [],
+            "open_questions": [],
+            "scheduling_recommendations": [],
+        }
+        sources = [{
+            "source_id": "src-001",
+            "locator": {
+                "namespace": "kb",
+                "resource": "Guides/Standard-Ops.md",
+                "fragment": "section-1",
+            },
+            "content_digest": "3" * 64,
+            "title": "Standard Operating Procedure",
+        }]
+        store.publish(
+            job_id=research_claim.job.job_id,
+            token=research_claim.token,
+            draft=draft,
+            sources=sources,
+            provenance={
+                "profile_id": "researcher",
+                "profile_revision": "3" * 64,
+                "model": "synthetic-thinking-model",
+                "provider": "synthetic",
+                "runtime": "manual-test",
+                "reasoning_requested": "high",
+                "reasoning_effective": "high",
+            },
+            coverage={
+                "searched_namespaces": ["kb"],
+                "queries": 1,
+                "documents_retrieved": 1,
+                "unavailable_source_ids": [],
+                "knowledge_revisions": {"kb": "4" * 64},
+            },
+        )
+
+        state_doc = json.loads(self.state_path.read_text(encoding="utf-8"))
+        root = state_doc.get("knowledge_root")
+        # A KB guide is named by its absolute path when the run has a KB root.
+        guide_path = (str(Path(root) / "Guides/Standard-Ops.md") if root
+                      else "kb:Guides/Standard-Ops.md")
+        expected_guide = {
+            "guide": guide_path,
+            "reason": "Synthetic procedure applies.",
+            "instruction": (
+                f"A house procedure applies: {guide_path}. "
+                "Read it first and follow it; in your result, say where you deviated from it and why."
+            ),
+        }
+
+        # Plan phase
+        with knowledge_server() as endpoint:
+            context = self._worker(endpoint).context()
+        self.assertEqual(context.get("guide"), expected_guide)
+
+        # Execute phase
+        state_doc = json.loads(self.state_path.read_text(encoding="utf-8"))
+        state_doc["phase"] = WorkflowPhase.EXECUTE.value
+        self.state_path.write_text(json.dumps(state_doc), encoding="utf-8")
+        with knowledge_server() as endpoint:
+            context = self._worker(endpoint).context()
+        self.assertEqual(context.get("guide"), expected_guide)
+
+    def test_context_omits_guide_when_record_has_no_guide(self):
+        from foxhound.task_research import ResearchStore, INPUT_SCHEMA, DRAFT_SCHEMA
+
+        cas_root = self.root / "cas"
+        cas_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        store = ResearchStore(self.database, cas_root)
+        task_folder = self.root / "T1-folder"
+        task_folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+        store.request(
+            {
+                "schema_version": INPUT_SCHEMA,
+                "task_id": 1,
+                "task_version": 1,
+                "workflow_version": 1,
+                "text": "Synthetic task",
+                "structured": {"action": "prepare", "object": "brief", "confidence": 0.9},
+                "due": "2030-01-10",
+                "owner": {"person_id": "person-a", "reliability": "resolved"},
+                "participants": [],
+                "working_group": {"id": "group-alpha", "evidence": "explicit"},
+                "external_identifiers": [{"kind": "issue", "value": "example-12"}],
+                "origin": {"kind": "meeting", "source_digest": "1" * 64},
+                "structured_schema_revisions": {"task": 12, "identity": 1},
+            },
+            task_work_root=self.root,
+            task_folder=task_folder,
+        )
+        research_claim = store.claim("worker-synthetic")
+        assert research_claim is not None
+
+        empty_claim = {"text": "Synthetic claim.", "status": "unsourced", "source_refs": []}
+        draft = {
+            "schema_version": DRAFT_SCHEMA,
+            "research_status": "sufficient",
+            "objective": empty_claim,
+            "requested_action": empty_claim,
+            "current_state": [],
+            "expected_deliverables": [],
+            "timeline": [],
+            "decisions": [],
+            "dependencies": [],
+            "constraints": [],
+            "stakeholders": [],
+            "related_entities": [],
+            "findings": [],
+            "conflicts": [],
+            "open_questions": [],
+            "scheduling_recommendations": [],
+        }
+        store.publish(
+            job_id=research_claim.job.job_id,
+            token=research_claim.token,
+            draft=draft,
+            sources=[],
+            provenance={
+                "profile_id": "researcher",
+                "profile_revision": "3" * 64,
+                "model": "synthetic-thinking-model",
+                "provider": "synthetic",
+                "runtime": "manual-test",
+                "reasoning_requested": "high",
+                "reasoning_effective": "high",
+            },
+            coverage={
+                "searched_namespaces": ["kb"],
+                "queries": 1,
+                "documents_retrieved": 0,
+                "unavailable_source_ids": [],
+                "knowledge_revisions": {"kb": "4" * 64},
+            },
+        )
+
+        with knowledge_server() as endpoint:
+            context = self._worker(endpoint).context()
+        self.assertNotIn("guide", context)
+
     def test_freshness_is_opt_in_and_refuses_noncurrent_effects(self):
         with closing(sqlite3.connect(self.database)) as connection:
             connection.execute(
