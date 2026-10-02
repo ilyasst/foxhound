@@ -110,6 +110,7 @@ class WorkflowConfig:
     awaiting_reader_cap: int
     ask_when_owned_by_others: tuple[str, ...] = ()
     research_before_planning: tuple[str, ...] = ()
+    research_wait_seconds: int | None = None
     steer_while_running: tuple[str, ...] = ()
     #: Kinds whose recorded plan runs without a card. Defaults to empty so a
     #: configuration written before this key existed keeps asking.
@@ -130,7 +131,12 @@ class WorkflowConfig:
     voice_summaries: bool = True
 
     def schedule_argv(
-        self, database: Path, profile_directory: Path | None
+        self,
+        database: Path,
+        profile_directory: Path | None,
+        *,
+        task_work_root: Path | None = None,
+        task_kb_root: Path | None = None,
     ) -> list[str]:
         result = [
             "foxhound-execution-schedule",
@@ -149,6 +155,13 @@ class WorkflowConfig:
             result.extend(("--ask-when-owned-by-others", kind))
         for kind in self.research_before_planning:
             result.extend(("--research-before-planning", kind))
+        if self.research_before_planning and self.research_wait_seconds is not None:
+            result.extend(("--research-wait-seconds", str(self.research_wait_seconds)))
+        if self.research_before_planning:
+            if task_work_root is not None:
+                result.extend(("--task-work-root", str(task_work_root)))
+            if task_kb_root is not None:
+                result.extend(("--task-kb-root", str(task_kb_root)))
         for kind in self.execute_without_asking:
             result.extend(("--execute-without-asking", kind))
         for kind in self.steer_while_running:
@@ -244,6 +257,11 @@ class ExecutionRunnerDeploymentConfig:
             result.extend(("--runtime-log-retention-bytes", str(self.runtime_log_retention_bytes)))
         for kind in workflow.plan_without_asking:
             result.extend(("--plan-without-asking", kind))
+        if workflow.research_before_planning:
+            for kind in workflow.research_before_planning:
+                result.extend(("--research-before-planning", kind))
+            if workflow.research_wait_seconds is not None:
+                result.extend(("--research-wait-seconds", str(workflow.research_wait_seconds)))
         for kind in workflow.execute_without_asking:
             result.extend(("--execute-without-asking", kind))
         for kind in workflow.act_without_asking:
@@ -397,14 +415,24 @@ class DeploymentConfig:
     execution_runners: tuple[ExecutionRunnerDeploymentConfig, ...]
     database_consumers: DatabaseConsumersConfig | None = None
 
+    def _first_archive_roots(self) -> tuple[Path | None, Path | None]:
+        for runner in self.execution_runners:
+            if runner.enabled and runner.task_work_root is not None and runner.task_kb_root is not None:
+                return runner.task_work_root, runner.task_kb_root
+        return None, None
+
     def argv(self, component: str) -> list[str]:
         if component == "task-cards":
             return self.card_service.argv(
                 self.database, self.agent_profile_directory
             )
         if component == "execution-schedule":
+            task_work_root, task_kb_root = self._first_archive_roots()
             return self.workflow.schedule_argv(
-                self.database, self.agent_profile_directory
+                self.database,
+                self.agent_profile_directory,
+                task_work_root=task_work_root,
+                task_kb_root=task_kb_root,
             )
         if component == "execution-runner" and len(self.execution_runners) == 1:
             return self.execution_runners[0].argv(
@@ -775,6 +803,7 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
         optional.add("steer_while_running")
     optional.add("ask_when_owned_by_others")
     optional.add("research_before_planning")
+    optional.add("research_wait_seconds")
     optional.add("voice_summaries")
     document = _object(value, fields, optional)
     profile = document["default_agent_profile"]
@@ -791,6 +820,13 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
     steer = document.get("steer_while_running", []) if version >= 15 else []
     ask_others = document.get("ask_when_owned_by_others", [])
     research_kinds = document.get("research_before_planning", [])
+    research_wait = document.get("research_wait_seconds")
+    if research_wait is not None and (
+        isinstance(research_wait, bool)
+        or not isinstance(research_wait, int)
+        or not 600 <= research_wait <= 86400
+    ):
+        raise DeploymentConfigError("workflow configuration is invalid")
     voice = document.get("voice_summaries", True)
     if not isinstance(voice, bool):
         raise DeploymentConfigError("workflow configuration is invalid")
@@ -825,6 +861,7 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
         *caps,
         ask_when_owned_by_others=tuple(ask_others),
         research_before_planning=tuple(research_kinds),
+        research_wait_seconds=research_wait,
         steer_while_running=tuple(steer),
         execute_without_asking=tuple(execute_grants),
         act_without_asking=tuple(act_grants),
@@ -1467,6 +1504,15 @@ def _validate_runtime(config: DeploymentConfig) -> None:
         config.workflow.research_before_planning,
         label="research-before-planning declarations",
     )
+    if config.workflow.research_before_planning:
+        has_roots = any(
+            runner.enabled and runner.task_work_root is not None and runner.task_kb_root is not None
+            for runner in config.execution_runners
+        )
+        if not has_roots:
+            raise DeploymentConfigError(
+                "research-before-planning requires an enabled runner with both task archive roots configured"
+            )
     executions = execution_grants(config.workflow.execute_without_asking)
     skipped = execution_grants(
         config.workflow.skip_planning_for,
@@ -1494,6 +1540,12 @@ def _validate_runtime(config: DeploymentConfig) -> None:
         label="workflow agent profile routes",
     )
     _validate_profile_routing(registry, config.workflow)
+    first_work_root, first_kb_root = config._first_archive_roots()
+    research_task_roots = (
+        (first_work_root, first_kb_root)
+        if first_work_root is not None and first_kb_root is not None
+        else None
+    )
     TaskExecutionService(
         config.database,
         profile_registry=registry,
@@ -1510,6 +1562,8 @@ def _validate_runtime(config: DeploymentConfig) -> None:
         reader_aliases=config.workflow.reader_aliases,
         profile_routes=dict(config.workflow.agent_profile_routes),
         research_before_planning=config.workflow.research_before_planning,
+        research_wait_seconds=config.workflow.research_wait_seconds,
+        research_task_roots=research_task_roots,
     )
     for runner in config.execution_runners:
         if runner.enabled:
@@ -1552,6 +1606,8 @@ def _validate_runtime(config: DeploymentConfig) -> None:
                 plan_ready_cap=config.workflow.plan_ready_cap,
                 awaiting_reader_cap=config.workflow.awaiting_reader_cap,
                 profile_routes=dict(config.workflow.agent_profile_routes),
+                research_before_planning=config.workflow.research_before_planning,
+                research_wait_seconds=config.workflow.research_wait_seconds,
             )
     cards = config.card_service
     if not cards.enabled:
