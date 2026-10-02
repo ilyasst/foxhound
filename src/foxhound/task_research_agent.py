@@ -109,10 +109,42 @@ def _clean_locator_string(loc_str: str) -> tuple[str, str | None]:
     return loc, extracted_fragment
 
 
+def _get_basename_map(
+    root_dir: str,
+    cache: dict[str, dict[str, list[str]]] | None = None,
+) -> dict[str, list[str]]:
+    """Return a mapping of basename -> list of relative posix paths under root_dir."""
+    real_root = os.path.realpath(root_dir)
+    if cache is not None and real_root in cache:
+        return cache[real_root]
+
+    bmap: dict[str, list[str]] = {}
+    entries_count = 0
+    cap = 200000
+
+    for dirpath, dirnames, filenames in os.walk(real_root, followlinks=False):
+        for fname in filenames:
+            entries_count += 1
+            if entries_count > cap:
+                break
+            full_file = os.path.join(dirpath, fname)
+            if os.path.isfile(full_file):
+                rel = os.path.relpath(full_file, real_root).replace("\\", "/")
+                bmap.setdefault(fname, []).append(rel)
+        if entries_count > cap:
+            break
+
+    if cache is not None:
+        cache[real_root] = bmap
+    return bmap
+
+
 def _map_locator(
     loc_str: str,
     knowledge_roots: Sequence[tuple[str, str]],
     read_only_commands: Sequence[str] | Sequence[Mapping[str, Any]] = (),
+    run_dir: Path | str | None = None,
+    basename_cache: dict[str, dict[str, list[str]]] | None = None,
 ) -> tuple[str, str, str | None] | None:
     """Map locator string to (namespace, resource, fragment). Return None if unmappable."""
     if not isinstance(loc_str, str) or not loc_str.strip():
@@ -144,6 +176,14 @@ def _map_locator(
             declared_tool_names.add(item)
         elif isinstance(item, Mapping) and "name" in item:
             declared_tool_names.add(item["name"])
+
+    # Normalization: prefixes "read_only_command:" or "tool:" followed by args,
+    # when exactly one read-only command is declared -> "<that name>:<args>".
+    if ":" in loc:
+        prefix_cand, text_cand = loc.split(":", 1)
+        if prefix_cand in ("read_only_command", "tool") and len(declared_tool_names) == 1:
+            only_name = next(iter(declared_tool_names))
+            loc = f"{only_name}:{text_cand}"
 
     if ":" in loc:
         prefix_cand, text_cand = loc.split(":", 1)
@@ -209,6 +249,18 @@ def _map_locator(
             real_root = os.path.realpath(rpath)
             real_full = os.path.realpath(full_path)
             # Refuse paths that do not exist as regular files under that root (no symlink escape)
+            if not os.path.isfile(real_full):
+                # Normalization: basename resolution under that root
+                base_name = os.path.basename(target_rel_path)
+                bmap = _get_basename_map(rpath, basename_cache)
+                candidates = bmap.get(base_name, [])
+                if len(candidates) == 1:
+                    norm_rel = candidates[0]
+                    full_path = os.path.join(rpath, norm_rel)
+                    real_full = os.path.realpath(full_path)
+                else:
+                    return None
+
             if not os.path.isfile(real_full):
                 return None
             try:
@@ -281,6 +333,35 @@ def _map_locator(
                     except SynthesisError:
                         return None
 
+    # For a locator without a "<root>:" prefix, or an absolute path:
+    # compute os.path.realpath (relative ones against run_dir)
+    # and accept it only if the realpath is inside a knowledge root's realpath;
+    # map to that root's namespace with the path relative to the root.
+    if os.path.isabs(resource_candidate):
+        target_candidate_path = resource_candidate
+    elif run_dir is not None:
+        target_candidate_path = os.path.join(str(run_dir), resource_candidate)
+    else:
+        target_candidate_path = None
+
+    if target_candidate_path is not None:
+        real_cand = os.path.realpath(target_candidate_path)
+        if os.path.isfile(real_cand):
+            for r_name, rpath in norm_roots:
+                real_rpath = os.path.realpath(rpath)
+                try:
+                    common = os.path.commonpath([real_rpath, real_cand])
+                    if common == real_rpath:
+                        ns = canon_prefixes.get(r_name, r_name)
+                        rel_posix = os.path.relpath(real_cand, real_rpath).replace("\\", "/")
+                        try:
+                            _validate_resource_locator(rel_posix, namespace=ns)
+                            return ns, rel_posix, fragment
+                        except SynthesisError:
+                            return None
+                except ValueError:
+                    continue
+
     return None
 
 
@@ -319,6 +400,8 @@ def _process_evidence_and_refs(
     sources_list: list[dict[str, Any]],
     knowledge_roots: Sequence[tuple[str, str]],
     read_only_commands: Sequence[str] | Sequence[Mapping[str, Any]] = (),
+    run_dir: Path | str | None = None,
+    basename_cache: dict[str, dict[str, list[str]]] | None = None,
 ) -> list[str]:
     refs: list[str] = []
     if not raw_evidence:
@@ -326,7 +409,7 @@ def _process_evidence_and_refs(
     for item in raw_evidence:
         if not isinstance(item, str):
             continue
-        mapped = _map_locator(item, knowledge_roots, read_only_commands)
+        mapped = _map_locator(item, knowledge_roots, read_only_commands, run_dir=run_dir, basename_cache=basename_cache)
         if mapped is None:
             continue
         ns, res, frag = mapped
@@ -350,9 +433,11 @@ def _make_claim(
     sources_list: list[dict[str, Any]],
     knowledge_roots: Sequence[tuple[str, str]],
     read_only_commands: Sequence[str] | Sequence[Mapping[str, Any]] = (),
+    run_dir: Path | str | None = None,
+    basename_cache: dict[str, dict[str, list[str]]] | None = None,
 ) -> dict[str, Any]:
     refs = _process_evidence_and_refs(
-        raw_evidence, sources_by_locator, sources_list, knowledge_roots, read_only_commands
+        raw_evidence, sources_by_locator, sources_list, knowledge_roots, read_only_commands, run_dir=run_dir, basename_cache=basename_cache
     )
     if status != "unknown" and not refs:
         status = "unknown"
@@ -367,6 +452,8 @@ def _convert_research_json(
     raw: Mapping[str, Any],
     knowledge_roots: Sequence[tuple[str, str]],
     read_only_commands: Sequence[str] | Sequence[Mapping[str, Any]] = (),
+    run_dir: Path | str | None = None,
+    basename_cache: dict[str, dict[str, list[str]]] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     sources_by_locator: dict[tuple[str, str], dict[str, Any]] = {}
     sources_list: list[dict[str, Any]] = []
@@ -391,6 +478,8 @@ def _convert_research_json(
         sources_list,
         knowledge_roots,
         read_only_commands,
+        run_dir=run_dir,
+        basename_cache=basename_cache,
     )
     requested_action = _make_claim(
         rd_text,
@@ -400,6 +489,8 @@ def _convert_research_json(
         sources_list,
         knowledge_roots,
         read_only_commands,
+        run_dir=run_dir,
+        basename_cache=basename_cache,
     )
 
     # constraints <- constraints
@@ -414,7 +505,10 @@ def _convert_research_json(
                 ev = c.get("evidence", [])
                 st = "supported" if ev else "inferred"
                 constraints_claims.append(
-                    _make_claim(text, st, ev, sources_by_locator, sources_list, knowledge_roots, read_only_commands)
+                    _make_claim(
+                        text, st, ev, sources_by_locator, sources_list, knowledge_roots, read_only_commands,
+                        run_dir=run_dir, basename_cache=basename_cache,
+                    )
                 )
 
     # findings <- facts
@@ -437,7 +531,10 @@ def _convert_research_json(
                     st = "supported" if f.get("evidence") else "inferred"
                 ev = f.get("evidence", [])
                 findings_claims.append(
-                    _make_claim(text, st, ev, sources_by_locator, sources_list, knowledge_roots, read_only_commands)
+                    _make_claim(
+                        text, st, ev, sources_by_locator, sources_list, knowledge_roots, read_only_commands,
+                        run_dir=run_dir, basename_cache=basename_cache,
+                    )
                 )
 
     # related_entities <- entities (unresolved -> status unknown, no refs)
@@ -464,7 +561,10 @@ def _convert_research_json(
                 else:
                     st = "supported" if ev else "inferred"
                     entities_claims.append(
-                        _make_claim(text, st, ev, sources_by_locator, sources_list, knowledge_roots, read_only_commands)
+                        _make_claim(
+                            text, st, ev, sources_by_locator, sources_list, knowledge_roots, read_only_commands,
+                            run_dir=run_dir, basename_cache=basename_cache,
+                        )
                     )
 
     # stakeholders <- ownership verdict claim
@@ -476,7 +576,10 @@ def _convert_research_json(
         if verdict:
             st = "supported" if ev else "inferred"
             stakeholders_claims.append(
-                _make_claim(f"Owner: {verdict}", st, ev, sources_by_locator, sources_list, knowledge_roots, read_only_commands)
+                _make_claim(
+                    f"Owner: {verdict}", st, ev, sources_by_locator, sources_list, knowledge_roots, read_only_commands,
+                    run_dir=run_dir, basename_cache=basename_cache,
+                )
             )
 
     # open_questions <- open_questions (status unknown)
@@ -546,6 +649,7 @@ def check_research_output(
         return None, None, ["research.json root must be a JSON object"]
 
     problems: list[str] = []
+    basename_cache: dict[str, dict[str, list[str]]] = {}
 
     # Check top-level fields
     # Expected fields:
@@ -582,7 +686,26 @@ def check_research_output(
             if not isinstance(item, str):
                 problems.append(f"Evidence at '{item_path}' must be a string, got {type(item).__name__}")
                 continue
-            mapped = _map_locator(item, knowledge_roots, read_only_commands)
+
+            # (c) any locator whose path part is task.json (with or without ./ or #L)
+            loc_str, _ = _clean_locator_string(item)
+            cand_path = loc_str.split("#", 1)[0].strip()
+            if cand_path.startswith("./"):
+                cand_path = cand_path[2:]
+            if cand_path == "task.json":
+                problems.append(
+                    f"Invalid evidence locator at '{item_path}': task.json is the task itself, "
+                    "not evidence; cite the origin record (meeting protocol, transcript, email) instead"
+                )
+                continue
+
+            mapped = _map_locator(
+                item,
+                knowledge_roots,
+                read_only_commands,
+                run_dir=run_dir_path,
+                basename_cache=basename_cache,
+            )
             if mapped is None:
                 problems.append(
                     f"Unmappable evidence locator at '{item_path}': {item!r}. "
@@ -621,7 +744,13 @@ def check_research_output(
 
     # Conversion and validation errors
     try:
-        draft, sources = _convert_research_json(raw_research, knowledge_roots, read_only_commands)
+        draft, sources = _convert_research_json(
+            raw_research,
+            knowledge_roots,
+            read_only_commands,
+            run_dir=run_dir_path,
+            basename_cache=basename_cache,
+        )
     except Exception as exc:
         problems.append(f"Conversion error: {exc}")
 
@@ -658,6 +787,19 @@ def agent_synthesize(
     task_snapshot = dict(ctx.get("task_snapshot", {}))
     knowledge_roots_data = _derive_knowledge_roots(config)
     starting_points_data = _derive_starting_points(ctx, bound_sources)
+
+    # In the run directory create one symlink per knowledge root (named after the root)
+    # (skip if exists)
+    for name, p in config.knowledge_roots:
+        link_path = run_dir / name
+        if not link_path.exists():
+            try:
+                link_path.symlink_to(Path(p).resolve())
+            except OSError:
+                pass
+
+    # Write run_dir/.ripgreprc containing "--follow\n"
+    (run_dir / ".ripgreprc").write_text("--follow\n", encoding="utf-8")
 
     task_json_payload = {
         **task_snapshot,
@@ -704,6 +846,7 @@ def agent_synthesize(
     env = dict(os.environ)
     env["TERMINAL_CWD"] = str(run_dir.resolve())
     env["FOXHOUND_VOICE_SUMMARIES"] = "0"
+    env["RIPGREP_CONFIG_PATH"] = str((run_dir / ".ripgreprc").resolve())
 
     try:
         proc = runner(
@@ -769,12 +912,13 @@ def agent_synthesize(
             "--toolsets",
             "file",
         ])
+        timed_out = False
         try:
             repair_proc = runner(
                 repair_argv,
                 cwd=run_dir,
                 env=env,
-                timeout=300,
+                timeout=600,
                 capture_output=True,
                 text=True,
             )
@@ -796,12 +940,14 @@ def agent_synthesize(
             if new_session_id:
                 session_id = new_session_id
         except subprocess.TimeoutExpired:
-            # Repair timeout stops further repair turns
-            break
+            # Repair timeout stops further repair turns, but re-checks output first
+            timed_out = True
 
         draft, sources, problems = check_research_output(
             run_dir, config.knowledge_roots, config.read_only_commands
         )
+        if timed_out:
+            break
 
     if problems:
         research_json_path = run_dir / "research.json"
