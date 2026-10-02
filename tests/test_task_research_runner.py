@@ -211,7 +211,7 @@ class TaskResearchRunnerTests(unittest.TestCase):
         self.assertEqual(job[0], "completed")
 
         # Transient scratch directories removed
-        scratch_items = list(self.paths["scratch_root"].iterdir())
+        scratch_items = [d for d in self.paths["scratch_root"].iterdir() if d.name != "metrics"]
         self.assertEqual(scratch_items, [])
 
     def test_interrupted_publication_is_repaired_without_repeating_model_work(self) -> None:
@@ -372,7 +372,7 @@ class TaskResearchRunnerTests(unittest.TestCase):
         self.assertEqual(job[2], "retrieval_empty")
 
         # Failed scratch preserved for diagnostics
-        failed_dirs = list(self.paths["scratch_root"].iterdir())
+        failed_dirs = [d for d in self.paths["scratch_root"].iterdir() if d.name != "metrics"]
         self.assertTrue(all(d.name.startswith("failed-") for d in failed_dirs))
         self.assertEqual(len(failed_dirs), 1)
 

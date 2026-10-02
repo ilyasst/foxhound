@@ -18,11 +18,12 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 from .execution_worker import ExecutionWorkerConfigError, load_knowledge_config
 from .knowledge_client import (
@@ -49,6 +50,7 @@ from .task_research_synthesis import (
     KnowledgeSearch,
     SynthesisConfig,
     SynthesisError,
+    SynthesisResult,
     synthesize,
 )
 
@@ -179,6 +181,46 @@ def run_once(
     job_id = claim.job.job_id
     token = claim.token
     run_scratch: Path | None = None
+    started_wall = time.monotonic()
+    synthesis_result: SynthesisResult | None = None
+
+    def _record_metrics(outcome: str) -> None:
+        try:
+            wall_seconds = max(0.0, time.monotonic() - started_wall)
+            now_dt = clock() if clock else datetime.now(timezone.utc)
+            ts = now_dt.strftime("%Y%m%dT%H%M%SZ")
+            metrics_dir = trusted_scratch_root / "metrics"
+            if not metrics_dir.exists():
+                metrics_dir.mkdir(parents=True, mode=0o700)
+            else:
+                metrics_dir.chmod(0o700)
+            doc: dict[str, Any] = {
+                "job_id": job_id,
+                "task_id": claim.job.task_id,
+                "task_version": claim.job.task_version,
+                "outcome": outcome,
+                "wall_seconds": wall_seconds,
+            }
+            if synthesis_result is not None and synthesis_result.metrics:
+                doc.update(synthesis_result.metrics)
+            data = (json.dumps(doc, sort_keys=True, indent=2) + "\n").encode("utf-8")
+            target = metrics_dir / f"{job_id}-{ts}.json"
+            tmp = target.with_name(f"{target.name}.tmp-{os.urandom(6).hex()}")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with open(fd, "wb", closefd=True) as f:
+                    f.write(data)
+                    f.flush()
+                    os.fsync(f.fileno())
+                tmp.replace(target)
+            finally:
+                if tmp.exists():
+                    try:
+                        tmp.unlink()
+                    except OSError:
+                        pass
+        except Exception:
+            pass
 
     def fail_or_repair(failure_code: str) -> ResearchRunResult:
         """Record an ordinary failure, or finish an interrupted publication."""
@@ -241,6 +283,7 @@ def run_once(
                 read_only_commands=read_only_commands,
                 profile_id=profile_id,
                 profile_revision=profile_revision,
+                job_id=job_id,
             )
             synthesis_result = agent_synthesize(
                 ctx,
@@ -296,6 +339,9 @@ def run_once(
             coverage=synthesis_result.coverage,
         )
 
+        outcome = "degraded" if bool(synthesis_result.coverage.get("degraded")) else "success"
+        _record_metrics(outcome)
+
         # Scratch directory cleanup on success
         if run_scratch.exists():
             shutil.rmtree(run_scratch, ignore_errors=True)
@@ -304,10 +350,13 @@ def run_once(
         return ResearchRunResult(claimed=True, completed=True, state="completed")
 
     except SynthesisError as exc:
+        _record_metrics("failure")
         return fail_or_repair(exc.code)
     except (ResearchError, ResearchSourceError, KnowledgeClientError, ExecutionWorkerConfigError):
+        _record_metrics("failure")
         return fail_or_repair("runtime_failed")
     except Exception:
+        _record_metrics("failure")
         return fail_or_repair("unexpected_error")
     finally:
         if run_scratch is not None and run_scratch.exists():
