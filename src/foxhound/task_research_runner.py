@@ -75,8 +75,15 @@ def _validate_owner_private_dir(path: Path) -> Path:
             info = cur.lstat()
             if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
                 raise ResearchError("path component is not a directory or is a symlink")
-            if info.st_uid == os.geteuid() and (info.st_mode & 0o077):
-                raise ResearchError("path component is not owner-private")
+            # The root itself must be private; above it, refuse only what
+            # another account could write to and so swap out from under us.
+            # Requiring every ancestor to be private rejected ordinary homes
+            # (0701) and synced folders (0775) the execution runners accept.
+            if cur == path:
+                if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+                    raise ResearchError("path component is not owner-private")
+            elif info.st_mode & 0o002 and not info.st_mode & stat.S_ISVTX:
+                raise ResearchError("path component is writable by others")
     except OSError as exc:
         raise ResearchError("inaccessible path") from exc
 
