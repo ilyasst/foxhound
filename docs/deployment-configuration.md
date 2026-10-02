@@ -352,6 +352,12 @@ Start card. Unresolved, provisional, group, or version-zero owners do not wait.
 A source kind cannot appear in both `plan_without_asking` and
 `ask_when_owned_by_others`.
 
+`research_before_planning` requires completed research before planning tasks
+from the listed source kinds. For a listed kind, planning is unclaimable until
+a completed research receipt exists for the task's current version (or research
+times out / fails). A task waiting at the Start card (such as one owned by others)
+does not request research until it is started.
+
 `workflow.voice_summaries` (optional boolean, default `true`): when `false`,
 the execution runner starts with `FOXHOUND_VOICE_SUMMARIES=0`, so recorded
 results carry no voice summary and no speech is synthesized (no model call

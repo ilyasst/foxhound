@@ -12,8 +12,10 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import stat
 import sys
+from contextlib import closing
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -114,6 +116,38 @@ _RESULT_INPUTS = (
 def _local_today() -> str:
     """Return the host's authoritative local calendar date."""
     return datetime.now().astimezone().date().isoformat()
+
+
+
+def _read_research(
+    state: "ExecutionRunState",
+    task_id: int,
+    task_version: int,
+) -> str | None:
+    if state.phase is not WorkflowPhase.PLAN:
+        return None
+    try:
+        from .task_research_gate import research_context
+        with closing(sqlite3.connect(state.database_path, timeout=5)) as connection:
+            connection.row_factory = sqlite3.Row
+            info = research_context(connection, task_id, task_version)
+    except Exception:
+        return None
+    if not isinstance(info, dict) or info.get("status") != "available":
+        return None
+    if not state.task_work_directory:
+        return None
+    path = Path(state.task_work_directory) / "Research.md"
+    if not path.is_file():
+        return None
+    try:
+        raw = path.read_bytes()
+        if not raw:
+            return None
+        text = raw.decode("utf-8", errors="replace")
+        return text[:20000]
+    except Exception:
+        return None
 
 
 def _read_handoff(task_work_directory: str | None, phase: str) -> str | None:
@@ -345,7 +379,7 @@ class ExecutionWorker:
         except Exception:
             working_group_context = None
 
-        return {
+        result = {
             "schema": WORK_CONTEXT_SCHEMA,
             "schema_version": WORK_CONTEXT_SCHEMA_VERSION,
             "runtime": {
@@ -466,6 +500,10 @@ class ExecutionWorker:
                 "institution_domains": list(context.institution_domains),
             },
         }
+        research_doc = _read_research(state, task.id, task.version)
+        if research_doc is not None:
+            result["research"] = research_doc
+        return result
 
     def _instructions(self, state: ExecutionRunState) -> dict[str, Any]:
         """Return the instructions of the revision this claim is pinned to.

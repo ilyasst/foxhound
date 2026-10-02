@@ -143,6 +143,23 @@ def prepare_task_archive(
     return paths
 
 
+def ensure_task_directory(
+    *, working_root: Path, kb_root: Path, task_id: int, task_text: str,
+) -> Path:
+    """Create (or find) the stable task folder without registering a run.
+
+    The same folder `prepare_task_archive` uses, so pre-planning research
+    lands beside the plan and execution runs that follow it.
+    """
+    if isinstance(task_id, bool) or not isinstance(task_id, int) or task_id < 1:
+        raise TaskArchiveError("task archive identity is invalid")
+    work = _prepare_root(working_root, "working")
+    kb = _prepare_root(kb_root, "knowledge")
+    task_directory = work / _task_basename(work, kb, task_id, task_text)
+    _make_directory(task_directory)
+    return task_directory
+
+
 def record_runtime_log(paths: TaskArchivePaths, log_name: str) -> None:
     """Point the task ledger at a private structured runtime record."""
     if not isinstance(log_name, str) or not log_name or "/" in log_name:

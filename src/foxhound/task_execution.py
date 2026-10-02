@@ -46,6 +46,11 @@ from .source_policy import (
     source_kinds_accepting,
 )
 from .task_ledger import TaskLedgerError, TaskStatus
+from .task_research_gate import (
+    ResearchGatePolicy,
+    evaluate_research_gate,
+    request_pending_research,
+)
 from .task_scheduling import evaluate_task_conditions
 
 
@@ -526,6 +531,9 @@ class TaskExecutionService:
         awaiting_reader_cap: int | None = None,
         reader_aliases: object = None,
         profile_routes: Mapping[str, str] | None = None,
+        research_before_planning: object = None,
+        research_wait_seconds: int | None = None,
+        research_task_roots: tuple[Path, Path] | None = None,
     ) -> None:
         if (isinstance(max_attempts, bool)
                 or not isinstance(max_attempts, int)
@@ -643,6 +651,24 @@ class TaskExecutionService:
         # other people can see are not the same permission.
         self._action_grants = _action_grants(action_grants)
         self._default_profile = profile
+        # Empty unless declared: a deployment that names no kinds plans
+        # exactly as it did before research existed (ADR 0063).
+        work_root, kb_root = research_task_roots or (None, None)
+        self._research_gate = ResearchGatePolicy.build(
+            research_before_planning,
+            wait_seconds=research_wait_seconds,
+            task_work_root=work_root,
+            task_kb_root=kb_root,
+        )
+        # A plan phase is what research precedes. A kind that skips planning
+        # has no plan to hold, so declaring both is a contradiction.
+        overlap = self._research_gate.source_kinds & self._skip_planning_for
+        if overlap:
+            raise ValueError(
+                "research-before-planning declarations skip planning: "
+                + ", ".join(sorted(overlap))
+            )
+        self._last_claim_research: Mapping[str, int] = {}
 
     def _profile_for(self, origin_kind: object) -> AgentProfile:
         """Which agent a task of this kind starts on.
@@ -1171,6 +1197,16 @@ class TaskExecutionService:
         """Task IDs the last claim could not run and deferred."""
         return self._last_claim_deferred
 
+    @property
+    def last_claim_research(self) -> Mapping[str, int]:
+        """Content-free research-gate counts from the last claim pass.
+
+        `requested` new research jobs, `held` plans skipped while research
+        is in flight, and one `bypassed_<reason>` count per plan released
+        without research. Empty when the policy is not enabled.
+        """
+        return dict(self._last_claim_research)
+
     def claim_next(
         self,
         *,
@@ -1190,6 +1226,14 @@ class TaskExecutionService:
             try:
                 self._cancel_stale(connection, now)
                 self._recover_expired(connection, stamp)
+                research_counts: dict[str, int] = {}
+                if self._research_gate.enabled:
+                    # Before the slot check, so research proceeds while
+                    # every execution slot is busy.
+                    research_counts["requested"] = request_pending_research(
+                        connection, self._research_gate, stamp
+                    )
+                self._last_claim_research = research_counts
                 running = int(connection.execute(
                     "SELECT COUNT(*) FROM task_execution_workflows AS w "
                     "JOIN tasks AS t ON t.id=w.task_id "
@@ -1260,6 +1304,29 @@ class TaskExecutionService:
                         continue
                     if not eligible:
                         continue
+                    if (
+                        candidate["phase"] == WorkflowPhase.PLAN
+                        and self._research_gate.selects(candidate["origin_kind"])
+                    ):
+                        gate = evaluate_research_gate(
+                            connection,
+                            self._research_gate,
+                            int(candidate["task_id"]),
+                            int(candidate["task_version"]),
+                            stamp,
+                        )
+                        if gate.reason == "requested":
+                            research_counts["requested"] = (
+                                research_counts.get("requested", 0) + 1
+                            )
+                        if not gate.claimable:
+                            research_counts["held"] = (
+                                research_counts.get("held", 0) + 1
+                            )
+                            continue
+                        if gate.reason != "receipt":
+                            key = "bypassed_" + gate.reason
+                            research_counts[key] = research_counts.get(key, 0) + 1
                     try:
                         resolved = self._resolve_profile(candidate)
                         if candidate["phase"] not in resolved.allowed_phases:

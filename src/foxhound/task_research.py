@@ -491,74 +491,19 @@ class ResearchStore:
     def request(self, snapshot: object, *, task_work_root: Path,
                 task_folder: Path, refresh: bool = False) -> ResearchJob:
         """Explicitly queue research; no intake path calls this automatically."""
-        normalized = normalize_task_snapshot(snapshot)
-        root, folder = self._bound_task_folder(task_work_root, task_folder)
-        payload = _canonical_bytes(normalized)
-        digest = _digest(payload)
         now = self._now().isoformat().replace("+00:00", "Z")
-        raw_task_id = normalized["task_id"]
-        assert isinstance(raw_task_id, int)
-        task_id = raw_task_id
-        task_version = int(normalized["task_version"])
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
-            task = connection.execute("SELECT version,text FROM tasks WHERE id=?", (task_id,)).fetchone()
-            # The broker owns the ledger snapshot.  Callers may request a
-            # specific version, but cannot smuggle an unrelated task body into
-            # the durable research record.
-            if (task is None or task["version"] != task_version
-                    or normalized["text"] != task["text"]):
+            try:
+                job = enqueue_in_transaction(
+                    connection, snapshot, task_work_root=task_work_root,
+                    task_folder=task_folder, now=now, refresh=refresh,
+                )
+            except BaseException:
                 connection.rollback()
-                raise ResearchError("task snapshot is stale or does not match ledger")
-            existing = connection.execute(
-                "SELECT * FROM task_research_jobs WHERE task_id=? AND task_version=? "
-                "AND input_digest=? ORDER BY generation DESC LIMIT 1",
-                (task_id, task_version, digest),
-            ).fetchone()
-            if not refresh and existing is not None and existing["state"] in {
-                "queued", "running", "publishing", "completed"
-            }:
-                connection.commit()
-                return self._job(existing)
-            active = connection.execute(
-                "SELECT job_id,state FROM task_research_jobs WHERE task_id=? "
-                "AND state IN ('queued','running','publishing')", (task_id,)
-            ).fetchone()
-            if active is not None:
-                if active["state"] == "publishing":
-                    # Fail-closed: refuse refresh while a publication is in flight
-                    # to prevent canceling or racing a committing deliverable.
-                    connection.rollback()
-                    raise ResearchError("task research publication is currently in progress")
-                connection.execute(
-                    "UPDATE task_research_jobs SET state='canceled',updated_at=? WHERE job_id=?",
-                    (now, active["job_id"]),
-                )
-                connection.execute("DELETE FROM task_research_claims WHERE job_id=?", (active["job_id"],))
-                connection.execute(
-                    "INSERT INTO task_research_events(job_id,task_id,kind,from_state,to_state,occurred_at) "
-                    "VALUES(?,?,'canceled',?,'canceled',?)",
-                    (active["job_id"], task_id, active["state"], now),
-                )
-            generation = connection.execute(
-                "SELECT COALESCE(MAX(generation),0)+1 FROM task_research_jobs WHERE task_id=?",
-                (task_id,),
-            ).fetchone()[0]
-            job_id = "research-" + secrets.token_hex(16)
-            connection.execute(
-                "INSERT INTO task_research_jobs(job_id,task_id,task_version,generation,input_digest,"
-                "input_json,task_work_root,task_folder,state,attempts,max_attempts,requested_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?,'queued',0,3,?,?)",
-                (job_id, task_id, task_version, generation, digest, payload.decode(),
-                 str(root), str(folder), now, now),
-            )
-            connection.execute(
-                "INSERT INTO task_research_events(job_id,task_id,kind,to_state,occurred_at) "
-                "VALUES(?,?,'requested','queued',?)", (job_id, task_id, now),
-            )
+                raise
             connection.commit()
-            row = connection.execute("SELECT * FROM task_research_jobs WHERE job_id=?", (job_id,)).fetchone()
-            return self._job(row)
+            return job
 
     def claim(
         self,
@@ -972,18 +917,125 @@ class ResearchStore:
                 "AND j.state='completed' ORDER BY j.generation DESC LIMIT 1",
                 (task_id, task_version, input_digest),
             ).fetchone()
-        if row is None:
-            return None
-        folder = self._folder_for_row(row)
-        try:
-            json_payload = (folder / ".task-research.json").read_bytes()
-            markdown_payload = (folder / "Research.md").read_bytes()
-        except OSError:
-            return None
-        if _digest(json_payload) != row["json_digest"] or _digest(markdown_payload) != row["markdown_digest"]:
-            return None
+        return _receipt_projection(row)
+
+
+def _receipt_projection(row: Mapping[str, object] | None) -> dict[str, object] | None:
+    """Read both receipt-authorized views and project them, or return None."""
+    if row is None:
+        return None
+    try:
+        folder = ResearchStore._folder_for_row(row)
+        json_payload = (folder / ".task-research.json").read_bytes()
+        markdown_payload = (folder / "Research.md").read_bytes()
+    except (OSError, ResearchError):
+        return None
+    if _digest(json_payload) != row["json_digest"] or _digest(markdown_payload) != row["markdown_digest"]:
+        return None
+    try:
         document = json.loads(json_payload)
         return consumer_projection(document)
+    except (ValueError, KeyError, TypeError, ResearchError):
+        return None
+
+
+def enqueue_in_transaction(
+    connection: sqlite3.Connection,
+    snapshot: object,
+    *,
+    task_work_root: Path,
+    task_folder: Path,
+    now: str,
+    refresh: bool = False,
+) -> ResearchJob:
+    """Queue research inside a transaction the caller already holds.
+
+    This is the whole of ``ResearchStore.request`` minus the transaction, so
+    a caller that is itself deciding something about the task in the same
+    database (the execution claim gate, for one) can request research
+    atomically with that decision.  It runs no model and contacts nothing.
+    """
+    normalized = normalize_task_snapshot(snapshot)
+    root, folder = ResearchStore._bound_task_folder(task_work_root, task_folder)
+    payload = _canonical_bytes(normalized)
+    digest = _digest(payload)
+    raw_task_id = normalized["task_id"]
+    assert isinstance(raw_task_id, int)
+    task_id = raw_task_id
+    task_version = int(normalized["task_version"])
+    task = connection.execute("SELECT version,text FROM tasks WHERE id=?", (task_id,)).fetchone()
+    # The broker owns the ledger snapshot.  Callers may request a specific
+    # version, but cannot smuggle an unrelated task body into the durable
+    # research record.
+    if (task is None or task["version"] != task_version
+            or normalized["text"] != task["text"]):
+        raise ResearchError("task snapshot is stale or does not match ledger")
+    existing = connection.execute(
+        "SELECT * FROM task_research_jobs WHERE task_id=? AND task_version=? "
+        "AND input_digest=? ORDER BY generation DESC LIMIT 1",
+        (task_id, task_version, digest),
+    ).fetchone()
+    if not refresh and existing is not None and existing["state"] in {
+        "queued", "running", "publishing", "completed"
+    }:
+        return ResearchStore._job(existing)
+    active = connection.execute(
+        "SELECT job_id,state FROM task_research_jobs WHERE task_id=? "
+        "AND state IN ('queued','running','publishing')", (task_id,)
+    ).fetchone()
+    if active is not None:
+        if active["state"] == "publishing":
+            # Fail-closed: refuse refresh while a publication is in flight
+            # to prevent canceling or racing a committing deliverable.
+            raise ResearchError("task research publication is currently in progress")
+        connection.execute(
+            "UPDATE task_research_jobs SET state='canceled',updated_at=? WHERE job_id=?",
+            (now, active["job_id"]),
+        )
+        connection.execute("DELETE FROM task_research_claims WHERE job_id=?", (active["job_id"],))
+        connection.execute(
+            "INSERT INTO task_research_events(job_id,task_id,kind,from_state,to_state,occurred_at) "
+            "VALUES(?,?,'canceled',?,'canceled',?)",
+            (active["job_id"], task_id, active["state"], now),
+        )
+    generation = connection.execute(
+        "SELECT COALESCE(MAX(generation),0)+1 FROM task_research_jobs WHERE task_id=?",
+        (task_id,),
+    ).fetchone()[0]
+    job_id = "research-" + secrets.token_hex(16)
+    connection.execute(
+        "INSERT INTO task_research_jobs(job_id,task_id,task_version,generation,input_digest,"
+        "input_json,task_work_root,task_folder,state,attempts,max_attempts,requested_at,updated_at) "
+        "VALUES(?,?,?,?,?,?,?,?,'queued',0,3,?,?)",
+        (job_id, task_id, task_version, generation, digest, payload.decode(),
+         str(root), str(folder), now, now),
+    )
+    connection.execute(
+        "INSERT INTO task_research_events(job_id,task_id,kind,to_state,occurred_at) "
+        "VALUES(?,?,'requested','queued',?)", (job_id, task_id, now),
+    )
+    row = connection.execute("SELECT * FROM task_research_jobs WHERE job_id=?", (job_id,)).fetchone()
+    return ResearchStore._job(row)
+
+
+def version_projection(
+    connection: sqlite3.Connection, task_id: int, task_version: int,
+) -> dict[str, object] | None:
+    """The newest receipt-authorized projection for one exact task version."""
+    previous = connection.row_factory
+    connection.row_factory = sqlite3.Row
+    try:
+        row = connection.execute(
+            "SELECT r.json_digest,r.markdown_digest,j.task_work_root,j.task_folder "
+            "FROM task_research_jobs j "
+            "JOIN task_research_receipts r ON r.job_id=j.job_id "
+            "WHERE j.task_id=? AND j.task_version=? AND j.state='completed' "
+            "ORDER BY j.generation DESC LIMIT 1",
+            (task_id, task_version),
+        ).fetchone()
+    finally:
+        connection.row_factory = previous
+    return _receipt_projection(row)
 
 
 def _load(path: Path) -> object:
