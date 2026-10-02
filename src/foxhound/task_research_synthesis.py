@@ -52,7 +52,7 @@ from .task_research_sources import (
 CONTEXT_SCHEMA = "foxhound.task-research-context.v1"
 INPUT_SCHEMA = "foxhound.task-research-input.v1"
 DRAFT_SCHEMA = "foxhound.task-research-draft.v1"
-SOURCE_NAMESPACES = frozenset({"kb", "meeting", "email", "attachment", "repo", "web"})
+SOURCE_NAMESPACES = frozenset({"kb", "meeting", "email", "attachment", "repo", "web", "tool"})
 RECOMMENDATION_TYPES = frozenset({
     "after_task_completed", "not_before", "raise_priority", "create_prerequisite",
 })
@@ -511,6 +511,19 @@ def _validate_resource_locator(resource: str, *, namespace: str | None = None) -
     if namespace == "web":
         parsed = urlsplit(resource)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise SynthesisError("retrieval_failed")
+        return
+    if namespace == "tool":
+        if (
+            not (1 <= len(resource) <= 300)
+            or "\x00" in resource
+            or "\n" in resource
+            or "\r" in resource
+            or ":" not in resource
+        ):
+            raise SynthesisError("retrieval_failed")
+        tool_name, tool_text = resource.split(":", 1)
+        if not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", tool_name) or not tool_text.strip():
             raise SynthesisError("retrieval_failed")
         return
     pure = PurePosixPath(resource)

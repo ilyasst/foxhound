@@ -35,7 +35,7 @@ MAX_MARKDOWN_BYTES = 64 * 1024
 MAX_PROJECTION_BYTES = 16 * 1024
 MAX_CLAIM_LEASE_SECONDS = 14_400
 RESERVED_FILENAMES = frozenset({".task-research.json", "Research.md"})
-SOURCE_NAMESPACES = frozenset({"kb", "meeting", "email", "attachment", "repo", "web"})
+SOURCE_NAMESPACES = frozenset({"kb", "meeting", "email", "attachment", "repo", "web", "tool"})
 RECOMMENDATION_TYPES = frozenset({
     "after_task_completed", "not_before", "raise_priority", "create_prerequisite",
 })
@@ -213,7 +213,13 @@ def validate_sources(document: object) -> list[dict[str, object]]:
         if not isinstance(locator, Mapping) or set(locator) - {"namespace", "resource", "fragment"}:
             raise ResearchError("invalid source locator")
         namespace = locator.get("namespace")
-        resource = _text(locator.get("resource"), "source resource", 2_000)
+        resource_raw = locator.get("resource")
+        if namespace == "tool":
+            if not isinstance(resource_raw, str):
+                raise ResearchError("invalid source resource")
+            resource = resource_raw
+        else:
+            resource = _text(resource_raw, "source resource", 2_000)
         if namespace not in SOURCE_NAMESPACES or resource is None:
             raise ResearchError("invalid source namespace")
         pure = PurePosixPath(resource)
@@ -222,6 +228,14 @@ def validate_sources(document: object) -> list[dict[str, object]]:
             # Public pages are cited by URL; nothing is read from disk.
             if (parsed.scheme not in {"http", "https"} or not parsed.netloc
                     or "\x00" in resource or "\\" in resource):
+                raise ResearchError("unsafe source resource")
+        elif namespace == "tool":
+            if not (1 <= len(resource) <= 300) or "\x00" in resource or "\n" in resource or "\r" in resource:
+                raise ResearchError("unsafe source resource")
+            if ":" not in resource:
+                raise ResearchError("unsafe source resource")
+            tool_name, tool_text = resource.split(":", 1)
+            if not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", tool_name) or not tool_text.strip():
                 raise ResearchError("unsafe source resource")
         elif (pure.is_absolute() or ".." in pure.parts or "\\" in resource
                 or "\x00" in resource or parsed.scheme or "://" in resource

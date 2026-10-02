@@ -383,6 +383,36 @@ class TaskResearchTests(unittest.TestCase):
         web_sources[0]["locator"]["resource"] = "https://example.com/program/rules"
         self._publish(job.job_id, research_claim.token, source_document=web_sources)
 
+    def test_tool_namespace_receipt_validation(self):
+        job = self._request()
+        research_claim = self.store.claim("worker-synthetic")
+        assert research_claim is not None
+        # Valid tool resource
+        tool_sources = sources()
+        tool_sources[0]["locator"]["namespace"] = "tool"
+        tool_sources[0]["locator"]["resource"] = "calendar-cmd:events --week"
+        tool_sources[0]["locator"]["fragment"] = None
+        self._publish(job.job_id, research_claim.token, source_document=tool_sources)
+
+        # Invalid tool resources: too long, multiline, missing colon, empty text, bad name
+        bad_tool_resources = [
+            "calendar-cmd:" + "x" * 300,  # exceeds 300 chars
+            "calendar-cmd:events\n--week",  # newline
+            "calendar-cmd:events\r--week",  # carriage return
+            "calendar-cmd:events\x00--week",  # null
+            "calendar-cmd",  # missing colon
+            "calendar-cmd:   ",  # empty text
+            "CALENDAR:events",  # uppercase name
+            "-calendar:events",  # leading dash
+        ]
+        for bad_resource in bad_tool_resources:
+            bad_sources = sources()
+            bad_sources[0]["locator"]["namespace"] = "tool"
+            bad_sources[0]["locator"]["resource"] = bad_resource
+            bad_sources[0]["locator"]["fragment"] = None
+            with self.assertRaisesRegex(ResearchError, "unsafe source resource"):
+                self._publish(job.job_id, research_claim.token, source_document=bad_sources)
+
     def test_scheduling_recommendations_canonical_rules(self):
         job = self._request()
         research_claim = self.store.claim("worker-synthetic")

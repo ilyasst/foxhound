@@ -252,6 +252,13 @@ class ExecutionRunnerDeploymentConfig:
 
 
 @dataclass(frozen=True)
+class ReadOnlyCommandConfig:
+    name: str
+    command: Path
+    description: str
+
+
+@dataclass(frozen=True)
 class ResearchRunnerConsumerConfig:
     cas_root: Path
     task_work_root: Path
@@ -264,6 +271,7 @@ class ResearchRunnerConsumerConfig:
     agent_max_turns: int | None = None
     agent_timeout: int | None = None
     knowledge_roots: tuple[tuple[str, Path], ...] = ()
+    read_only_commands: tuple[ReadOnlyCommandConfig, ...] = ()
     profile_id: str | None = None
     worker_id: str | None = None
     lease_seconds: int | None = None
@@ -473,6 +481,17 @@ class DeploymentConfig:
             cmd.extend(("--agent-timeout", str(cfg.agent_timeout)))
         for name, path in cfg.knowledge_roots:
             cmd.extend(("--knowledge-root", f"{name}={path}"))
+        for ro_cmd in cfg.read_only_commands:
+            payload = json.dumps(
+                {
+                    "command": str(ro_cmd.command),
+                    "description": ro_cmd.description,
+                    "name": ro_cmd.name,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            cmd.extend(("--read-only-command", payload))
         if cfg.profile_id is not None:
             cmd.extend(("--profile-id", cfg.profile_id))
         if cfg.worker_id is not None:
@@ -1185,8 +1204,8 @@ def _parse_research_runner(
     }
     optional = {
         "hermes_command", "agent_toolsets", "agent_max_turns",
-        "agent_timeout", "knowledge_roots", "profile_id", "worker_id",
-        "lease_seconds",
+        "agent_timeout", "knowledge_roots", "read_only_commands",
+        "profile_id", "worker_id", "lease_seconds",
     }
     document = _enabled_document(value, required, optional)
     if document is None:
@@ -1260,6 +1279,40 @@ def _parse_research_runner(
             path = _absolute_path(entry["path"])
             knowledge_roots.append((name, path))
 
+    read_only_commands: list[ReadOnlyCommandConfig] = []
+    if "read_only_commands" in document:
+        raw_ro_cmds = document["read_only_commands"]
+        if not isinstance(raw_ro_cmds, list):
+            raise DeploymentConfigError("database consumer configuration is invalid")
+        seen_names: set[str] = set()
+        reserved_names = {
+            "kb", "attachment", "attachments", "email", "emails", "repo", "web", "meeting",
+        }
+        for entry in raw_ro_cmds:
+            if not isinstance(entry, Mapping):
+                raise DeploymentConfigError("database consumer configuration is invalid")
+            _object(entry, {"name", "command", "description"})
+            name_raw = entry["name"]
+            if not isinstance(name_raw, str) or not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", name_raw):
+                raise DeploymentConfigError("database consumer configuration is invalid")
+            if name_raw in reserved_names or name_raw in seen_names:
+                raise DeploymentConfigError("database consumer configuration is invalid")
+            seen_names.add(name_raw)
+
+            command = _absolute_path(entry["command"])
+
+            desc_raw = entry["description"]
+            if not isinstance(desc_raw, str) or not desc_raw.strip() or len(desc_raw) > 2000:
+                raise DeploymentConfigError("database consumer configuration is invalid")
+
+            read_only_commands.append(
+                ReadOnlyCommandConfig(
+                    name=name_raw,
+                    command=command,
+                    description=desc_raw,
+                )
+            )
+
     profile_id: str | None = None
     if "profile_id" in document:
         profile_id = _nonempty_string(document["profile_id"])
@@ -1291,6 +1344,7 @@ def _parse_research_runner(
         agent_max_turns=agent_max_turns,
         agent_timeout=agent_timeout,
         knowledge_roots=tuple(knowledge_roots),
+        read_only_commands=tuple(read_only_commands),
         profile_id=profile_id,
         worker_id=worker_id,
         lease_seconds=lease_seconds,

@@ -890,12 +890,95 @@ class DeploymentConfigTests(unittest.TestCase):
             kroots,
             [f"kb1={self.root / 'kb1'}", f"kb2={self.root / 'kb2'}"],
         )
+        ro_cmds = [
+            command[i + 1]
+            for i, arg in enumerate(command)
+            if arg == "--read-only-command"
+        ]
+        self.assertEqual(ro_cmds, [])
         self.assertEqual(command[command.index("--profile-id") + 1], "custom-researcher")
         self.assertEqual(command[command.index("--worker-id") + 1], "test-worker")
         self.assertEqual(command[command.index("--lease-seconds") + 1], "1200")
         self.assertEqual(command[command.index("--gw-endpoint") + 1], f"http://{LOOPBACK}:8787")
         self.assertEqual(command[command.index("--gw-alias") + 1], "example-operator")
         self.assertEqual(command[command.index("--gw-token-file") + 1], str(self.gateway_token))
+
+    def test_research_runner_read_only_commands_valid_and_rendered(self) -> None:
+        document = self._document()
+        document["database_consumers"]["research_runner"] = {  # type: ignore[index]
+            "enabled": True,
+            "cas_root": str(self.root / "cas"),
+            "task_work_root": str(self.task_work_root),
+            "scratch_root": str(self.root / "scratch"),
+            "model": "example-research-model",
+            "endpoint": "https://example.com/v1",
+            "synthesizer": "agent",
+            "hermes_command": str(self.root / "bin" / "hermes"),
+            "read_only_commands": [
+                {
+                    "name": "calendar-reader",
+                    "command": "/srv/example/bin/calendar-readonly",
+                    "description": "Read-only calendar inspection",
+                },
+                {
+                    "name": "mail-reader",
+                    "command": "/srv/example/bin/mail-readonly",
+                    "description": "Read-only mail inspection",
+                },
+            ],
+        }
+        self._write_config(document)
+
+        config = load_deployment_config(self.config_path)
+        command = config.argv("research-runner")
+        ro_cmds = [
+            command[i + 1]
+            for i, arg in enumerate(command)
+            if arg == "--read-only-command"
+        ]
+        self.assertEqual(
+            ro_cmds,
+            [
+                '{"command":"/srv/example/bin/calendar-readonly","description":"Read-only calendar inspection","name":"calendar-reader"}',
+                '{"command":"/srv/example/bin/mail-readonly","description":"Read-only mail inspection","name":"mail-reader"}',
+            ],
+        )
+
+    def test_research_runner_read_only_commands_validation_errors(self) -> None:
+        invalid_cases = [
+            # duplicate name
+            [
+                {"name": "cal", "command": "/srv/example/bin/cal", "description": "d1"},
+                {"name": "cal", "command": "/srv/example/bin/cal2", "description": "d2"},
+            ],
+            # reserved name
+            [{"name": "kb", "command": "/srv/example/bin/cal", "description": "d1"}],
+            [{"name": "meeting", "command": "/srv/example/bin/cal", "description": "d1"}],
+            [{"name": "email", "command": "/srv/example/bin/cal", "description": "d1"}],
+            # relative path
+            [{"name": "cal", "command": "relative/bin/cal", "description": "d1"}],
+            # bad identifier name
+            [{"name": "Cal", "command": "/srv/example/bin/cal", "description": "d1"}],
+            [{"name": "1cal", "command": "/srv/example/bin/cal", "description": "d1"}],
+            # empty description
+            [{"name": "cal", "command": "/srv/example/bin/cal", "description": ""}],
+        ]
+        for ro_list in invalid_cases:
+            document = self._document()
+            document["database_consumers"]["research_runner"] = {  # type: ignore[index]
+                "enabled": True,
+                "cas_root": str(self.root / "cas"),
+                "task_work_root": str(self.task_work_root),
+                "scratch_root": str(self.root / "scratch"),
+                "model": "example-research-model",
+                "endpoint": "https://example.com/v1",
+                "synthesizer": "agent",
+                "hermes_command": str(self.root / "bin" / "hermes"),
+                "read_only_commands": ro_list,
+            }
+            self._write_config(document)
+            with self.assertRaises(DeploymentConfigError):
+                load_deployment_config(self.config_path)
 
     def test_research_runner_agent_without_hermes_command_rejected(self) -> None:
         document = self._document()
