@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 import time
 from dataclasses import dataclass
@@ -76,6 +77,35 @@ def _derive_starting_points(ctx: Mapping[str, Any], bound_sources: Any) -> list[
     return starting_points
 
 
+def _clean_locator_string(loc_str: str) -> tuple[str, str | None]:
+    """Strip trailing whitespace-separated parenthesized note or URL query/trailer, extracting fragment if present."""
+    loc = loc_str.strip()
+    extracted_fragment: str | None = None
+
+    # Check for trailing whitespace-separated note in parentheses
+    # e.g. "path/to/file (line 29, Decisions: ...)"
+    paren_idx = loc.rfind(" (")
+    if paren_idx != -1 and loc.endswith(")"):
+        note = loc[paren_idx + 2 : -1]
+        loc = loc[:paren_idx].strip()
+        # Parse "line N" / "lines N-M" (first range) from note
+        # e.g. "lines 23, 42-45" -> "L23", "line 29..." -> "L29", "lines 10-20" -> "L10-L20"
+        m = re.search(r"\blines?\s+(\d+)(?:\s*-\s*(\d+))?", note, re.IGNORECASE)
+        if m:
+            start_line = m.group(1)
+            end_line = m.group(2)
+            if end_line:
+                extracted_fragment = f"L{start_line}-L{end_line}"
+            else:
+                extracted_fragment = f"L{start_line}"
+
+    # For URLs, anything after first whitespace is stripped
+    if loc.startswith("http://") or loc.startswith("https://"):
+        loc = loc.split(None, 1)[0]
+
+    return loc, extracted_fragment
+
+
 def _map_locator(
     loc_str: str,
     knowledge_roots: Sequence[tuple[str, str]],
@@ -83,7 +113,10 @@ def _map_locator(
     """Map locator string to (namespace, resource, fragment). Return None if unmappable."""
     if not isinstance(loc_str, str) or not loc_str.strip():
         return None
-    loc = loc_str.strip()
+
+    loc, note_fragment = _clean_locator_string(loc_str)
+    if not loc:
+        return None
 
     # Web URL check
     if loc.startswith("http://") or loc.startswith("https://"):
@@ -92,6 +125,8 @@ def _map_locator(
             loc_base, fragment = loc.split("#", 1)
         else:
             loc_base = loc
+        if not fragment and note_fragment:
+            fragment = note_fragment
         try:
             _validate_resource_locator(loc_base, namespace="web")
             return "web", loc_base, fragment
@@ -103,11 +138,72 @@ def _map_locator(
     resource_candidate = loc
     if "#" in loc:
         resource_candidate, fragment = loc.split("#", 1)
+    if not fragment and note_fragment:
+        fragment = note_fragment
 
-    # Check knowledge roots
     norm_roots = [(name, os.path.abspath(os.path.expanduser(p))) for name, p in knowledge_roots]
-    abs_cand = os.path.abspath(os.path.expanduser(resource_candidate))
 
+    # Check if locator has a "<name>:" prefix where name is a configured knowledge-root
+    # or one of kb, attachment(s), email(s), repo, web
+    target_root_name: str | None = None
+    target_rel_path: str | None = None
+
+    # Recognized prefix names
+    canon_prefixes = {
+        "kb": "kb",
+        "attachment": "attachment",
+        "attachments": "attachment",
+        "email": "email",
+        "emails": "email",
+        "repo": "repo",
+        "web": "web",
+    }
+    for r_name, _ in norm_roots:
+        if r_name not in canon_prefixes:
+            canon_prefixes[r_name] = r_name
+
+    # Check for prefix: e.g. "kb:Meetings/..."
+    if ":" in resource_candidate:
+        prefix_part, rest_part = resource_candidate.split(":", 1)
+        if prefix_part in canon_prefixes:
+            target_root_name = prefix_part
+            target_rel_path = rest_part
+
+    if target_root_name is not None and target_rel_path is not None:
+        # Check against matching knowledge root
+        # Find root corresponding to target_root_name
+        rpath = None
+        for r_name, p in norm_roots:
+            if r_name == target_root_name or (target_root_name in ("attachment", "attachments") and r_name in ("attachment", "attachments")) or (target_root_name in ("email", "emails") and r_name in ("email", "emails")):
+                rpath = p
+                break
+
+        if rpath is not None:
+            # Resolve relative path against named root
+            norm_rel = os.path.normpath(target_rel_path.lstrip("/"))
+            full_path = os.path.join(rpath, norm_rel)
+            real_root = os.path.realpath(rpath)
+            real_full = os.path.realpath(full_path)
+            # Refuse paths that do not exist as regular files under that root (no symlink escape)
+            if not os.path.isfile(real_full):
+                return None
+            try:
+                common = os.path.commonpath([real_root, real_full])
+                if common != real_root:
+                    return None
+            except ValueError:
+                return None
+
+            ns = canon_prefixes.get(target_root_name, target_root_name)
+            rel_posix = os.path.relpath(real_full, real_root).replace("\\", "/")
+            try:
+                _validate_resource_locator(rel_posix, namespace=ns)
+                return ns, rel_posix, fragment
+            except SynthesisError:
+                return None
+
+    # Check absolute path against knowledge roots
+    abs_cand = os.path.abspath(os.path.expanduser(resource_candidate))
     matched_root = None
     for name, rpath in norm_roots:
         if abs_cand == rpath or abs_cand.startswith(rpath.rstrip(os.sep) + os.sep):
@@ -116,56 +212,75 @@ def _map_locator(
 
     if matched_root:
         name, rpath = matched_root
-        rel_path = os.path.relpath(abs_cand, rpath).replace("\\", "/")
-        if name == "kb":
-            ns = "kb"
-        elif name == "attachments":
-            ns = "attachment"
-        elif name == "emails":
-            ns = "email"
-        elif name == "repo":
-            ns = "repo"
-        else:
-            ns = name
-
+        real_root = os.path.realpath(rpath)
+        real_full = os.path.realpath(abs_cand)
+        if not os.path.isfile(real_full):
+            return None
         try:
-            _validate_resource_locator(rel_path, namespace=ns)
-            return ns, rel_path, fragment
+            common = os.path.commonpath([real_root, real_full])
+            if common != real_root:
+                return None
+        except ValueError:
+            return None
+
+        rel_posix = os.path.relpath(real_full, real_root).replace("\\", "/")
+        ns = canon_prefixes.get(name, name)
+        try:
+            _validate_resource_locator(rel_posix, namespace=ns)
+            return ns, rel_posix, fragment
         except SynthesisError:
             return None
 
     # Maybe relative path directly given (e.g. repo or relative path)
     clean_rel = resource_candidate.lstrip("/")
-    # Check if namespace is prefix
+    # Check if namespace is prefix like kb/...
     for prefix, ns in (("emails/", "email"), ("attachments/", "attachment"), ("repo/", "repo"), ("kb/", "kb")):
         if clean_rel.startswith(prefix):
             rel = clean_rel[len(prefix):]
-            try:
-                _validate_resource_locator(rel, namespace=ns)
-                return ns, rel, fragment
-            except SynthesisError:
-                pass
+            # Try to find corresponding root
+            for r_name, rpath in norm_roots:
+                if (r_name == ns) or (ns == "attachment" and r_name == "attachments") or (ns == "email" and r_name == "emails"):
+                    real_root = os.path.realpath(rpath)
+                    real_full = os.path.realpath(os.path.join(rpath, rel))
+                    if not os.path.isfile(real_full):
+                        return None
+                    try:
+                        common = os.path.commonpath([real_root, real_full])
+                        if common != real_root:
+                            return None
+                    except ValueError:
+                        return None
+                    rel_posix = os.path.relpath(real_full, real_root).replace("\\", "/")
+                    try:
+                        _validate_resource_locator(rel_posix, namespace=ns)
+                        return ns, rel_posix, fragment
+                    except SynthesisError:
+                        return None
 
-    try:
-        _validate_resource_locator(clean_rel, namespace="repo")
-        return "repo", clean_rel, fragment
-    except SynthesisError:
-        return None
+    return None
 
 
 def _make_source_receipt(
     namespace: str,
     resource: str,
-    fragment: str | None,
     source_id: str,
 ) -> dict[str, Any]:
     locator = {
         "namespace": namespace,
         "resource": resource,
-        "fragment": fragment,
+        "fragment": None,
     }
     content_digest = hashlib.sha256(_json_bytes(locator)).hexdigest()
-    title = PurePosixPath(resource).name or resource
+    if namespace == "web":
+        parsed = urlsplit(resource)
+        title = f"{parsed.netloc}{parsed.path}"
+    else:
+        title = PurePosixPath(resource).as_posix()
+    title = title.strip()
+    if not title:
+        title = resource.strip() or "source"
+    if len(title) > 200:
+        title = title[:200].strip()
     return {
         "source_id": source_id,
         "locator": locator,
@@ -176,7 +291,7 @@ def _make_source_receipt(
 
 def _process_evidence_and_refs(
     raw_evidence: Sequence[str] | None,
-    sources_by_locator: dict[str, dict[str, Any]],
+    sources_by_locator: dict[tuple[str, str], dict[str, Any]],
     sources_list: list[dict[str, Any]],
     knowledge_roots: Sequence[tuple[str, str]],
 ) -> list[str]:
@@ -190,10 +305,10 @@ def _process_evidence_and_refs(
         if mapped is None:
             continue
         ns, res, frag = mapped
-        key = f"{ns}::{res}::{frag}"
+        key = (ns, res)
         if key not in sources_by_locator:
             src_id = f"src-{len(sources_list) + 1:03d}"
-            receipt = _make_source_receipt(ns, res, frag, src_id)
+            receipt = _make_source_receipt(ns, res, src_id)
             sources_by_locator[key] = receipt
             sources_list.append(receipt)
         ref_id = sources_by_locator[key]["source_id"]
@@ -206,7 +321,7 @@ def _make_claim(
     text: str,
     status: str,
     raw_evidence: Sequence[str] | None,
-    sources_by_locator: dict[str, dict[str, Any]],
+    sources_by_locator: dict[tuple[str, str], dict[str, Any]],
     sources_list: list[dict[str, Any]],
     knowledge_roots: Sequence[tuple[str, str]],
 ) -> dict[str, Any]:
@@ -224,7 +339,7 @@ def _convert_research_json(
     raw: Mapping[str, Any],
     knowledge_roots: Sequence[tuple[str, str]],
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    sources_by_locator: dict[str, dict[str, Any]] = {}
+    sources_by_locator: dict[tuple[str, str], dict[str, Any]] = {}
     sources_list: list[dict[str, Any]] = []
 
     # objective and requested_action <- requested_deliverable
