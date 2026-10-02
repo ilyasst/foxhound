@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import signal
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -10,10 +12,13 @@ import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from foxhound.agent_dispatch import (
     DispatchError,
+    _probe_edited,
+    _probe_tool_calls,
+    _run,
     cancel,
     log,
     start,
@@ -29,7 +34,7 @@ class AgentDispatchTests(unittest.TestCase):
         self.state_root = self.root / "state"
         self.work = self.root / "work"
         self.work.mkdir()
-        subprocess.run(["git", "init", "-q", str(self.work)], check=True)
+        subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "init", "-q", str(self.work)], check=True)
         self.prompt = self.root / "prompt.txt"
         self.prompt.write_text("SYNTHETIC PRIVATE PROMPT\n", encoding="utf-8")
         self.credentials = self.root / ".env"
@@ -107,7 +112,7 @@ class AgentDispatchTests(unittest.TestCase):
     def test_global_concurrency_is_bounded(self) -> None:
         other = self.root / "other"
         other.mkdir()
-        subprocess.run(["git", "init", "-q", str(other)], check=True)
+        subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "init", "-q", str(other)], check=True)
         with patch.dict(os.environ, {"SYNTHETIC_RUNTIME_SLEEP": "30"}):
             first = self._start(concurrency=1)
             with self.assertRaisesRegex(DispatchError, "concurrency_limit"):
@@ -193,6 +198,192 @@ class AgentDispatchTests(unittest.TestCase):
         with patch("foxhound.agent_dispatch._process_start", return_value=None):
             self.assertEqual(status(self.state_root, job_id)["state"], "orphaned")
 
+    def test_first_edit_within_validation(self) -> None:
+        with self.assertRaisesRegex(DispatchError, "invalid_limits"):
+            start(
+                prompt=self.prompt, working_directory=self.work, state_root=self.state_root,
+                runtime_command=self.runtime, credential_file=self.credentials, credential_name="SYNTHETIC_KEY",
+                model="gemini-3.8-flash", provider="gemini", reasoning="low", toolsets="terminal",
+                max_turns=10, timeout_seconds=10, max_concurrency=2, first_edit_within=4,
+            )
+        with self.assertRaisesRegex(DispatchError, "invalid_limits"):
+            start(
+                prompt=self.prompt, working_directory=self.work, state_root=self.state_root,
+                runtime_command=self.runtime, credential_file=self.credentials, credential_name="SYNTHETIC_KEY",
+                model="gemini-3.8-flash", provider="gemini", reasoning="low", toolsets="terminal",
+                max_turns=10, timeout_seconds=10, max_concurrency=2, first_edit_within=501,
+            )
+        # None and valid ints in 5..500 should pass validation
+        res = start(
+            prompt=self.prompt, working_directory=self.work, state_root=self.state_root,
+            runtime_command=self.runtime, credential_file=self.credentials, credential_name="SYNTHETIC_KEY",
+            model="gemini-3.8-flash", provider="gemini", reasoning="low", toolsets="terminal",
+            max_turns=10, timeout_seconds=10, max_concurrency=2, first_edit_within=None,
+        )
+        self.assertIsNone(res.get("first_edit_within"))
+        wait(self.state_root, str(res["job_id"]), 10)
+
+    def test_status_shows_counters(self) -> None:
+        result = self._start()
+        stat_doc = status(self.state_root, str(result["job_id"]))
+        self.assertIsInstance(stat_doc, dict)
+        assert isinstance(stat_doc, dict)
+        self.assertIn("tool_calls", stat_doc)
+        self.assertIn("edited", stat_doc)
+        self.assertIn("first_edit_within", stat_doc)
+        self.assertEqual(stat_doc["first_edit_within"], 40)
+        wait(self.state_root, str(result["job_id"]), 10)
+
+    def test_stalled_lane_stopped_when_probes_report_no_edit_and_tool_calls_over_limit(self) -> None:
+        result = self._start()
+        job_id = str(result["job_id"])
+        self._wait_running(job_id)
+        job_dir = self.state_root / "jobs" / job_id
+        # Wait for the running supervisor to finish
+        wait(self.state_root, job_id, 10)
+        # Remove transcript.log so a subsequent _run invocation can run
+        transcript_file = job_dir / "transcript.log"
+        if transcript_file.exists():
+            transcript_file.unlink()
+
+        # Populate state.db with messages containing 10 tool calls
+        db_path = job_dir / "runtime-home" / "state.db"
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, tool_calls TEXT)")
+            conn.execute(
+                "INSERT INTO messages (tool_calls) VALUES (?)",
+                (json.dumps([{"id": f"call_{i}"} for i in range(10)]),)
+            )
+        # Verify probes directly
+        self.assertEqual(_probe_tool_calls(job_dir / "runtime-home"), 10)
+        self.assertFalse(_probe_edited(self.work))
+        # Now test _run loop logic directly using a mock Popen
+        with patch("subprocess.Popen") as mock_popen, \
+             patch("foxhound.agent_dispatch.HEARTBEAT_SECONDS", 0.0), \
+             patch("time.sleep", return_value=None), \
+             patch("os.killpg") as mock_killpg:
+            fake_proc = MagicMock()
+            fake_proc.poll.side_effect = [None, None, 0]
+            fake_proc.pid = 12345
+            fake_proc.wait.return_value = 0
+            mock_popen.return_value = fake_proc
+
+            # Update document to have first_edit_within=5 and supervisor info matching current process
+            state_path = job_dir / "state.json"
+            doc = json.loads(state_path.read_text(encoding="utf-8"))
+            doc["state"] = "starting"
+            doc["supervisor_pid"] = os.getpid()
+            from foxhound.agent_dispatch import _process_start
+            doc["supervisor_start"] = _process_start(os.getpid())
+            doc["first_edit_within"] = 5
+            state_path.write_text(json.dumps(doc), encoding="utf-8")
+
+            exit_code = _run(self.state_root, job_id, self.runtime, self.credentials, "SYNTHETIC_KEY")
+            self.assertEqual(exit_code, 125)
+            final_doc = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(final_doc["state"], "stalled_no_edit")
+            self.assertEqual(final_doc["exit_code"], 125)
+            self.assertEqual(final_doc["tool_calls"], 10)
+            self.assertFalse(final_doc["edited"])
+            mock_killpg.assert_called_with(12345, signal.SIGTERM)
+
+    def test_lane_that_edits_is_not_stopped(self) -> None:
+        result = self._start()
+        job_id = str(result["job_id"])
+        self._wait_running(job_id)
+        job_dir = self.state_root / "jobs" / job_id
+        wait(self.state_root, job_id, 10)
+        transcript_file = job_dir / "transcript.log"
+        if transcript_file.exists():
+            transcript_file.unlink()
+
+        (self.work / "file.txt").write_text("hello", encoding="utf-8")
+        with patch("foxhound.agent_dispatch._probe_edited", return_value=True):
+            self.assertTrue(_probe_edited(self.work))
+
+            with patch("subprocess.Popen") as mock_popen, \
+                 patch("foxhound.agent_dispatch.HEARTBEAT_SECONDS", 0.0), \
+                 patch("time.sleep", return_value=None):
+                fake_proc = MagicMock()
+                fake_proc.poll.side_effect = [None, 0]
+                fake_proc.pid = 12345
+                fake_proc.wait.return_value = 0
+                mock_popen.return_value = fake_proc
+
+                state_path = job_dir / "state.json"
+                doc = json.loads(state_path.read_text(encoding="utf-8"))
+                doc["state"] = "starting"
+                doc["supervisor_pid"] = os.getpid()
+                from foxhound.agent_dispatch import _process_start
+                doc["supervisor_start"] = _process_start(os.getpid())
+                doc["first_edit_within"] = 5
+                state_path.write_text(json.dumps(doc), encoding="utf-8")
+
+                exit_code = _run(self.state_root, job_id, self.runtime, self.credentials, "SYNTHETIC_KEY")
+                self.assertEqual(exit_code, 0)
+                final_doc = json.loads(state_path.read_text(encoding="utf-8"))
+                self.assertEqual(final_doc["state"], "completed")
+                self.assertTrue(final_doc["edited"])
+
+    def test_disabled_deadline_never_stops(self) -> None:
+        result = self._start()
+        job_id = str(result["job_id"])
+        self._wait_running(job_id)
+        job_dir = self.state_root / "jobs" / job_id
+        wait(self.state_root, job_id, 10)
+        transcript_file = job_dir / "transcript.log"
+        if transcript_file.exists():
+            transcript_file.unlink()
+
+        db_path = job_dir / "runtime-home" / "state.db"
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, tool_calls TEXT)")
+            conn.execute(
+                "INSERT INTO messages (tool_calls) VALUES (?)",
+                (json.dumps([{"id": f"call_{i}"} for i in range(50)]),)
+            )
+
+        with patch("subprocess.Popen") as mock_popen, \
+             patch("foxhound.agent_dispatch.HEARTBEAT_SECONDS", 0.0), \
+             patch("time.sleep", return_value=None):
+            fake_proc = MagicMock()
+            fake_proc.poll.side_effect = [None, None, 0]
+            fake_proc.pid = 12345
+            fake_proc.wait.return_value = 0
+            mock_popen.return_value = fake_proc
+
+            state_path = job_dir / "state.json"
+            doc = json.loads(state_path.read_text(encoding="utf-8"))
+            doc["state"] = "starting"
+            doc["supervisor_pid"] = os.getpid()
+            from foxhound.agent_dispatch import _process_start
+            doc["supervisor_start"] = _process_start(os.getpid())
+            doc["first_edit_within"] = None
+            state_path.write_text(json.dumps(doc), encoding="utf-8")
+
+            exit_code = _run(self.state_root, job_id, self.runtime, self.credentials, "SYNTHETIC_KEY")
+            self.assertEqual(exit_code, 0)
+            final_doc = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(final_doc["state"], "completed")
+            self.assertFalse(final_doc["edited"])
+            self.assertEqual(final_doc["tool_calls"], 50)
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WorktreeBaselineTests(unittest.TestCase):
+    def test_edit_is_measured_against_the_starting_state(self):
+        import subprocess as sp
+        from foxhound.agent_dispatch import _worktree_status
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            sp.run(["git", "init", "-q", str(repo)], check=True)
+            (repo / "earlier_lane.py").write_text("x = 1\n")
+            baseline = _worktree_status(repo)
+            self.assertFalse(_probe_edited(repo, baseline))
+            (repo / "agent-guard-rejection.log").write_text("noise\n")
+            self.assertFalse(_probe_edited(repo, baseline))
+            (repo / "this_lane.py").write_text("y = 2\n")
+            self.assertTrue(_probe_edited(repo, baseline))
