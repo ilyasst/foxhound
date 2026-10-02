@@ -135,15 +135,118 @@ class DeploymentConfigResearchGateTests(unittest.TestCase):
                 label="research-before-planning declarations",
             )
 
-    def test_renders_schedule_argv(self):
+    def test_parses_valid_research_wait_seconds(self):
         workflow = _parse_workflow(
-            self._document(research_before_planning=["meeting"]),
+            self._document(research_wait_seconds=1800),
             version=DEPLOYMENT_SCHEMA_VERSION,
         )
-        argv = workflow.schedule_argv(Path("/srv/example/db.sqlite3"), None)
+        self.assertEqual(workflow.research_wait_seconds, 1800)
+
+    def test_rejects_invalid_research_wait_seconds(self):
+        for invalid in [599, 86401, "3600", True, -1]:
+            with self.assertRaises(DeploymentConfigError):
+                _parse_workflow(
+                    self._document(research_wait_seconds=invalid),
+                    version=DEPLOYMENT_SCHEMA_VERSION,
+                )
+
+    def test_renders_schedule_argv(self):
+        workflow = _parse_workflow(
+            self._document(
+                research_before_planning=["meeting"],
+                research_wait_seconds=1800,
+            ),
+            version=DEPLOYMENT_SCHEMA_VERSION,
+        )
+        argv = workflow.schedule_argv(
+            Path("/srv/example/db.sqlite3"),
+            None,
+            task_work_root=Path("/srv/example/work"),
+            task_kb_root=Path("/srv/example/kb"),
+        )
         self.assertIn("--research-before-planning", argv)
         index = argv.index("--research-before-planning")
         self.assertEqual(argv[index + 1], "meeting")
+        self.assertIn("--research-wait-seconds", argv)
+        index_wait = argv.index("--research-wait-seconds")
+        self.assertEqual(argv[index_wait + 1], "1800")
+        self.assertIn("--task-work-root", argv)
+        index_work = argv.index("--task-work-root")
+        self.assertEqual(argv[index_work + 1], "/srv/example/work")
+        self.assertIn("--task-kb-root", argv)
+        index_kb = argv.index("--task-kb-root")
+        self.assertEqual(argv[index_kb + 1], "/srv/example/kb")
+
+    def test_absent_setting_leaves_rendered_argv_identical(self):
+        workflow = _parse_workflow(
+            self._document(),
+            version=DEPLOYMENT_SCHEMA_VERSION,
+        )
+        argv_no_roots = workflow.schedule_argv(Path("/srv/example/db.sqlite3"), None)
+        argv_with_roots = workflow.schedule_argv(
+            Path("/srv/example/db.sqlite3"),
+            None,
+            task_work_root=Path("/srv/example/work"),
+            task_kb_root=Path("/srv/example/kb"),
+        )
+        self.assertEqual(argv_no_roots, argv_with_roots)
+        self.assertNotIn("--research-before-planning", argv_no_roots)
+        self.assertNotIn("--research-wait-seconds", argv_no_roots)
+        self.assertNotIn("--task-work-root", argv_no_roots)
+        self.assertNotIn("--task-kb-root", argv_no_roots)
+
+    def test_runner_argv_with_kinds_and_wait(self):
+        from foxhound.deployment_config import ExecutionRunnerDeploymentConfig
+        runner = ExecutionRunnerDeploymentConfig(
+            enabled=True,
+            run_root=Path("/srv/example/runs"),
+            gw_endpoint="http://127.0.0.1:8787",
+            gw_alias="example-operator",
+            gw_token_file=Path("/srv/example/token"),
+            agent_command="hermes",
+            worker_command="foxhound-task-worker",
+            runner_slot="primary",
+            task_work_root=Path("/srv/example/work"),
+            task_kb_root=Path("/srv/example/kb"),
+        )
+        workflow = _parse_workflow(
+            self._document(
+                research_before_planning=["meeting"],
+                research_wait_seconds=1800,
+            ),
+            version=DEPLOYMENT_SCHEMA_VERSION,
+        )
+        argv = runner.argv(Path("/srv/example/db.sqlite3"), None, workflow)
+        self.assertIn("--research-before-planning", argv)
+        idx_kind = argv.index("--research-before-planning")
+        self.assertEqual(argv[idx_kind + 1], "meeting")
+        self.assertIn("--research-wait-seconds", argv)
+        idx_wait = argv.index("--research-wait-seconds")
+        self.assertEqual(argv[idx_wait + 1], "1800")
+        self.assertIn("--task-work-root", argv)
+        self.assertEqual(argv[argv.index("--task-work-root") + 1], "/srv/example/work")
+        self.assertIn("--task-kb-root", argv)
+        self.assertEqual(argv[argv.index("--task-kb-root") + 1], "/srv/example/kb")
+
+    def test_runner_argv_absent_setting_identical(self):
+        from foxhound.deployment_config import ExecutionRunnerDeploymentConfig
+        runner = ExecutionRunnerDeploymentConfig(
+            enabled=True,
+            run_root=Path("/srv/example/runs"),
+            gw_endpoint="http://127.0.0.1:8787",
+            gw_alias="example-operator",
+            gw_token_file=Path("/srv/example/token"),
+            agent_command="hermes",
+            worker_command="foxhound-task-worker",
+            runner_slot="primary",
+        )
+        workflow = _parse_workflow(
+            self._document(),
+            version=DEPLOYMENT_SCHEMA_VERSION,
+        )
+        argv = runner.argv(Path("/srv/example/db.sqlite3"), None, workflow)
+        self.assertNotIn("--research-before-planning", argv)
+        self.assertNotIn("--research-wait-seconds", argv)
 
 
 class ResearchGatePlanningTests(unittest.TestCase):
@@ -404,6 +507,135 @@ class ResearchGatePlanningTests(unittest.TestCase):
             self.assertIn("research", ctx_after)
             self.assertIn("# Task Research", ctx_after["research"])
             self.assertLessEqual(len(ctx_after["research"]), 20000)
+
+    def test_execution_runner_built_service_gating_behavior(self):
+        from foxhound.execution_runner import ExecutionRunnerConfig
+        token_file = self.root / "gateway.token"
+        token_file.write_text("synthetic-token", encoding="utf-8")
+        token_file.chmod(0o600)
+        config = ExecutionRunnerConfig(
+            database_path=self.database,
+            run_root=self.root / "runs",
+            gw_endpoint="http://127.0.0.1:8787",
+            gw_alias="example-operator",
+            gw_token_file=token_file,
+            agent_command="hermes",
+            worker_command="foxhound-task-worker",
+            runner_slot="primary",
+            task_work_root=self.task_work_root,
+            task_kb_root=self.task_kb_root,
+            planning_grants=("meeting",),
+            research_before_planning=("meeting",),
+            research_wait_seconds=1800,
+        )
+        research_task_roots = (
+            (config.task_work_root, config.task_kb_root)
+            if config.task_work_root is not None and config.task_kb_root is not None
+            else None
+        )
+        service = TaskExecutionService(
+            config.database_path,
+            profile_registry=config.profile_registry,
+            default_profile_id=config.default_agent_profile,
+            planning_grants=config.planning_grants,
+            execution_grants=config.execution_grants,
+            action_grants=config.action_grants,
+            profile_routes=config.profile_routes,
+            execution_slot_cap=config.execution_slot_cap,
+            plan_ready_cap=config.plan_ready_cap,
+            awaiting_reader_cap=config.awaiting_reader_cap,
+            reader_aliases=[READER],
+            research_before_planning=config.research_before_planning,
+            research_wait_seconds=config.research_wait_seconds,
+            research_task_roots=research_task_roots,
+            clock=lambda: NOW,
+        )
+        self._task(1, READER, origin_kind="meeting")
+        service.schedule_new(limit=10)
+
+        # Before research receipt: not claimed
+        self.assertIsNone(service.claim_next())
+
+        # Publish research receipt
+        self._publish_research(task_id=1, text="Synthetic task 1")
+
+        # After receipt: claimed
+        claim = service.claim_next()
+        self.assertIsNotNone(claim)
+        assert claim is not None
+        self.assertEqual(claim.task_id, 1)
+
+    def test_schedule_main_with_gate_set(self):
+        from foxhound.execution_schedule import main
+        self._task(1, READER, origin_kind="meeting")
+        exit_code = main([
+            "--database", str(self.database),
+            "--plan-without-asking", "meeting",
+            "--reader-alias", READER,
+            "--research-before-planning", "meeting",
+            "--research-wait-seconds", "1800",
+            "--task-work-root", str(self.task_work_root),
+            "--task-kb-root", str(self.task_kb_root),
+        ])
+        self.assertEqual(exit_code, 0)
+        # Without roots, schedule main exits 78 (config unavailable)
+        exit_code_no_roots = main([
+            "--database", str(self.database),
+            "--plan-without-asking", "meeting",
+            "--research-before-planning", "meeting",
+        ])
+        self.assertEqual(exit_code_no_roots, 78)
+
+    def test_validate_runtime_rejects_research_kinds_without_roots(self):
+        from foxhound.deployment_config import (
+            DeploymentConfig,
+            CardServiceConfig,
+            ExecutionRunnerDeploymentConfig,
+            _validate_runtime,
+        )
+        token_file = self.root / "gateway.token"
+        token_file.write_text("synthetic-token", encoding="utf-8")
+        token_file.chmod(0o600)
+        card_service = CardServiceConfig(
+            enabled=False,
+        )
+        workflow = _parse_workflow(
+            {
+                "default_agent_profile": "general",
+                "plan_without_asking": ["meeting"],
+                "execution_slot_cap": 1,
+                "plan_ready_cap": 1,
+                "awaiting_reader_cap": 1,
+                "execute_without_asking": [],
+                "act_without_asking": [],
+                "reader_aliases": [],
+                "skip_planning_for": [],
+                "agent_profile_routes": [],
+                "research_before_planning": ["meeting"],
+            },
+            version=DEPLOYMENT_SCHEMA_VERSION,
+        )
+        # Runner without task_work_root and task_kb_root
+        runner_no_roots = ExecutionRunnerDeploymentConfig(
+            enabled=True,
+            run_root=self.root / "runs",
+            gw_endpoint="http://127.0.0.1:8787",
+            gw_alias="example-operator",
+            gw_token_file=token_file,
+            agent_command="hermes",
+            worker_command="foxhound-task-worker",
+            runner_slot="primary",
+        )
+        dep_config = DeploymentConfig(
+            database=self.database,
+            agent_profile_directory=None,
+            card_service=card_service,
+            workflow=workflow,
+            execution_runners=(runner_no_roots,),
+        )
+        with self.assertRaises(DeploymentConfigError) as ctx:
+            _validate_runtime(dep_config)
+        self.assertIn("research-before-planning requires an enabled runner with both task archive roots configured", str(ctx.exception))
 
 
 if __name__ == "__main__":

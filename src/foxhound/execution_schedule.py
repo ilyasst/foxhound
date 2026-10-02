@@ -28,6 +28,8 @@ def run_schedule(
     plan_without_asking: Sequence[str] | None = None,
     ask_when_owned_by_others: Sequence[str] | None = None,
     research_before_planning: Sequence[str] | None = None,
+    research_wait_seconds: int | None = None,
+    research_task_roots: tuple[Path, Path] | None = None,
     execute_without_asking: Sequence[str] | None = None,
     steer_while_running: Sequence[str] | None = None,
     skip_planning_for: Sequence[str] | None = None,
@@ -45,6 +47,8 @@ def run_schedule(
         planning_grants=plan_without_asking,
         ask_when_owned_by_others=ask_when_owned_by_others,
         research_before_planning=research_before_planning,
+        research_wait_seconds=research_wait_seconds,
+        research_task_roots=research_task_roots,
         execution_grants=execute_without_asking,
         steer_while_running=steer_while_running,
         skip_planning_for=skip_planning_for,
@@ -94,6 +98,22 @@ def _parser() -> argparse.ArgumentParser:
             "require research before planning tasks from SOURCE_KIND; "
             "repeat for each kind."
         ),
+    )
+    parser.add_argument(
+        "--research-wait-seconds",
+        type=int,
+        default=None,
+        help="maximum seconds to wait for research before planning",
+    )
+    parser.add_argument(
+        "--task-work-root",
+        type=Path,
+        help="machine-local sync root for durable task working folders",
+    )
+    parser.add_argument(
+        "--task-kb-root",
+        type=Path,
+        help="machine-local knowledge-base Tasks root for task Markdown files",
     )
     parser.add_argument(
         "--execute-without-asking",
@@ -159,6 +179,11 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        research_task_roots = (
+            (args.task_work_root, args.task_kb_root)
+            if args.task_work_root is not None and args.task_kb_root is not None
+            else None
+        )
         result = run_schedule(
             database_path=args.database,
             limit=args.limit,
@@ -168,6 +193,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             plan_without_asking=args.plan_without_asking,
             ask_when_owned_by_others=args.ask_when_owned_by_others,
             research_before_planning=args.research_before_planning,
+            research_wait_seconds=args.research_wait_seconds,
+            research_task_roots=research_task_roots,
             execute_without_asking=args.execute_without_asking,
             steer_while_running=args.steer_while_running,
             skip_planning_for=args.skip_planning_for,

@@ -190,6 +190,8 @@ class ExecutionRunnerConfig:
     plan_ready_cap: int | None = None
     awaiting_reader_cap: int | None = None
     profile_routes: Mapping[str, str] = field(default_factory=dict)
+    research_before_planning: tuple[str, ...] = ()
+    research_wait_seconds: int | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -255,6 +257,18 @@ class ExecutionRunnerConfig:
             )
         ):
             raise ValueError("execution agent profile routes are invalid")
+        if not isinstance(self.research_before_planning, tuple):
+            raise ValueError("execution research before planning declarations are invalid")
+        try:
+            _planning_grants(self.research_before_planning)
+        except ValueError as exc:
+            raise ValueError("execution research before planning declarations are invalid") from exc
+        if self.research_wait_seconds is not None and (
+            isinstance(self.research_wait_seconds, bool)
+            or not isinstance(self.research_wait_seconds, int)
+            or not 600 <= self.research_wait_seconds <= 86400
+        ):
+            raise ValueError("execution research wait seconds is invalid")
         if self.workflow_policy is not None:
             try:
                 parse_workflow_policy(self.workflow_policy)
@@ -523,6 +537,11 @@ def run_once(
     load_knowledge_config(
         config.gw_endpoint, config.gw_alias, config.gw_token_file
     )
+    research_task_roots = (
+        (config.task_work_root, config.task_kb_root)
+        if config.task_work_root is not None and config.task_kb_root is not None
+        else None
+    )
     service = TaskExecutionService(
         database,
         profile_registry=config.profile_registry,
@@ -534,6 +553,9 @@ def run_once(
         execution_slot_cap=config.execution_slot_cap,
         plan_ready_cap=config.plan_ready_cap,
         awaiting_reader_cap=config.awaiting_reader_cap,
+        research_before_planning=config.research_before_planning,
+        research_wait_seconds=config.research_wait_seconds,
+        research_task_roots=research_task_roots,
     )
     terminator = terminate or _terminate_process_group
     with _exclusive_lock(_runner_lock_path(root, config.runner_slot)) as acquired:
@@ -1663,6 +1685,14 @@ def _parser() -> argparse.ArgumentParser:
         help="refill the ready plan reserve for this source kind",
     )
     parser.add_argument(
+        "--research-before-planning", action="append", metavar="SOURCE_KIND",
+        help="require research before planning tasks from SOURCE_KIND",
+    )
+    parser.add_argument(
+        "--research-wait-seconds", type=int, default=None,
+        help="maximum seconds to wait for research before planning",
+    )
+    parser.add_argument(
         "--execute-without-asking", action="append", metavar="SOURCE_KIND",
         help="run a recorded plan for this source kind without a card",
     )
@@ -1879,6 +1909,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             execution_slot_cap=args.execution_slot_cap,
             plan_ready_cap=args.plan_ready_cap,
             awaiting_reader_cap=args.awaiting_reader_cap,
+            research_before_planning=tuple(args.research_before_planning or ()),
+            research_wait_seconds=args.research_wait_seconds,
         )
         # Before anything is claimed. A worker that cannot parse the run
         # state this runner writes fails every run at the agent's first tool
