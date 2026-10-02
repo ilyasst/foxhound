@@ -241,7 +241,7 @@ def test_agent_synthesize_argv_env_cwd(tmp_path: Path) -> None:
     assert recorded_args["timeout"] == 1200
 
 
-def test_agent_synthesize_unresolved_entity_inconclusive(tmp_path: Path) -> None:
+def test_agent_synthesize_unresolved_entity_sufficient(tmp_path: Path) -> None:
     fake_hermes = tmp_path / "fake_hermes.py"
     research_data = {
         "ownership": {"verdict": "reader", "evidence": []},
@@ -259,14 +259,14 @@ def test_agent_synthesize_unresolved_entity_inconclusive(tmp_path: Path) -> None
     run_dir = tmp_path / "run"
     result = agent_synthesize({"task_snapshot": {}}, config=config, bound_sources=None, run_dir=run_dir)
 
-    assert result.draft["research_status"] == "inconclusive"
+    assert result.draft["research_status"] == "sufficient"
     entity_claim = result.draft["related_entities"][0]
     assert entity_claim["status"] == "unknown"
     assert entity_claim["source_refs"] == []
     validate_draft(result.draft, list(result.sources))
 
 
-def test_agent_synthesize_open_questions_inconclusive(tmp_path: Path) -> None:
+def test_agent_synthesize_open_questions_non_blocking_sufficient(tmp_path: Path) -> None:
     fake_hermes = tmp_path / "fake_hermes.py"
     research_data = {
         "ownership": {"verdict": "reader", "evidence": []},
@@ -282,9 +282,11 @@ def test_agent_synthesize_open_questions_inconclusive(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     result = agent_synthesize({"task_snapshot": {}}, config=config, bound_sources=None, run_dir=run_dir)
 
-    assert result.draft["research_status"] == "inconclusive"
-    assert len(result.draft["open_questions"]) == 1
-    assert result.draft["open_questions"][0]["status"] == "unknown"
+    assert result.draft["research_status"] == "sufficient"
+    open_qs = result.draft["open_questions"]
+    assert isinstance(open_qs, list) and len(open_qs) == 1
+    assert open_qs[0]["status"] == "unknown"
+    assert open_qs[0]["text"] == "What is the timeline?"
     validate_draft(result.draft, list(result.sources))
 
 
@@ -800,7 +802,106 @@ def test_agent_locator_single_command_prefix_normalization(tmp_path: Path) -> No
     assert _map_locator("tool:cal list --days 14", (), ro_two) is None
 
 
-def test_agent_task_json_locator_problem_message(tmp_path: Path) -> None:
+def test_convert_research_json_features(tmp_path: Path) -> None:
+    from foxhound.task_research_agent import _convert_research_json
+    from foxhound.task_research import render_markdown, validate_draft
+
+    kb_dir = tmp_path / "kb"
+    kb_dir.mkdir()
+    doc_file = kb_dir / "note.md"
+    doc_file.write_text("Hello world")
+    k_roots = (("kb", str(kb_dir)),)
+
+    # 1. Recommendation present, ownership reasoning present, blocking open question
+    raw = {
+        "ownership": {
+            "verdict": "other:Alice",
+            "reasoning": "Alice owns the student workflow. She agreed during the sync.",
+            "evidence": ["kb:note.md"],
+        },
+        "requested_deliverable": {
+            "text": "Review student submissions",
+            "evidence": ["kb:note.md"],
+        },
+        "constraints": [],
+        "entities": [],
+        "facts": [
+            {"text": "Deadline is tomorrow", "status": "confirmed", "evidence": ["kb:note.md"]}
+        ],
+        "open_questions": [
+            {"text": "Is the rubric finalized?", "blocking": True},
+            "Non-blocking question",
+        ],
+        "recommendation": {
+            "text": "Follow up with Alice regarding the submissions",
+            "evidence": ["kb:note.md"],
+        },
+    }
+
+    draft, sources = _convert_research_json(raw, k_roots)
+    assert draft["research_status"] == "inconclusive"
+    assert draft["requested_action"]["text"] == "Follow up with Alice regarding the submissions"
+    assert draft["objective"]["text"] == "Review student submissions"
+    stakeholders = draft["stakeholders"]
+    assert len(stakeholders) == 1
+    assert stakeholders[0]["text"] == "Owner: other:Alice — Alice owns the student workflow"
+    open_qs = draft["open_questions"]
+    assert len(open_qs) == 2
+    assert open_qs[0]["text"] == "Is the rubric finalized? (blocking)"
+    assert open_qs[1]["text"] == "Non-blocking question"
+    assert "recommendation" in draft
+    assert len(draft["recommendation"]) == 1
+    assert draft["recommendation"][0]["text"] == "Follow up with Alice regarding the submissions"
+
+    # Validate draft
+    validate_draft(draft, sources)
+
+    # Render markdown and verify sections
+    published_doc = {
+        "schema_version": 1,
+        "task_identity": {"task_id": 123, "task_version": 1},
+        "research_status": draft["research_status"],
+        "report": {k: v for k, v in draft.items() if k not in {"research_status", "scheduling_recommendations"}},
+        "scheduling_recommendations": draft["scheduling_recommendations"],
+        "sources": sources,
+    }
+    md = render_markdown(published_doc)
+    assert "## Recommendation" in md
+    assert "- Follow up with Alice regarding the submissions (supported) [src-001]" in md
+    assert "- Is the rubric finalized? (blocking) (unknown)" in md
+    assert "- Owner: other:Alice — Alice owns the student workflow (supported) [src-001]" in md
+
+    # Check status rules:
+    # 2. Undetermined owner -> inconclusive even with no blocking questions
+    raw2 = dict(raw)
+    raw2["ownership"] = {"verdict": "undetermined", "evidence": []}
+    raw2["open_questions"] = [{"text": "Just asking", "blocking": False}]
+    draft2, sources2 = _convert_research_json(raw2, k_roots)
+    assert draft2["research_status"] == "inconclusive"
+
+    # 3. Non-blocking only + known owner + unresolved entity -> sufficient
+    raw3 = dict(raw)
+    raw3["ownership"] = {"verdict": "reader", "evidence": []}
+    raw3["entities"] = [{"as_written": "Unresolved Thing", "status": "unresolved", "meaning": "unresolved"}]
+    raw3["open_questions"] = ["Non-blocking plain string question"]
+    del raw3["recommendation"]
+    draft3, sources3 = _convert_research_json(raw3, k_roots)
+    assert draft3["research_status"] == "sufficient"
+    # When recommendation is absent, requested_action falls back to objective
+    assert draft3["requested_action"]["text"] == "Review student submissions"
+    assert "recommendation" not in draft3
+    validate_draft(draft3, sources3)
+    published_doc3 = {
+        "schema_version": 1,
+        "task_identity": {"task_id": 123, "task_version": 1},
+        "research_status": draft3["research_status"],
+        "report": {k: v for k, v in draft3.items() if k not in {"research_status", "scheduling_recommendations"}},
+        "scheduling_recommendations": draft3["scheduling_recommendations"],
+        "sources": sources3,
+    }
+    md3 = render_markdown(published_doc3)
+    assert "## Recommendation" not in md3
+
     from foxhound.task_research_agent import check_research_output
 
     run_dir = tmp_path / "run_task_json"

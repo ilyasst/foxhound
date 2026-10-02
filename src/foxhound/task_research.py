@@ -265,6 +265,7 @@ def validate_draft(document: object, sources: list[dict[str, object]]) -> dict[s
         "current_state", "expected_deliverables", "timeline", "decisions",
         "dependencies", "constraints", "stakeholders", "related_entities",
         "findings", "conflicts", "open_questions", "scheduling_recommendations",
+        "recommendation",
     }
     if set(document) - allowed:
         raise ResearchError("draft contains publisher-owned or unknown fields")
@@ -288,6 +289,13 @@ def validate_draft(document: object, sources: list[dict[str, object]]) -> dict[s
             raise ResearchError(f"invalid {section}")
         result[section] = [
             _claim(value, f"{section} claim", source_ids) for value in values
+        ]
+    if "recommendation" in document:
+        rec_values = document.get("recommendation", [])
+        if not isinstance(rec_values, list) or len(rec_values) > 32:
+            raise ResearchError("invalid recommendation")
+        result["recommendation"] = [
+            _claim(value, "recommendation claim", source_ids) for value in rec_values
         ]
     recommendations = document.get("scheduling_recommendations", [])
     if not isinstance(recommendations, list) or len(recommendations) > 3:
@@ -345,15 +353,16 @@ def render_markdown(document: Mapping[str, object]) -> str:
     for key in (
         "current_state", "expected_deliverables", "timeline", "decisions",
         "dependencies", "constraints", "stakeholders", "related_entities",
-        "findings", "conflicts", "open_questions",
+        "findings", "recommendation", "conflicts", "open_questions",
     ):
-        claims = report[key]
+        claims = report.get(key)
         if not claims:
             continue
         lines.extend([f"## {key.replace('_', ' ').title()}", ""])
         for claim in claims:
             refs = ", ".join(f"[{ref}]" for ref in claim["source_refs"])
-            lines.append(f"- {claim['text']} ({claim['status']}) {refs}".rstrip())
+            suffix = f" {refs}" if refs else ""
+            lines.append(f"- {claim['text']} ({claim['status']}){suffix}".rstrip())
         lines.append("")
     recommendations = document["scheduling_recommendations"]
     if recommendations:

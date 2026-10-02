@@ -719,7 +719,8 @@ def validate_draft(value: object, sources: list[dict[str, object]]) -> dict[str,
         "dependencies", "constraints", "stakeholders", "related_entities",
         "findings", "conflicts", "open_questions", "scheduling_recommendations",
     }
-    if set(value) != fields or value.get("research_status") not in RESEARCH_STATUSES:
+    allowed_fields = fields | {"recommendation"}
+    if not (fields <= set(value) <= allowed_fields) or value.get("research_status") not in RESEARCH_STATUSES:
         raise SynthesisError("invalid_draft")
     source_ids = {str(item["source_id"]) for item in sources}
 
@@ -760,6 +761,11 @@ def validate_draft(value: object, sources: list[dict[str, object]]) -> dict[str,
         if not isinstance(items, list) or len(items) > 32:
             raise SynthesisError("invalid_draft")
         result[name] = [claim(item) for item in items]
+    if "recommendation" in value:
+        rec_items = value.get("recommendation")
+        if not isinstance(rec_items, list) or len(rec_items) > 32:
+            raise SynthesisError("invalid_draft")
+        result["recommendation"] = [claim(item) for item in rec_items]
     recommendations = value.get("scheduling_recommendations")
     if not isinstance(recommendations, list) or len(recommendations) > 3:
         raise SynthesisError("invalid_draft")
