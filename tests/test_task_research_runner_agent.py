@@ -175,6 +175,20 @@ class TaskResearchRunnerAgentTests(unittest.TestCase):
         self.assertTrue((task_folder / ".task-research.json").is_file())
         self.assertTrue((task_folder / "Research.md").is_file())
 
+        metrics_files = list((self.paths["scratch_root"] / "metrics").glob("*.json"))
+        self.assertEqual(len(metrics_files), 1)
+        metrics_data = json.loads(metrics_files[0].read_text(encoding="utf-8"))
+        self.assertEqual(metrics_data["outcome"], "success")
+        self.assertEqual(metrics_data["task_id"], 1)
+        self.assertEqual(metrics_data["task_version"], 1)
+        self.assertIn("job_id", metrics_data)
+        self.assertIn("wall_seconds", metrics_data)
+        self.assertIn("repair_turns", metrics_data)
+
+        # Check permissions: directory 0700, file 0600
+        self.assertEqual((self.paths["scratch_root"] / "metrics").stat().st_mode & 0o777, 0o700)
+        self.assertEqual(metrics_files[0].stat().st_mode & 0o777, 0o600)
+
         with closing(sqlite3.connect(self.paths["database"])) as connection:
             receipt = connection.execute(
                 "SELECT r.json_digest, r.markdown_digest FROM task_research_receipts r "
@@ -215,6 +229,15 @@ class TaskResearchRunnerAgentTests(unittest.TestCase):
         self.assertEqual(row[0], "queued")
         self.assertEqual(row[1], 0)
         self.assertEqual(row[2], "model_timeout")
+
+        metrics_files = list((self.paths["scratch_root"] / "metrics").glob("*.json"))
+        self.assertEqual(len(metrics_files), 1)
+        metrics_data = json.loads(metrics_files[0].read_text(encoding="utf-8"))
+        self.assertEqual(metrics_data["outcome"], "failure")
+        self.assertEqual(metrics_data["task_id"], 1)
+        self.assertEqual(metrics_data["task_version"], 1)
+        self.assertIn("job_id", metrics_data)
+        self.assertIn("wall_seconds", metrics_data)
 
     def test_missing_hermes_command_raises_value_error(self) -> None:
         _queue_job(self.paths)
@@ -305,6 +328,41 @@ class TaskResearchRunnerAgentTests(unittest.TestCase):
                 ])
             self.assertEqual(cm.exception.code, 2)
         self.assertIn("duplicate command name", err_buf.getvalue())
+
+    def test_unwritable_metrics_dir_does_not_affect_outcome(self) -> None:
+        task_folder = _queue_job(self.paths)
+        valid_research = _sample_research_json(self.kb_file)
+
+        def fake_runner(argv, cwd=None, env=None, timeout=None, **kwargs):
+            assert cwd is not None
+            research_path = Path(cwd) / "research.json"
+            research_path.write_text(json.dumps(valid_research), encoding="utf-8")
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+        # Pre-create metrics as a file so creating directory or writing inside fails
+        metrics_file = self.paths["scratch_root"] / "metrics"
+        metrics_file.write_text("blocking file")
+        metrics_file.chmod(0o400)
+
+        result = run_once(
+            database=self.paths["database"],
+            cas_root=self.paths["cas_root"],
+            task_work_root=self.paths["task_work_root"],
+            scratch_root=self.paths["scratch_root"],
+            model="synthetic-agent-model",
+            endpoint="http://127.0.0.1:8800",
+            synthesizer="agent",
+            hermes_command="/usr/bin/synthetic-hermes",
+            knowledge_roots=(("kb", str(self.kb_dir)),),
+            agent_runner=fake_runner,
+            clock=lambda: NOW,
+        )
+
+        self.assertTrue(result.claimed)
+        self.assertTrue(result.completed)
+        self.assertEqual(result.state, "completed")
+        self.assertTrue((task_folder / ".task-research.json").is_file())
+
 
 
 if __name__ == "__main__":

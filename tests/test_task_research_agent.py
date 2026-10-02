@@ -249,6 +249,10 @@ def test_agent_synthesize_argv_env_cwd(tmp_path: Path) -> None:
     assert recorded_args["env"]["TERMINAL_CWD"] == str(run_dir.resolve())
     assert recorded_args["env"]["FOXHOUND_VOICE_SUMMARIES"] == "0"
     assert recorded_args["env"]["RIPGREP_CONFIG_PATH"] == str((run_dir / ".ripgreprc").resolve())
+    assert recorded_args["env"]["CAPROUTE_APP"] == "foxhound"
+    assert recorded_args["env"]["CAPROUTE_OPERATION"] == "research"
+    assert recorded_args["env"]["CAPROUTE_JOB"] == ""
+    assert recorded_args["env"]["CAPROUTE_RUN_ID"] == ""
     assert (run_dir / ".ripgreprc").read_text(encoding="utf-8") == "--follow\n"
     assert recorded_args["timeout"] == 1200
 
@@ -533,8 +537,11 @@ def test_agent_synthesize_repair_flow(tmp_path: Path) -> None:
         "open_questions": [],
     }
 
+    envs = []
+
     def fake_runner(argv, cwd, env, timeout, capture_output, text):
         calls.append(list(argv))
+        envs.append(dict(env))
         res = MagicMock()
         res.returncode = 0
         res.stderr = ""
@@ -557,11 +564,17 @@ def test_agent_synthesize_repair_flow(tmp_path: Path) -> None:
         hermes_command="hermes",
         model="test-model",
         knowledge_roots=(("kb", str(kb_dir)),),
+        job_id="job-repair-99",
     )
     run_dir = tmp_path / "run_repair"
     result = agent_synthesize({"task_snapshot": {}}, config=config, bound_sources=None, run_dir=run_dir, runner=fake_runner)
 
     assert len(calls) == 2
+    for call_env in envs:
+        assert call_env["CAPROUTE_APP"] == "foxhound"
+        assert call_env["CAPROUTE_OPERATION"] == "research"
+        assert call_env["CAPROUTE_JOB"] == "job-repair-99"
+        assert call_env["CAPROUTE_RUN_ID"] == "job-repair-99"
     first_argv = calls[0]
     repair_argv = calls[1]
 
@@ -699,6 +712,7 @@ def test_agent_synthesize_repair_timeout_rechecks_and_publishes(tmp_path: Path) 
 
 def test_agent_synthesize_continuation_flow(tmp_path: Path) -> None:
     calls = []
+    envs = []
     kb_dir = tmp_path / "sync_kb"
     kb_dir.mkdir()
     kb_file = kb_dir / "doc.txt"
@@ -715,6 +729,7 @@ def test_agent_synthesize_continuation_flow(tmp_path: Path) -> None:
 
     def fake_runner(argv, cwd, env, timeout, capture_output, text):
         calls.append(list(argv))
+        envs.append(dict(env))
         res = MagicMock()
         res.returncode = 0
         res.stderr = ""
@@ -729,11 +744,17 @@ def test_agent_synthesize_continuation_flow(tmp_path: Path) -> None:
         hermes_command="hermes",
         model="test-model",
         knowledge_roots=(("kb", str(kb_dir)),),
+        job_id="job-cont-123",
     )
     run_dir = tmp_path / "run_continuation"
     result = agent_synthesize({"task_snapshot": {}}, config=config, bound_sources=None, run_dir=run_dir, runner=fake_runner)
 
     assert len(calls) == 2
+    for call_env in envs:
+        assert call_env["CAPROUTE_APP"] == "foxhound"
+        assert call_env["CAPROUTE_OPERATION"] == "research"
+        assert call_env["CAPROUTE_JOB"] == "job-cont-123"
+        assert call_env["CAPROUTE_RUN_ID"] == "job-cont-123"
     cont_argv = calls[1]
     assert "--resume" in cont_argv
     assert cont_argv[cont_argv.index("--resume") + 1] == "sess-cont-123"

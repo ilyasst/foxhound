@@ -40,6 +40,7 @@ class AgentResearchConfig:
     read_only_commands: tuple[dict[str, str], ...] = ()
     profile_id: str = "researcher"
     profile_revision: str = "agent-researcher-v1"
+    job_id: str | None = None
 
 
 def _default_prompt_path() -> Path:
@@ -1023,6 +1024,10 @@ def agent_synthesize(
     env["TERMINAL_CWD"] = str(run_dir.resolve())
     env["FOXHOUND_VOICE_SUMMARIES"] = "0"
     env["RIPGREP_CONFIG_PATH"] = str((run_dir / ".ripgreprc").resolve())
+    env["CAPROUTE_APP"] = "foxhound"
+    env["CAPROUTE_OPERATION"] = "research"
+    env["CAPROUTE_JOB"] = config.job_id or ""
+    env["CAPROUTE_RUN_ID"] = config.job_id or ""
 
     try:
         proc = runner(
