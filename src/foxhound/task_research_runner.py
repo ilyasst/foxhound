@@ -141,6 +141,7 @@ def run_once(
     agent_timeout: int = 3600,
     knowledge_roots: tuple[tuple[str, str], ...] = (),
     read_only_commands: tuple[dict[str, str], ...] = (),
+    reader_aliases: tuple[str, ...] = (),
     agent_runner=None,
 ) -> ResearchRunResult:
     """Claim at most one queued research job and execute it through publication."""
@@ -281,6 +282,7 @@ def run_once(
                 timeout_seconds=agent_timeout,
                 knowledge_roots=knowledge_roots,
                 read_only_commands=read_only_commands,
+                reader_aliases=reader_aliases,
                 profile_id=profile_id,
                 profile_revision=profile_revision,
                 job_id=job_id,
@@ -441,6 +443,12 @@ def _parser() -> argparse.ArgumentParser:
         metavar="JSON",
         help="JSON string defining a read-only command: {name, command, description} (repeatable)",
     )
+    parser.add_argument(
+        "--reader-alias",
+        action="append",
+        default=[],
+        help="reader alias exposed to the agent researcher in task.json (repeatable)",
+    )
     return parser
 
 
@@ -502,6 +510,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     knowledge_roots = _parse_knowledge_roots(parser, arguments.knowledge_root)
     read_only_commands = _parse_read_only_commands(parser, arguments.read_only_command)
+    reader_aliases = tuple(arguments.reader_alias)
     try:
         result = run_once(
             database=arguments.database,
@@ -531,6 +540,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             agent_timeout=arguments.agent_timeout,
             knowledge_roots=knowledge_roots,
             read_only_commands=read_only_commands,
+            reader_aliases=reader_aliases,
         )
     except (ResearchError, ValueError, OSError):
         print(json.dumps({"accepted": False, "error_code": "configuration_unavailable"}, sort_keys=True))

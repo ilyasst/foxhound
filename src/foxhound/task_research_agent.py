@@ -38,6 +38,7 @@ class AgentResearchConfig:
     prompt_path: Path | None = None
     knowledge_roots: tuple[tuple[str, str], ...] = ()
     read_only_commands: tuple[dict[str, str], ...] = ()
+    reader_aliases: tuple[str, ...] = ()
     profile_id: str = "researcher"
     profile_revision: str = "agent-researcher-v1"
     job_id: str | None = None
@@ -955,6 +956,47 @@ def agent_synthesize(
     knowledge_roots_data = _derive_knowledge_roots(config)
     starting_points_data = _derive_starting_points(ctx, bound_sources)
 
+    # Check for declared "origin" read-only command and ctx origin.record_id
+    origin_cmd = None
+    for cmd in config.read_only_commands:
+        if cmd.get("name") == "origin":
+            origin_cmd = cmd.get("command")
+            break
+
+    ctx_origin = ctx.get("origin")
+    record_id = None
+    item_id = None
+    if isinstance(ctx_origin, Mapping):
+        record_id = ctx_origin.get("record_id")
+        item_id = ctx_origin.get("item_id")
+
+    if origin_cmd and record_id:
+        argv_cmd = [str(origin_cmd), str(record_id)]
+        if item_id is not None:
+            argv_cmd.extend(["--item", str(item_id)])
+        try:
+            res = runner(
+                argv_cmd,
+                cwd=run_dir,
+                timeout=60,
+                capture_output=True,
+                text=True,
+            )
+            if res.returncode == 0:
+                raw_stdout = getattr(res, "stdout", "") or ""
+                doc = json.loads(raw_stdout)
+                if isinstance(doc, dict) and doc.get("status") == "resolved":
+                    starting_points_data.insert(0, {"origin_documents": doc})
+                else:
+                    status_val = doc.get("status") if isinstance(doc, dict) else "unknown"
+                    starting_points_data.append({"origin_documents": None, "origin_error": f"unresolved status: {status_val}"})
+            else:
+                stderr_preview = (getattr(res, "stderr", "") or "").strip()[:100]
+                reason = f"exit {res.returncode}: {stderr_preview}" if stderr_preview else f"exit {res.returncode}"
+                starting_points_data.append({"origin_documents": None, "origin_error": reason})
+        except Exception as exc:
+            starting_points_data.append({"origin_documents": None, "origin_error": str(exc)})
+
     # In the run directory create one symlink per knowledge root (named after the root)
     # (skip if exists)
     for name, p in config.knowledge_roots:
@@ -973,6 +1015,8 @@ def agent_synthesize(
         "knowledge_roots": knowledge_roots_data,
         "starting_points": starting_points_data,
     }
+    if config.reader_aliases:
+        task_json_payload["reader"] = {"aliases": list(config.reader_aliases)}
     if config.read_only_commands:
         task_json_payload["read_only_commands"] = [
             {
