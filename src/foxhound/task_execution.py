@@ -47,6 +47,10 @@ from .source_policy import (
 )
 from .task_ledger import TaskLedgerError, TaskStatus
 from .task_research_gate import (
+    ownership_disagreement,
+    ownership_review_status,
+    record_ownership_decision,
+    record_ownership_review,
     ResearchGatePolicy,
     evaluate_research_gate,
     request_pending_research,
@@ -784,6 +788,10 @@ class TaskExecutionService:
                     "JOIN tasks AS t ON t.id=w.task_id "
                     "WHERE w.status='awaiting_start' AND w.phase='plan' "
                     "AND t.status='open' AND t.version=w.task_version "
+                    # An open ownership proposal waits for the reader.
+                    "AND NOT EXISTS(SELECT 1 FROM ownership_reviews AS r "
+                    " WHERE r.task_id=t.id AND r.task_version=t.version "
+                    " AND r.status='pending') "
                     "AND NOT EXISTS("
                     " SELECT 1 FROM task_candidate_bindings AS blocked JOIN "
                     " task_candidate_lifecycle AS l "
@@ -1327,6 +1335,13 @@ class TaskExecutionService:
                         if gate.reason != "receipt":
                             key = "bypassed_" + gate.reason
                             research_counts[key] = research_counts.get(key, 0) + 1
+                        elif self._hold_for_ownership_review(
+                            connection, candidate, now,
+                        ):
+                            research_counts["ownership_review"] = (
+                                research_counts.get("ownership_review", 0) + 1
+                            )
+                            continue
                     try:
                         resolved = self._resolve_profile(candidate)
                         if candidate["phase"] not in resolved.allowed_phases:
@@ -2874,6 +2889,55 @@ class TaskExecutionService:
             agent_profile_revision=row["agent_profile_revision"],
         )
 
+    def _hold_for_ownership_review(
+        self, connection: sqlite3.Connection, candidate: sqlite3.Row, now: str,
+    ) -> bool:
+        """Park a researched plan at its Start card when the owner is disputed.
+
+        The Researcher's cited verdict names someone else (or the reader, for
+        a task recorded as someone else's). Planning would otherwise proceed
+        on the recorded owner; instead the reader decides on the Start card.
+        A decided proposal never holds again for this task version.
+        """
+        task_id = int(candidate["task_id"])
+        task_version = int(candidate["task_version"])
+        status = ownership_review_status(connection, task_id, task_version)
+        if status is not None:
+            return status == "pending"
+        previous = connection.row_factory
+        connection.row_factory = sqlite3.Row
+        try:
+            task_row = connection.execute(
+                "SELECT owner,owner_kind,owner_ref_version,owner_provisional,"
+                "owner_pinned FROM tasks WHERE id=?",
+                (task_id,),
+            ).fetchone()
+        finally:
+            connection.row_factory = previous
+        if task_row is None:
+            return False
+        proposal = ownership_disagreement(
+            connection, task_row, task_id, task_version, self._reader_aliases,
+        )
+        if proposal is None:
+            return False
+        version = int(candidate["version"]) + 1
+        moved = connection.execute(
+            "UPDATE task_execution_workflows SET status='awaiting_start',"
+            "version=?,due_at=NULL,next_attempt_at=NULL,updated_at=? "
+            "WHERE task_id=? AND version=? AND phase='plan' "
+            "AND status IN ('queued','parked')",
+            (version, now, task_id, int(candidate["version"])),
+        )
+        if moved.rowcount != 1:
+            return False
+        record_ownership_review(connection, task_id, task_version, proposal, now)
+        self._event(
+            connection, task_id, "scheduled", version, task_version,
+            WorkflowPhase.PLAN, WorkflowStatus.AWAITING_START, now,
+        )
+        return True
+
     @staticmethod
     def _event(
         connection: sqlite3.Connection,
@@ -3237,6 +3301,14 @@ def _apply_start_action(
         status,
         now,
     )
+    if kind == "start_approved" and record_ownership_decision(
+        connection, task_id, int(row["task_version"]), "kept", None, now,
+    ):
+        # "No, mine" on an ownership proposal: the recorded owner stands and
+        # later research may not reopen it.
+        connection.execute(
+            "UPDATE tasks SET owner_pinned=1 WHERE id=?", (task_id,),
+        )
     return WorkflowOperationResult(
         WorkflowDisposition.APPLIED,
         task_id,

@@ -51,7 +51,7 @@ from .contracts.task_candidate import (
 )
 
 
-SCHEMA_VERSION = 67
+SCHEMA_VERSION = 68
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 _CUMULATIVE_SCHEMA_VERSIONS = {
@@ -3645,6 +3645,30 @@ END;
 # A validated scheduling recommendation is applied as one reversible local
 # transaction.  Conditions are ordinary queue eligibility facts; change sets
 # remember the exact fence and inverse operation; cards expose Keep and Undo.
+# V68 records the Researcher's ownership proposals and the reader's answers.
+# A proposal holds a plan at its Start card until the reader decides; the
+# answer is kept so later research cannot reopen it and so the proposals can
+# be evaluated. Purely additive.
+_SCHEMA_V68 = (
+    """
+CREATE TABLE IF NOT EXISTS ownership_reviews (
+    task_id         INTEGER NOT NULL REFERENCES tasks(id),
+    task_version    INTEGER NOT NULL CHECK(task_version >= 1),
+    receipt_job_id  TEXT NOT NULL CHECK(length(receipt_job_id) BETWEEN 1 AND 128),
+    proposed_owner  TEXT NOT NULL CHECK(length(proposed_owner) BETWEEN 1 AND 200),
+    proposed_kind   TEXT NOT NULL CHECK(proposed_kind IN ('reader','other')),
+    reasoning       TEXT CHECK(reasoning IS NULL OR length(reasoning) <= 2000),
+    source_title    TEXT CHECK(source_title IS NULL OR length(source_title) <= 500),
+    status          TEXT NOT NULL CHECK(status IN ('pending','confirmed','kept','reassigned')),
+    decided_owner   TEXT CHECK(decided_owner IS NULL OR length(decided_owner) <= 200),
+    created_at      TEXT NOT NULL,
+    decided_at      TEXT,
+    PRIMARY KEY(task_id, task_version)
+);
+""",
+)
+
+
 _SCHEMA_V66 = (
     "ALTER TABLE task_execution_workflows ADD COLUMN queue_priority_source "
     "TEXT CHECK(queue_priority_source IS NULL OR queue_priority_source IN "
@@ -5495,6 +5519,18 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 67
+            if version == 67:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V68:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 68")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 68
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:

@@ -192,6 +192,7 @@ class ExecutionRunnerConfig:
     awaiting_reader_cap: int | None = None
     profile_routes: Mapping[str, str] = field(default_factory=dict)
     research_before_planning: tuple[str, ...] = ()
+    reader_aliases: tuple[str, ...] = ()
     research_wait_seconds: int | None = None
 
     def __post_init__(self) -> None:
@@ -558,6 +559,7 @@ def run_once(
         research_before_planning=config.research_before_planning,
         research_wait_seconds=config.research_wait_seconds,
         research_task_roots=research_task_roots,
+        reader_aliases=config.reader_aliases,
     )
     terminator = terminate or _terminate_process_group
     with _exclusive_lock(_runner_lock_path(root, config.runner_slot)) as acquired:
@@ -1721,6 +1723,10 @@ def _parser() -> argparse.ArgumentParser:
         help="maximum seconds to wait for research before planning",
     )
     parser.add_argument(
+        "--reader-alias", action="append", metavar="NAME",
+        help="the reader's own name, for ownership proposals from research",
+    )
+    parser.add_argument(
         "--execute-without-asking", action="append", metavar="SOURCE_KIND",
         help="run a recorded plan for this source kind without a card",
     )
@@ -1939,6 +1945,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             awaiting_reader_cap=args.awaiting_reader_cap,
             research_before_planning=tuple(args.research_before_planning or ()),
             research_wait_seconds=args.research_wait_seconds,
+            reader_aliases=tuple(args.reader_alias or ()),
         )
         # Before anything is claimed. A worker that cannot parse the run
         # state this runner writes fails every run at the agent's first tool

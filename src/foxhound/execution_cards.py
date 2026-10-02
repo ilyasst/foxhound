@@ -19,6 +19,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
+from .task_owner import normalized_owner
+from .task_research_gate import record_ownership_decision
 from . import task_relations
 from .agent_profiles import (
     AgentProfile,
@@ -865,6 +867,7 @@ class ExecutionCardService:
                         task_version = int(row["task_version"]) + 1
                         if connection.execute("UPDATE tasks SET owner=?,version=?,updated_at=?,owner_ref_version=1,owner_kind='external',owner_speaker_id=NULL,owner_canonical_speaker_id=NULL,owner_speaker_registry_id=NULL,owner_pinned=1,owner_provisional=0 WHERE id=? AND version=? AND status='open'", (value, task_version, now, int(row["task_id"]), int(row["task_version"]))).rowcount != 1:
                             raise TaskLedgerError("task ownership state changed")
+                        _close_ownership_review(connection, int(row["task_id"]), int(row["task_version"]), value, now)
                         status, phase, resolution = WorkflowStatus.AWAITING_START, WorkflowPhase.PLAN, "reassign"
                     else:
                         task_version = int(row["task_version"])
@@ -2381,6 +2384,10 @@ class ExecutionCardService:
                     )
                     if task_update.rowcount != 1:
                         raise TaskLedgerError("task ownership state changed")
+                    _close_ownership_review(
+                        connection, int(row["task_id"]),
+                        int(row["task_version"]), value, now,
+                    )
                     connection.execute(
                         "INSERT INTO task_owner_events("
                         "task_id,task_version,card_id,from_owner,to_owner,"
@@ -5648,3 +5655,23 @@ def _valid_opaque(value: object, maximum: int) -> bool:
 
 def _token_digest(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _close_ownership_review(
+    connection: sqlite3.Connection, task_id: int, task_version: int,
+    new_owner: object, now: str,
+) -> None:
+    """A reassignment answers an open ownership proposal for that version."""
+    proposal = connection.execute(
+        "SELECT proposed_owner FROM ownership_reviews "
+        "WHERE task_id=? AND task_version=? AND status='pending'",
+        (task_id, task_version),
+    ).fetchone()
+    if proposal is None:
+        return
+    same = normalized_owner(str(new_owner)) == normalized_owner(str(proposal[0]))
+    record_ownership_decision(
+        connection, task_id, task_version,
+        "confirmed" if same else "reassigned", str(new_owner), now,
+    )
+
