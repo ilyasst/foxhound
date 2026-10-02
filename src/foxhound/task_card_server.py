@@ -21,7 +21,7 @@ from datetime import timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from .agent_profiles import AgentProfileError, load_registry
 from .card_provenance import provenance_document
@@ -2389,6 +2389,16 @@ def serve(host: str, port: int, app: TaskCardApplication) -> None:
         server.server_close()
 
 
+def _legacy_roots(values: Sequence[str]) -> tuple[tuple[str, str], ...]:
+    pairs = []
+    for item in values:
+        old, sep, new = item.partition("=")
+        if not sep:
+            raise TaskCardServerConfigError("--legacy-root must be OLD=NEW")
+        pairs.append((old, new))
+    return tuple(pairs)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Serve Foxhound review cards on an authenticated loopback API"
@@ -2432,6 +2442,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--agent-profile-directory", type=Path)
     parser.add_argument(
+        "--legacy-root", action="append", default=[], metavar="OLD=NEW",
+        help="show results recorded under a moved KB root at its new path",
+    )
+    parser.add_argument(
         "--task-work-root", type=Path,
         help="canonical task archive root used for verified result files",
     )
@@ -2469,6 +2483,7 @@ def main(argv: list[str] | None = None) -> int:
                 seconds=arguments.steer_plan_threshold_seconds),
             steer_execute_threshold=timedelta(
                 seconds=arguments.steer_execute_threshold_seconds),
+            legacy_roots=_legacy_roots(arguments.legacy_root),
         )
         execution_cards.count()
         execution_workflows = TaskExecutionService(

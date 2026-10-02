@@ -179,6 +179,28 @@ class DeploymentConfigTests(unittest.TestCase):
         self.config_path.write_text(json.dumps(document), encoding="utf-8")
         self.config_path.chmod(0o600)
 
+    def test_card_service_legacy_roots_render_and_validate(self) -> None:
+        document = self._document()
+        document["card_service"]["legacy_root_translations"] = [
+            ["/srv/vault-old/KB", "/srv/vault/KB"]]
+        self._write_config(document)
+        cards = load_deployment_config(self.config_path).argv("task-cards")
+        self.assertEqual(
+            cards[cards.index("--legacy-root") + 1],
+            "/srv/vault-old/KB=/srv/vault/KB")
+        for bad in ([["relative", "/srv/x"]], [["/srv/a", "/srv/a"]],
+                    [["/srv/a"]], "nope"):
+            with self.subTest(bad=bad):
+                document["card_service"]["legacy_root_translations"] = bad
+                self._write_config(document)
+                with self.assertRaises(DeploymentConfigError):
+                    load_deployment_config(self.config_path)
+        del document["card_service"]["legacy_root_translations"]
+        self._write_config(document)
+        self.assertNotIn(
+            "--legacy-root",
+            load_deployment_config(self.config_path).argv("task-cards"))
+
     def test_loads_valid_configuration_and_renders_known_commands(self) -> None:
         self._write_config(self._document())
 
