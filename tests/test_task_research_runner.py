@@ -491,3 +491,39 @@ class TaskResearchRunnerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OwnerPrivateRootTests(unittest.TestCase):
+    """Only the root must be private; ancestors must not be world-writable."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.base = Path(temporary.name).resolve()
+
+    def _chain(self, *modes):
+        path = self.base
+        for index, mode in enumerate(modes):
+            path = path / f"level-{index}"
+            path.mkdir()
+            path.chmod(mode)
+        return path
+
+    def test_ordinary_home_and_synced_ancestors_are_accepted(self):
+        from foxhound.task_research_runner import _validate_owner_private_dir
+        root = self._chain(0o701, 0o775, 0o700)
+        self.assertEqual(_validate_owner_private_dir(root), root)
+
+    def test_world_writable_ancestor_is_refused(self):
+        from foxhound.task_research import ResearchError
+        from foxhound.task_research_runner import _validate_owner_private_dir
+        root = self._chain(0o777, 0o700)
+        with self.assertRaisesRegex(ResearchError, "writable by others"):
+            _validate_owner_private_dir(root)
+
+    def test_root_must_still_be_private(self):
+        from foxhound.task_research import ResearchError
+        from foxhound.task_research_runner import _validate_owner_private_dir
+        root = self._chain(0o755, 0o750)
+        with self.assertRaisesRegex(ResearchError, "not owner-private"):
+            _validate_owner_private_dir(root)
