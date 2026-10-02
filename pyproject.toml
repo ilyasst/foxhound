@@ -51,6 +51,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "foxhound.contracts" = ["schemas/*.json"]
+"foxhound.prompts" = ["*.md"]
 
 [tool.pytest.ini_options]
 # Repo root ("."), not just "src", must be on sys.path: tools/ (the

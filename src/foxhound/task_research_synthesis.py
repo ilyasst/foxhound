@@ -52,7 +52,7 @@ from .task_research_sources import (
 CONTEXT_SCHEMA = "foxhound.task-research-context.v1"
 INPUT_SCHEMA = "foxhound.task-research-input.v1"
 DRAFT_SCHEMA = "foxhound.task-research-draft.v1"
-SOURCE_NAMESPACES = frozenset({"kb", "meeting", "email", "attachment", "repo"})
+SOURCE_NAMESPACES = frozenset({"kb", "meeting", "email", "attachment", "repo", "web"})
 RECOMMENDATION_TYPES = frozenset({
     "after_task_completed", "not_before", "raise_priority", "create_prerequisite",
 })
@@ -500,7 +500,7 @@ def _retrieve(
     return ordered[:config.max_documents], searches, truncated, unavailable
 
 
-def _validate_resource_locator(resource: str) -> None:
+def _validate_resource_locator(resource: str, *, namespace: str | None = None) -> None:
     if (
         not isinstance(resource, str)
         or not resource
@@ -508,6 +508,11 @@ def _validate_resource_locator(resource: str) -> None:
         or "\\" in resource
     ):
         raise SynthesisError("retrieval_failed")
+    if namespace == "web":
+        parsed = urlsplit(resource)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise SynthesisError("retrieval_failed")
+        return
     pure = PurePosixPath(resource)
     if pure.is_absolute() or ".." in pure.parts or "." in pure.parts:
         raise SynthesisError("retrieval_failed")
