@@ -29,7 +29,9 @@ from pathlib import Path
 
 from .source_policy import source_kind_grants
 from .task_archive import TaskArchiveError, ensure_task_directory
+from .task_owner import UNRESOLVED_DISPLAY, canonical_owner_display, normalized_owner, reader_owned
 from .task_research import (
+    version_document,
     INPUT_SCHEMA,
     ResearchError,
     enqueue_in_transaction,
@@ -351,3 +353,134 @@ def _parse(value: str) -> datetime:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+@dataclass(frozen=True)
+class OwnershipProposal:
+    """The Researcher's cited disagreement with a task's recorded owner."""
+
+    receipt_job_id: str
+    proposed_owner: str
+    proposed_kind: str  # "reader" | "other"
+    reasoning: str | None
+    source_title: str | None
+
+
+def _owner_claim(document: dict[str, object]) -> tuple[str, str | None, list[str]] | None:
+    report = document.get("report")
+    if not isinstance(report, dict):
+        return None
+    for claim in report.get("stakeholders") or ():
+        if not isinstance(claim, dict):
+            continue
+        text = claim.get("text")
+        if not isinstance(text, str) or not text.startswith("Owner: "):
+            continue
+        verdict, _, reasoning = text[len("Owner: "):].partition(" — ")
+        refs = [str(r) for r in claim.get("source_refs") or () if isinstance(r, str)]
+        return verdict.strip(), (reasoning.strip() or None), refs
+    return None
+
+
+def ownership_disagreement(
+    connection: sqlite3.Connection,
+    task_row: object,
+    task_id: int,
+    task_version: int,
+    reader_aliases: frozenset[str],
+) -> OwnershipProposal | None:
+    """A proposal when the published research names a different owner.
+
+    Only a verdict that cites at least one source counts; ``undetermined``
+    never does. A task whose owner is unresolved belongs to the reader, so
+    a cited named owner is a proposal too. A pinned owner is never reopened.
+    """
+    if not reader_aliases:
+        return None
+    try:
+        if int(task_row["owner_pinned"] or 0):
+            return None
+    except (KeyError, IndexError, TypeError, ValueError):
+        pass
+    found = version_document(connection, task_id, task_version)
+    if found is None:
+        return None
+    job_id, document = found
+    claim = _owner_claim(document)
+    if claim is None:
+        return None
+    verdict, reasoning, refs = claim
+    if not refs:
+        return None
+    current_display = canonical_owner_display(
+        task_row["owner"], task_row["owner_kind"]
+    )
+    current_is_reader = (
+        reader_owned(task_row, reader_aliases)
+        or current_display in (None, UNRESOLVED_DISPLAY)
+    )
+    if verdict == "reader":
+        if current_is_reader:
+            return None
+        proposed, kind = "reader", "reader"
+    elif verdict.startswith("other:"):
+        name = verdict[len("other:"):].strip()
+        if not name or normalized_owner(name) in reader_aliases:
+            return None
+        if not current_is_reader and current_display and (
+            normalized_owner(current_display) == normalized_owner(name)
+        ):
+            return None
+        proposed, kind = name[:200], "other"
+    else:
+        return None
+    title = None
+    sources = document.get("sources")
+    if isinstance(sources, list):
+        for source in sources:
+            if isinstance(source, dict) and source.get("source_id") == refs[0]:
+                title = str(source.get("title") or "")[:500] or None
+                break
+    return OwnershipProposal(
+        receipt_job_id=job_id, proposed_owner=proposed, proposed_kind=kind,
+        reasoning=(reasoning or None) and reasoning[:2000], source_title=title,
+    )
+
+
+def record_ownership_review(
+    connection: sqlite3.Connection, task_id: int, task_version: int,
+    proposal: OwnershipProposal, now: str,
+) -> None:
+    connection.execute(
+        "INSERT OR IGNORE INTO ownership_reviews(task_id,task_version,"
+        "receipt_job_id,proposed_owner,proposed_kind,reasoning,source_title,"
+        "status,created_at) VALUES(?,?,?,?,?,?,?,'pending',?)",
+        (task_id, task_version, proposal.receipt_job_id, proposal.proposed_owner,
+         proposal.proposed_kind, proposal.reasoning, proposal.source_title, now),
+    )
+
+
+def ownership_review_status(
+    connection: sqlite3.Connection, task_id: int, task_version: int,
+) -> str | None:
+    row = connection.execute(
+        "SELECT status FROM ownership_reviews WHERE task_id=? AND task_version=?",
+        (task_id, task_version),
+    ).fetchone()
+    return None if row is None else str(row[0])
+
+
+def record_ownership_decision(
+    connection: sqlite3.Connection, task_id: int, task_version: int,
+    decision: str, decided_owner: str | None, now: str,
+) -> bool:
+    """Close a pending proposal; False when none is pending."""
+    if decision not in {"confirmed", "kept", "reassigned"}:
+        raise ValueError("ownership decision is invalid")
+    cursor = connection.execute(
+        "UPDATE ownership_reviews SET status=?,decided_owner=?,decided_at=? "
+        "WHERE task_id=? AND task_version=? AND status='pending'",
+        (decision, decided_owner, now, task_id, task_version),
+    )
+    return cursor.rowcount == 1
+

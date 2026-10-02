@@ -19,6 +19,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
+from .task_owner import normalized_owner
+from .task_research_gate import record_ownership_decision
 from . import task_relations
 from .agent_profiles import (
     AgentProfile,
@@ -865,6 +867,7 @@ class ExecutionCardService:
                         task_version = int(row["task_version"]) + 1
                         if connection.execute("UPDATE tasks SET owner=?,version=?,updated_at=?,owner_ref_version=1,owner_kind='external',owner_speaker_id=NULL,owner_canonical_speaker_id=NULL,owner_speaker_registry_id=NULL,owner_pinned=1,owner_provisional=0 WHERE id=? AND version=? AND status='open'", (value, task_version, now, int(row["task_id"]), int(row["task_version"]))).rowcount != 1:
                             raise TaskLedgerError("task ownership state changed")
+                        _close_ownership_review(connection, int(row["task_id"]), int(row["task_version"]), value, now)
                         status, phase, resolution = WorkflowStatus.AWAITING_START, WorkflowPhase.PLAN, "reassign"
                     else:
                         task_version = int(row["task_version"])
@@ -2381,6 +2384,10 @@ class ExecutionCardService:
                     )
                     if task_update.rowcount != 1:
                         raise TaskLedgerError("task ownership state changed")
+                    _close_ownership_review(
+                        connection, int(row["task_id"]),
+                        int(row["task_version"]), value, now,
+                    )
                     connection.execute(
                         "INSERT INTO task_owner_events("
                         "task_id,task_version,card_id,from_owner,to_owner,"
@@ -3053,6 +3060,19 @@ class ExecutionCardService:
             "(SELECT i.value FROM execution_reader_inputs AS i "
             " WHERE i.task_id=c.task_id AND i.kind='discussion' "
             " ORDER BY i.sequence DESC LIMIT 1) AS revision_note,"
+            # An open ownership proposal explains why a Start card exists.
+            "(SELECT o.proposed_owner FROM ownership_reviews AS o "
+            " WHERE o.task_id=c.task_id AND o.task_version=c.task_version "
+            " AND o.status='pending') AS ownership_proposed_owner,"
+            "(SELECT o.proposed_kind FROM ownership_reviews AS o "
+            " WHERE o.task_id=c.task_id AND o.task_version=c.task_version "
+            " AND o.status='pending') AS ownership_proposed_kind,"
+            "(SELECT o.reasoning FROM ownership_reviews AS o "
+            " WHERE o.task_id=c.task_id AND o.task_version=c.task_version "
+            " AND o.status='pending') AS ownership_reasoning,"
+            "(SELECT o.source_title FROM ownership_reviews AS o "
+            " WHERE o.task_id=c.task_id AND o.task_version=c.task_version "
+            " AND o.status='pending') AS ownership_source_title,"
             # Whether this pass actually changed anything. Read from the
             # ledger's own definition of an answer rather than a second one
             # kept here: a card that says "unchanged" while the ledger would
@@ -3544,7 +3564,7 @@ def _card(
                 condition_available=condition_available,
             )),
             owner_hold_reason=owner_hold_reason,
-            summary="" if row["summary"] is None else str(row["summary"]),
+            summary=_ownership_summary(row, kind) or ("" if row["summary"] is None else str(row["summary"])),
             work_markdown=(
                 ""
                 if row["work_markdown"] is None
@@ -3559,7 +3579,7 @@ def _card(
                 else str(row["steer_digest"])
             ),
             claimed_at=row["workflow_claimed_at"],
-            questions=_stored_lines(row["questions_json"]),
+            questions=_ownership_questions(row, kind) or _stored_lines(row["questions_json"]),
             external_actions=_stored_collection(row["external_actions_json"]),
             deliverables=_stored_collection(row["deliverables_json"]),
             repository_references=_stored_repository_references(
@@ -5648,3 +5668,65 @@ def _valid_opaque(value: object, maximum: int) -> bool:
 
 def _token_digest(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _close_ownership_review(
+    connection: sqlite3.Connection, task_id: int, task_version: int,
+    new_owner: object, now: str,
+) -> None:
+    """A reassignment answers an open ownership proposal for that version."""
+    proposal = connection.execute(
+        "SELECT proposed_owner FROM ownership_reviews "
+        "WHERE task_id=? AND task_version=? AND status='pending'",
+        (task_id, task_version),
+    ).fetchone()
+    if proposal is None:
+        return
+    same = normalized_owner(str(new_owner)) == normalized_owner(str(proposal[0]))
+    record_ownership_decision(
+        connection, task_id, task_version,
+        "confirmed" if same else "reassigned", str(new_owner), now,
+    )
+
+
+def _ownership_field(row: Mapping[str, object], name: str) -> str | None:
+    try:
+        value = row["ownership_" + name]
+    except (KeyError, IndexError):
+        return None
+    return str(value) if value else None
+
+
+def _ownership_summary(row: Mapping[str, object], kind: ExecutionCardKind) -> str | None:
+    """Why this Start card exists, when research disputes the owner."""
+    owner = _ownership_field(row, "proposed_owner")
+    if kind is not ExecutionCardKind.START or owner is None:
+        return None
+    if _ownership_field(row, "proposed_kind") == "reader":
+        text = "The researcher thinks this task is yours."
+    else:
+        text = f"The researcher thinks this is {owner}'s task."
+    reasoning = _ownership_field(row, "reasoning")
+    if reasoning:
+        text += " " + reasoning
+    source = _ownership_field(row, "source_title")
+    if source:
+        text += f" Source: {source}"
+    return text[:3_000]
+
+
+def _ownership_questions(
+    row: Mapping[str, object], kind: ExecutionCardKind,
+) -> tuple[str, ...] | None:
+    owner = _ownership_field(row, "proposed_owner")
+    if kind is not ExecutionCardKind.START or owner is None:
+        return None
+    if _ownership_field(row, "proposed_kind") == "reader":
+        return ("Is this your task? Start to take it, or Reassign to the right person.",)
+    return (
+        f"Whose task is this? Reassign to {owner} to confirm, Start to keep it "
+        "yours, or Reassign to someone else.",
+        f"To follow up with {owner} instead of doing it yourself, use Discuss "
+        f"and write: Follow up with {owner}.",
+    )
+

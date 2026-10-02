@@ -262,6 +262,9 @@ class ExecutionRunnerDeploymentConfig:
                 result.extend(("--research-before-planning", kind))
             if workflow.research_wait_seconds is not None:
                 result.extend(("--research-wait-seconds", str(workflow.research_wait_seconds)))
+            # Ownership proposals compare the research verdict with the reader.
+            for alias in workflow.reader_aliases:
+                result.extend(("--reader-alias", alias))
         for kind in workflow.execute_without_asking:
             result.extend(("--execute-without-asking", kind))
         for kind in workflow.act_without_asking:

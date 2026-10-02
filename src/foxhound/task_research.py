@@ -971,8 +971,8 @@ class ResearchStore:
         return _receipt_projection(row)
 
 
-def _receipt_projection(row: Mapping[str, object] | None) -> dict[str, object] | None:
-    """Read both receipt-authorized views and project them, or return None."""
+def _receipt_document(row: Mapping[str, object] | None) -> dict[str, object] | None:
+    """The receipt-verified published document, or None."""
     if row is None:
         return None
     try:
@@ -985,9 +985,47 @@ def _receipt_projection(row: Mapping[str, object] | None) -> dict[str, object] |
         return None
     try:
         document = json.loads(json_payload)
+    except ValueError:
+        return None
+    return document if isinstance(document, dict) else None
+
+
+def _receipt_projection(row: Mapping[str, object] | None) -> dict[str, object] | None:
+    """Read both receipt-authorized views and project them, or return None."""
+    document = _receipt_document(row)
+    if document is None:
+        return None
+    try:
         return consumer_projection(document)
     except (ValueError, KeyError, TypeError, ResearchError):
         return None
+
+
+def version_document(
+    connection: sqlite3.Connection, task_id: int, task_version: int,
+) -> tuple[str, dict[str, object]] | None:
+    """(job id, verified document) of the newest receipt for one task version.
+
+    Unlike the consumer projection this includes the stakeholders section,
+    which carries the Researcher's ownership verdict.
+    """
+    previous = connection.row_factory
+    connection.row_factory = sqlite3.Row
+    try:
+        row = connection.execute(
+            "SELECT j.job_id,r.json_digest,r.markdown_digest,j.task_work_root,"
+            "j.task_folder FROM task_research_jobs j "
+            "JOIN task_research_receipts r ON r.job_id=j.job_id "
+            "WHERE j.task_id=? AND j.task_version=? AND j.state='completed' "
+            "ORDER BY j.generation DESC LIMIT 1",
+            (task_id, task_version),
+        ).fetchone()
+    finally:
+        connection.row_factory = previous
+    document = _receipt_document(row)
+    if document is None:
+        return None
+    return str(row["job_id"]), document
 
 
 def enqueue_in_transaction(
