@@ -147,6 +147,36 @@ class OwnershipReviewTests(base.ResearchGatePlanningTests):
                 self.assertEqual(row, (expected, new_owner))
 
 
+    def test_start_card_explains_the_proposal(self):
+        from foxhound.execution_cards import ExecutionCardService
+        service = self._researched("Owner: other:Person B — assigned in the meeting")
+        self.assertIsNone(service.claim_next())
+        cards = ExecutionCardService(self.database, clock=lambda: base.NOW)
+        self.assertGreaterEqual(cards.schedule().created, 1)
+        claim = cards.claim_next(lease_seconds=60)
+        self.assertIsNotNone(claim)
+        card = claim.card
+        self.assertEqual(card.kind.value, "start")
+        self.assertIn("Person B's task", card.summary)
+        self.assertIn("assigned in the meeting", card.summary)
+        self.assertIn("Source: Project Alpha plan", card.summary)
+        self.assertTrue(any("Follow up with Person B" in q for q in card.questions))
+
+    def test_start_card_without_proposal_is_unchanged(self):
+        from foxhound.execution_cards import ExecutionCardService
+        self._task(1, "Person C", origin_kind="meeting")
+        service = self._service(research_before_planning=["meeting"],
+                                ask_when_owned_by_others=("meeting",),
+                                planning_grants=())
+        service.schedule_new(limit=10)
+        cards = ExecutionCardService(self.database, clock=lambda: base.NOW)
+        cards.schedule()
+        claim = cards.claim_next(lease_seconds=60)
+        if claim is not None:
+            self.assertEqual(claim.card.summary, "")
+            self.assertEqual(tuple(claim.card.questions), ())
+
+
 for _name in dir(base.ResearchGatePlanningTests):
     if _name.startswith("test_") and _name not in vars(OwnershipReviewTests):
         setattr(OwnershipReviewTests, _name, None)
