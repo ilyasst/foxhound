@@ -697,6 +697,165 @@ def test_agent_synthesize_repair_timeout_rechecks_and_publishes(tmp_path: Path) 
     assert len(calls) == 2
 
 
+def test_agent_synthesize_continuation_flow(tmp_path: Path) -> None:
+    calls = []
+    kb_dir = tmp_path / "sync_kb"
+    kb_dir.mkdir()
+    kb_file = kb_dir / "doc.txt"
+    kb_file.write_text("valid content")
+
+    valid_json = {
+        "ownership": {"verdict": "reader", "evidence": [str(kb_file)]},
+        "requested_deliverable": {"text": "Deliverable", "evidence": []},
+        "constraints": [],
+        "entities": [],
+        "facts": [],
+        "open_questions": [],
+    }
+
+    def fake_runner(argv, cwd, env, timeout, capture_output, text):
+        calls.append(list(argv))
+        res = MagicMock()
+        res.returncode = 0
+        res.stderr = ""
+        if len(calls) == 1:
+            res.stdout = "session_id: sess-cont-123\nInterrupted."
+        else:
+            res.stdout = "Finished."
+            (cwd / "research.json").write_text(json.dumps(valid_json))
+        return res
+
+    config = AgentResearchConfig(
+        hermes_command="hermes",
+        model="test-model",
+        knowledge_roots=(("kb", str(kb_dir)),),
+    )
+    run_dir = tmp_path / "run_continuation"
+    result = agent_synthesize({"task_snapshot": {}}, config=config, bound_sources=None, run_dir=run_dir, runner=fake_runner)
+
+    assert len(calls) == 2
+    cont_argv = calls[1]
+    assert "--resume" in cont_argv
+    assert cont_argv[cont_argv.index("--resume") + 1] == "sess-cont-123"
+    assert "--query" in cont_argv
+    query_text = cont_argv[cont_argv.index("--query") + 1]
+    assert "Your research was interrupted before research.json was written." in query_text
+    assert "--max-turns" in cont_argv and cont_argv[cont_argv.index("--max-turns") + 1] == "40"
+    assert result.metrics["continuation_turns"] == 1
+    assert result.draft["research_status"] == "sufficient"
+
+
+def test_agent_synthesize_missing_output_no_session_fails(tmp_path: Path) -> None:
+    calls = []
+
+    def fake_runner(argv, cwd, env, timeout, capture_output, text):
+        calls.append(list(argv))
+        res = MagicMock()
+        res.returncode = 0
+        res.stdout = "No session info"
+        res.stderr = ""
+        return res
+
+    config = AgentResearchConfig(hermes_command="hermes")
+    run_dir = tmp_path / "run_missing_no_sess"
+    with pytest.raises(SynthesisError) as exc_info:
+        agent_synthesize({"task_snapshot": {}}, config=config, bound_sources=None, run_dir=run_dir, runner=fake_runner)
+    assert exc_info.value.code == "draft_missing"
+    assert len(calls) == 1
+
+
+def test_agent_synthesize_missing_output_runtime_failed(tmp_path: Path) -> None:
+    calls = []
+
+    def fake_runner(argv, cwd, env, timeout, capture_output, text):
+        calls.append(list(argv))
+        res = MagicMock()
+        res.returncode = 1
+        res.stdout = "No session info"
+        res.stderr = "Fatal error"
+        return res
+
+    config = AgentResearchConfig(hermes_command="hermes")
+    run_dir = tmp_path / "run_missing_fail"
+    with pytest.raises(SynthesisError) as exc_info:
+        agent_synthesize({"task_snapshot": {}}, config=config, bound_sources=None, run_dir=run_dir, runner=fake_runner)
+    assert exc_info.value.code == "runtime_failed"
+    assert len(calls) == 1
+
+
+def test_agent_synthesize_main_pass_timeout_no_continuation(tmp_path: Path) -> None:
+    calls = []
+
+    def fake_runner(argv, cwd, env, timeout, capture_output, text):
+        calls.append(list(argv))
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout)
+
+    config = AgentResearchConfig(hermes_command="hermes")
+    run_dir = tmp_path / "run_main_timeout"
+    with pytest.raises(SynthesisError) as exc_info:
+        agent_synthesize({"task_snapshot": {}}, config=config, bound_sources=None, run_dir=run_dir, runner=fake_runner)
+    assert exc_info.value.code == "model_timeout"
+    assert len(calls) == 1
+
+
+def test_agent_synthesize_prompt_additions() -> None:
+    prompt_path = Path(__file__).resolve().parent.parent / "src" / "foxhound" / "prompts" / "research_agent.md"
+    content = prompt_path.read_text(encoding="utf-8")
+    assert "`task.json` is in your current directory." in content
+    assert "file search in files mode" in content
+    assert "Never open databases" in content and "sqlite3" in content
+    assert "declared read-only commands" in content
+    assert "a search without a path covers them" in content
+    assert "empty working directory" not in content
+
+
+def test_agent_synthesize_state_db_access_audit(tmp_path: Path) -> None:
+    kb_dir = tmp_path / "sync_kb"
+    kb_dir.mkdir()
+    kb_file = kb_dir / "doc.txt"
+    kb_file.write_text("valid content")
+
+    valid_json = {
+        "ownership": {"verdict": "reader", "evidence": [str(kb_file)]},
+        "requested_deliverable": {"text": "Deliverable", "evidence": []},
+        "constraints": [],
+        "entities": [],
+        "facts": [],
+        "open_questions": [],
+    }
+
+    # Case 1: stdout contains sqlite3
+    def fake_runner_sqlite(argv, cwd, env, timeout, capture_output, text):
+        res = MagicMock()
+        res.returncode = 0
+        res.stdout = "Running sqlite3 query on state.db"
+        res.stderr = ""
+        (cwd / "research.json").write_text(json.dumps(valid_json))
+        return res
+
+    config = AgentResearchConfig(
+        hermes_command="hermes",
+        model="test-model",
+        knowledge_roots=(("kb", str(kb_dir)),),
+    )
+    run_dir = tmp_path / "run_audit_sqlite"
+    result = agent_synthesize({"task_snapshot": {}}, config=config, bound_sources=None, run_dir=run_dir, runner=fake_runner_sqlite)
+    assert result.metrics["state_db_access"] is True
+
+    # Case 2: clean run without sqlite3
+    def fake_runner_clean(argv, cwd, env, timeout, capture_output, text):
+        res = MagicMock()
+        res.returncode = 0
+        res.stdout = "Clean run"
+        res.stderr = ""
+        (cwd / "research.json").write_text(json.dumps(valid_json))
+        return res
+
+    run_dir_clean = tmp_path / "run_audit_clean"
+    result_clean = agent_synthesize({"task_snapshot": {}}, config=config, bound_sources=None, run_dir=run_dir_clean, runner=fake_runner_clean)
+    assert result_clean.metrics["state_db_access"] is False
+
+
 def test_agent_synthesize_knowledge_roots_symlinks_and_ripgreprc(tmp_path: Path) -> None:
     kb_dir = tmp_path / "kb_dir"
     kb_dir.mkdir()

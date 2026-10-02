@@ -1052,6 +1052,65 @@ def agent_synthesize(
 
     session_id = extract_session_id_from_bytes(proc_output.encode("utf-8", errors="replace"))
 
+    continuation_turns = 0
+    research_json_path = run_dir / "research.json"
+    if not research_json_path.exists() and session_id:
+        continuation_turns += 1
+        continuation_message = (
+            "Your research was interrupted before research.json was written. "
+            "Continue from your notes and what you already found; do not restart the research. "
+            "Write research.json now, run ./research-check, fix only the listed entries, "
+            "then reply with the single word done."
+        )
+        cont_argv = [
+            config.hermes_command,
+            "--model",
+            config.model,
+        ]
+        if config.provider:
+            cont_argv.extend(["--provider", config.provider])
+        cont_argv.extend([
+            "chat",
+            "-Q",
+            "--resume",
+            session_id,
+            "--query",
+            continuation_message,
+            "--max-turns",
+            "40",
+            "--source",
+            "tool",
+            "--ignore-rules",
+            "--toolsets",
+            config.toolsets,
+        ])
+        try:
+            cont_proc = runner(
+                cont_argv,
+                cwd=run_dir,
+                env=env,
+                timeout=900,
+                capture_output=True,
+                text=True,
+            )
+            c_stdout = getattr(cont_proc, "stdout", None)
+            if isinstance(c_stdout, str):
+                proc_output += c_stdout
+            elif isinstance(c_stdout, bytes):
+                proc_output += c_stdout.decode("utf-8", errors="replace")
+
+            c_stderr = getattr(cont_proc, "stderr", None)
+            if isinstance(c_stderr, str):
+                proc_output += c_stderr
+            elif isinstance(c_stderr, bytes):
+                proc_output += c_stderr.decode("utf-8", errors="replace")
+
+            new_session_id = extract_session_id_from_bytes(proc_output.encode("utf-8", errors="replace"))
+            if new_session_id:
+                session_id = new_session_id
+        except subprocess.TimeoutExpired:
+            pass
+
     repair_turns = 0
     draft, sources, problems = check_research_output(
         run_dir, config.knowledge_roots, config.read_only_commands
@@ -1129,6 +1188,17 @@ def agent_synthesize(
     is_degraded = False
     dropped_citations = 0
     unsourced_claims = 0
+
+    # Audit for direct state-database access
+    # TODO: Implement a richer audit via Hermes session export / tool-call transcript parsing
+    # Only the run directory's own entries: the knowledge roots are linked
+    # into it, and walking those links would crawl the whole store.
+    has_db_file = any(
+        f.name.endswith((".db", ".sqlite3"))
+        for f in run_dir.iterdir()
+        if f.is_file() and not f.is_symlink()
+    )
+    state_db_access = has_db_file or ("sqlite3" in proc_output)
 
     if problems:
         research_json_path = run_dir / "research.json"
@@ -1209,10 +1279,12 @@ def agent_synthesize(
         "latency_ms": elapsed_ms,
         "prompt_tokens": None,
         "completion_tokens": None,
+        "continuation_turns": continuation_turns,
         "repair_turns": repair_turns,
         "self_check_ok": self_check_ok,
         "degraded": is_degraded,
         "dropped_citations": dropped_citations,
         "unsourced_claims": unsourced_claims,
+        "state_db_access": state_db_access,
     }
     return SynthesisResult(draft, tuple(sources), coverage, provenance, metrics)
