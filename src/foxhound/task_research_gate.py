@@ -74,7 +74,7 @@ class ResearchGatePolicy:
     """One machine's validated research-before-planning declaration."""
 
     source_kinds: frozenset[str]
-    wait_seconds: int
+    wait_seconds: int | None
     task_work_root: Path | None
     task_kb_root: Path | None
 
@@ -90,9 +90,7 @@ class ResearchGatePolicy:
         kinds = source_kind_grants(
             source_kinds, label="research-before-planning declarations"
         )
-        if wait_seconds is None:
-            wait_seconds = DEFAULT_RESEARCH_WAIT_SECONDS
-        if (
+        if wait_seconds is not None and (
             isinstance(wait_seconds, bool)
             or not isinstance(wait_seconds, int)
             or not MIN_RESEARCH_WAIT_SECONDS <= wait_seconds
@@ -262,11 +260,12 @@ def evaluate_research_gate(
         )
     latest = rows[0]["state"]
     if latest in _ACTIVE_STATES:
-        first_requested = min(_parse(row["requested_at"]) for row in rows)
-        if now - first_requested >= timedelta(seconds=policy.wait_seconds):
-            return ResearchGateResult(
-                ResearchGateDecision.BYPASSED, "timed_out"
-            )
+        if policy.wait_seconds is not None:
+            first_requested = min(_parse(row["requested_at"]) for row in rows)
+            if now - first_requested >= timedelta(seconds=policy.wait_seconds):
+                return ResearchGateResult(
+                    ResearchGateDecision.BYPASSED, "timed_out"
+                )
         return ResearchGateResult(ResearchGateDecision.PENDING, "in_flight")
     if latest == "parked":
         return ResearchGateResult(ResearchGateDecision.BYPASSED, "parked")
