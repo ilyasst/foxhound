@@ -109,6 +109,7 @@ class WorkflowConfig:
     plan_ready_cap: int
     awaiting_reader_cap: int
     ask_when_owned_by_others: tuple[str, ...] = ()
+    research_before_planning: tuple[str, ...] = ()
     steer_while_running: tuple[str, ...] = ()
     #: Kinds whose recorded plan runs without a card. Defaults to empty so a
     #: configuration written before this key existed keeps asking.
@@ -146,6 +147,8 @@ class WorkflowConfig:
             result.extend(("--plan-without-asking", kind))
         for kind in self.ask_when_owned_by_others:
             result.extend(("--ask-when-owned-by-others", kind))
+        for kind in self.research_before_planning:
+            result.extend(("--research-before-planning", kind))
         for kind in self.execute_without_asking:
             result.extend(("--execute-without-asking", kind))
         for kind in self.steer_while_running:
@@ -686,6 +689,7 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
     if version >= 15:
         optional.add("steer_while_running")
     optional.add("ask_when_owned_by_others")
+    optional.add("research_before_planning")
     optional.add("voice_summaries")
     document = _object(value, fields, optional)
     profile = document["default_agent_profile"]
@@ -701,6 +705,7 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
     )
     steer = document.get("steer_while_running", []) if version >= 15 else []
     ask_others = document.get("ask_when_owned_by_others", [])
+    research_kinds = document.get("research_before_planning", [])
     voice = document.get("voice_summaries", True)
     if not isinstance(voice, bool):
         raise DeploymentConfigError("workflow configuration is invalid")
@@ -716,6 +721,7 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
         or not _grant_list(skipped)
         or not _grant_list(steer)
         or not _grant_list(ask_others)
+        or not _grant_list(research_kinds)
         or any(isinstance(cap, bool) or not isinstance(cap, int) for cap in caps)
     ):
         raise DeploymentConfigError("workflow configuration is invalid")
@@ -726,12 +732,14 @@ def _parse_workflow(value: object, *, version: int) -> WorkflowConfig:
     assert isinstance(skipped, list)
     assert isinstance(steer, list)
     assert isinstance(ask_others, list)
+    assert isinstance(research_kinds, list)
     return WorkflowConfig(
         profile,
         routes,
         tuple(grants),
         *caps,
         ask_when_owned_by_others=tuple(ask_others),
+        research_before_planning=tuple(research_kinds),
         steer_while_running=tuple(steer),
         execute_without_asking=tuple(execute_grants),
         act_without_asking=tuple(act_grants),
@@ -1209,6 +1217,10 @@ def _validate_runtime(config: DeploymentConfig) -> None:
             "ask-when-owned-by-others declarations overlap with planning grants: "
             + ", ".join(sorted(overlap))
         )
+    source_kind_grants(
+        config.workflow.research_before_planning,
+        label="research-before-planning declarations",
+    )
     executions = execution_grants(config.workflow.execute_without_asking)
     skipped = execution_grants(
         config.workflow.skip_planning_for,
@@ -1251,6 +1263,7 @@ def _validate_runtime(config: DeploymentConfig) -> None:
         awaiting_reader_cap=config.workflow.awaiting_reader_cap,
         reader_aliases=config.workflow.reader_aliases,
         profile_routes=dict(config.workflow.agent_profile_routes),
+        research_before_planning=config.workflow.research_before_planning,
     )
     for runner in config.execution_runners:
         if runner.enabled:
