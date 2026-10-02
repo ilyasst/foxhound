@@ -1250,12 +1250,31 @@ def test_convert_research_json_features(tmp_path: Path) -> None:
     raw3["entities"] = [{"as_written": "Unresolved Thing", "status": "unresolved", "meaning": "unresolved"}]
     raw3["open_questions"] = ["Non-blocking plain string question"]
     del raw3["recommendation"]
+    raw3["guide"] = {
+        "path": "kb:note.md",
+        "reason": "Follow student grading workflow guide",
+        "evidence": [],
+    }
     draft3, sources3 = _convert_research_json(raw3, k_roots)
     assert draft3["research_status"] == "sufficient"
     # When recommendation is absent, requested_action falls back to objective
     assert draft3["requested_action"]["text"] == "Review student submissions"
     assert "recommendation" not in draft3
+    assert "guide" in draft3
+    assert draft3["guide"]["text"] == "Follow student grading workflow guide"
+    assert draft3["guide"]["status"] == "supported"
+    assert len(draft3["guide"]["source_refs"]) == 1
     validate_draft(draft3, sources3)
+
+    # If guide path is unmappable, it is dropped
+    raw_unmappable_guide = dict(raw3)
+    raw_unmappable_guide["guide"] = {
+        "path": "kb:nonexistent_guide.md",
+        "reason": "Follow nonexistent guide",
+        "evidence": [],
+    }
+    draft_unmap, sources_unmap = _convert_research_json(raw_unmappable_guide, k_roots)
+    assert "guide" not in draft_unmap
     published_doc3 = {
         "schema_version": 1,
         "task_identity": {"task_id": 123, "task_version": 1},

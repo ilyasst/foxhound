@@ -265,7 +265,7 @@ def validate_draft(document: object, sources: list[dict[str, object]]) -> dict[s
         "current_state", "expected_deliverables", "timeline", "decisions",
         "dependencies", "constraints", "stakeholders", "related_entities",
         "findings", "conflicts", "open_questions", "scheduling_recommendations",
-        "recommendation",
+        "recommendation", "guide",
     }
     if set(document) - allowed:
         raise ResearchError("draft contains publisher-owned or unknown fields")
@@ -297,6 +297,8 @@ def validate_draft(document: object, sources: list[dict[str, object]]) -> dict[s
         result["recommendation"] = [
             _claim(value, "recommendation claim", source_ids) for value in rec_values
         ]
+    if "guide" in document:
+        result["guide"] = _claim(document.get("guide"), "guide claim", source_ids)
     recommendations = document.get("scheduling_recommendations", [])
     if not isinstance(recommendations, list) or len(recommendations) > 3:
         raise ResearchError("invalid scheduling recommendations")
@@ -350,6 +352,12 @@ def render_markdown(document: Mapping[str, object]) -> str:
         assert isinstance(claim, Mapping)
         refs = ", ".join(f"[{ref}]" for ref in claim["source_refs"])
         lines.extend([f"## {title}", "", f"{claim['text']} ({claim['status']}) {refs}".rstrip(), ""])
+    if "guide" in report and report["guide"]:
+        guide_claim = report["guide"]
+        assert isinstance(guide_claim, Mapping)
+        refs = ", ".join(f"[{ref}]" for ref in guide_claim["source_refs"])
+        suffix = f" {refs}" if refs else ""
+        lines.extend(["## Guide", "", f"{guide_claim['text']} ({guide_claim['status']}){suffix}".rstrip(), ""])
     for key in (
         "current_state", "expected_deliverables", "timeline", "decisions",
         "dependencies", "constraints", "stakeholders", "related_entities",
@@ -400,6 +408,8 @@ def consumer_projection(document: Mapping[str, object]) -> dict[str, object]:
         "open_questions": report["open_questions"],
         "scheduling_recommendations": document["scheduling_recommendations"],
     }
+    if "guide" in report and report["guide"]:
+        projection["guide"] = report["guide"]
     while len(_canonical_bytes(projection)) > MAX_PROJECTION_BYTES:
         for key in ("findings", "open_questions", "constraints", "dependencies"):
             values = projection[key]
