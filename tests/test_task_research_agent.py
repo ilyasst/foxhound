@@ -29,11 +29,14 @@ def _write_fake_hermes(
     output_json: dict[str, Any] | None = None,
     exit_code: int = 0,
     sleep_seconds: float = 0.0,
+    session_id: str | None = None,
 ) -> None:
     code_lines = [
         "#!/usr/bin/env python3",
         "import sys, time, json, os",
     ]
+    if session_id:
+        code_lines.append(f"print('session_id: {session_id}')")
     if sleep_seconds > 0:
         code_lines.append(f"time.sleep({sleep_seconds})")
     if output_json is not None:
@@ -142,12 +145,18 @@ def test_agent_synthesize_argv_env_cwd(tmp_path: Path) -> None:
         recorded_args["cwd"] = cwd
         recorded_args["env"] = env
         recorded_args["timeout"] = timeout
-        # Write research.json
         (cwd / "research.json").write_text(json.dumps({
+            "ownership": {"verdict": "reader", "evidence": []},
             "requested_deliverable": {"text": "Done", "evidence": []},
+            "constraints": [],
+            "entities": [],
+            "facts": [],
+            "open_questions": [],
         }))
         res = MagicMock()
         res.returncode = 0
+        res.stdout = ""
+        res.stderr = ""
         return res
 
     config = AgentResearchConfig(
@@ -189,10 +198,14 @@ def test_agent_synthesize_argv_env_cwd(tmp_path: Path) -> None:
 def test_agent_synthesize_unresolved_entity_inconclusive(tmp_path: Path) -> None:
     fake_hermes = tmp_path / "fake_hermes.py"
     research_data = {
+        "ownership": {"verdict": "reader", "evidence": []},
         "requested_deliverable": {"text": "Goal", "evidence": []},
+        "constraints": [],
+        "facts": [],
         "entities": [
             {"as_written": "Mystery Corp", "status": "unresolved", "meaning": "unresolved"}
         ],
+        "open_questions": [],
     }
     _write_fake_hermes(fake_hermes, output_json=research_data)
 
@@ -210,7 +223,11 @@ def test_agent_synthesize_unresolved_entity_inconclusive(tmp_path: Path) -> None
 def test_agent_synthesize_open_questions_inconclusive(tmp_path: Path) -> None:
     fake_hermes = tmp_path / "fake_hermes.py"
     research_data = {
+        "ownership": {"verdict": "reader", "evidence": []},
         "requested_deliverable": {"text": "Goal", "evidence": []},
+        "constraints": [],
+        "entities": [],
+        "facts": [],
         "open_questions": ["What is the timeline?"],
     }
     _write_fake_hermes(fake_hermes, output_json=research_data)
@@ -261,19 +278,26 @@ def test_agent_synthesize_runtime_failed_nonzero_exit(tmp_path: Path) -> None:
     assert exc_info.value.code == "runtime_failed"
 
 
-def test_agent_synthesize_unmappable_evidence_downgrades_to_unknown(tmp_path: Path) -> None:
+def test_agent_synthesize_unmappable_evidence_reported_as_problem(tmp_path: Path) -> None:
     fake_hermes = tmp_path / "fake_hermes.py"
     research_data = {
+        "ownership": {"verdict": "reader", "evidence": []},
         "requested_deliverable": {
             "text": "Do work",
             "evidence": ["invalid/../path"],
         },
+        "constraints": [],
+        "entities": [],
+        "facts": [],
+        "open_questions": [],
     }
     _write_fake_hermes(fake_hermes, output_json=research_data)
 
     config = AgentResearchConfig(hermes_command=str(fake_hermes))
     run_dir = tmp_path / "run"
-    result = agent_synthesize({"task_snapshot": {}}, config=config, bound_sources=None, run_dir=run_dir)
+    with pytest.raises(SynthesisError) as exc_info:
+        agent_synthesize({"task_snapshot": {}}, config=config, bound_sources=None, run_dir=run_dir)
+    assert exc_info.value.code == "invalid_draft"
 
 
 def test_agent_locators_four_shapes_and_safeguards(tmp_path: Path) -> None:
@@ -336,12 +360,15 @@ def test_agent_locators_four_shapes_and_safeguards(tmp_path: Path) -> None:
     research_json = {
         "ownership": {"verdict": "reader", "evidence": [ev1]},
         "requested_deliverable": {"text": "Do task", "evidence": [ev2]},
+        "constraints": [],
+        "entities": [],
         "facts": [
             {"text": "Fact 1", "status": "confirmed", "evidence": [ev3]},
             {"text": "Fact 2", "status": "confirmed", "evidence": [ev4]},
             # Duplicate resource with different fragment or note
             {"text": "Fact 3", "status": "confirmed", "evidence": ["kb:Working_Groups/Alpha.md (line 99)"]},
         ],
+        "open_questions": [],
     }
     _write_fake_hermes(fake_hermes, output_json=research_json)
     config = AgentResearchConfig(hermes_command=str(fake_hermes), knowledge_roots=k_roots)
@@ -418,3 +445,127 @@ def test_agent_runner_failed_dir_and_cleanup(tmp_path: Path) -> None:
     # Check that a new failed-* directory was created in scratch_root
     created_failed = [d for d in scratch.iterdir() if d.is_dir() and d.name.startswith("failed-")]
     assert any(d.name != "failed-recent-200" for d in created_failed)
+
+
+def test_agent_synthesize_repair_flow(tmp_path: Path) -> None:
+    calls = []
+
+    kb_dir = tmp_path / "sync_kb"
+    kb_dir.mkdir()
+    kb_file = kb_dir / "doc.txt"
+    kb_file.write_text("valid content")
+
+    valid_json = {
+        "ownership": {"verdict": "reader", "evidence": [str(kb_file)]},
+        "requested_deliverable": {"text": "Deliverable", "evidence": []},
+        "constraints": [],
+        "entities": [],
+        "facts": [],
+        "open_questions": [],
+    }
+
+    def fake_runner(argv, cwd, env, timeout, capture_output, text):
+        calls.append(list(argv))
+        res = MagicMock()
+        res.returncode = 0
+        res.stderr = ""
+        if len(calls) == 1:
+            # First turn: print session id, write invalid json (unmappable locator and missing field)
+            res.stdout = "session_id: sess-12345\nStarted run."
+            invalid_json = {
+                "ownership": {"verdict": "reader", "evidence": ["unmappable/locator"]},
+                "requested_deliverable": {"text": "Deliverable", "evidence": []},
+                # Missing constraints, entities, facts, open_questions
+            }
+            (cwd / "research.json").write_text(json.dumps(invalid_json))
+        else:
+            # Repair turn: write fixed json
+            res.stdout = "Fixed."
+            (cwd / "research.json").write_text(json.dumps(valid_json))
+        return res
+
+    config = AgentResearchConfig(
+        hermes_command="hermes",
+        model="test-model",
+        knowledge_roots=(("kb", str(kb_dir)),),
+    )
+    run_dir = tmp_path / "run_repair"
+    result = agent_synthesize({"task_snapshot": {}}, config=config, bound_sources=None, run_dir=run_dir, runner=fake_runner)
+
+    assert len(calls) == 2
+    first_argv = calls[0]
+    repair_argv = calls[1]
+
+    assert "-Q" in first_argv
+    assert "--resume" in repair_argv
+    resume_idx = repair_argv.index("--resume")
+    assert repair_argv[resume_idx + 1] == "sess-12345"
+    assert "--query" in repair_argv
+    query_text = repair_argv[repair_argv.index("--query") + 1]
+    assert "Unmappable evidence locator" in query_text
+    assert "Missing required top-level field" in query_text
+    assert "kb:Meetings/x.md#L29" in query_text
+    assert "--toolsets" in repair_argv and repair_argv[repair_argv.index("--toolsets") + 1] == "file"
+    assert "--max-turns" in repair_argv and repair_argv[repair_argv.index("--max-turns") + 1] == "8"
+
+    assert result.metrics["repair_turns"] == 1
+    assert result.draft["research_status"] == "sufficient"
+
+
+def test_agent_synthesize_no_repair_without_session_id(tmp_path: Path) -> None:
+    calls = []
+
+    def fake_runner(argv, cwd, env, timeout, capture_output, text):
+        calls.append(list(argv))
+        res = MagicMock()
+        res.returncode = 0
+        res.stdout = "No session info printed"
+        res.stderr = ""
+        # Write invalid json
+        (cwd / "research.json").write_text(json.dumps({"invalid": True}))
+        return res
+
+    config = AgentResearchConfig(hermes_command="hermes")
+    run_dir = tmp_path / "run_no_sess"
+    with pytest.raises(SynthesisError) as exc_info:
+        agent_synthesize({"task_snapshot": {}}, config=config, bound_sources=None, run_dir=run_dir, runner=fake_runner)
+    assert exc_info.value.code == "invalid_draft"
+    assert len(calls) == 1  # No repair attempted
+
+
+def test_agent_synthesize_no_repair_on_timeout(tmp_path: Path) -> None:
+    calls = []
+
+    def fake_runner(argv, cwd, env, timeout, capture_output, text):
+        calls.append(list(argv))
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout)
+
+    config = AgentResearchConfig(hermes_command="hermes")
+    run_dir = tmp_path / "run_timeout"
+    with pytest.raises(SynthesisError) as exc_info:
+        agent_synthesize({"task_snapshot": {}}, config=config, bound_sources=None, run_dir=run_dir, runner=fake_runner)
+    assert exc_info.value.code == "model_timeout"
+    assert len(calls) == 1  # No repair attempted
+
+
+def test_agent_synthesize_two_failed_repairs_raises_original_error(tmp_path: Path) -> None:
+    calls = []
+
+    def fake_runner(argv, cwd, env, timeout, capture_output, text):
+        calls.append(list(argv))
+        res = MagicMock()
+        res.returncode = 0
+        res.stdout = "session_id: sess-999"
+        res.stderr = ""
+        # Keep writing invalid json with missing fields
+        (cwd / "research.json").write_text(json.dumps({
+            "requested_deliverable": {"text": "Goal", "evidence": []},
+        }))
+        return res
+
+    config = AgentResearchConfig(hermes_command="hermes")
+    run_dir = tmp_path / "run_two_failed"
+    with pytest.raises(SynthesisError) as exc_info:
+        agent_synthesize({"task_snapshot": {}}, config=config, bound_sources=None, run_dir=run_dir, runner=fake_runner)
+    assert exc_info.value.code == "invalid_draft"
+    assert len(calls) == 3  # 1 initial + 2 repair turns

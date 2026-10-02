@@ -14,6 +14,8 @@ from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlsplit
 
 from . import task_research_synthesis
+from .hermes_session import extract_session_id_from_bytes
+from .task_research import validate_sources
 from .task_research_synthesis import (
     DRAFT_SCHEMA,
     SynthesisError,
@@ -486,6 +488,129 @@ def _convert_research_json(
     return draft, sources_list
 
 
+def check_research_output(
+    run_dir: Path | str,
+    knowledge_roots: Sequence[tuple[str, str]],
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]] | None, list[str]]:
+    """Check research.json in run_dir.
+
+    Returns (draft, sources, problems).
+    If problems is non-empty, draft and sources may be None or partially constructed.
+    """
+    run_dir_path = Path(run_dir)
+    research_json_path = run_dir_path / "research.json"
+    if not research_json_path.exists():
+        return None, None, ["research.json does not exist in run directory"]
+
+    try:
+        raw_json_content = research_json_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return None, None, [f"Failed to read research.json: {exc}"]
+
+    try:
+        raw_research = json.loads(raw_json_content)
+    except Exception as exc:
+        return None, None, [f"research.json is not valid JSON: {exc}"]
+
+    if not isinstance(raw_research, Mapping):
+        return None, None, ["research.json root must be a JSON object"]
+
+    problems: list[str] = []
+
+    # Check top-level fields
+    # Expected fields:
+    # "ownership": Mapping
+    # "requested_deliverable": Mapping | str
+    # "constraints": Sequence
+    # "entities": Sequence
+    # "facts": Sequence
+    # "open_questions": Sequence
+    # "recommendation": Mapping | str (optional or Mapping)
+    for f_name in ("ownership", "requested_deliverable", "constraints", "entities", "facts", "open_questions"):
+        if f_name not in raw_research:
+            problems.append(f"Missing required top-level field '{f_name}'")
+
+    if "ownership" in raw_research and not isinstance(raw_research["ownership"], Mapping):
+        problems.append("Top-level field 'ownership' must be an object")
+
+    if "requested_deliverable" in raw_research and not isinstance(raw_research["requested_deliverable"], (Mapping, str)):
+        problems.append("Top-level field 'requested_deliverable' must be an object or string")
+
+    for f_name in ("constraints", "entities", "facts", "open_questions"):
+        if f_name in raw_research and (not isinstance(raw_research[f_name], Sequence) or isinstance(raw_research[f_name], (str, bytes))):
+            problems.append(f"Top-level field '{f_name}' must be an array")
+
+    # Check unmappable locators across all evidence fields
+    def check_evidence(ev_list: Any, field_path: str) -> None:
+        if ev_list is None:
+            return
+        if not isinstance(ev_list, Sequence) or isinstance(ev_list, (str, bytes)):
+            problems.append(f"Field '{field_path}' must be an array of evidence strings")
+            return
+        for idx, item in enumerate(ev_list):
+            item_path = f"{field_path}[{idx}]"
+            if not isinstance(item, str):
+                problems.append(f"Evidence at '{item_path}' must be a string, got {type(item).__name__}")
+                continue
+            mapped = _map_locator(item, knowledge_roots)
+            if mapped is None:
+                problems.append(
+                    f"Unmappable evidence locator at '{item_path}': {item!r}. "
+                    "Accepted format is '<root-name>:<path relative to root>' (e.g. kb:Meetings/x.md#L29) "
+                    "or a bare http:// or https:// URL."
+                )
+
+    if isinstance(raw_research.get("ownership"), Mapping):
+        check_evidence(raw_research["ownership"].get("evidence"), "ownership.evidence")
+
+    if isinstance(raw_research.get("requested_deliverable"), Mapping):
+        rd_val = raw_research["requested_deliverable"]
+        if isinstance(rd_val, Mapping):
+            check_evidence(rd_val.get("evidence"), "requested_deliverable.evidence")
+
+    if isinstance(raw_research.get("constraints"), Sequence) and not isinstance(raw_research.get("constraints"), (str, bytes)):
+        for i, c in enumerate(raw_research["constraints"]):
+            if isinstance(c, Mapping):
+                check_evidence(c.get("evidence"), f"constraints[{i}].evidence")
+
+    if isinstance(raw_research.get("entities"), Sequence) and not isinstance(raw_research.get("entities"), (str, bytes)):
+        for i, e in enumerate(raw_research["entities"]):
+            if isinstance(e, Mapping):
+                check_evidence(e.get("evidence"), f"entities[{i}].evidence")
+
+    if isinstance(raw_research.get("facts"), Sequence) and not isinstance(raw_research.get("facts"), (str, bytes)):
+        for i, f in enumerate(raw_research["facts"]):
+            if isinstance(f, Mapping):
+                check_evidence(f.get("evidence"), f"facts[{i}].evidence")
+
+    if isinstance(raw_research.get("recommendation"), Mapping):
+        check_evidence(raw_research["recommendation"].get("evidence"), "recommendation.evidence")
+
+    draft = None
+    sources = None
+
+    # Conversion and validation errors
+    try:
+        draft, sources = _convert_research_json(raw_research, knowledge_roots)
+    except Exception as exc:
+        problems.append(f"Conversion error: {exc}")
+
+    if draft is not None and sources is not None:
+        try:
+            validate_draft(draft, sources)
+        except Exception as exc:
+            problems.append(f"Draft validation error: {exc}")
+        try:
+            validate_sources(sources)
+        except Exception as exc:
+            problems.append(f"Sources validation error: {exc}")
+
+    if problems:
+        return draft, sources, problems
+
+    return draft, sources, []
+
+
 def agent_synthesize(
     ctx: dict[str, Any],
     *,
@@ -525,6 +650,7 @@ def agent_synthesize(
         argv.extend(["--provider", config.provider])
     argv.extend([
         "chat",
+        "-Q",
         "--query",
         prompt_text,
         "--max-turns",
@@ -552,30 +678,116 @@ def agent_synthesize(
     except subprocess.TimeoutExpired as exc:
         raise SynthesisError("model_timeout") from exc
 
-    research_json_path = run_dir / "research.json"
-    if not research_json_path.exists():
-        if proc.returncode != 0:
-            raise SynthesisError("runtime_failed")
-        raise SynthesisError("draft_missing")
+    # Capture session ID if Hermes printed it
+    proc_output = ""
+    stdout_val = getattr(proc, "stdout", None)
+    if isinstance(stdout_val, str):
+        proc_output += stdout_val
+    elif isinstance(stdout_val, bytes):
+        proc_output += stdout_val.decode("utf-8", errors="replace")
 
-    # c) read run_dir/research.json
-    try:
-        raw_json_content = research_json_path.read_text(encoding="utf-8")
-        raw_research = json.loads(raw_json_content)
-        if not isinstance(raw_research, Mapping):
-            raise ValueError("Root must be object")
-    except Exception as exc:
-        raise SynthesisError("draft_missing") from exc
+    stderr_val = getattr(proc, "stderr", None)
+    if isinstance(stderr_val, str):
+        proc_output += stderr_val
+    elif isinstance(stderr_val, bytes):
+        proc_output += stderr_val.decode("utf-8", errors="replace")
 
-    draft, sources = _convert_research_json(raw_research, config.knowledge_roots)
+    session_id = extract_session_id_from_bytes(proc_output.encode("utf-8", errors="replace"))
 
-    # e) validate_draft
-    try:
-        validate_draft(draft, sources)
-    except SynthesisError:
-        raise
-    except Exception as exc:
-        raise SynthesisError("invalid_draft") from exc
+    repair_turns = 0
+    draft, sources, problems = check_research_output(run_dir, config.knowledge_roots)
+
+    while problems and session_id and repair_turns < 2:
+        repair_turns += 1
+        bullet_problems = "\n".join(f"- {p}" for p in problems)
+        repair_message = (
+            "Your research.json was rejected with the following problems:\n"
+            f"{bullet_problems}\n\n"
+            "Please rewrite research.json (and research.md if affected) fixing only these problems. "
+            "Do not research again. Keep all findings."
+        )
+        repair_argv = [
+            config.hermes_command,
+            "--model",
+            config.model,
+        ]
+        if config.provider:
+            repair_argv.extend(["--provider", config.provider])
+        repair_argv.extend([
+            "chat",
+            "-Q",
+            "--resume",
+            session_id,
+            "--query",
+            repair_message,
+            "--max-turns",
+            "8",
+            "--source",
+            "tool",
+            "--ignore-rules",
+            "--toolsets",
+            "file",
+        ])
+        try:
+            repair_proc = runner(
+                repair_argv,
+                cwd=run_dir,
+                env=env,
+                timeout=300,
+                capture_output=True,
+                text=True,
+            )
+            # Update session_id if new one printed
+            repair_out = ""
+            r_stdout = getattr(repair_proc, "stdout", None)
+            if isinstance(r_stdout, str):
+                repair_out += r_stdout
+            elif isinstance(r_stdout, bytes):
+                repair_out += r_stdout.decode("utf-8", errors="replace")
+
+            r_stderr = getattr(repair_proc, "stderr", None)
+            if isinstance(r_stderr, str):
+                repair_out += r_stderr
+            elif isinstance(r_stderr, bytes):
+                repair_out += r_stderr.decode("utf-8", errors="replace")
+
+            new_session_id = extract_session_id_from_bytes(repair_out.encode("utf-8", errors="replace"))
+            if new_session_id:
+                session_id = new_session_id
+        except subprocess.TimeoutExpired:
+            # Repair timeout stops further repair turns
+            break
+
+        draft, sources, problems = check_research_output(run_dir, config.knowledge_roots)
+
+    if problems:
+        research_json_path = run_dir / "research.json"
+        if not research_json_path.exists():
+            if proc.returncode != 0:
+                raise SynthesisError("runtime_failed")
+            raise SynthesisError("draft_missing")
+
+        try:
+            raw_json_content = research_json_path.read_text(encoding="utf-8")
+            raw_research = json.loads(raw_json_content)
+            if not isinstance(raw_research, Mapping):
+                raise ValueError("Root must be object")
+        except Exception as exc:
+            raise SynthesisError("draft_missing") from exc
+
+        try:
+            d, s = _convert_research_json(raw_research, config.knowledge_roots)
+            validate_draft(d, s)
+        except SynthesisError:
+            raise
+        except Exception as exc:
+            raise SynthesisError("invalid_draft") from exc
+
+        # If it reached here but still had problems (e.g. unmappable locators or missing fields)
+        raise SynthesisError("invalid_draft")
+
+    assert draft is not None
+    assert sources is not None
 
     elapsed_ms = max(0, round((time.monotonic() - started) * 1000))
     retrieval_revision = hashlib.sha256(_json_bytes({
@@ -611,5 +823,6 @@ def agent_synthesize(
         "latency_ms": elapsed_ms,
         "prompt_tokens": None,
         "completion_tokens": None,
+        "repair_turns": repair_turns,
     }
     return SynthesisResult(draft, tuple(sources), coverage, provenance, metrics)
