@@ -33,6 +33,7 @@ PUBLISHED_SCHEMA = "foxhound.task-research.v1"
 MAX_JSON_BYTES = 512 * 1024
 MAX_MARKDOWN_BYTES = 64 * 1024
 MAX_PROJECTION_BYTES = 16 * 1024
+MAX_CLAIM_LEASE_SECONDS = 14_400
 RESERVED_FILENAMES = frozenset({".task-research.json", "Research.md"})
 SOURCE_NAMESPACES = frozenset({"kb", "meeting", "email", "attachment", "repo", "web"})
 RECOMMENDATION_TYPES = frozenset({
@@ -518,7 +519,10 @@ class ResearchStore:
         task_work_root: Path | None = None,
     ) -> ResearchClaim | None:
         worker_id = _identifier(worker_id, "worker id")
-        if not isinstance(lease_seconds, int) or isinstance(lease_seconds, bool) or not 1 <= lease_seconds <= 1800:
+        # An agent Researcher may work for an hour and nothing renews the
+        # lease meanwhile, so the claim must be able to outlast its budget.
+        if (not isinstance(lease_seconds, int) or isinstance(lease_seconds, bool)
+                or not 1 <= lease_seconds <= MAX_CLAIM_LEASE_SECONDS):
             raise ResearchError("invalid claim lease")
         bounded_root = (
             None

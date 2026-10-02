@@ -252,6 +252,24 @@ class ExecutionRunnerDeploymentConfig:
 
 
 @dataclass(frozen=True)
+class ResearchRunnerConsumerConfig:
+    cas_root: Path
+    task_work_root: Path
+    scratch_root: Path
+    model: str
+    endpoint: str
+    synthesizer: str
+    hermes_command: Path | None = None
+    agent_toolsets: str | None = None
+    agent_max_turns: int | None = None
+    agent_timeout: int | None = None
+    knowledge_roots: tuple[tuple[str, Path], ...] = ()
+    profile_id: str | None = None
+    worker_id: str | None = None
+    lease_seconds: int | None = None
+
+
+@dataclass(frozen=True)
 class DatabaseConsumersConfig:
     """One-shot database consumers that must share the selected database."""
 
@@ -264,6 +282,7 @@ class DatabaseConsumersConfig:
     duplicate_card_schedule: int | None
     duplicate_stage1: tuple[int, int, int] | None = None
     duplicate_stage2: tuple[str, str, str, int, int, int] | None = None
+    research_runner: ResearchRunnerConsumerConfig | None = None
     #: How many failed attempts one digest pass explains.  Absent means the
     #: consumer is disabled, as it does for every other entry here.
     failure_digest: int | None = None
@@ -395,6 +414,8 @@ class DeploymentConfig:
             return self._failure_digest_argv()
         if component == "duplicate-stage2":
             return self._duplicate_stage2_argv()
+        if component == "research-runner":
+            return self._research_runner_argv()
         if self.database_consumers is not None:
             return self.database_consumers.argv(component, self.database)
         raise DeploymentConfigError("deployment component is unknown")
@@ -424,6 +445,51 @@ class DeploymentConfig:
             "--daily-budget", str(daily_budget),
             "--timeout", str(timeout),
         ]
+
+    def _research_runner_argv(self) -> list[str]:
+        if (
+            self.database_consumers is None
+            or self.database_consumers.research_runner is None
+        ):
+            raise DeploymentConfigError("database consumer is disabled")
+        cfg = self.database_consumers.research_runner
+        cmd = [
+            "foxhound-task-research-runner",
+            "--database", str(self.database),
+            "--cas-root", str(cfg.cas_root),
+            "--task-work-root", str(cfg.task_work_root),
+            "--scratch-root", str(cfg.scratch_root),
+            "--model", cfg.model,
+            "--endpoint", cfg.endpoint,
+            "--synthesizer", cfg.synthesizer,
+        ]
+        if cfg.hermes_command is not None:
+            cmd.extend(("--hermes-command", str(cfg.hermes_command)))
+        if cfg.agent_toolsets is not None:
+            cmd.extend(("--agent-toolsets", cfg.agent_toolsets))
+        if cfg.agent_max_turns is not None:
+            cmd.extend(("--agent-max-turns", str(cfg.agent_max_turns)))
+        if cfg.agent_timeout is not None:
+            cmd.extend(("--agent-timeout", str(cfg.agent_timeout)))
+        for name, path in cfg.knowledge_roots:
+            cmd.extend(("--knowledge-root", f"{name}={path}"))
+        if cfg.profile_id is not None:
+            cmd.extend(("--profile-id", cfg.profile_id))
+        if cfg.worker_id is not None:
+            cmd.extend(("--worker-id", cfg.worker_id))
+        if cfg.lease_seconds is not None:
+            cmd.extend(("--lease-seconds", str(cfg.lease_seconds)))
+        if (
+            self.card_service.gw_endpoint is not None
+            and self.card_service.gw_alias is not None
+            and self.card_service.gw_token_file is not None
+        ):
+            cmd.extend((
+                "--gw-endpoint", self.card_service.gw_endpoint,
+                "--gw-alias", self.card_service.gw_alias,
+                "--gw-token-file", str(self.card_service.gw_token_file),
+            ))
+        return cmd
 
     def _failure_digest_argv(self) -> list[str]:
         """Explain failed runs from the transcripts this deployment wrote.
@@ -911,7 +977,7 @@ def _parse_database_consumers(
     # have to be edited before any of them could run it.
     optional_fields = (
         {"task_card_requeue", "failure_digest", "execution_card_schedule",
-         "duplicate_stage1", "duplicate_stage2"}
+         "duplicate_stage1", "duplicate_stage2", "research_runner"}
         if version >= 5 else set()
     )
     document = _object(value, fields, optional_fields)
@@ -947,6 +1013,10 @@ def _parse_database_consumers(
         _parse_duplicate_stage2(document["duplicate_stage2"])
         if "duplicate_stage2" in document else None
     )
+    research_runner = (
+        _parse_research_runner(document["research_runner"])
+        if "research_runner" in document else None
+    )
     return DatabaseConsumersConfig(
         candidate_feed_import=candidate,
         native_intake_run=intake,
@@ -958,19 +1028,20 @@ def _parse_database_consumers(
         duplicate_card_schedule=duplicates,
         duplicate_stage1=duplicate_stage1,
         duplicate_stage2=duplicate_stage2,
+        research_runner=research_runner,
         failure_digest=digests,
     )
 
 
 def _enabled_document(
-    value: object, fields: set[str]
+    value: object, fields: set[str], optional: set[str] | None = None
 ) -> Mapping[str, object] | None:
     if not isinstance(value, Mapping) or not isinstance(value.get("enabled"), bool):
         raise DeploymentConfigError("database consumer configuration is invalid")
     if not value["enabled"]:
         _object(value, {"enabled"})
         return None
-    return _object(value, {"enabled", *fields})
+    return _object(value, {"enabled", *fields}, optional)
 
 
 def _parse_candidate_feed_import(value: object) -> tuple[Path, str] | None:
@@ -1102,6 +1173,127 @@ def _parse_duplicate_stage2(
         _positive_int(document["limit"]),
         _positive_int(document["daily_budget"]),
         timeout,
+    )
+
+
+def _parse_research_runner(
+    value: object,
+) -> ResearchRunnerConsumerConfig | None:
+    required = {
+        "cas_root", "task_work_root", "scratch_root", "model",
+        "endpoint", "synthesizer",
+    }
+    optional = {
+        "hermes_command", "agent_toolsets", "agent_max_turns",
+        "agent_timeout", "knowledge_roots", "profile_id", "worker_id",
+        "lease_seconds",
+    }
+    document = _enabled_document(value, required, optional)
+    if document is None:
+        return None
+
+    cas_root = _absolute_path(document["cas_root"])
+    task_work_root = _absolute_path(document["task_work_root"])
+    scratch_root = _absolute_path(document["scratch_root"])
+    model = _nonempty_string(document["model"])
+
+    raw_endpoint = document["endpoint"]
+    if not isinstance(raw_endpoint, str) or not raw_endpoint.strip():
+        raise DeploymentConfigError("database consumer configuration is invalid")
+    try:
+        parsed_url = urlsplit(raw_endpoint)
+        if (
+            parsed_url.scheme not in {"http", "https"}
+            or not parsed_url.netloc
+        ):
+            raise DeploymentConfigError("database consumer configuration is invalid")
+    except ValueError:
+        raise DeploymentConfigError("database consumer configuration is invalid")
+    endpoint = raw_endpoint
+
+    synthesizer = document["synthesizer"]
+    if synthesizer not in {"single", "agent"}:
+        raise DeploymentConfigError("database consumer configuration is invalid")
+
+    hermes_command: Path | None = None
+    if "hermes_command" in document:
+        hermes_command = _absolute_path(document["hermes_command"])
+    elif synthesizer == "agent":
+        raise DeploymentConfigError("database consumer configuration is invalid")
+
+    agent_toolsets: str | None = None
+    if "agent_toolsets" in document:
+        agent_toolsets = _nonempty_string(document["agent_toolsets"])
+
+    agent_max_turns: int | None = None
+    if "agent_max_turns" in document:
+        raw_turns = document["agent_max_turns"]
+        if (
+            isinstance(raw_turns, bool)
+            or not isinstance(raw_turns, int)
+            or not 1 <= raw_turns <= 500
+        ):
+            raise DeploymentConfigError("database consumer configuration is invalid")
+        agent_max_turns = raw_turns
+
+    agent_timeout: int | None = None
+    if "agent_timeout" in document:
+        raw_timeout = document["agent_timeout"]
+        if (
+            isinstance(raw_timeout, bool)
+            or not isinstance(raw_timeout, int)
+            or not 60 <= raw_timeout <= 14400
+        ):
+            raise DeploymentConfigError("database consumer configuration is invalid")
+        agent_timeout = raw_timeout
+
+    knowledge_roots: list[tuple[str, Path]] = []
+    if "knowledge_roots" in document:
+        raw_kroots = document["knowledge_roots"]
+        if not isinstance(raw_kroots, list):
+            raise DeploymentConfigError("database consumer configuration is invalid")
+        for entry in raw_kroots:
+            if not isinstance(entry, Mapping):
+                raise DeploymentConfigError("database consumer configuration is invalid")
+            _object(entry, {"name", "path"})
+            name = _nonempty_string(entry["name"])
+            path = _absolute_path(entry["path"])
+            knowledge_roots.append((name, path))
+
+    profile_id: str | None = None
+    if "profile_id" in document:
+        profile_id = _nonempty_string(document["profile_id"])
+
+    worker_id: str | None = None
+    if "worker_id" in document:
+        worker_id = _nonempty_string(document["worker_id"])
+
+    lease_seconds: int | None = None
+    if "lease_seconds" in document:
+        raw_lease = document["lease_seconds"]
+        if (
+            isinstance(raw_lease, bool)
+            or not isinstance(raw_lease, int)
+            or not 60 <= raw_lease <= 14400
+        ):
+            raise DeploymentConfigError("database consumer configuration is invalid")
+        lease_seconds = raw_lease
+
+    return ResearchRunnerConsumerConfig(
+        cas_root=cas_root,
+        task_work_root=task_work_root,
+        scratch_root=scratch_root,
+        model=model,
+        endpoint=endpoint,
+        synthesizer=str(synthesizer),
+        hermes_command=hermes_command,
+        agent_toolsets=agent_toolsets,
+        agent_max_turns=agent_max_turns,
+        agent_timeout=agent_timeout,
+        knowledge_roots=tuple(knowledge_roots),
+        profile_id=profile_id,
+        worker_id=worker_id,
+        lease_seconds=lease_seconds,
     )
 
 
