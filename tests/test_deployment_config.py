@@ -905,6 +905,7 @@ class DeploymentConfigTests(unittest.TestCase):
 
     def test_research_runner_read_only_commands_valid_and_rendered(self) -> None:
         document = self._document()
+        document["workflow"]["reader_aliases"] = ["Alice", "Bob"]
         document["database_consumers"]["research_runner"] = {  # type: ignore[index]
             "enabled": True,
             "cas_root": str(self.root / "cas"),
@@ -943,6 +944,12 @@ class DeploymentConfigTests(unittest.TestCase):
                 '{"command":"/srv/example/bin/mail-readonly","description":"Read-only mail inspection","name":"mail-reader"}',
             ],
         )
+        aliases = [
+            command[i + 1]
+            for i, arg in enumerate(command)
+            if arg == "--reader-alias"
+        ]
+        self.assertEqual(aliases, ["Alice", "Bob"])
 
     def test_research_runner_read_only_commands_validation_errors(self) -> None:
         invalid_cases = [

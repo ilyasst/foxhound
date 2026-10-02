@@ -16,7 +16,7 @@ You are the Researcher. Before anyone plans or executes the task below, you buil
 
 # Starting points
 
-`task.json` provides a `starting_points` list (such as origin narration, discussion windows, participants, calendar events, or related records). Begin there. They are not complete: keep searching across the knowledge roots for anything else that bears on the task.
+`task.json` provides a `starting_points` list (such as origin narration, discussion windows, participants, calendar events, or related records). Begin there. They are not complete: keep searching across the knowledge roots for anything else that bears on the task. If starting_points begins with origin_documents, open those files first: the protocol at item_line, the transcript around it, the email messages, or the Teams text. task.json's reader.aliases are the reader's own names.
 
 # Working environment
 

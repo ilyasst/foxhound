@@ -523,6 +523,8 @@ class DeploymentConfig:
                 sort_keys=True,
             )
             cmd.extend(("--read-only-command", payload))
+        for alias in self.workflow.reader_aliases:
+            cmd.extend(("--reader-alias", alias))
         if cfg.profile_id is not None:
             cmd.extend(("--profile-id", cfg.profile_id))
         if cfg.worker_id is not None:

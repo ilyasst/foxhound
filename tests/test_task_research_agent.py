@@ -193,6 +193,168 @@ def test_agent_synthesize_task_json_contains_read_only_commands(tmp_path: Path) 
     ]
 
 
+def test_agent_synthesize_origin_documents_resolved(tmp_path: Path) -> None:
+    calls = []
+
+    def mock_runner(argv, cwd, timeout=None, capture_output=False, text=False, **kwargs):
+        calls.append((argv, cwd))
+        if argv[0] == "/srv/example/bin/origin":
+            res = MagicMock()
+            res.returncode = 0
+            res.stdout = json.dumps({
+                "schema": "gw.source-documents",
+                "status": "resolved",
+                "kind": "email",
+                "paths": ["kb/mail.eml"],
+            })
+            res.stderr = ""
+            return res
+        # Fake Hermes run
+        (cwd / "research.json").write_text(json.dumps({
+            "ownership": {"verdict": "reader", "evidence": []},
+            "requested_deliverable": {"text": "Done", "evidence": []},
+            "constraints": [],
+            "entities": [],
+            "facts": [],
+            "open_questions": [],
+            "recommendation": {"text": "Proceed", "evidence": []},
+        }))
+        res = MagicMock()
+        res.returncode = 0
+        res.stdout = ""
+        res.stderr = ""
+        return res
+
+    config = AgentResearchConfig(
+        hermes_command="hermes",
+        read_only_commands=({
+            "name": "origin",
+            "command": "/srv/example/bin/origin",
+            "description": "fetch origin",
+        },),
+    )
+    ctx = {
+        "task_snapshot": {"task_id": 789},
+        "origin": {"kind": "email", "record_id": "rec-123", "item_id": "item-456"},
+    }
+    run_dir = tmp_path / "run_origin_resolved"
+    agent_synthesize(ctx, config=config, bound_sources=None, run_dir=run_dir, runner=mock_runner)
+
+    assert calls[0][0] == ["/srv/example/bin/origin", "rec-123", "--item", "item-456"]
+    assert calls[0][1] == run_dir
+    task_json = json.loads((run_dir / "task.json").read_text())
+    assert task_json["starting_points"][0]["origin_documents"]["status"] == "resolved"
+
+
+def test_agent_synthesize_origin_documents_failed_or_unresolved(tmp_path: Path) -> None:
+    calls = []
+
+    def mock_runner(argv, cwd, timeout=None, capture_output=False, text=False, **kwargs):
+        calls.append(argv)
+        if argv[0] == "/srv/example/bin/origin":
+            res = MagicMock()
+            res.returncode = 1
+            res.stdout = ""
+            res.stderr = "network error"
+            return res
+        (cwd / "research.json").write_text(json.dumps({
+            "ownership": {"verdict": "reader", "evidence": []},
+            "requested_deliverable": {"text": "Done", "evidence": []},
+            "constraints": [],
+            "entities": [],
+            "facts": [],
+            "open_questions": [],
+            "recommendation": {"text": "Proceed", "evidence": []},
+        }))
+        res = MagicMock()
+        res.returncode = 0
+        res.stdout = ""
+        res.stderr = ""
+        return res
+
+    config = AgentResearchConfig(
+        hermes_command="hermes",
+        read_only_commands=({
+            "name": "origin",
+            "command": "/srv/example/bin/origin",
+            "description": "fetch origin",
+        },),
+    )
+    ctx = {
+        "task_snapshot": {"task_id": 789},
+        "origin": {"kind": "email", "record_id": "rec-123"},
+    }
+    run_dir = tmp_path / "run_origin_fail"
+    agent_synthesize(ctx, config=config, bound_sources=None, run_dir=run_dir, runner=mock_runner)
+
+    assert calls[0] == ["/srv/example/bin/origin", "rec-123"]
+    task_json = json.loads((run_dir / "task.json").read_text())
+    assert task_json["starting_points"][-1]["origin_documents"] is None
+    assert "network error" in task_json["starting_points"][-1]["origin_error"]
+
+
+def test_agent_synthesize_no_origin_command(tmp_path: Path) -> None:
+    calls = []
+
+    def mock_runner(argv, cwd, timeout=None, capture_output=False, text=False, **kwargs):
+        calls.append(argv)
+        (cwd / "research.json").write_text(json.dumps({
+            "ownership": {"verdict": "reader", "evidence": []},
+            "requested_deliverable": {"text": "Done", "evidence": []},
+            "constraints": [],
+            "entities": [],
+            "facts": [],
+            "open_questions": [],
+            "recommendation": {"text": "Proceed", "evidence": []},
+        }))
+        res = MagicMock()
+        res.returncode = 0
+        res.stdout = ""
+        res.stderr = ""
+        return res
+
+    config = AgentResearchConfig(hermes_command="hermes")
+    ctx = {
+        "task_snapshot": {"task_id": 789},
+        "origin": {"kind": "email", "record_id": "rec-123"},
+    }
+    run_dir = tmp_path / "run_no_origin"
+    agent_synthesize(ctx, config=config, bound_sources=None, run_dir=run_dir, runner=mock_runner)
+
+    assert len(calls) == 1  # Only hermes
+    task_json = json.loads((run_dir / "task.json").read_text())
+    assert not any("origin_documents" in sp for sp in task_json["starting_points"])
+
+
+def test_agent_synthesize_reader_aliases(tmp_path: Path) -> None:
+    def mock_runner(argv, cwd, timeout=None, capture_output=False, text=False, **kwargs):
+        (cwd / "research.json").write_text(json.dumps({
+            "ownership": {"verdict": "reader", "evidence": []},
+            "requested_deliverable": {"text": "Done", "evidence": []},
+            "constraints": [],
+            "entities": [],
+            "facts": [],
+            "open_questions": [],
+            "recommendation": {"text": "Proceed", "evidence": []},
+        }))
+        res = MagicMock()
+        res.returncode = 0
+        res.stdout = ""
+        res.stderr = ""
+        return res
+
+    config = AgentResearchConfig(
+        hermes_command="hermes",
+        reader_aliases=("Alice", "Bob"),
+    )
+    ctx = {"task_snapshot": {"task_id": 100}}
+    run_dir = tmp_path / "run_aliases"
+    agent_synthesize(ctx, config=config, bound_sources=None, run_dir=run_dir, runner=mock_runner)
+
+    task_json = json.loads((run_dir / "task.json").read_text())
+    assert task_json["reader"] == {"aliases": ["Alice", "Bob"]}
+
+
 def test_agent_synthesize_argv_env_cwd(tmp_path: Path) -> None:
     recorded_args = {}
 
