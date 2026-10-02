@@ -46,25 +46,27 @@ If `task.json` lists `read_only_commands`, they are read-only views of the reade
 
 # Outputs
 
-Write exactly two files in the current working directory:
+Write `research.json` only in the current working directory (plus your own working notes if useful).
 
-1. `research.json`:
-   ```json
-   {
-     "ownership": {"verdict": "reader|other:<name>|undetermined", "reasoning": "...", "evidence": ["..."]},
-     "requested_deliverable": {"text": "...", "evidence": ["..."]},
-     "constraints": [{"text": "...", "binding": true, "evidence": ["..."]}],
-     "entities": [{"as_written": "...", "status": "verified|resolved|unresolved", "meaning": "...", "evidence": ["..."]}],
-     "facts": [{"text": "...", "status": "confirmed|single-source|inferred|conflicting", "evidence": ["..."]}],
-     "open_questions": [{"text": "...", "blocking": true}],
-     "recommendation": {"text": "...", "evidence": ["..."]}
-   }
-   ```
-   Every item in `evidence` is a source locator in one of the following formats:
-   - `<root-name>:<path relative to that root>` optionally followed by `#L<n>` or `#L<n>-L<m>` (for example: `kb:Meetings/20300101_mix.md#L29` or `attachments:Meetings/transcript.txt#L120-L140`).
-   - A bare `http://` or `https://` URL for external facts.
-   - Cite read-only command results as "<name from read_only_commands>:<subcommand and arguments>", e.g. "outlook:cal list --days 14".
-   Never cite task.json.
-   Notes never go inside the locator (put them in the claim text). A claim with no evidence must have status `inferred` or be listed in `open_questions`. `open_questions` items can be strings or objects with `text` and `blocking` boolean (set `blocking: true` when the plan cannot be made correctly without the answer).
+```json
+{
+  "ownership": {"verdict": "reader|other:<name>|undetermined", "reasoning": "...", "evidence": [...]},
+  "requested_deliverable": {"text": "...", "evidence": [...]},
+  "constraints": [{"text": "...", "binding": true, "evidence": [...]}],
+  "entities": [{"as_written": "...", "status": "verified|resolved|unresolved", "meaning": "...", "evidence": [...]}],
+  "facts": [{"text": "...", "status": "confirmed|single-source|inferred|conflicting", "evidence": [...]}],
+  "open_questions": [{"text": "...", "blocking": true}],
+  "recommendation": {"text": "...", "evidence": [...]}
+}
+```
+Each item in `evidence` is an object:
+- For files under a knowledge root: `{"root": "<root-name>", "path": "<path relative to root>", "lines": "<n> or <n>-<m>" (optional), "note": "..." (optional)}`
+- For read-only commands: `{"root": "<declared command name>", "command": "<subcommand and arguments>", "note": "..." (optional)}`
+- For web pages: `{"url": "https://...", "note": "..." (optional)}`
+(Legacy locator strings like `<root>:<path>#L<n>` or bare URLs are also accepted.)
+Never cite task.json.
+A claim with no evidence must have status `inferred` or be listed in `open_questions`. `open_questions` items can be strings or objects with `text` and `blocking` boolean (set `blocking: true` when the plan cannot be made correctly without the answer).
 
-2. `research.md`: the same findings structured as a concise, readable brief.
+# Finish
+
+Run `./research-check` after writing `research.json`. If it reports problems, fix only the listed entries by editing them and re-run until it prints "OK research.json is publishable". When `./research-check` prints OK, reply with the single word done.

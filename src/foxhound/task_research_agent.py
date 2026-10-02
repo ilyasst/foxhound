@@ -7,6 +7,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -365,6 +366,80 @@ def _map_locator(
     return None
 
 
+def _evidence_item_to_locator_string(item: Any) -> tuple[str | None, str | None]:
+    """Convert an evidence item (string or structured dict) to a legacy locator string.
+
+    Returns (locator_string, error_message).
+    """
+    if isinstance(item, str):
+        return item, None
+
+    if isinstance(item, Mapping):
+        # 1. Web citation: {"url": ...}
+        if "url" in item:
+            # A note is an explanation, never part of the locator, on every kind.
+            allowed_keys = {"url", "note"}
+            unknown = set(item.keys()) - allowed_keys
+            if unknown:
+                return None, f"Unknown key(s) in web evidence object: {sorted(unknown)}"
+            url_val = item.get("url")
+            if not isinstance(url_val, str) or not url_val.strip():
+                return None, "Field 'url' in evidence object must be a non-empty string"
+            return url_val.strip(), None
+
+        # 2. Command citation: {"root": <cmd_name>, "command": ...}
+        # Note: if "command" in item
+        if "command" in item:
+            allowed_keys = {"root", "command", "note"}
+            unknown = set(item.keys()) - allowed_keys
+            if unknown:
+                return None, f"Unknown key(s) in command evidence object: {sorted(unknown)}"
+            root_val = item.get("root")
+            cmd_val = item.get("command")
+            if not isinstance(root_val, str) or not root_val.strip():
+                return None, "Field 'root' in command evidence object must be a non-empty string"
+            if not isinstance(cmd_val, str) or not cmd_val.strip():
+                return None, "Field 'command' in command evidence object must be a non-empty string"
+            return f"{root_val.strip()}:{cmd_val.strip()}", None
+
+        # 3. Knowledge root file citation: {"root", "path", "lines"?, "note"?}
+        if "root" in item or "path" in item:
+            allowed_keys = {"root", "path", "lines", "note"}
+            unknown = set(item.keys()) - allowed_keys
+            if unknown:
+                return None, f"Unknown key(s) in file evidence object: {sorted(unknown)}"
+            root_val = item.get("root")
+            path_val = item.get("path")
+            if not isinstance(root_val, str) or not root_val.strip():
+                return None, "Field 'root' in file evidence object must be a non-empty string"
+            if not isinstance(path_val, str) or not path_val.strip():
+                return None, "Field 'path' in file evidence object must be a non-empty string"
+            root_str = root_val.strip()
+            path_str = path_val.strip()
+            loc_str = f"{root_str}:{path_str}"
+            lines_val = item.get("lines")
+            if lines_val is not None:
+                lines_str = str(lines_val).strip()
+                if lines_str:
+                    if lines_str.startswith("#"):
+                        loc_str += lines_str
+                    elif lines_str.startswith("L"):
+                        loc_str += f"#{lines_str}"
+                    elif "-" in lines_str:
+                        start_l, end_l = lines_str.split("-", 1)
+                        start_l = start_l.strip().lstrip("L")
+                        end_l = end_l.strip().lstrip("L")
+                        loc_str += f"#L{start_l}-L{end_l}"
+                    else:
+                        start_l = lines_str.lstrip("L")
+                        loc_str += f"#L{start_l}"
+            return loc_str, None
+
+        return None, f"Unrecognized evidence object format: {sorted(item.keys())}"
+
+    return None, f"Evidence must be a string or object, got {type(item).__name__}"
+
+
 def _make_source_receipt(
     namespace: str,
     resource: str,
@@ -395,7 +470,7 @@ def _make_source_receipt(
 
 
 def _process_evidence_and_refs(
-    raw_evidence: Sequence[str] | None,
+    raw_evidence: Sequence[Any] | None,
     sources_by_locator: dict[tuple[str, str], dict[str, Any]],
     sources_list: list[dict[str, Any]],
     knowledge_roots: Sequence[tuple[str, str]],
@@ -407,9 +482,10 @@ def _process_evidence_and_refs(
     if not raw_evidence:
         return refs
     for item in raw_evidence:
-        if not isinstance(item, str):
+        loc_str, _ = _evidence_item_to_locator_string(item)
+        if loc_str is None:
             continue
-        mapped = _map_locator(item, knowledge_roots, read_only_commands, run_dir=run_dir, basename_cache=basename_cache)
+        mapped = _map_locator(loc_str, knowledge_roots, read_only_commands, run_dir=run_dir, basename_cache=basename_cache)
         if mapped is None:
             continue
         ns, res, frag = mapped
@@ -428,19 +504,44 @@ def _process_evidence_and_refs(
 def _make_claim(
     text: str,
     status: str,
-    raw_evidence: Sequence[str] | None,
+    raw_evidence: Sequence[Any] | None,
     sources_by_locator: dict[tuple[str, str], dict[str, Any]],
     sources_list: list[dict[str, Any]],
     knowledge_roots: Sequence[tuple[str, str]],
     read_only_commands: Sequence[str] | Sequence[Mapping[str, Any]] = (),
     run_dir: Path | str | None = None,
     basename_cache: dict[str, dict[str, list[str]]] | None = None,
+    degrade: bool = False,
+    stats: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     refs = _process_evidence_and_refs(
         raw_evidence, sources_by_locator, sources_list, knowledge_roots, read_only_commands, run_dir=run_dir, basename_cache=basename_cache
     )
-    if status != "unknown" and not refs:
-        status = "unknown"
+    if degrade:
+        # In degrade mode, count dropped citations
+        orig_ev_count = len(raw_evidence) if raw_evidence else 0
+        dropped_here = 0
+        if orig_ev_count > 0:
+            for item in raw_evidence:  # type: ignore
+                loc_str, _ = _evidence_item_to_locator_string(item)
+                mapped = None
+                if loc_str:
+                    mapped = _map_locator(loc_str, knowledge_roots, read_only_commands, run_dir=run_dir, basename_cache=basename_cache)
+                if mapped is None:
+                    dropped_here += 1
+        if stats is not None:
+            stats["dropped_citations"] += dropped_here
+        if not refs:
+            if orig_ev_count > 0:
+                status = "unsourced"
+                if stats is not None:
+                    stats["unsourced_claims"] += 1
+            else:
+                if status not in {"unknown", "unsourced"}:
+                    status = "unknown"
+    else:
+        if status != "unknown" and not refs:
+            status = "unknown"
     return {
         "text": text,
         "status": status,
@@ -454,6 +555,8 @@ def _convert_research_json(
     read_only_commands: Sequence[str] | Sequence[Mapping[str, Any]] = (),
     run_dir: Path | str | None = None,
     basename_cache: dict[str, dict[str, list[str]]] | None = None,
+    degrade: bool = False,
+    stats: dict[str, int] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     sources_by_locator: dict[tuple[str, str], dict[str, Any]] = {}
     sources_list: list[dict[str, Any]] = []
@@ -470,6 +573,7 @@ def _convert_research_json(
                 _make_claim(
                     rec_text, rec_st, rec_ev, sources_by_locator, sources_list, knowledge_roots, read_only_commands,
                     run_dir=run_dir, basename_cache=basename_cache,
+                    degrade=degrade, stats=stats,
                 )
             )
     elif isinstance(raw_rec, Sequence) and not isinstance(raw_rec, (str, bytes)):
@@ -484,6 +588,7 @@ def _convert_research_json(
                     _make_claim(
                         text, st, ev, sources_by_locator, sources_list, knowledge_roots, read_only_commands,
                         run_dir=run_dir, basename_cache=basename_cache,
+                        degrade=degrade, stats=stats,
                     )
                 )
 
@@ -509,6 +614,8 @@ def _convert_research_json(
         read_only_commands,
         run_dir=run_dir,
         basename_cache=basename_cache,
+        degrade=degrade,
+        stats=stats,
     )
 
     # requested_action: from the recommendation's first claim when present;
@@ -516,17 +623,7 @@ def _convert_research_json(
     if recommendation_claims:
         requested_action = dict(recommendation_claims[0])
     else:
-        requested_action = _make_claim(
-            rd_text,
-            "supported" if rd_evidence else "inferred",
-            rd_evidence,
-            sources_by_locator,
-            sources_list,
-            knowledge_roots,
-            read_only_commands,
-            run_dir=run_dir,
-            basename_cache=basename_cache,
-        )
+        requested_action = dict(objective)
 
     # constraints <- constraints
     constraints_claims = []
@@ -543,6 +640,7 @@ def _convert_research_json(
                     _make_claim(
                         text, st, ev, sources_by_locator, sources_list, knowledge_roots, read_only_commands,
                         run_dir=run_dir, basename_cache=basename_cache,
+                        degrade=degrade, stats=stats,
                     )
                 )
 
@@ -569,6 +667,7 @@ def _convert_research_json(
                     _make_claim(
                         text, st, ev, sources_by_locator, sources_list, knowledge_roots, read_only_commands,
                         run_dir=run_dir, basename_cache=basename_cache,
+                        degrade=degrade, stats=stats,
                     )
                 )
 
@@ -599,6 +698,7 @@ def _convert_research_json(
                         _make_claim(
                             text, st, ev, sources_by_locator, sources_list, knowledge_roots, read_only_commands,
                             run_dir=run_dir, basename_cache=basename_cache,
+                            degrade=degrade, stats=stats,
                         )
                     )
 
@@ -623,6 +723,7 @@ def _convert_research_json(
                 _make_claim(
                     claim_text, st, ev, sources_by_locator, sources_list, knowledge_roots, read_only_commands,
                     run_dir=run_dir, basename_cache=basename_cache,
+                    degrade=degrade, stats=stats,
                 )
             )
 
@@ -740,17 +841,21 @@ def check_research_output(
         if ev_list is None:
             return
         if not isinstance(ev_list, Sequence) or isinstance(ev_list, (str, bytes)):
-            problems.append(f"Field '{field_path}' must be an array of evidence strings")
+            problems.append(f"Field '{field_path}' must be an array of evidence items")
             return
         for idx, item in enumerate(ev_list):
             item_path = f"{field_path}[{idx}]"
-            if not isinstance(item, str):
-                problems.append(f"Evidence at '{item_path}' must be a string, got {type(item).__name__}")
+            loc_str, conv_err = _evidence_item_to_locator_string(item)
+            if conv_err is not None:
+                problems.append(f"Invalid evidence format at '{item_path}': {conv_err}")
+                continue
+            if loc_str is None:
+                problems.append(f"Evidence at '{item_path}' must be a string or object, got {type(item).__name__}")
                 continue
 
             # (c) any locator whose path part is task.json (with or without ./ or #L)
-            loc_str, _ = _clean_locator_string(item)
-            cand_path = loc_str.split("#", 1)[0].strip()
+            loc_clean, _ = _clean_locator_string(loc_str)
+            cand_path = loc_clean.split("#", 1)[0].strip()
             if cand_path.startswith("./"):
                 cand_path = cand_path[2:]
             if cand_path == "task.json":
@@ -761,7 +866,7 @@ def check_research_output(
                 continue
 
             mapped = _map_locator(
-                item,
+                loc_str,
                 knowledge_roots,
                 read_only_commands,
                 run_dir=run_dir_path,
@@ -770,7 +875,7 @@ def check_research_output(
             if mapped is None:
                 problems.append(
                     f"Unmappable evidence locator at '{item_path}': {item!r}. "
-                    "Accepted format is '<root-name>:<path relative to root>' (e.g. kb:Meetings/x.md#L29) "
+                    "Accepted format is an evidence object or '<root-name>:<path relative to root>' (e.g. kb:Meetings/x.md#L29) "
                     "or a bare http:// or https:// URL."
                 )
 
@@ -881,6 +986,16 @@ def agent_synthesize(
         encoding="utf-8",
     )
 
+    # Write executable ./research-check script into run_dir
+    research_check_script = (
+        f"#!{sys.executable}\n"
+        "from foxhound.research_check import main\n"
+        "raise SystemExit(main())\n"
+    )
+    research_check_path = run_dir / "research-check"
+    research_check_path.write_text(research_check_script, encoding="utf-8")
+    research_check_path.chmod(0o755)
+
     # b) launch hermes agent
     prompt_text = _load_prompt(config.prompt_path)
     argv = [
@@ -942,13 +1057,13 @@ def agent_synthesize(
         run_dir, config.knowledge_roots, config.read_only_commands
     )
 
-    while problems and session_id and repair_turns < 2:
+    while problems and session_id and repair_turns < 1:
         repair_turns += 1
         bullet_problems = "\n".join(f"- {p}" for p in problems)
         repair_message = (
             "Your research.json was rejected with the following problems:\n"
             f"{bullet_problems}\n\n"
-            "Please rewrite research.json (and research.md if affected) fixing only these problems. "
+            "Please edit only the listed entries; do not rewrite the file. "
             "Do not research again. Keep all findings."
         )
         repair_argv = [
@@ -1010,6 +1125,11 @@ def agent_synthesize(
         if timed_out:
             break
 
+    self_check_ok = not bool(problems)
+    is_degraded = False
+    dropped_citations = 0
+    unsourced_claims = 0
+
     if problems:
         research_json_path = run_dir / "research.json"
         if not research_json_path.exists():
@@ -1025,16 +1145,27 @@ def agent_synthesize(
         except Exception as exc:
             raise SynthesisError("draft_missing") from exc
 
+        # Degrade: drop invalid citations, mark claims left with no evidence status "unsourced"
+        degrade_stats = {"dropped_citations": 0, "unsourced_claims": 0}
         try:
-            d, s = _convert_research_json(raw_research, config.knowledge_roots)
-            validate_draft(d, s)
+            draft, sources = _convert_research_json(
+                raw_research,
+                config.knowledge_roots,
+                config.read_only_commands,
+                run_dir=run_dir,
+                degrade=True,
+                stats=degrade_stats,
+            )
+            validate_draft(draft, sources)
+            validate_sources(sources)
         except SynthesisError:
             raise
         except Exception as exc:
             raise SynthesisError("invalid_draft") from exc
 
-        # If it reached here but still had problems (e.g. unmappable locators or missing fields)
-        raise SynthesisError("invalid_draft")
+        is_degraded = True
+        dropped_citations = degrade_stats["dropped_citations"]
+        unsourced_claims = degrade_stats["unsourced_claims"]
 
     assert draft is not None
     assert sources is not None
@@ -1049,13 +1180,18 @@ def agent_synthesize(
     if not searched_namespaces:
         searched_namespaces = {"kb", "attachment", "email"}
 
-    coverage = {
+    coverage: dict[str, Any] = {
         "searched_namespaces": sorted(searched_namespaces),
         "queries": 0,
         "documents_retrieved": len(sources),
         "unavailable_source_ids": [],
         "knowledge_revisions": {"retrieval_snapshot": retrieval_revision},
     }
+    if is_degraded:
+        coverage["degraded"] = True
+        coverage["dropped_citations"] = dropped_citations
+        coverage["unsourced_claims"] = unsourced_claims
+
     provenance: dict[str, Any] = {
         "profile_id": config.profile_id,
         "profile_revision": config.profile_revision,
@@ -1074,5 +1210,9 @@ def agent_synthesize(
         "prompt_tokens": None,
         "completion_tokens": None,
         "repair_turns": repair_turns,
+        "self_check_ok": self_check_ok,
+        "degraded": is_degraded,
+        "dropped_citations": dropped_citations,
+        "unsourced_claims": unsourced_claims,
     }
     return SynthesisResult(draft, tuple(sources), coverage, provenance, metrics)

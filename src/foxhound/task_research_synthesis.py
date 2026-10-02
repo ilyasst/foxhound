@@ -56,7 +56,7 @@ SOURCE_NAMESPACES = frozenset({"kb", "meeting", "email", "attachment", "repo", "
 RECOMMENDATION_TYPES = frozenset({
     "after_task_completed", "not_before", "raise_priority", "create_prerequisite",
 })
-CLAIM_STATUSES = frozenset({"supported", "inferred", "conflicting", "unknown"})
+CLAIM_STATUSES = frozenset({"supported", "inferred", "conflicting", "unknown", "unsourced"})
 RESEARCH_STATUSES = frozenset({"sufficient", "inconclusive", "unreachable"})
 DEFAULT_MAX_SEARCHES = 20
 DEFAULT_MAX_DOCUMENTS = 50
@@ -734,7 +734,7 @@ def validate_draft(value: object, sources: list[dict[str, object]]) -> dict[str,
                 or status not in CLAIM_STATUSES or not isinstance(refs, list)
                 or len(refs) > 16 or len(set(refs)) != len(refs)
                 or any(ref not in source_ids for ref in refs)
-                or (status != "unknown" and not refs)):
+                or (status not in {"unknown", "unsourced"} and not refs)):
             raise SynthesisError("invalid_draft")
         return {"text": text, "status": status, "source_refs": refs}
 
