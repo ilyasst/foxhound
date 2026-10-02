@@ -1071,8 +1071,8 @@ def test_convert_research_json_features(tmp_path: Path) -> None:
     md = render_markdown(published_doc)
     assert "## Recommendation" in md
     assert "- Follow up with Alice regarding the submissions (supported) [src-001]" in md
-    assert "- Is the rubric finalized? (blocking) (unknown)" in md
     assert "- Owner: other:Alice — Alice owns the student workflow (supported) [src-001]" in md
+    assert "Open Questions" not in md
 
     # Check status rules:
     # 2. Undetermined owner -> inconclusive even with no blocking questions
