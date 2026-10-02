@@ -142,6 +142,116 @@ def _get_basename_map(
     return bmap
 
 
+def _repair_locator(
+    loc_str: str,
+    knowledge_roots: Sequence[tuple[str, str]],
+    read_only_commands: Sequence[str] | Sequence[Mapping[str, Any]] = (),
+    run_dir: Path | str | None = None,
+    basename_cache: dict[str, dict[str, list[str]]] | None = None,
+) -> str | None:
+    """Attempt deterministic repair of an unmappable locator string."""
+    if not isinstance(loc_str, str) or not loc_str.strip():
+        return None
+
+    # Rule 1: strip wrapping quotes, backticks, angle brackets and trailing punctuation (.,;:)
+    s = loc_str.strip()
+    strip_chars = "\"'`<>.,;:)"
+    while s:
+        new_s = s.strip("\"'`<>").rstrip(".,;:)")
+        if new_s == s:
+            break
+        s = new_s
+
+    if s != loc_str:
+        if _map_locator(s, knowledge_roots, read_only_commands, run_dir=run_dir, basename_cache=basename_cache) is not None:
+            return s
+
+    cand = s
+
+    # Rule 2: path:LINE or path:LINE-LINE -> path#LLINE fragment form
+    # e.g. foo.md:12 -> foo.md#L12 or foo.md:12-20 -> foo.md#L12
+    # Match trailing :(\d+)(?:-\d+)?
+    m_line = re.search(r":(\d+)(?:-\d+)?$", cand)
+    if m_line:
+        line_num = m_line.group(1)
+        base_part = cand[: m_line.start()]
+        rewritten = f"{base_part}#L{line_num}"
+        if _map_locator(rewritten, knowledge_roots, read_only_commands, run_dir=run_dir, basename_cache=basename_cache) is not None:
+            return rewritten
+
+    frag_part = ""
+    target_path = cand
+    if "#" in cand:
+        target_path, frag_part = cand.split("#", 1)
+        frag_part = "#" + frag_part
+
+    norm_roots = [(name, os.path.abspath(os.path.expanduser(p))) for name, p in knowledge_roots]
+
+    # Rule 3: an absolute path under a knowledge root -> rewrite to <root-name>:<relative>
+    if os.path.isabs(target_path):
+        real_cand = os.path.realpath(target_path)
+        for r_name, r_path in norm_roots:
+            real_root = os.path.realpath(r_path)
+            if real_cand == real_root or real_cand.startswith(real_root + os.sep):
+                rel = os.path.relpath(real_cand, real_root)
+                rewritten = f"{r_name}:{rel}{frag_part}"
+                if _map_locator(rewritten, knowledge_roots, read_only_commands, run_dir=run_dir, basename_cache=basename_cache) is not None:
+                    return rewritten
+
+    # Rule 4: a path relative to the run directory that goes through a knowledge-root symlink -> <root-name>:<relative>
+    if run_dir:
+        abs_run = Path(run_dir).expanduser().resolve()
+        norm_target = Path(target_path)
+        resolved_under_run = (abs_run / norm_target).resolve()
+        for r_name, r_path in norm_roots:
+            real_root = os.path.realpath(r_path)
+            if resolved_under_run == real_root or str(resolved_under_run).startswith(real_root + os.sep):
+                rel = os.path.relpath(str(resolved_under_run), real_root)
+                rewritten = f"{r_name}:{rel}{frag_part}"
+                if _map_locator(rewritten, knowledge_roots, read_only_commands, run_dir=run_dir, basename_cache=basename_cache) is not None:
+                    return rewritten
+
+    # Rule 5: a bare file name, or a path whose basename is unique across the knowledge roots -> that file
+    # Rule 6: a path with one wrong leading directory: unique basename match inside the same root
+    prefix_root = None
+    bare_cand = target_path
+    if ":" in target_path:
+        pfx, rest = target_path.split(":", 1)
+        # Check if pfx matches a known root
+        for r_name, _ in norm_roots:
+            if pfx == r_name:
+                prefix_root = r_name
+                bare_cand = rest
+                break
+
+    base_name = os.path.basename(bare_cand.rstrip("/"))
+    if base_name:
+        if prefix_root is not None:
+            # Rule 6: unique basename match inside the same root
+            r_path = next(p for n, p in norm_roots if n == prefix_root)
+            bmap = _get_basename_map(r_path, basename_cache)
+            candidates = bmap.get(base_name, [])
+            if len(candidates) == 1:
+                rewritten = f"{prefix_root}:{candidates[0]}{frag_part}"
+                if _map_locator(rewritten, knowledge_roots, read_only_commands, run_dir=run_dir, basename_cache=basename_cache) is not None:
+                    return rewritten
+        else:
+            # Rule 5: across all knowledge roots
+            root_matches = []
+            for r_name, r_path in norm_roots:
+                bmap = _get_basename_map(r_path, basename_cache)
+                cands = bmap.get(base_name, [])
+                for rel in cands:
+                    root_matches.append((r_name, rel))
+            if len(root_matches) == 1:
+                r_name, rel = root_matches[0]
+                rewritten = f"{r_name}:{rel}{frag_part}"
+                if _map_locator(rewritten, knowledge_roots, read_only_commands, run_dir=run_dir, basename_cache=basename_cache) is not None:
+                    return rewritten
+
+    return None
+
+
 def _map_locator(
     loc_str: str,
     knowledge_roots: Sequence[tuple[str, str]],
@@ -479,6 +589,7 @@ def _process_evidence_and_refs(
     read_only_commands: Sequence[str] | Sequence[Mapping[str, Any]] = (),
     run_dir: Path | str | None = None,
     basename_cache: dict[str, dict[str, list[str]]] | None = None,
+    stats: dict[str, Any] | None = None,
 ) -> list[str]:
     refs: list[str] = []
     if not raw_evidence:
@@ -488,6 +599,12 @@ def _process_evidence_and_refs(
         if loc_str is None:
             continue
         mapped = _map_locator(loc_str, knowledge_roots, read_only_commands, run_dir=run_dir, basename_cache=basename_cache)
+        if mapped is None:
+            repaired = _repair_locator(loc_str, knowledge_roots, read_only_commands, run_dir=run_dir, basename_cache=basename_cache)
+            if repaired is not None:
+                if stats is not None and "repaired_citations" in stats:
+                    stats["repaired_citations"] += 1
+                mapped = _map_locator(repaired, knowledge_roots, read_only_commands, run_dir=run_dir, basename_cache=basename_cache)
         if mapped is None:
             continue
         ns, res, frag = mapped
@@ -514,10 +631,10 @@ def _make_claim(
     run_dir: Path | str | None = None,
     basename_cache: dict[str, dict[str, list[str]]] | None = None,
     degrade: bool = False,
-    stats: dict[str, int] | None = None,
+    stats: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     refs = _process_evidence_and_refs(
-        raw_evidence, sources_by_locator, sources_list, knowledge_roots, read_only_commands, run_dir=run_dir, basename_cache=basename_cache
+        raw_evidence, sources_by_locator, sources_list, knowledge_roots, read_only_commands, run_dir=run_dir, basename_cache=basename_cache, stats=stats
     )
     if degrade:
         # In degrade mode, count dropped citations
@@ -529,8 +646,16 @@ def _make_claim(
                 mapped = None
                 if loc_str:
                     mapped = _map_locator(loc_str, knowledge_roots, read_only_commands, run_dir=run_dir, basename_cache=basename_cache)
+                    if mapped is None:
+                        repaired = _repair_locator(loc_str, knowledge_roots, read_only_commands, run_dir=run_dir, basename_cache=basename_cache)
+                        if repaired is not None:
+                            mapped = _map_locator(repaired, knowledge_roots, read_only_commands, run_dir=run_dir, basename_cache=basename_cache)
                 if mapped is None:
                     dropped_here += 1
+                    if stats is not None and "dropped_locators" in stats and loc_str:
+                        trunc = loc_str[:200]
+                        if len(stats["dropped_locators"]) < 20 and trunc not in stats["dropped_locators"]:
+                            stats["dropped_locators"].append(trunc)
         if stats is not None:
             stats["dropped_citations"] += dropped_here
         if not refs:
@@ -558,7 +683,7 @@ def _convert_research_json(
     run_dir: Path | str | None = None,
     basename_cache: dict[str, dict[str, list[str]]] | None = None,
     degrade: bool = False,
-    stats: dict[str, int] | None = None,
+    stats: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     sources_by_locator: dict[tuple[str, str], dict[str, Any]] = {}
     sources_list: list[dict[str, Any]] = []
@@ -875,6 +1000,22 @@ def check_research_output(
                 basename_cache=basename_cache,
             )
             if mapped is None:
+                repaired = _repair_locator(
+                    loc_str,
+                    knowledge_roots,
+                    read_only_commands,
+                    run_dir=run_dir_path,
+                    basename_cache=basename_cache,
+                )
+                if repaired is not None:
+                    mapped = _map_locator(
+                        repaired,
+                        knowledge_roots,
+                        read_only_commands,
+                        run_dir=run_dir_path,
+                        basename_cache=basename_cache,
+                    )
+            if mapped is None:
                 problems.append(
                     f"Unmappable evidence locator at '{item_path}': {item!r}. "
                     "Accepted format is an evidence object or '<root-name>:<path relative to root>' (e.g. kb:Meetings/x.md#L29) "
@@ -1167,10 +1308,48 @@ def agent_synthesize(
 
     while problems and session_id and repair_turns < 1:
         repair_turns += 1
+        # Check if any problems are unmappable evidence locators, and provide nearest path suggestions
+        unmappable_locs: list[str] = []
+        for p in problems:
+            m = re.search(r"Unmappable evidence locator at '[^']+': (.*)\. Accepted format is", p)
+            if m:
+                unmappable_locs.append(m.group(1))
+
+        suggestions: list[str] = []
+        if unmappable_locs:
+            import difflib
+            suggestion_cache: dict[str, dict[str, list[str]]] = {}
+            # The same capped, cached basename index the mapper uses: the
+            # attachments root alone holds tens of thousands of files.
+            by_basename: dict[str, list[str]] = {}
+            for r_name, r_path in config.knowledge_roots:
+                if not Path(r_path).expanduser().is_dir():
+                    continue
+                for base, rels in _get_basename_map(
+                    os.path.expanduser(r_path), suggestion_cache
+                ).items():
+                    by_basename.setdefault(base, []).extend(
+                        f"{r_name}:{rel}" for rel in rels)
+
+            for loc in unmappable_locs:
+                raw_loc = loc.strip("'\"")
+                loc_base = os.path.basename(raw_loc.split("#")[0].split(":")[-1])
+                matches = difflib.get_close_matches(
+                    loc_base, list(by_basename), n=3, cutoff=0.4)
+                matched_paths = [
+                    path for m_base in matches for path in by_basename[m_base]
+                ][:3]
+                if matched_paths:
+                    suggestions.append(f"Locator {loc} could not be mapped. Nearest existing paths: {', '.join(matched_paths)}")
+
         bullet_problems = "\n".join(f"- {p}" for p in problems)
         repair_message = (
             "Your research.json was rejected with the following problems:\n"
             f"{bullet_problems}\n\n"
+        )
+        if suggestions:
+            repair_message += "\n".join(suggestions) + "\n\n"
+        repair_message += (
             "Please edit only the listed entries; do not rewrite the file. "
             "Do not research again. Keep all findings."
         )
@@ -1237,6 +1416,8 @@ def agent_synthesize(
     is_degraded = False
     dropped_citations = 0
     unsourced_claims = 0
+    dropped_locators: list[str] = []
+    repaired_citations = 0
 
     # Audit for direct state-database access
     # TODO: Implement a richer audit via Hermes session export / tool-call transcript parsing
@@ -1265,7 +1446,12 @@ def agent_synthesize(
             raise SynthesisError("draft_missing") from exc
 
         # Degrade: drop invalid citations, mark claims left with no evidence status "unsourced"
-        degrade_stats = {"dropped_citations": 0, "unsourced_claims": 0}
+        degrade_stats: dict[str, Any] = {
+            "dropped_citations": 0,
+            "unsourced_claims": 0,
+            "dropped_locators": [],
+            "repaired_citations": 0,
+        }
         try:
             draft, sources = _convert_research_json(
                 raw_research,
@@ -1285,6 +1471,27 @@ def agent_synthesize(
         is_degraded = True
         dropped_citations = degrade_stats["dropped_citations"]
         unsourced_claims = degrade_stats["unsourced_claims"]
+        dropped_locators = degrade_stats["dropped_locators"]
+        repaired_citations = degrade_stats["repaired_citations"]
+    else:
+        # Non-degraded draft: compute repaired_citations during synthesis
+        normal_stats: dict[str, Any] = {"repaired_citations": 0}
+        research_json_path = run_dir / "research.json"
+        if research_json_path.exists():
+            try:
+                raw_research = json.loads(research_json_path.read_text(encoding="utf-8"))
+                if isinstance(raw_research, Mapping):
+                    _convert_research_json(
+                        raw_research,
+                        config.knowledge_roots,
+                        config.read_only_commands,
+                        run_dir=run_dir,
+                        degrade=False,
+                        stats=normal_stats,
+                    )
+                    repaired_citations = normal_stats["repaired_citations"]
+            except Exception:
+                pass
 
     assert draft is not None
     assert sources is not None
@@ -1333,6 +1540,8 @@ def agent_synthesize(
         "self_check_ok": self_check_ok,
         "degraded": is_degraded,
         "dropped_citations": dropped_citations,
+        "dropped_locators": dropped_locators,
+        "repaired_citations": repaired_citations,
         "unsourced_claims": unsourced_claims,
         "state_db_access": state_db_access,
     }

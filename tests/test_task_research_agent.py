@@ -1472,3 +1472,179 @@ def test_note_is_accepted_on_url_and_command_citations():
             run, (), [{"name": "mail", "command": "/bin/true", "description": "d"}],
         )
         assert problems == []
+
+
+def test_repair_locator_rules(tmp_path: Path) -> None:
+    from foxhound.task_research_agent import _repair_locator, _map_locator
+    kb_dir = tmp_path / "kb"
+    kb_dir.mkdir()
+    (kb_dir / "notes").mkdir()
+    doc1 = kb_dir / "notes" / "alpha.md"
+    doc1.write_text("Hello alpha")
+
+    sub_dir = kb_dir / "Meetings" / "2026"
+    sub_dir.mkdir(parents=True)
+    doc2 = sub_dir / "protocol.md"
+    doc2.write_text("Protocol notes")
+
+    roots = (("kb", str(kb_dir)),)
+
+    # Rule 1: strip wrapping quotes, backticks, angle brackets and trailing punctuation
+    r1 = _repair_locator('"kb:notes/alpha.md")', roots)
+    assert r1 == "kb:notes/alpha.md"
+    assert _map_locator(r1, roots) is not None
+
+    r1_ticks = _repair_locator("`<kb:notes/alpha.md>:`", roots)
+    assert r1_ticks == "kb:notes/alpha.md"
+
+    # Rule 2: path:LINE or path:LINE-LINE -> path#LLINE fragment form
+    r2_single = _repair_locator("kb:notes/alpha.md:14", roots)
+    assert r2_single == "kb:notes/alpha.md#L14"
+    assert _map_locator(r2_single, roots) is not None
+
+    r2_range = _repair_locator("kb:notes/alpha.md:14-25", roots)
+    assert r2_range == "kb:notes/alpha.md#L14"
+    assert _map_locator(r2_range, roots) is not None
+
+    # Rule 3: absolute path under a knowledge root
+    r3 = _repair_locator(str(doc1), roots)
+    assert r3 == "kb:notes/alpha.md"
+    assert _map_locator(r3, roots) is not None
+
+    # Rule 4: path relative to run directory through a symlink
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "kb_link").symlink_to(kb_dir, target_is_directory=True)
+    r4 = _repair_locator("kb_link/notes/alpha.md", roots, run_dir=run_dir)
+    assert r4 == "kb:notes/alpha.md"
+    assert _map_locator(r4, roots) is not None
+
+    # Rule 5: bare file name unique across knowledge roots
+    r5 = _repair_locator("protocol.md", roots)
+    assert r5 == "kb:Meetings/2026/protocol.md"
+    assert _map_locator(r5, roots) is not None
+
+    # Rule 6: path with one wrong leading directory (e.g. Meetings/protocol.md)
+    r6 = _repair_locator("kb:Meetings/protocol.md", roots)
+    assert r6 == "kb:Meetings/2026/protocol.md"
+    assert _map_locator(r6, roots) is not None
+
+
+def test_repair_locator_ambiguity(tmp_path: Path) -> None:
+    from foxhound.task_research_agent import _repair_locator
+    kb_dir = tmp_path / "kb"
+    (kb_dir / "dir1").mkdir(parents=True)
+    (kb_dir / "dir2").mkdir(parents=True)
+    (kb_dir / "dir1" / "dup.txt").write_text("1")
+    (kb_dir / "dir2" / "dup.txt").write_text("2")
+
+    roots = (("kb", str(kb_dir)),)
+    # dup.txt is ambiguous across kb roots
+    assert _repair_locator("dup.txt", roots) is None
+    assert _repair_locator("kb:dup.txt", roots) is None
+
+
+def test_agent_synthesize_metrics_dropped_and_repaired(tmp_path: Path) -> None:
+    kb_dir = tmp_path / "kb"
+    kb_dir.mkdir()
+    doc = kb_dir / "file.txt"
+    doc.write_text("content")
+
+    # 1 valid, 1 repairable ("<kb:file.txt:10>"), 1 totally unmappable
+    research_doc = {
+        "ownership": {"verdict": "reader", "evidence": [str(doc)]},
+        "requested_deliverable": {"text": "Do task", "evidence": ["<kb:file.txt:10>"]},
+        "constraints": [{"text": "constraint", "evidence": ["nonexistent_bogus_xyz.pdf"]}],
+        "entities": [],
+        "facts": [],
+        "open_questions": [],
+    }
+
+    run_dir = tmp_path / "run_metrics"
+    run_dir.mkdir()
+    (run_dir / "research.json").write_text(json.dumps(research_doc), encoding="utf-8")
+
+    def fake_runner(argv, cwd, env, timeout, capture_output, text):
+        res = MagicMock()
+        res.returncode = 0
+        res.stdout = "done"
+        res.stderr = ""
+        return res
+
+    config = AgentResearchConfig(
+        hermes_command="hermes",
+        model="test-model",
+        knowledge_roots=(("kb", str(kb_dir)),),
+    )
+
+    result = agent_synthesize(
+        {"task_snapshot": {}},
+        config=config,
+        bound_sources=None,
+        run_dir=run_dir,
+        runner=fake_runner,
+    )
+
+    assert result.metrics["degraded"] is True
+    assert result.metrics["repaired_citations"] == 1
+    assert result.metrics["dropped_citations"] == 1
+    assert result.metrics["dropped_locators"] == ["nonexistent_bogus_xyz.pdf"]
+
+
+def test_agent_synthesize_repair_turn_suggests_nearest_path(tmp_path: Path) -> None:
+    kb_dir = tmp_path / "kb"
+    kb_dir.mkdir()
+    (kb_dir / "Meeting_Notes_2026.md").write_text("Notes")
+
+    bad_json = {
+        "ownership": {"verdict": "reader", "evidence": ["Meeting_Notes_2025.md"]},
+        "requested_deliverable": {"text": "Deliverable", "evidence": []},
+        "constraints": [],
+        "entities": [],
+        "facts": [],
+        "open_questions": [],
+    }
+    fixed_json = {
+        "ownership": {"verdict": "reader", "evidence": ["kb:Meeting_Notes_2026.md"]},
+        "requested_deliverable": {"text": "Deliverable", "evidence": []},
+        "constraints": [],
+        "entities": [],
+        "facts": [],
+        "open_questions": [],
+    }
+
+    captured_queries = []
+
+    def fake_runner(argv, cwd, env, timeout, capture_output, text):
+        res = MagicMock()
+        res.returncode = 0
+        res.stderr = ""
+        query_idx = argv.index("--query") + 1
+        captured_queries.append(argv[query_idx])
+        if len(captured_queries) == 1:
+            res.stdout = "session_id: sess-nearest-test\nOutput ready."
+            (cwd / "research.json").write_text(json.dumps(bad_json))
+        else:
+            res.stdout = "Repaired."
+            (cwd / "research.json").write_text(json.dumps(fixed_json))
+        return res
+
+    config = AgentResearchConfig(
+        hermes_command="hermes",
+        model="test-model",
+        knowledge_roots=(("kb", str(kb_dir)),),
+    )
+    run_dir = tmp_path / "run_repair_suggest"
+    result = agent_synthesize(
+        {"task_snapshot": {}},
+        config=config,
+        bound_sources=None,
+        run_dir=run_dir,
+        runner=fake_runner,
+    )
+
+    assert result.metrics["repair_turns"] == 1
+    assert len(captured_queries) == 2
+    repair_msg = captured_queries[1]
+    assert "Meeting_Notes_2025.md" in repair_msg
+    assert "kb:Meeting_Notes_2026.md" in repair_msg
