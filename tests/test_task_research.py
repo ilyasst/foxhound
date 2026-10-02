@@ -189,7 +189,7 @@ class TaskResearchTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(row[0], 1)
 
-    def test_agent_cannot_author_owned_fields_or_web_sources(self):
+    def test_agent_cannot_author_owned_fields(self):
         bad = draft()
         bad["provenance"] = {"model": "agent-selected"}
         job = self._request()
@@ -197,7 +197,7 @@ class TaskResearchTests(unittest.TestCase):
         with self.assertRaisesRegex(ResearchError, "publisher-owned"):
             self._publish(job.job_id, research_claim.token, bad)
         bad_sources = sources()
-        bad_sources[0]["locator"]["namespace"] = "web"
+        bad_sources[0]["locator"]["namespace"] = "calendar"
         with self.assertRaisesRegex(ResearchError, "namespace"):
             self._publish(job.job_id, research_claim.token, draft(), bad_sources)
 
@@ -368,6 +368,20 @@ class TaskResearchTests(unittest.TestCase):
             bad_sources[0]["locator"]["resource"] = bad_resource
             with self.assertRaisesRegex(ResearchError, "unsafe source resource"):
                 self._publish(job.job_id, research_claim.token, source_document=bad_sources)
+
+    def test_web_namespace_accepts_only_http_urls(self):
+        job = self._request()
+        research_claim = self.store.claim("worker-synthetic")
+        for bad_resource in ["file:///etc/passwd", "ftp://example.com/x", "notes/doc.md"]:
+            bad_sources = sources()
+            bad_sources[0]["locator"]["namespace"] = "web"
+            bad_sources[0]["locator"]["resource"] = bad_resource
+            with self.assertRaisesRegex(ResearchError, "unsafe source resource"):
+                self._publish(job.job_id, research_claim.token, source_document=bad_sources)
+        web_sources = sources()
+        web_sources[0]["locator"]["namespace"] = "web"
+        web_sources[0]["locator"]["resource"] = "https://example.com/program/rules"
+        self._publish(job.job_id, research_claim.token, source_document=web_sources)
 
     def test_scheduling_recommendations_canonical_rules(self):
         job = self._request()

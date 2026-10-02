@@ -34,7 +34,7 @@ MAX_JSON_BYTES = 512 * 1024
 MAX_MARKDOWN_BYTES = 64 * 1024
 MAX_PROJECTION_BYTES = 16 * 1024
 RESERVED_FILENAMES = frozenset({".task-research.json", "Research.md"})
-SOURCE_NAMESPACES = frozenset({"kb", "meeting", "email", "attachment", "repo"})
+SOURCE_NAMESPACES = frozenset({"kb", "meeting", "email", "attachment", "repo", "web"})
 RECOMMENDATION_TYPES = frozenset({
     "after_task_completed", "not_before", "raise_priority", "create_prerequisite",
 })
@@ -217,7 +217,12 @@ def validate_sources(document: object) -> list[dict[str, object]]:
             raise ResearchError("invalid source namespace")
         pure = PurePosixPath(resource)
         parsed = urlsplit(resource)
-        if (pure.is_absolute() or ".." in pure.parts or "\\" in resource
+        if namespace == "web":
+            # Public pages are cited by URL; nothing is read from disk.
+            if (parsed.scheme not in {"http", "https"} or not parsed.netloc
+                    or "\x00" in resource or "\\" in resource):
+                raise ResearchError("unsafe source resource")
+        elif (pure.is_absolute() or ".." in pure.parts or "\\" in resource
                 or "\x00" in resource or parsed.scheme or "://" in resource
                 or ":" in resource or re.match(r"^[A-Za-z]:", resource)):
             raise ResearchError("unsafe source resource")
