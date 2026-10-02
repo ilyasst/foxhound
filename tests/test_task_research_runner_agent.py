@@ -259,6 +259,53 @@ class TaskResearchRunnerAgentTests(unittest.TestCase):
             self.assertEqual(cm.exception.code, 2)
         self.assertIn("PATH must be absolute", err_buf.getvalue())
 
+    def test_cli_read_only_command_parsing_and_validation(self) -> None:
+        base_argv = [
+            "--database", str(self.paths["database"]),
+            "--cas-root", str(self.paths["cas_root"]),
+            "--task-work-root", str(self.paths["task_work_root"]),
+            "--scratch-root", str(self.paths["scratch_root"]),
+            "--model", "synthetic-model",
+            "--endpoint", "http://127.0.0.1:8800",
+            "--synthesizer", "agent",
+            "--hermes-command", "/usr/bin/synthetic-hermes",
+        ]
+
+        # Invalid JSON
+        err_buf = io.StringIO()
+        with redirect_stderr(err_buf):
+            with self.assertRaises(SystemExit) as cm:
+                main(base_argv + ["--read-only-command", "not json"])
+            self.assertEqual(cm.exception.code, 2)
+        self.assertIn("invalid JSON", err_buf.getvalue())
+
+        # Reserved name
+        err_buf = io.StringIO()
+        with redirect_stderr(err_buf):
+            with self.assertRaises(SystemExit) as cm:
+                main(base_argv + ["--read-only-command", json.dumps({"name": "meeting", "command": "/srv/example/bin/meeting", "description": "desc"})])
+            self.assertEqual(cm.exception.code, 2)
+        self.assertIn("is reserved", err_buf.getvalue())
+
+        # Relative path
+        err_buf = io.StringIO()
+        with redirect_stderr(err_buf):
+            with self.assertRaises(SystemExit) as cm:
+                main(base_argv + ["--read-only-command", json.dumps({"name": "calendar", "command": "relative/path", "description": "desc"})])
+            self.assertEqual(cm.exception.code, 2)
+        self.assertIn("command must be an absolute path", err_buf.getvalue())
+
+        # Duplicate name
+        err_buf = io.StringIO()
+        with redirect_stderr(err_buf):
+            with self.assertRaises(SystemExit) as cm:
+                main(base_argv + [
+                    "--read-only-command", json.dumps({"name": "cal", "command": "/srv/example/bin/cal", "description": "desc"}),
+                    "--read-only-command", json.dumps({"name": "cal", "command": "/srv/example/bin/cal2", "description": "desc2"}),
+                ])
+            self.assertEqual(cm.exception.code, 2)
+        self.assertIn("duplicate command name", err_buf.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

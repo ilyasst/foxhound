@@ -36,6 +36,7 @@ class AgentResearchConfig:
     timeout_seconds: int = 3600
     prompt_path: Path | None = None
     knowledge_roots: tuple[tuple[str, str], ...] = ()
+    read_only_commands: tuple[dict[str, str], ...] = ()
     profile_id: str = "researcher"
     profile_revision: str = "agent-researcher-v1"
 
@@ -111,6 +112,7 @@ def _clean_locator_string(loc_str: str) -> tuple[str, str | None]:
 def _map_locator(
     loc_str: str,
     knowledge_roots: Sequence[tuple[str, str]],
+    read_only_commands: Sequence[str] | Sequence[Mapping[str, Any]] = (),
 ) -> tuple[str, str, str | None] | None:
     """Map locator string to (namespace, resource, fragment). Return None if unmappable."""
     if not isinstance(loc_str, str) or not loc_str.strip():
@@ -134,6 +136,26 @@ def _map_locator(
             return "web", loc_base, fragment
         except SynthesisError:
             return None
+
+    # Check for declared read-only commands
+    declared_tool_names = set()
+    for item in read_only_commands:
+        if isinstance(item, str):
+            declared_tool_names.add(item)
+        elif isinstance(item, Mapping) and "name" in item:
+            declared_tool_names.add(item["name"])
+
+    if ":" in loc:
+        prefix_cand, text_cand = loc.split(":", 1)
+        if prefix_cand in declared_tool_names:
+            clean_text = text_cand.strip()
+            if 1 <= len(clean_text) <= 300 and "\x00" not in clean_text and "\n" not in clean_text and "\r" not in clean_text:
+                resource_val = f"{prefix_cand}:{clean_text}"
+                try:
+                    _validate_resource_locator(resource_val, namespace="tool")
+                    return "tool", resource_val, None
+                except SynthesisError:
+                    return None
 
     # Check for fragment/section (e.g. path#section or path:line)
     fragment = None
@@ -296,6 +318,7 @@ def _process_evidence_and_refs(
     sources_by_locator: dict[tuple[str, str], dict[str, Any]],
     sources_list: list[dict[str, Any]],
     knowledge_roots: Sequence[tuple[str, str]],
+    read_only_commands: Sequence[str] | Sequence[Mapping[str, Any]] = (),
 ) -> list[str]:
     refs: list[str] = []
     if not raw_evidence:
@@ -303,7 +326,7 @@ def _process_evidence_and_refs(
     for item in raw_evidence:
         if not isinstance(item, str):
             continue
-        mapped = _map_locator(item, knowledge_roots)
+        mapped = _map_locator(item, knowledge_roots, read_only_commands)
         if mapped is None:
             continue
         ns, res, frag = mapped
@@ -326,8 +349,11 @@ def _make_claim(
     sources_by_locator: dict[tuple[str, str], dict[str, Any]],
     sources_list: list[dict[str, Any]],
     knowledge_roots: Sequence[tuple[str, str]],
+    read_only_commands: Sequence[str] | Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
-    refs = _process_evidence_and_refs(raw_evidence, sources_by_locator, sources_list, knowledge_roots)
+    refs = _process_evidence_and_refs(
+        raw_evidence, sources_by_locator, sources_list, knowledge_roots, read_only_commands
+    )
     if status != "unknown" and not refs:
         status = "unknown"
     return {
@@ -340,6 +366,7 @@ def _make_claim(
 def _convert_research_json(
     raw: Mapping[str, Any],
     knowledge_roots: Sequence[tuple[str, str]],
+    read_only_commands: Sequence[str] | Sequence[Mapping[str, Any]] = (),
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     sources_by_locator: dict[tuple[str, str], dict[str, Any]] = {}
     sources_list: list[dict[str, Any]] = []
@@ -363,6 +390,7 @@ def _convert_research_json(
         sources_by_locator,
         sources_list,
         knowledge_roots,
+        read_only_commands,
     )
     requested_action = _make_claim(
         rd_text,
@@ -371,6 +399,7 @@ def _convert_research_json(
         sources_by_locator,
         sources_list,
         knowledge_roots,
+        read_only_commands,
     )
 
     # constraints <- constraints
@@ -385,7 +414,7 @@ def _convert_research_json(
                 ev = c.get("evidence", [])
                 st = "supported" if ev else "inferred"
                 constraints_claims.append(
-                    _make_claim(text, st, ev, sources_by_locator, sources_list, knowledge_roots)
+                    _make_claim(text, st, ev, sources_by_locator, sources_list, knowledge_roots, read_only_commands)
                 )
 
     # findings <- facts
@@ -408,7 +437,7 @@ def _convert_research_json(
                     st = "supported" if f.get("evidence") else "inferred"
                 ev = f.get("evidence", [])
                 findings_claims.append(
-                    _make_claim(text, st, ev, sources_by_locator, sources_list, knowledge_roots)
+                    _make_claim(text, st, ev, sources_by_locator, sources_list, knowledge_roots, read_only_commands)
                 )
 
     # related_entities <- entities (unresolved -> status unknown, no refs)
@@ -435,7 +464,7 @@ def _convert_research_json(
                 else:
                     st = "supported" if ev else "inferred"
                     entities_claims.append(
-                        _make_claim(text, st, ev, sources_by_locator, sources_list, knowledge_roots)
+                        _make_claim(text, st, ev, sources_by_locator, sources_list, knowledge_roots, read_only_commands)
                     )
 
     # stakeholders <- ownership verdict claim
@@ -447,7 +476,7 @@ def _convert_research_json(
         if verdict:
             st = "supported" if ev else "inferred"
             stakeholders_claims.append(
-                _make_claim(f"Owner: {verdict}", st, ev, sources_by_locator, sources_list, knowledge_roots)
+                _make_claim(f"Owner: {verdict}", st, ev, sources_by_locator, sources_list, knowledge_roots, read_only_commands)
             )
 
     # open_questions <- open_questions (status unknown)
@@ -491,6 +520,7 @@ def _convert_research_json(
 def check_research_output(
     run_dir: Path | str,
     knowledge_roots: Sequence[tuple[str, str]],
+    read_only_commands: Sequence[str] | Sequence[Mapping[str, Any]] = (),
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]] | None, list[str]]:
     """Check research.json in run_dir.
 
@@ -552,7 +582,7 @@ def check_research_output(
             if not isinstance(item, str):
                 problems.append(f"Evidence at '{item_path}' must be a string, got {type(item).__name__}")
                 continue
-            mapped = _map_locator(item, knowledge_roots)
+            mapped = _map_locator(item, knowledge_roots, read_only_commands)
             if mapped is None:
                 problems.append(
                     f"Unmappable evidence locator at '{item_path}': {item!r}. "
@@ -591,7 +621,7 @@ def check_research_output(
 
     # Conversion and validation errors
     try:
-        draft, sources = _convert_research_json(raw_research, knowledge_roots)
+        draft, sources = _convert_research_json(raw_research, knowledge_roots, read_only_commands)
     except Exception as exc:
         problems.append(f"Conversion error: {exc}")
 
@@ -634,6 +664,15 @@ def agent_synthesize(
         "knowledge_roots": knowledge_roots_data,
         "starting_points": starting_points_data,
     }
+    if config.read_only_commands:
+        task_json_payload["read_only_commands"] = [
+            {
+                "name": cmd["name"],
+                "command": cmd["command"],
+                "description": cmd["description"],
+            }
+            for cmd in config.read_only_commands
+        ]
     (run_dir / "task.json").write_text(
         json.dumps(task_json_payload, indent=2, ensure_ascii=False),
         encoding="utf-8",
@@ -695,7 +734,9 @@ def agent_synthesize(
     session_id = extract_session_id_from_bytes(proc_output.encode("utf-8", errors="replace"))
 
     repair_turns = 0
-    draft, sources, problems = check_research_output(run_dir, config.knowledge_roots)
+    draft, sources, problems = check_research_output(
+        run_dir, config.knowledge_roots, config.read_only_commands
+    )
 
     while problems and session_id and repair_turns < 2:
         repair_turns += 1
@@ -758,7 +799,9 @@ def agent_synthesize(
             # Repair timeout stops further repair turns
             break
 
-        draft, sources, problems = check_research_output(run_dir, config.knowledge_roots)
+        draft, sources, problems = check_research_output(
+            run_dir, config.knowledge_roots, config.read_only_commands
+        )
 
     if problems:
         research_json_path = run_dir / "research.json"

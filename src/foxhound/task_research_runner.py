@@ -13,10 +13,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -136,6 +138,7 @@ def run_once(
     agent_max_turns: int = 120,
     agent_timeout: int = 3600,
     knowledge_roots: tuple[tuple[str, str], ...] = (),
+    read_only_commands: tuple[dict[str, str], ...] = (),
     agent_runner=None,
 ) -> ResearchRunResult:
     """Claim at most one queued research job and execute it through publication."""
@@ -231,6 +234,7 @@ def run_once(
                 max_turns=agent_max_turns,
                 timeout_seconds=agent_timeout,
                 knowledge_roots=knowledge_roots,
+                read_only_commands=read_only_commands,
                 profile_id=profile_id,
                 profile_revision=profile_revision,
             )
@@ -377,7 +381,54 @@ def _parser() -> argparse.ArgumentParser:
         metavar="NAME=PATH",
         help="named knowledge root exposed to the agent researcher (repeatable)",
     )
+    parser.add_argument(
+        "--read-only-command",
+        action="append",
+        default=[],
+        metavar="JSON",
+        help="JSON string defining a read-only command: {name, command, description} (repeatable)",
+    )
     return parser
+
+
+def _parse_read_only_commands(
+    parser: argparse.ArgumentParser, entries: Sequence[str]
+) -> tuple[dict[str, str], ...]:
+    reserved_names = {
+        "kb", "attachment", "attachments", "email", "emails", "repo", "web", "meeting",
+    }
+    seen_names: set[str] = set()
+    commands: list[dict[str, str]] = []
+    for entry in entries:
+        try:
+            data = json.loads(entry)
+        except Exception:
+            parser.error(f"invalid --read-only-command '{entry}': invalid JSON")
+        if not isinstance(data, Mapping) or set(data) != {"name", "command", "description"}:
+            parser.error(f"invalid --read-only-command '{entry}': must be JSON object with keys name, command, description")
+        name = data["name"]
+        if not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", name):
+            parser.error(f"invalid --read-only-command '{entry}': name must be identifier [a-z][a-z0-9-]{{0,31}}")
+        if name in reserved_names:
+            parser.error(f"invalid --read-only-command '{entry}': name '{name}' is reserved")
+        if name in seen_names:
+            parser.error(f"invalid --read-only-command '{entry}': duplicate command name '{name}'")
+        seen_names.add(name)
+
+        raw_cmd = data["command"]
+        if not isinstance(raw_cmd, str) or not Path(raw_cmd).is_absolute():
+            parser.error(f"invalid --read-only-command '{entry}': command must be an absolute path")
+
+        desc = data["description"]
+        if not isinstance(desc, str) or not desc.strip() or len(desc) > 2000:
+            parser.error(f"invalid --read-only-command '{entry}': description must be non-empty and <= 2000 characters")
+
+        commands.append({
+            "name": name,
+            "command": str(Path(raw_cmd)),
+            "description": desc,
+        })
+    return tuple(commands)
 
 
 def _parse_knowledge_roots(parser: argparse.ArgumentParser, entries: Sequence[str]) -> tuple[tuple[str, str], ...]:
@@ -397,6 +448,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     arguments = parser.parse_args(argv)
     knowledge_roots = _parse_knowledge_roots(parser, arguments.knowledge_root)
+    read_only_commands = _parse_read_only_commands(parser, arguments.read_only_command)
     try:
         result = run_once(
             database=arguments.database,
@@ -425,6 +477,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             agent_max_turns=arguments.agent_max_turns,
             agent_timeout=arguments.agent_timeout,
             knowledge_roots=knowledge_roots,
+            read_only_commands=read_only_commands,
         )
     except (ResearchError, ValueError, OSError):
         print(json.dumps({"accepted": False, "error_code": "configuration_unavailable"}, sort_keys=True))

@@ -134,7 +134,51 @@ def test_agent_synthesize_success(tmp_path: Path) -> None:
     task_json = json.loads((run_dir / "task.json").read_text())
     assert task_json["task_id"] == 123
     assert task_json["knowledge_roots"] == [{"name": "kb", "path": str(kb_dir)}]
+    assert "read_only_commands" not in task_json
     assert len(task_json["starting_points"]) > 0
+
+
+def test_agent_synthesize_task_json_contains_read_only_commands(tmp_path: Path) -> None:
+    fake_hermes = tmp_path / "fake_hermes.py"
+    valid_research = {
+        "ownership": {"verdict": "reader", "evidence": []},
+        "requested_deliverable": {"text": "Produce research summary", "evidence": []},
+        "constraints": [],
+        "entities": [],
+        "facts": [],
+        "open_questions": [],
+        "recommendation": {"text": "Proceed", "evidence": []},
+    }
+    _write_fake_hermes(fake_hermes, output_json=valid_research)
+
+    ro_cmds = (
+        {
+            "name": "calendar-cli",
+            "command": "/srv/example/bin/cal",
+            "description": "check calendar",
+        },
+    )
+    config = AgentResearchConfig(
+        hermes_command=str(fake_hermes),
+        model="test-model",
+        read_only_commands=ro_cmds,
+    )
+    ctx = {
+        "task_snapshot": {"task_id": 456, "title": "Test Task RO"},
+        "origin": {"kind": "issue", "record_id": "repo/test"},
+    }
+    run_dir = tmp_path / "run_ro"
+    agent_synthesize(ctx, config=config, bound_sources=None, run_dir=run_dir)
+
+    task_json = json.loads((run_dir / "task.json").read_text())
+    assert task_json["task_id"] == 456
+    assert task_json["read_only_commands"] == [
+        {
+            "name": "calendar-cli",
+            "command": "/srv/example/bin/cal",
+            "description": "check calendar",
+        }
+    ]
 
 
 def test_agent_synthesize_argv_env_cwd(tmp_path: Path) -> None:
@@ -354,6 +398,14 @@ def test_agent_locators_four_shapes_and_safeguards(tmp_path: Path) -> None:
 
     # Symlink escaping root -> dropped (None)
     assert _map_locator("kb:Meetings/escape_symlink.txt", k_roots) is None
+
+    # Declared tool command mapping
+    ro_cmds = ({"name": "calendar-cli", "command": "/srv/example/bin/calendar-readonly", "description": "view calendar"},)
+    map_tool = _map_locator("calendar-cli:events --from 2030-01-01", k_roots, ro_cmds)
+    assert map_tool == ("tool", "calendar-cli:events --from 2030-01-01", None)
+
+    # Undeclared tool command mapping returns None
+    assert _map_locator("mail-cli:messages --unread", k_roots, ro_cmds) is None
 
     # Full conversion with synthesize output
     fake_hermes = tmp_path / "fake_hermes.py"
