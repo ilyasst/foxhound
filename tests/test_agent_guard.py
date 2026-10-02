@@ -19,6 +19,15 @@ class AgentGuardTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
+        # Git config outside the fixture must not decide the outcome: a
+        # machine-wide core.hooksPath (or a guard already installed there)
+        # would otherwise make every repository here look "already installed".
+        self.gitconfig = self.root / "gitconfig"
+        self.gitconfig.write_text("", encoding="utf-8")
+        self.git_env = {
+            "GIT_CONFIG_GLOBAL": str(self.gitconfig),
+            "GIT_CONFIG_NOSYSTEM": "1",
+        }
         self.repo = self.root / "example-repo"
         self.repo.mkdir(mode=0o700)
         self._git(["init", "-b", "main"], cwd=self.repo)
@@ -29,7 +38,7 @@ class AgentGuardTests(unittest.TestCase):
         self._git(["commit", "-m", "initial commit"], cwd=self.repo)
 
     def _git(self, args: list[str], *, cwd: Path, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-        full_env = dict(os.environ)
+        full_env = {**os.environ, **self.git_env}
         if env:
             full_env.update(env)
         return subprocess.run(
@@ -45,6 +54,7 @@ class AgentGuardTests(unittest.TestCase):
         return subprocess.run(
             [str(INSTALL_SCRIPT)],
             cwd=cwd,
+            env={**os.environ, **self.git_env},
             capture_output=True,
             text=True,
             check=False,
