@@ -309,6 +309,19 @@ class TaskArchiveTests(unittest.TestCase):
                 with self.assertRaises(TaskArchiveError):
                     preserve_run_files(self.run, paths.run_directory)
 
+    def test_preserve_run_files_names_missing_artifact_path_and_reason(self):
+        paths = self._paths()
+        manifest = self.run / "result-artifacts.json"
+        manifest.write_text(json.dumps(["missing-file.txt"]), encoding="utf-8")
+        manifest.chmod(0o600)
+        with self.assertRaises(TaskArchiveError) as ctx:
+            preserve_run_files(self.run, paths.run_directory)
+        message = str(ctx.exception)
+        self.assertIn("missing-file.txt", message)
+        self.assertIn("missing", message)
+        self.assertNotIn(str(self.run), message)
+        self.assertNotIn(str(paths.run_directory), message)
+
 
 if __name__ == "__main__":
     unittest.main()

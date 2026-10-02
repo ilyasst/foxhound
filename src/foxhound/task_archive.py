@@ -281,18 +281,30 @@ def preserve_run_files(
             info = source.lstat()
         except FileNotFoundError:
             if relative in manifested:
-                raise TaskArchiveError("task run evidence is unavailable")
+                raise TaskArchiveError(
+                    f"task run evidence is unavailable: {relative} is missing"
+                )
             continue
         except OSError as exc:
-            raise TaskArchiveError("task run evidence is unavailable") from exc
+            raise TaskArchiveError(
+                f"task run evidence is unavailable: {relative} cannot be read: {exc.strerror or exc}"
+            ) from exc
         if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_ARTIFACT_BYTES:
             if relative in {Path(name) for name in RESULT_INPUT_NAMES} or (
                 relative.name == TRANSCRIPT_NAME
             ) or relative in manifested:
-                raise TaskArchiveError("task run evidence is unsafe")
+                if not stat.S_ISREG(info.st_mode):
+                    raise TaskArchiveError(
+                        f"task run evidence is unsafe: {relative} is not a regular file"
+                    )
+                raise TaskArchiveError(
+                    f"task run evidence is unsafe: {relative} is too large"
+                )
             continue
         if total + info.st_size > MAX_ARCHIVE_BYTES:
-            raise TaskArchiveError("task run evidence is too large")
+            raise TaskArchiveError(
+                f"task run evidence is too large: {relative} exceeds total archive budget"
+            )
         destination = destination_directory / relative
         _make_directory(destination.parent)
         try:
@@ -303,7 +315,9 @@ def preserve_run_files(
             raise TaskArchiveError("task run evidence is unavailable") from exc
         if destination_info is not None:
             if not stat.S_ISREG(destination_info.st_mode):
-                raise TaskArchiveError("task run evidence is unsafe")
+                raise TaskArchiveError(
+                    f"task run evidence is unsafe: {relative} is not a regular file in destination"
+                )
             copied.append(relative.as_posix())
             total += info.st_size
             continue
@@ -379,7 +393,13 @@ def recorded_artifacts(run_directory: Path) -> tuple[dict[str, object], ...]:
                 not stat.S_ISREG(info.st_mode)
                 or info.st_size > MAX_ARTIFACT_BYTES
             ):
-                raise TaskArchiveError("task result artifacts are unsafe")
+                if not stat.S_ISREG(info.st_mode):
+                    raise TaskArchiveError(
+                        f"task result artifacts are unsafe: {relative} is not a regular file"
+                    )
+                raise TaskArchiveError(
+                    f"task result artifacts are unsafe: {relative} is too large"
+                )
             digest = hashlib.sha256()
             with os.fdopen(descriptor, "rb") as source:
                 descriptor = -1
@@ -387,7 +407,7 @@ def recorded_artifacts(run_directory: Path) -> tuple[dict[str, object], ...]:
                     digest.update(block)
         except OSError as exc:
             raise TaskArchiveError(
-                "task result artifacts are unavailable"
+                f"task result artifacts are unavailable: {relative} cannot be read: {exc.strerror or exc}"
             ) from exc
         finally:
             if descriptor >= 0:
@@ -489,10 +509,19 @@ def _publish_log(paths: TaskArchivePaths, log: dict) -> None:
     _write_private(
         paths.working_directory / TASK_LOG_NAME,
         json.dumps(log, ensure_ascii=False, indent=1, sort_keys=True) + "\n",
+        root=paths.working_directory,
     )
     document = _render_task_document(log)
-    _write_private(paths.working_directory / "README.md", document)
-    _write_private(paths.task_file, document)
+    _write_private(
+        paths.working_directory / "README.md",
+        document,
+        root=paths.working_directory,
+    )
+    _write_private(
+        paths.task_file,
+        document,
+        root=paths.task_file.parent,
+    )
 
 
 def _render_task_document(log: Mapping[str, object]) -> str:
@@ -617,19 +646,25 @@ def _single_line(value: str, maximum: int) -> str:
     return text
 
 
-def _write_private(path: Path, value: str) -> None:
+def _write_private(path: Path, value: str, *, root: Path | None = None) -> None:
     """Replace a file's contents, following no symlink."""
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
+        rel = path.relative_to(root) if root is not None else path.name
+    except ValueError:
+        rel = path.name
+    try:
         descriptor = os.open(path, flags, 0o600)
     except OSError as exc:
-        raise TaskArchiveError("task archive file is unavailable") from exc
+        raise TaskArchiveError(
+            f"task archive file is unavailable: {rel} cannot be written: {exc.strerror or exc}"
+        ) from exc
     try:
         info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode):
-            raise TaskArchiveError("task archive file is unsafe")
+            raise TaskArchiveError(f"task archive file is unsafe: {rel} is not a regular file")
         with os.fdopen(
             descriptor, "w", encoding="utf-8", closefd=False
         ) as handle:
