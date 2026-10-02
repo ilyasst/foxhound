@@ -637,6 +637,134 @@ class ResearchGatePlanningTests(unittest.TestCase):
             _validate_runtime(dep_config)
         self.assertIn("research-before-planning requires an enabled runner with both task archive roots configured", str(ctx.exception))
 
+    def test_queued_job_older_than_limit_keeps_plan_pending_with_no_limit(self):
+        from datetime import timedelta
+        from foxhound.task_research_gate import ResearchGateDecision, evaluate_research_gate, ResearchGatePolicy
+        task_id = 1
+        self._task(task_id, READER, origin_kind="meeting")
+        old_time = NOW - timedelta(days=30)
+        task_folder = self.task_work_root / f"T{task_id}-folder"
+        task_folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+        snap = _snapshot(task_id=task_id, version=1, text="Synthetic task 1")
+        # Request at old_time
+        store_old = ResearchStore(self.database, self.cas, clock=lambda: old_time)
+        store_old.request(
+            snap,
+            task_work_root=self.task_work_root,
+            task_folder=task_folder,
+        )
+
+        with closing(sqlite3.connect(self.database)) as conn:
+            conn.row_factory = sqlite3.Row
+            # Policy with no wait_seconds (default / None)
+            policy_unlimited = ResearchGatePolicy.build(
+                ["meeting"],
+                task_work_root=self.task_work_root,
+                task_kb_root=self.task_kb_root,
+            )
+            res = evaluate_research_gate(conn, policy_unlimited, task_id, 1, NOW)
+            self.assertEqual(res.decision, ResearchGateDecision.PENDING)
+            self.assertEqual(res.reason, "in_flight")
+
+            # Policy with explicit wait_seconds (e.g. 1800) -> bypasses timed_out
+            policy_limited = ResearchGatePolicy.build(
+                ["meeting"],
+                wait_seconds=1800,
+                task_work_root=self.task_work_root,
+                task_kb_root=self.task_kb_root,
+            )
+            res_limited = evaluate_research_gate(conn, policy_limited, task_id, 1, NOW)
+            self.assertEqual(res_limited.decision, ResearchGateDecision.BYPASSED)
+            self.assertEqual(res_limited.reason, "timed_out")
+
+    def test_parked_research_bypasses_gate(self):
+        from foxhound.task_research_gate import ResearchGateDecision, evaluate_research_gate, ResearchGatePolicy
+        task_id = 2
+        self._task(task_id, READER, origin_kind="meeting")
+        task_folder = self.task_work_root / f"T{task_id}-folder"
+        task_folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+        snap = _snapshot(task_id=task_id, version=1, text="Synthetic task 2")
+        self.store.request(
+            snap,
+            task_work_root=self.task_work_root,
+            task_folder=task_folder,
+        )
+        with closing(sqlite3.connect(self.database)) as conn:
+            conn.execute(
+                "UPDATE task_research_jobs SET state='parked' WHERE task_id=?",
+                (task_id,),
+            )
+            conn.commit()
+            conn.row_factory = sqlite3.Row
+            policy = ResearchGatePolicy.build(
+                ["meeting"],
+                task_work_root=self.task_work_root,
+                task_kb_root=self.task_kb_root,
+            )
+            res = evaluate_research_gate(conn, policy, task_id, 1, NOW)
+            self.assertEqual(res.decision, ResearchGateDecision.BYPASSED)
+            self.assertEqual(res.reason, "parked")
+
+    def test_expired_running_lease_requeued_by_runner_and_gate_stays_pending(self):
+        from datetime import timedelta
+        from foxhound.task_research_gate import ResearchGateDecision, evaluate_research_gate, ResearchGatePolicy
+        from foxhound.task_research_runner import run_once
+        task_id = 3
+        self._task(task_id, READER, origin_kind="meeting")
+        task_folder = self.task_work_root / f"T{task_id}-folder"
+        task_folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+        snap = _snapshot(task_id=task_id, version=1, text="Synthetic task 3")
+        self.store.request(
+            snap,
+            task_work_root=self.task_work_root,
+            task_folder=task_folder,
+        )
+        # Claim it with a lease of 600s
+        claim = self.store.claim("worker-1", lease_seconds=600, task_work_root=self.task_work_root)
+        self.assertIsNotNone(claim)
+
+        # Advance clock past lease expiry
+        later = NOW + timedelta(seconds=1200)
+
+        # Runner run_once runs at `later`; recover pass will requeue the expired job
+        scratch_root = self.root / "scratch"
+        scratch_root.mkdir(mode=0o700)
+
+        with mock.patch("foxhound.task_research_runner.synthesize") as mock_synth, \
+             mock.patch("foxhound.task_research_runner.load_knowledge_config") as mock_load_kc, \
+             mock.patch("foxhound.task_research_runner.GwKnowledgeClient"):
+            mock_load_kc.return_value = None
+            mock_synth.side_effect = Exception("Synthetic abort so run_once doesn't finish")
+            try:
+                run_once(
+                    database=self.database,
+                    cas_root=self.cas,
+                    task_work_root=self.task_work_root,
+                    scratch_root=scratch_root,
+                    model="synthetic-model",
+                    endpoint="http://127.0.0.1:8787",
+                    clock=lambda: later,
+                )
+            except Exception:
+                pass
+
+        # Check job in db is recovered (state is queued or claimed by run_once, but definitely active)
+        with closing(sqlite3.connect(self.database)) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT state, attempts FROM task_research_jobs WHERE task_id=?",
+                (task_id,),
+            ).fetchone()
+            self.assertIn(row["state"], ("queued", "running"))
+            policy = ResearchGatePolicy.build(
+                ["meeting"],
+                task_work_root=self.task_work_root,
+                task_kb_root=self.task_kb_root,
+            )
+            res = evaluate_research_gate(conn, policy, task_id, 1, later)
+            self.assertEqual(res.decision, ResearchGateDecision.PENDING)
+            self.assertEqual(res.reason, "in_flight")
+
 
 if __name__ == "__main__":
     unittest.main()

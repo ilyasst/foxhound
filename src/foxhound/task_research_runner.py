@@ -164,6 +164,10 @@ def run_once(
                 pass
 
     store = ResearchStore(db_path, cas_path, clock=clock)
+    try:
+        store.recover_expired()
+    except ResearchError:
+        pass
     claim = store.claim(
         worker_id,
         lease_seconds=lease_seconds,

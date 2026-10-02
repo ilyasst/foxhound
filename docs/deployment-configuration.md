@@ -374,8 +374,13 @@ A source kind cannot appear in both `plan_without_asking` and
 `research_before_planning` requires completed research before planning tasks
 from the listed source kinds. For a listed kind, planning is unclaimable until
 a completed research receipt exists for the task's current version (or research
-times out / fails). A task waiting at the Start card (such as one owned by others)
+fails / is parked / canceled). A task waiting at the Start card (such as one owned by others)
 does not request research until it is started.
+
+`workflow.research_wait_seconds` (optional integer between 600 and 86400):
+maximum seconds planning waits for in-flight or queued research before bypassing
+the research gate with `timed_out`. When absent, planning waits for queued or
+running research without a time limit.
 
 `workflow.voice_summaries` (optional boolean, default `true`): when `false`,
 the execution runner starts with `FOXHOUND_VOICE_SUMMARIES=0`, so recorded
