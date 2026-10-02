@@ -18,7 +18,7 @@ import stat
 import subprocess
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -147,6 +147,18 @@ def run_once(
     cas_path = Path(cas_root).resolve()
     work_root_path = _validate_owner_private_dir(Path(task_work_root))
     trusted_scratch_root = _ensure_private_scratch_root(Path(scratch_root))
+
+    # At start of run_once, delete failed-* directories older than 7 days
+    now_ts = (clock() if clock else datetime.now(timezone.utc)).timestamp()
+    cutoff_ts = now_ts - (7 * 86400)
+    for entry in trusted_scratch_root.iterdir():
+        if entry.is_dir() and entry.name.startswith("failed-"):
+            try:
+                mtime = entry.stat().st_mtime
+                if mtime < cutoff_ts:
+                    shutil.rmtree(entry, ignore_errors=True)
+            except OSError:
+                pass
 
     store = ResearchStore(db_path, cas_path, clock=clock)
     claim = store.claim(
@@ -291,7 +303,13 @@ def run_once(
         return fail_or_repair("unexpected_error")
     finally:
         if run_scratch is not None and run_scratch.exists():
-            shutil.rmtree(run_scratch, ignore_errors=True)
+            # Failure occurred: rename to failed-<job_id>-<timestamp> inside scratch_root
+            ts = int((clock() if clock else datetime.now(timezone.utc)).timestamp())
+            failed_dir = trusted_scratch_root / f"failed-{job_id}-{ts}"
+            try:
+                run_scratch.rename(failed_dir)
+            except OSError:
+                shutil.rmtree(run_scratch, ignore_errors=True)
 
 
 def _parser() -> argparse.ArgumentParser:

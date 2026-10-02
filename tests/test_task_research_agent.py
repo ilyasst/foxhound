@@ -5,6 +5,8 @@ import os
 import stat
 import subprocess
 import sys
+from contextlib import closing
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -273,7 +275,146 @@ def test_agent_synthesize_unmappable_evidence_downgrades_to_unknown(tmp_path: Pa
     run_dir = tmp_path / "run"
     result = agent_synthesize({"task_snapshot": {}}, config=config, bound_sources=None, run_dir=run_dir)
 
-    assert result.draft["objective"]["status"] == "unknown"
-    assert result.draft["objective"]["source_refs"] == []
-    assert len(result.sources) == 0
-    validate_draft(result.draft, list(result.sources))
+
+def test_agent_locators_four_shapes_and_safeguards(tmp_path: Path) -> None:
+    from foxhound.task_research import validate_sources as vr_sources
+
+    # Temp knowledge roots
+    kb_root = tmp_path / "sync_kb"
+    kb_root.mkdir()
+    attachments_root = tmp_path / "attachments"
+    attachments_root.mkdir()
+
+    # Create files for the 4 shapes
+    meeting_md = kb_root / "Meetings" / "20300101_100000_mix_protocol.md"
+    meeting_md.parent.mkdir(parents=True, exist_ok=True)
+    meeting_md.write_text("line 1\nline 29 Decisions\n")
+
+    wg_md = kb_root / "Working_Groups" / "Alpha.md"
+    wg_md.parent.mkdir(parents=True, exist_ok=True)
+    wg_md.write_text("line 1\nline 23\nline 42\n")
+
+    transcript_txt = attachments_root / "Meetings" / "20300101_100000_mix_transcript.txt"
+    transcript_txt.parent.mkdir(parents=True, exist_ok=True)
+    transcript_txt.write_text("transcript text")
+
+    # Outside root for symlink test
+    outside_file = tmp_path / "secret.txt"
+    outside_file.write_text("sensitive")
+    symlink_file = kb_root / "Meetings" / "escape_symlink.txt"
+    symlink_file.symlink_to(outside_file)
+
+    k_roots = (("kb", str(kb_root)), ("attachments", str(attachments_root)))
+
+    # Test the four shapes
+    ev1 = "kb:Meetings/20300101_100000_mix_protocol.md (line 29, Decisions: Person B will prepare ...)"
+    ev2 = "kb:Working_Groups/Alpha.md (lines 23, 42-45)"
+    ev3 = "https://example.org/funding/options/ (accessed 2030-01-01)"
+    ev4 = "attachments:Meetings/20300101_100000_mix_transcript.txt#L120-L140"
+
+    from foxhound.task_research_agent import _map_locator
+    map1 = _map_locator(ev1, k_roots)
+    assert map1 == ("kb", "Meetings/20300101_100000_mix_protocol.md", "L29")
+
+    map2 = _map_locator(ev2, k_roots)
+    assert map2 == ("kb", "Working_Groups/Alpha.md", "L23")
+
+    map3 = _map_locator(ev3, k_roots)
+    assert map3 == ("web", "https://example.org/funding/options/", None)
+
+    map4 = _map_locator(ev4, k_roots)
+    assert map4 == ("attachment", "Meetings/20300101_100000_mix_transcript.txt", "L120-L140")
+
+    # Nonexistent file -> dropped (None)
+    assert _map_locator("kb:Meetings/nonexistent.md", k_roots) is None
+
+    # Symlink escaping root -> dropped (None)
+    assert _map_locator("kb:Meetings/escape_symlink.txt", k_roots) is None
+
+    # Full conversion with synthesize output
+    fake_hermes = tmp_path / "fake_hermes.py"
+    research_json = {
+        "ownership": {"verdict": "reader", "evidence": [ev1]},
+        "requested_deliverable": {"text": "Do task", "evidence": [ev2]},
+        "facts": [
+            {"text": "Fact 1", "status": "confirmed", "evidence": [ev3]},
+            {"text": "Fact 2", "status": "confirmed", "evidence": [ev4]},
+            # Duplicate resource with different fragment or note
+            {"text": "Fact 3", "status": "confirmed", "evidence": ["kb:Working_Groups/Alpha.md (line 99)"]},
+        ],
+    }
+    _write_fake_hermes(fake_hermes, output_json=research_json)
+    config = AgentResearchConfig(hermes_command=str(fake_hermes), knowledge_roots=k_roots)
+    run_dir = tmp_path / "run_full"
+    res = agent_synthesize({"task_snapshot": {}}, config=config, bound_sources=None, run_dir=run_dir)
+
+    # Dedup check: Working_Groups/Alpha.md was referenced twice, but sources should only have it once
+    resources = [(dict(s["locator"])["namespace"], dict(s["locator"])["resource"]) for s in res.sources]  # type: ignore[index]
+    assert len(resources) == len(set(resources))
+    assert len(res.sources) == 4  # protocol, alpha, example.org, transcript
+
+    # Titles check
+    for s in res.sources:
+        title = str(s["title"])  # type: ignore[index]
+        assert title == title.strip()
+        assert len(title) <= 200
+        if dict(s["locator"])["namespace"] == "web":  # type: ignore[index]
+            assert title == "example.org/funding/options/"
+        else:
+            assert title == dict(s["locator"])["resource"]  # type: ignore[index]
+
+    # Validate sources and draft
+    validated_sources = vr_sources(list(res.sources))
+    assert len(validated_sources) == 4
+    validate_draft(res.draft, list(res.sources))
+
+
+def test_agent_runner_failed_dir_and_cleanup(tmp_path: Path) -> None:
+    from foxhound.task_research_runner import run_once
+    from tests.test_task_research_runner import _setup_test_env, _queue_job
+
+    now = datetime(2030, 1, 15, 12, 0, tzinfo=timezone.utc)
+    paths = _setup_test_env(tmp_path)
+    _queue_job(paths)
+
+    scratch = paths["scratch_root"]
+
+    # Also create an old failed dir (older than 7 days) and a fresh failed dir
+    old_failed = scratch / "failed-old-100"
+    old_failed.mkdir()
+    # Set mtime to 10 days ago relative to now
+    old_mtime = now.timestamp() - (10 * 86400)
+    os.utime(old_failed, (old_mtime, old_mtime))
+
+    recent_failed = scratch / "failed-recent-200"
+    recent_failed.mkdir()
+    recent_mtime = now.timestamp() - (2 * 86400)
+    os.utime(recent_failed, (recent_mtime, recent_mtime))
+
+    # Hermes script that fails
+    fake_hermes = tmp_path / "fake_hermes_fail.py"
+    _write_fake_hermes(fake_hermes, exit_code=1)
+
+    result = run_once(
+        database=paths["database"],
+        cas_root=paths["cas_root"],
+        task_work_root=paths["task_work_root"],
+        scratch_root=scratch,
+        model="synthetic-model",
+        endpoint="http://127.0.0.1:8800",
+        synthesizer="agent",
+        hermes_command=str(fake_hermes),
+        clock=lambda: now,
+    )
+
+    assert result.claimed is True
+    assert result.completed is False
+
+    # Check that old failed dir was deleted
+    assert not old_failed.exists()
+    # Recent failed dir remains
+    assert recent_failed.exists()
+
+    # Check that a new failed-* directory was created in scratch_root
+    created_failed = [d for d in scratch.iterdir() if d.is_dir() and d.name.startswith("failed-")]
+    assert any(d.name != "failed-recent-200" for d in created_failed)

@@ -371,8 +371,10 @@ class TaskResearchRunnerTests(unittest.TestCase):
         self.assertEqual(job[1], 3)
         self.assertEqual(job[2], "retrieval_empty")
 
-        # Transient scratch cleaned up
-        self.assertEqual(list(self.paths["scratch_root"].iterdir()), [])
+        # Failed scratch preserved for diagnostics
+        failed_dirs = list(self.paths["scratch_root"].iterdir())
+        self.assertTrue(all(d.name.startswith("failed-") for d in failed_dirs))
+        self.assertEqual(len(failed_dirs), 1)
 
     def test_stale_task_version_fails_closed(self) -> None:
         _queue_job(self.paths)

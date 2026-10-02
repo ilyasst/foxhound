@@ -21,7 +21,7 @@ You are the Researcher. Before anyone plans or executes the task below, you buil
 # Method
 
 1. First write `research-plan.md`: the specific questions you must answer for this task (at least one per section of "What to establish"), and for each the sources you will check.
-2. Execute the plan. Add questions as new leads appear. Search first, then read: find matches near the target line, then inspect around it. Do not page through large files from the top. Read origin windows to the end of the topic.
+2. Execute the plan. Add questions as new leads appear. Search first, then read: find matches near the target line, then inspect around it. Do not page through large files from the top. Read origin windows to the end of the topic. Note: Every file search must pass an explicit path inside a knowledge root; a search without a path only covers the empty working directory. Meeting transcripts are not in the KB protocol; the protocol's "## Transcript" section points to the transcript file in the attachments root; follow it and read the window around the item.
 3. Read each file once. Keep running notes in `notes.md` (claims with their source locator and line) and work from your notes instead of re-reading.
 4. Before writing the outputs, perform a self-check: re-read `research-plan.md` and verify every question is either answered with evidence or explicitly marked unresolved after an exhaustive search. Any skipped question must be researched.
 5. Write the outputs.
@@ -56,6 +56,9 @@ Write exactly two files in the current working directory:
      "recommendation": {"text": "...", "evidence": ["..."]}
    }
    ```
-   Every item in `evidence` is a source locator: a file path relative to a knowledge root or repo, or an `http://`/`https://` URL for external facts. A claim with no evidence must have status `inferred` or be listed in `open_questions`.
+   Every item in `evidence` is a source locator in one of the following formats:
+   - `<root-name>:<path relative to that root>` optionally followed by `#L<n>` or `#L<n>-L<m>` (for example: `kb:Meetings/20300101_mix.md#L29` or `attachments:Meetings/transcript.txt#L120-L140`).
+   - A bare `http://` or `https://` URL for external facts.
+   Notes never go inside the locator (put them in the claim text). A claim with no evidence must have status `inferred` or be listed in `open_questions`.
 
 2. `research.md`: the same findings structured as a concise, readable brief.
