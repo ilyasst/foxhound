@@ -842,6 +842,139 @@ class DeploymentConfigTests(unittest.TestCase):
         )
         duplicate_stage2_parser().parse_args(command[1:])
 
+    def test_optional_research_runner_consumer_parses_and_renders_argv(self) -> None:
+        document = self._document()
+        document["database_consumers"]["research_runner"] = {  # type: ignore[index]
+            "enabled": True,
+            "cas_root": str(self.root / "cas"),
+            "task_work_root": str(self.task_work_root),
+            "scratch_root": str(self.root / "scratch"),
+            "model": "example-research-model",
+            "endpoint": "https://example.com/v1",
+            "synthesizer": "agent",
+            "hermes_command": str(self.root / "bin" / "hermes"),
+            "agent_toolsets": "all",
+            "agent_max_turns": 25,
+            "agent_timeout": 300,
+            "knowledge_roots": [
+                {"name": "kb1", "path": str(self.root / "kb1")},
+                {"name": "kb2", "path": str(self.root / "kb2")},
+            ],
+            "profile_id": "custom-researcher",
+            "worker_id": "test-worker",
+            "lease_seconds": 1200,
+        }
+        self._write_config(document)
+
+        config = load_deployment_config(self.config_path)
+        command = config.argv("research-runner")
+
+        self.assertEqual(command[0], "foxhound-task-research-runner")
+        self.assertEqual(command[command.index("--database") + 1], str(self.database))
+        self.assertEqual(command[command.index("--cas-root") + 1], str(self.root / "cas"))
+        self.assertEqual(command[command.index("--task-work-root") + 1], str(self.task_work_root))
+        self.assertEqual(command[command.index("--scratch-root") + 1], str(self.root / "scratch"))
+        self.assertEqual(command[command.index("--model") + 1], "example-research-model")
+        self.assertEqual(command[command.index("--endpoint") + 1], "https://example.com/v1")
+        self.assertEqual(command[command.index("--synthesizer") + 1], "agent")
+        self.assertEqual(command[command.index("--hermes-command") + 1], str(self.root / "bin" / "hermes"))
+        self.assertEqual(command[command.index("--agent-toolsets") + 1], "all")
+        self.assertEqual(command[command.index("--agent-max-turns") + 1], "25")
+        self.assertEqual(command[command.index("--agent-timeout") + 1], "300")
+        kroots = [
+            command[i + 1]
+            for i, arg in enumerate(command)
+            if arg == "--knowledge-root"
+        ]
+        self.assertEqual(
+            kroots,
+            [f"kb1={self.root / 'kb1'}", f"kb2={self.root / 'kb2'}"],
+        )
+        self.assertEqual(command[command.index("--profile-id") + 1], "custom-researcher")
+        self.assertEqual(command[command.index("--worker-id") + 1], "test-worker")
+        self.assertEqual(command[command.index("--lease-seconds") + 1], "1200")
+        self.assertEqual(command[command.index("--gw-endpoint") + 1], f"http://{LOOPBACK}:8787")
+        self.assertEqual(command[command.index("--gw-alias") + 1], "example-operator")
+        self.assertEqual(command[command.index("--gw-token-file") + 1], str(self.gateway_token))
+
+    def test_research_runner_agent_without_hermes_command_rejected(self) -> None:
+        document = self._document()
+        document["database_consumers"]["research_runner"] = {  # type: ignore[index]
+            "enabled": True,
+            "cas_root": str(self.root / "cas"),
+            "task_work_root": str(self.task_work_root),
+            "scratch_root": str(self.root / "scratch"),
+            "model": "example-research-model",
+            "endpoint": "https://example.com/v1",
+            "synthesizer": "agent",
+        }
+        self._write_config(document)
+
+        with self.assertRaises(DeploymentConfigError):
+            load_deployment_config(self.config_path)
+
+    def test_research_runner_relative_path_rejected(self) -> None:
+        document = self._document()
+        document["database_consumers"]["research_runner"] = {  # type: ignore[index]
+            "enabled": True,
+            "cas_root": "relative/cas",
+            "task_work_root": str(self.task_work_root),
+            "scratch_root": str(self.root / "scratch"),
+            "model": "example-research-model",
+            "endpoint": "https://example.com/v1",
+            "synthesizer": "single",
+        }
+        self._write_config(document)
+
+        with self.assertRaises(DeploymentConfigError):
+            load_deployment_config(self.config_path)
+
+    def test_research_runner_unknown_key_rejected(self) -> None:
+        document = self._document()
+        document["database_consumers"]["research_runner"] = {  # type: ignore[index]
+            "enabled": True,
+            "cas_root": str(self.root / "cas"),
+            "task_work_root": str(self.task_work_root),
+            "scratch_root": str(self.root / "scratch"),
+            "model": "example-research-model",
+            "endpoint": "https://example.com/v1",
+            "synthesizer": "single",
+            "unknown_field": "disallowed",
+        }
+        self._write_config(document)
+
+        with self.assertRaises(DeploymentConfigError):
+            load_deployment_config(self.config_path)
+
+    def test_research_runner_disabled_raises_disabled_error(self) -> None:
+        document = self._document()
+        document["database_consumers"]["research_runner"] = {  # type: ignore[index]
+            "enabled": False,
+        }
+        self._write_config(document)
+
+        config = load_deployment_config(self.config_path)
+        with self.assertRaisesRegex(DeploymentConfigError, "database consumer is disabled"):
+            config.argv("research-runner")
+
+    def test_research_runner_absent_keeps_existing_components_argv_unchanged(self) -> None:
+        document = self._document()
+        self.assertNotIn("research_runner", document["database_consumers"])  # type: ignore[operator]
+        self._write_config(document)
+
+        config = load_deployment_config(self.config_path)
+        # Verify existing components still render properly
+        self.assertEqual(config.argv("task-cards")[0], "foxhound-task-cards")
+        self.assertEqual(config.argv("execution-schedule")[0], "foxhound-execution-schedule")
+        self.assertEqual(config.argv("candidate-feed-import")[0], "foxhound-candidate-feed-import")
+        self.assertEqual(config.argv("native-intake-run")[0], "foxhound-native-intake")
+        self.assertEqual(config.argv("execution-card-requeue")[0], "foxhound-execution-card-requeue")
+        self.assertEqual(config.argv("lifecycle-outcome-export")[0], "foxhound-task-lifecycle-outcome-export")
+        self.assertEqual(config.argv("fused-task-titles")[0], "foxhound-fused-task-titles")
+        self.assertEqual(config.argv("duplicate-card-schedule")[0], "foxhound-task-duplicate-card-schedule")
+        with self.assertRaises(DeploymentConfigError):
+            config.argv("research-runner")
+
     def test_refuses_a_non_loopback_fused_title_endpoint(self) -> None:
         document = self._document()
         document["database_consumers"]["fused_task_titles"]["endpoint"] = (  # type: ignore[index]

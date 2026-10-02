@@ -480,6 +480,8 @@ class TaskResearchTests(unittest.TestCase):
             self.store.claim("worker-synthetic", lease_seconds="900")  # type: ignore
         with self.assertRaisesRegex(ResearchError, "invalid claim lease"):
             self.store.claim("worker-synthetic", lease_seconds=0)
+        with self.assertRaisesRegex(ResearchError, "invalid claim lease"):
+            self.store.claim("worker-synthetic", lease_seconds=14_401)
 
         # Successful claim with 10s lease
         research_claim = self.store.claim("worker-synthetic", lease_seconds=10)

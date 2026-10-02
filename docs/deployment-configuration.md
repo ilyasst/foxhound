@@ -181,6 +181,15 @@ before it existed is brought forward.
       "limit": 10,
       "daily_budget": 50,
       "timeout_seconds": 600
+    },
+    "research_runner": {
+      "enabled": true,
+      "cas_root": "/srv/example/research/cas",
+      "task_work_root": "/srv/example/work",
+      "scratch_root": "/srv/example/scratch",
+      "model": "example-research-model",
+      "endpoint": "http://<canonical IPv4 loopback address>:8800",
+      "synthesizer": "single"
     }
   }
 }
@@ -223,6 +232,16 @@ loopback HTTP. `limit` bounds a pass, `daily_budget` is a durable UTC-day cap on
 agent attempts (including failed attempts), and `timeout_seconds` bounds each
 pair. Its output is aggregate-only; citations remain in the private database.
 
+`research_runner` is also optional. It declares the one-shot research runner
+consumer. Required keys are `enabled`, `cas_root`, `task_work_root`,
+`scratch_root`, `model`, `endpoint`, and `synthesizer` ("single" or "agent").
+When `synthesizer` is "agent", `hermes_command` is required. Optional keys include
+`hermes_command`, `agent_toolsets`, `agent_max_turns` (1..500), `agent_timeout`
+(60..14400), `knowledge_roots` (list of `{"name": ..., "path": ...}`),
+`profile_id`, `worker_id`, and `lease_seconds` (60..14400). If the card service
+has a gateway configured (`gw_endpoint`, `gw_alias`, `gw_token_file`), those are
+forwarded to the research runner command.
+
 Validate before changing a service definition or restarting anything:
 
 ```sh
@@ -250,7 +269,7 @@ Supported names are `task-cards`, `execution-schedule`,
 `execution-runner:<slot>`, `candidate-feed-import`, `native-intake-run`,
 `execution-card-requeue`, `task-card-requeue`, `lifecycle-outcome-export`, and
 `fused-task-titles`.
-`duplicate-card-schedule`, `duplicate-stage1`, and `duplicate-stage2` are also available. Use the
+`duplicate-card-schedule`, `duplicate-stage1`, `duplicate-stage2`, and `research-runner` are also available. Use the
 configured slot name when rendering a runner. Rendering reads no token contents. Its JSON output does
 contain private paths, so consume it only in the private deployment mechanism,
 never in a repository, issue, or shared log.
