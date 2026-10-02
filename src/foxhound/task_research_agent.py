@@ -483,10 +483,12 @@ def agent_synthesize(
         "profile_id": config.profile_id,
         "profile_revision": config.profile_revision,
         "model": config.model,
-        "provider": config.provider,
+        "provider": config.provider or "local",
         "runtime": "hermes-agent-researcher-v1",
-        "reasoning_requested": None,
-        "reasoning_effective": None,
+        # The receipt has no "none" level; the agent's effort is set by the
+        # model route (thinking_no), so claim the least and report unknown.
+        "reasoning_requested": "low",
+        "reasoning_effective": "unknown",
     }
     metrics = {
         "searches": 0,

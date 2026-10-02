@@ -148,6 +148,18 @@ foxhound-task-research --database /srv/example/state.sqlite3 \
   --task-folder /srv/example/tasks/T101-example
 ```
 
+### Agent researcher
+
+The research runner (`foxhound-task-research-runner`) supports an alternative agent-based synthesis mode via Hermes (`--synthesizer agent`). In agent mode, the runner invokes an interactive Hermes agent within a private run directory instead of making a single model call over keyword snippets.
+
+New CLI flags:
+- `--synthesizer {single,agent}`: synthesis implementation (`single` model call or Hermes `agent`, default: `single`).
+- `--hermes-command PATH`: path to the Hermes CLI or executable (required when `--synthesizer agent`).
+- `--agent-toolsets TOOLSETS`: comma-separated toolsets permitted to the agent researcher (default: `terminal,file,web,browser`).
+- `--agent-max-turns TURNS`: maximum agent turns before giving up (default: 120).
+- `--agent-timeout SECONDS`: total timeout in seconds for agent research execution (default: 3600).
+- `--knowledge-root NAME=PATH`: named knowledge root directory exposed to the agent researcher (repeatable, must be absolute paths).
+
 Production orchestration must pass a failure code to the foundation's `fail`
 command when synthesis exits nonzero. It must not log the context, claim token,
 scratch artifacts, or model response. The metrics file contains only counts and
