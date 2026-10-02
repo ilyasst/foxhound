@@ -922,6 +922,11 @@ class ExecutionWorker:
         draft_path, draft = load_result_draft(
             self._state_path.parent, draft_name
         )
+        if draft["result_id"] != state.run_id:
+            raise ExecutionWorkerDraftError(
+                f"execution result draft id {draft['result_id']!r} does not match current run id {state.run_id!r}: "
+                "re-run `draft` to regenerate the result files for this run, then `record` again; do not rename result files by hand"
+            )
         draft = _repository_result(state, draft, self._state_path.parent)
         voice_summary_text = ""
         if os.environ.get("FOXHOUND_VOICE_SUMMARIES", "1") != "0":
@@ -1015,10 +1020,11 @@ class ExecutionWorker:
                     origin_record=None if origin is None else origin.record_id,
                     origin_item=None if origin is None else origin.item_id,
                 )
-            except TaskArchiveError:
-                raise ExecutionWorkerDraftError(
-                    "execution result review files could not be preserved"
-                ) from None
+            except TaskArchiveError as exc:
+                cause_text = str(exc).strip()
+                hint = "re-run `draft` to regenerate the result files for this run, then `record` again; do not rename result files by hand"
+                message = f"execution result review files could not be preserved: {cause_text}; {hint}" if cause_text else f"execution result review files could not be preserved; {hint}"
+                raise ExecutionWorkerDraftError(message) from None
         result = service.record_result(envelope)
         if result.disposition is WorkflowDisposition.REFUSED:
             # The ledger says exactly why. Discarding it left an agent to

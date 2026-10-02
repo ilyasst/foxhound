@@ -375,7 +375,7 @@ class ExecutionWorkerTests(unittest.TestCase):
         document = {
             "schema": "foxhound.execution-result-draft",
             "schema_version": 1,
-            "result_id": RESULT_ID,
+            "result_id": RUN_ID,
             "outcome": "awaiting_plan",
             "summary": "Synthetic result summary",
             "work_markdown": "# Synthetic work\n\nNo private evidence.",
@@ -386,7 +386,7 @@ class ExecutionWorkerTests(unittest.TestCase):
             "repository_impact": True,
         }
         document.update(changes)
-        path = self.run_directory / f"result-{RESULT_ID}.json"
+        path = self.run_directory / f"result-{document['result_id']}.json"
         path.write_text(json.dumps(document), encoding="utf-8")
         path.chmod(0o600)
         return path
@@ -701,7 +701,7 @@ class ExecutionWorkerTests(unittest.TestCase):
         with knowledge_server() as endpoint:
             self._worker(endpoint).record(draft.name)
 
-        second_id = "d" * 32
+        second_id = RUN_ID
         second = self.run_directory / f"result-{second_id}.json"
         second.write_text(json.dumps({
             "schema": "foxhound.execution-result-draft",
@@ -1049,7 +1049,7 @@ class ExecutionWorkerTests(unittest.TestCase):
 
         state = TaskExecutionService(self.database).get(1)
         self.assertEqual(state.status, WorkflowStatus.AWAITING_REVIEW)
-        self.assertEqual(state.last_result_id, RESULT_ID)
+        self.assertEqual(state.last_result_id, RUN_ID)
         self.assertEqual(receipt["status"], "awaiting_review")
         scrubbed = draft.read_text(encoding="utf-8")
         self.assertNotIn(CLAIM_TOKEN, scrubbed)
@@ -1187,7 +1187,7 @@ class ExecutionWorkerTests(unittest.TestCase):
         draft = self._write_draft()
         path, document = load_result_draft(self.run_directory, str(draft))
         self.assertEqual(path, draft)
-        self.assertEqual(document["result_id"], RESULT_ID)
+        self.assertEqual(document["result_id"], RUN_ID)
 
         alias_id = "c" * 32
         alias = self.run_directory / f"result-{alias_id}.json"
@@ -1298,6 +1298,53 @@ class ExecutionWorkerTests(unittest.TestCase):
             hashlib.sha256(b"Synthetic verification.\n").hexdigest(),
             str(paths.run_directory),
         ))
+
+    def test_record_refuses_missing_manifested_artifact_with_cause_and_hint(self):
+        self._enable_archive()
+        self._write_result_inputs()
+        self._write_result_input("result-artifacts.json", ["verification.txt"])
+
+        with knowledge_server() as endpoint:
+            worker = self._worker(endpoint)
+            ready = worker.draft(outcome="awaiting_plan")
+            with self.assertRaises(ExecutionWorkerDraftError) as ctx:
+                worker.record(ready["draft"])
+
+        message = str(ctx.exception)
+        self.assertIn("verification.txt", message)
+        self.assertIn("missing", message)
+        self.assertIn("re-run `draft` to regenerate the result files for this run", message)
+        self.assertNotIn(str(self.run_directory), message)
+
+    def test_record_refuses_stale_run_draft_up_front(self):
+        self._enable_archive()
+        self._write_result_inputs()
+        stale_run_id = "0" * 32
+        draft_content = {
+            "schema": "foxhound.execution-result-draft",
+            "schema_version": 1,
+            "result_id": stale_run_id,
+            "outcome": "awaiting_plan",
+            "summary": "Synthetic summary",
+            "work_markdown": "Synthetic work",
+            "questions": [],
+            "external_actions": [],
+            "deliverables": [],
+        }
+        draft_file = self.run_directory / f"result-{stale_run_id}.json"
+        draft_file.write_text(json.dumps(draft_content), encoding="utf-8")
+        draft_file.chmod(0o600)
+
+        with knowledge_server() as endpoint:
+            worker = self._worker(endpoint)
+            with self.assertRaises(ExecutionWorkerDraftError) as ctx:
+                worker.record(draft_file.name)
+
+        message = str(ctx.exception)
+        self.assertIn(stale_run_id, message)
+        self.assertIn(RUN_ID, message)
+        self.assertIn("re-run `draft` to regenerate the result files for this run", message)
+        self.assertNotIn(str(self.run_directory), message)
 
     def test_draft_rejects_invalid_inputs_before_writing(self):
         self._write_result_inputs()
