@@ -39,7 +39,7 @@ SOURCE_NAMESPACES = frozenset({"kb", "meeting", "email", "attachment", "repo", "
 RECOMMENDATION_TYPES = frozenset({
     "after_task_completed", "not_before", "raise_priority", "create_prerequisite",
 })
-CLAIM_STATUSES = frozenset({"supported", "inferred", "conflicting", "unknown"})
+CLAIM_STATUSES = frozenset({"supported", "inferred", "conflicting", "unknown", "unsourced"})
 RESEARCH_STATUSES = frozenset({"sufficient", "inconclusive", "unreachable"})
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -193,7 +193,7 @@ def _claim(value: object, name: str, source_ids: set[str]) -> dict[str, object]:
         raise ResearchError(f"invalid {name}")
     if len(refs) > 16 or len(set(refs)) != len(refs) or any(ref not in source_ids for ref in refs):
         raise ResearchError(f"invalid {name} sources")
-    if status != "unknown" and not refs:
+    if status not in {"unknown", "unsourced"} and not refs:
         raise ResearchError(f"ungrounded {name}")
     return {"text": text, "status": status, "source_refs": refs}
 
@@ -445,7 +445,10 @@ def validate_coverage(document: object) -> dict[str, object]:
         "searched_namespaces", "queries", "documents_retrieved",
         "unavailable_source_ids", "knowledge_revisions",
     }
-    if not isinstance(document, Mapping) or set(document) != required:
+    if not isinstance(document, Mapping) or not required.issubset(set(document)):
+        raise ResearchError("invalid coverage")
+    allowed = required | {"degraded", "dropped_citations", "unsourced_claims"}
+    if set(document) - allowed:
         raise ResearchError("invalid coverage")
     namespaces = document.get("searched_namespaces")
     unavailable = document.get("unavailable_source_ids")
@@ -468,13 +471,29 @@ def validate_coverage(document: object) -> dict[str, object]:
         raise ResearchError("invalid search count")
     if not isinstance(documents, int) or isinstance(documents, bool) or not 0 <= documents <= 50:
         raise ResearchError("invalid document count")
-    return {
+    res = {
         "searched_namespaces": sorted(namespaces),
         "queries": queries,
         "documents_retrieved": documents,
         "unavailable_source_ids": sorted(unavailable),
         "knowledge_revisions": dict(sorted(revisions.items())),
     }
+    if "degraded" in document:
+        degraded = document["degraded"]
+        if not isinstance(degraded, bool):
+            raise ResearchError("invalid degraded flag")
+        res["degraded"] = degraded
+        if "dropped_citations" in document:
+            dc = document["dropped_citations"]
+            if not isinstance(dc, int) or isinstance(dc, bool) or dc < 0:
+                raise ResearchError("invalid dropped_citations count")
+            res["dropped_citations"] = dc
+        if "unsourced_claims" in document:
+            uc = document["unsourced_claims"]
+            if not isinstance(uc, int) or isinstance(uc, bool) or uc < 0:
+                raise ResearchError("invalid unsourced_claims count")
+            res["unsourced_claims"] = uc
+    return res
 
 
 class ResearchStore:

@@ -130,6 +130,18 @@ def test_agent_synthesize_success(tmp_path: Path) -> None:
     assert "web" in namespaces
     assert "kb" in namespaces
 
+    # Verify research-check was written and is executable
+    check_bin = run_dir / "research-check"
+    assert check_bin.exists()
+    assert os.access(check_bin, os.X_OK)
+
+    # Verify metrics
+    assert result.metrics["self_check_ok"] is True
+    assert result.metrics["repair_turns"] == 0
+    assert result.metrics["degraded"] is False
+    assert result.metrics["dropped_citations"] == 0
+    assert result.metrics["unsourced_claims"] == 0
+
     # Verify task.json written
     task_json = json.loads((run_dir / "task.json").read_text())
     assert task_json["task_id"] == 123
@@ -326,7 +338,7 @@ def test_agent_synthesize_runtime_failed_nonzero_exit(tmp_path: Path) -> None:
     assert exc_info.value.code == "runtime_failed"
 
 
-def test_agent_synthesize_unmappable_evidence_reported_as_problem(tmp_path: Path) -> None:
+def test_agent_synthesize_unmappable_evidence_degrades_and_publishes(tmp_path: Path) -> None:
     fake_hermes = tmp_path / "fake_hermes.py"
     research_data = {
         "ownership": {"verdict": "reader", "evidence": []},
@@ -343,9 +355,10 @@ def test_agent_synthesize_unmappable_evidence_reported_as_problem(tmp_path: Path
 
     config = AgentResearchConfig(hermes_command=str(fake_hermes))
     run_dir = tmp_path / "run"
-    with pytest.raises(SynthesisError) as exc_info:
-        agent_synthesize({"task_snapshot": {}}, config=config, bound_sources=None, run_dir=run_dir)
-    assert exc_info.value.code == "invalid_draft"
+    result = agent_synthesize({"task_snapshot": {}}, config=config, bound_sources=None, run_dir=run_dir)
+    assert result.metrics["degraded"] is True
+    assert result.metrics["dropped_citations"] == 1
+    assert result.metrics["unsourced_claims"] == 1
 
 
 def test_agent_locators_four_shapes_and_safeguards(tmp_path: Path) -> None:
@@ -568,7 +581,7 @@ def test_agent_synthesize_repair_flow(tmp_path: Path) -> None:
     assert result.draft["research_status"] == "sufficient"
 
 
-def test_agent_synthesize_no_repair_without_session_id(tmp_path: Path) -> None:
+def test_agent_synthesize_no_repair_without_session_id_degrades(tmp_path: Path) -> None:
     calls = []
 
     def fake_runner(argv, cwd, env, timeout, capture_output, text):
@@ -577,15 +590,21 @@ def test_agent_synthesize_no_repair_without_session_id(tmp_path: Path) -> None:
         res.returncode = 0
         res.stdout = "No session info printed"
         res.stderr = ""
-        # Write invalid json
-        (cwd / "research.json").write_text(json.dumps({"invalid": True}))
+        # Write json with unknown evidence
+        (cwd / "research.json").write_text(json.dumps({
+            "ownership": {"verdict": "reader", "evidence": ["unknown:source"]},
+            "requested_deliverable": {"text": "Goal", "evidence": []},
+            "constraints": [],
+            "entities": [],
+            "facts": [],
+            "open_questions": [],
+        }))
         return res
 
     config = AgentResearchConfig(hermes_command="hermes")
     run_dir = tmp_path / "run_no_sess"
-    with pytest.raises(SynthesisError) as exc_info:
-        agent_synthesize({"task_snapshot": {}}, config=config, bound_sources=None, run_dir=run_dir, runner=fake_runner)
-    assert exc_info.value.code == "invalid_draft"
+    result = agent_synthesize({"task_snapshot": {}}, config=config, bound_sources=None, run_dir=run_dir, runner=fake_runner)
+    assert result.metrics["degraded"] is True
     assert len(calls) == 1  # No repair attempted
 
 
@@ -604,7 +623,7 @@ def test_agent_synthesize_no_repair_on_timeout(tmp_path: Path) -> None:
     assert len(calls) == 1  # No repair attempted
 
 
-def test_agent_synthesize_two_failed_repairs_raises_original_error(tmp_path: Path) -> None:
+def test_agent_synthesize_one_failed_repair_degrades(tmp_path: Path) -> None:
     calls = []
 
     def fake_runner(argv, cwd, env, timeout, capture_output, text):
@@ -613,18 +632,22 @@ def test_agent_synthesize_two_failed_repairs_raises_original_error(tmp_path: Pat
         res.returncode = 0
         res.stdout = "session_id: sess-999"
         res.stderr = ""
-        # Keep writing invalid json with missing fields
+        # Keep writing json with invalid locator
         (cwd / "research.json").write_text(json.dumps({
+            "ownership": {"verdict": "reader", "evidence": ["bad:locator"]},
             "requested_deliverable": {"text": "Goal", "evidence": []},
+            "constraints": [],
+            "entities": [],
+            "facts": [],
+            "open_questions": [],
         }))
         return res
 
     config = AgentResearchConfig(hermes_command="hermes")
-    run_dir = tmp_path / "run_two_failed"
-    with pytest.raises(SynthesisError) as exc_info:
-        agent_synthesize({"task_snapshot": {}}, config=config, bound_sources=None, run_dir=run_dir, runner=fake_runner)
-    assert exc_info.value.code == "invalid_draft"
-    assert len(calls) == 3  # 1 initial + 2 repair turns
+    run_dir = tmp_path / "run_failed_repair"
+    result = agent_synthesize({"task_snapshot": {}}, config=config, bound_sources=None, run_dir=run_dir, runner=fake_runner)
+    assert result.metrics["degraded"] is True
+    assert len(calls) == 2  # 1 initial + 1 repair turn (max repair turns = 1)
 
 
 def test_agent_synthesize_repair_timeout_rechecks_and_publishes(tmp_path: Path) -> None:
@@ -921,3 +944,189 @@ def test_convert_research_json_features(tmp_path: Path) -> None:
             "task.json is the task itself, not evidence; cite the origin record (meeting protocol, transcript, email) instead" in p
             for p in problems
         )
+
+
+def test_structured_citations_and_research_check(tmp_path: Path) -> None:
+    from foxhound.research_check import main as check_main
+    from foxhound.task_research_agent import (
+        _evidence_item_to_locator_string,
+        _map_locator,
+        check_research_output,
+    )
+
+    kb_dir = tmp_path / "sync_kb"
+    kb_dir.mkdir()
+    doc_file = kb_dir / "doc.md"
+    doc_file.write_text("line 1\nline 2\n")
+
+    k_roots = (("kb", str(kb_dir)),)
+    ro_cmds = ({"name": "cal", "command": "calendar", "description": ""},)
+
+    # 1. Object citations mapping
+    # File object
+    loc1, err1 = _evidence_item_to_locator_string({"root": "kb", "path": "doc.md", "lines": "2", "note": "some note"})
+    assert err1 is None
+    assert loc1 == "kb:doc.md#L2"
+    assert _map_locator(loc1, k_roots) == ("kb", "doc.md", "L2")
+
+    # Command object
+    loc2, err2 = _evidence_item_to_locator_string({"root": "cal", "command": "list --today"})
+    assert err2 is None
+    assert loc2 == "cal:list --today"
+    assert _map_locator(loc2, k_roots, read_only_commands=ro_cmds) == ("tool", "cal:list --today", None)
+
+    # Web object
+    loc3, err3 = _evidence_item_to_locator_string({"url": "https://example.com/spec"})
+    assert err3 is None
+    assert loc3 == "https://example.com/spec"
+    assert _map_locator(loc3, k_roots) == ("web", "https://example.com/spec", None)
+
+    # Legacy strings
+    assert _map_locator("kb:doc.md#L2", k_roots) == ("kb", "doc.md", "L2")
+    assert _map_locator("https://example.com/spec", k_roots) == ("web", "https://example.com/spec", None)
+
+    # Unknown key -> error
+    loc_err, err = _evidence_item_to_locator_string({"root": "kb", "path": "doc.md", "extra": "invalid"})
+    assert err is not None
+    assert "Unknown key" in err
+
+    # 2. research-check CLI
+    run_dir = tmp_path / "check_run"
+    run_dir.mkdir()
+    (run_dir / "task.json").write_text(json.dumps({
+        "knowledge_roots": [{"name": "kb", "path": str(kb_dir)}],
+        "read_only_commands": [{"name": "cal", "command": "cal", "description": ""}],
+    }))
+
+    # Valid research.json
+    valid_obj = {
+        "ownership": {"verdict": "reader", "evidence": [{"root": "kb", "path": "doc.md"}]},
+        "requested_deliverable": {"text": "Deliverable", "evidence": [{"url": "https://example.com/page"}]},
+        "constraints": [],
+        "entities": [],
+        "facts": [],
+        "open_questions": [],
+    }
+    (run_dir / "research.json").write_text(json.dumps(valid_obj))
+
+    cwd = os.getcwd()
+    try:
+        os.chdir(run_dir)
+        ret = check_main([])
+        assert ret == 0
+
+        # Bad path
+        bad_path_obj = dict(valid_obj)
+        bad_path_obj["ownership"] = {"verdict": "reader", "evidence": [{"root": "kb", "path": "nonexistent.md"}]}
+        (run_dir / "research.json").write_text(json.dumps(bad_path_obj))
+        ret = check_main([])
+        assert ret == 1
+
+        # Unknown root
+        bad_root_obj = dict(valid_obj)
+        bad_root_obj["ownership"] = {"verdict": "reader", "evidence": [{"root": "unknown_root", "path": "doc.md"}]}
+        (run_dir / "research.json").write_text(json.dumps(bad_root_obj))
+        ret = check_main([])
+        assert ret == 1
+
+        # Bad JSON
+        (run_dir / "research.json").write_text("invalid json")
+        ret = check_main([])
+        assert ret == 1
+    finally:
+        os.chdir(cwd)
+
+
+def test_degraded_publication_and_metrics(tmp_path: Path) -> None:
+    fake_hermes = tmp_path / "fake_hermes_degraded.py"
+    kb_dir = tmp_path / "sync_kb"
+    kb_dir.mkdir()
+    doc_file = kb_dir / "valid.md"
+    doc_file.write_text("hello")
+
+    # One valid citation and two unmappable citations
+    research_with_bad_cits = {
+        "ownership": {"verdict": "reader", "evidence": [{"root": "kb", "path": "nonexistent.md"}]},
+        "requested_deliverable": {"text": "Produce summary", "evidence": [{"root": "kb", "path": "valid.md"}]},
+        "constraints": [{"text": "Be fast", "binding": True, "evidence": ["kb:ghost.md"]}],
+        "entities": [],
+        "facts": [{"text": "A fact", "status": "confirmed", "evidence": []}],
+        "open_questions": [],
+    }
+
+    _write_fake_hermes(fake_hermes, output_json=research_with_bad_cits)
+
+    config = AgentResearchConfig(
+        hermes_command=str(fake_hermes),
+        model="test-model",
+        knowledge_roots=(("kb", str(kb_dir)),),
+    )
+    ctx = {
+        "task_snapshot": {"task_id": 789, "title": "Degraded Task"},
+        "origin": {"kind": "issue", "record_id": "repo/test"},
+    }
+    run_dir = tmp_path / "run_degraded"
+    result = agent_synthesize(ctx, config=config, bound_sources=None, run_dir=run_dir)
+
+    assert result.metrics["degraded"] is True
+    assert result.metrics["self_check_ok"] is False
+    assert result.metrics["dropped_citations"] == 2
+    assert result.metrics["unsourced_claims"] == 2
+    assert result.coverage["degraded"] is True
+    assert result.coverage["dropped_citations"] == 2
+    assert result.coverage["unsourced_claims"] == 2
+
+    # Verify ownership claim became "unsourced" because its only evidence was dropped
+    draft_dict: dict[str, Any] = result.draft  # type: ignore
+    assert draft_dict["stakeholders"][0]["status"] == "unsourced"
+    assert draft_dict["stakeholders"][0]["source_refs"] == []
+
+    # Constraints claim became "unsourced"
+    assert draft_dict["constraints"][0]["status"] == "unsourced"
+    assert draft_dict["constraints"][0]["source_refs"] == []
+
+    # Deliverable kept its valid source
+    assert draft_dict["objective"]["status"] == "supported"
+    assert len(draft_dict["objective"]["source_refs"]) == 1
+
+    # Validate draft accepts unsourced status
+    validate_draft(result.draft, list(result.sources))
+
+
+def test_missing_or_unparseable_research_json_fails(tmp_path: Path) -> None:
+    fake_hermes = tmp_path / "fake_hermes_fail.py"
+    # hermes creates no research.json
+    _write_fake_hermes(fake_hermes, output_json=None)
+
+    config = AgentResearchConfig(
+        hermes_command=str(fake_hermes),
+        model="test-model",
+    )
+    ctx = {
+        "task_snapshot": {"task_id": 999, "title": "Failing Task"},
+        "origin": {"kind": "issue", "record_id": "repo/test"},
+    }
+    run_dir = tmp_path / "run_fail"
+    with pytest.raises(SynthesisError) as exc:
+        agent_synthesize(ctx, config=config, bound_sources=None, run_dir=run_dir)
+    assert exc.value.code == "draft_missing"
+
+
+def test_note_is_accepted_on_url_and_command_citations():
+    import tempfile, json as _json
+    from pathlib import Path as _P
+    from foxhound.task_research_agent import check_research_output
+    with tempfile.TemporaryDirectory() as tmp:
+        run = _P(tmp)
+        doc = {
+            "ownership": {"verdict": "reader", "evidence": [
+                {"url": "https://example.org/a", "note": "official page"}]},
+            "requested_deliverable": {"text": "Do X.", "evidence": [
+                {"root": "mail", "command": "search alpha", "note": "thread"}]},
+            "constraints": [], "entities": [], "facts": [], "open_questions": [],
+        }
+        (run / "research.json").write_text(_json.dumps(doc), encoding="utf-8")
+        _, _, problems = check_research_output(
+            run, (), [{"name": "mail", "command": "/bin/true", "description": "d"}],
+        )
+        assert problems == []
