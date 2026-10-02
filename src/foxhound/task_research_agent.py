@@ -688,6 +688,25 @@ def _convert_research_json(
     sources_by_locator: dict[tuple[str, str], dict[str, Any]] = {}
     sources_list: list[dict[str, Any]] = []
 
+    # guide <- guide
+    guide_claim = None
+    raw_guide = raw.get("guide")
+    if isinstance(raw_guide, Mapping):
+        guide_reason = str(raw_guide.get("reason", "")).strip()
+        guide_path = raw_guide.get("path")
+        guide_ev = raw_guide.get("evidence", [])
+        if guide_path:
+            all_ev = [guide_path] + list(guide_ev if isinstance(guide_ev, Sequence) and not isinstance(guide_ev, (str, bytes)) else [guide_ev])
+        else:
+            all_ev = list(guide_ev if isinstance(guide_ev, Sequence) and not isinstance(guide_ev, (str, bytes)) else [guide_ev])
+        claim = _make_claim(
+            guide_reason, "supported", all_ev, sources_by_locator, sources_list, knowledge_roots, read_only_commands,
+            run_dir=run_dir, basename_cache=basename_cache,
+            degrade=degrade, stats=stats,
+        )
+        if claim["source_refs"]:
+            guide_claim = claim
+
     # recommendation <- recommendation
     recommendation_claims = []
     raw_rec = raw.get("recommendation")
@@ -904,6 +923,8 @@ def _convert_research_json(
         "open_questions": open_questions_claims,
         "scheduling_recommendations": [],
     }
+    if guide_claim is not None:
+        draft["guide"] = guide_claim
     if recommendation_claims:
         draft["recommendation"] = recommendation_claims
     return draft, sources_list
@@ -1044,6 +1065,13 @@ def check_research_output(
         for i, f in enumerate(raw_research["facts"]):
             if isinstance(f, Mapping):
                 check_evidence(f.get("evidence"), f"facts[{i}].evidence")
+
+    if isinstance(raw_research.get("guide"), Mapping):
+        guide_obj = raw_research["guide"]
+        if "path" in guide_obj and guide_obj["path"] is not None:
+            check_evidence([guide_obj["path"]], "guide.path")
+        if "evidence" in guide_obj and guide_obj["evidence"] is not None:
+            check_evidence(guide_obj.get("evidence"), "guide.evidence")
 
     if isinstance(raw_research.get("recommendation"), Mapping):
         check_evidence(raw_research["recommendation"].get("evidence"), "recommendation.evidence")

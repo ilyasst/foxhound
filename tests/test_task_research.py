@@ -660,6 +660,55 @@ class TaskResearchTests(unittest.TestCase):
             _write_claim(self.folder / "another.claim", claim)
         self.folder.chmod(0o700)
 
+    def test_validate_draft_and_render_markdown_with_guide(self):
+        from foxhound.task_research import render_markdown, validate_draft
+        srcs = sources()
+        doc = {
+            "schema_version": DRAFT_SCHEMA,
+            "research_status": "sufficient",
+            "objective": {"text": "Synthetic objective", "status": "supported", "source_refs": ["src-001"]},
+            "requested_action": {"text": "Synthetic action", "status": "supported", "source_refs": ["src-001"]},
+            "current_state": [],
+            "expected_deliverables": [],
+            "timeline": [],
+            "decisions": [],
+            "dependencies": [],
+            "constraints": [],
+            "stakeholders": [],
+            "related_entities": [],
+            "findings": [{"text": "Synthetic finding", "status": "supported", "source_refs": ["src-001"]}],
+            "conflicts": [],
+            "open_questions": [],
+            "scheduling_recommendations": [],
+            "guide": {
+                "text": "Follow Project Alpha process guide",
+                "status": "supported",
+                "source_refs": ["src-001"],
+            },
+        }
+        validated = validate_draft(doc, srcs)
+        self.assertIn("guide", validated)
+        guide_val = validated["guide"]
+        assert isinstance(guide_val, dict)
+        self.assertEqual(guide_val["text"], "Follow Project Alpha process guide")
+
+        published = {
+            "task_identity": {"task_id": 42, "task_version": 1},
+            "research_status": "sufficient",
+            "report": validated,
+            "scheduling_recommendations": [],
+            "sources": srcs,
+        }
+        rendered = render_markdown(published)
+        self.assertIn("## Guide", rendered)
+        self.assertIn("Follow Project Alpha process guide (supported) [src-001]", rendered)
+
+        # Check order: ## Guide right after Requested action
+        req_idx = rendered.index("## Requested action")
+        guide_idx = rendered.index("## Guide")
+        find_idx = rendered.index("## Findings")
+        self.assertTrue(req_idx < guide_idx < find_idx)
+
     def test_render_markdown_omits_open_questions(self):
         from foxhound.task_research import render_markdown
         doc = {
