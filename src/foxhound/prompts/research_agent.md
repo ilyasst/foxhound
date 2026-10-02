@@ -51,12 +51,12 @@ Write exactly two files in the current working directory:
 1. `research.json`:
    ```json
    {
-     "ownership": {"verdict": "reader|other:<name>|undetermined", "evidence": ["..."]},
+     "ownership": {"verdict": "reader|other:<name>|undetermined", "reasoning": "...", "evidence": ["..."]},
      "requested_deliverable": {"text": "...", "evidence": ["..."]},
      "constraints": [{"text": "...", "binding": true, "evidence": ["..."]}],
      "entities": [{"as_written": "...", "status": "verified|resolved|unresolved", "meaning": "...", "evidence": ["..."]}],
      "facts": [{"text": "...", "status": "confirmed|single-source|inferred|conflicting", "evidence": ["..."]}],
-     "open_questions": ["..."],
+     "open_questions": [{"text": "...", "blocking": true}],
      "recommendation": {"text": "...", "evidence": ["..."]}
    }
    ```
@@ -65,6 +65,6 @@ Write exactly two files in the current working directory:
    - A bare `http://` or `https://` URL for external facts.
    - Cite read-only command results as "<name from read_only_commands>:<subcommand and arguments>", e.g. "outlook:cal list --days 14".
    Never cite task.json.
-   Notes never go inside the locator (put them in the claim text). A claim with no evidence must have status `inferred` or be listed in `open_questions`.
+   Notes never go inside the locator (put them in the claim text). A claim with no evidence must have status `inferred` or be listed in `open_questions`. `open_questions` items can be strings or objects with `text` and `blocking` boolean (set `blocking: true` when the plan cannot be made correctly without the answer).
 
 2. `research.md`: the same findings structured as a concise, readable brief.

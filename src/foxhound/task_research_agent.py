@@ -458,7 +458,36 @@ def _convert_research_json(
     sources_by_locator: dict[tuple[str, str], dict[str, Any]] = {}
     sources_list: list[dict[str, Any]] = []
 
-    # objective and requested_action <- requested_deliverable
+    # recommendation <- recommendation
+    recommendation_claims = []
+    raw_rec = raw.get("recommendation")
+    if isinstance(raw_rec, Mapping):
+        rec_text = str(raw_rec.get("text", "")).strip()
+        if rec_text:
+            rec_ev = raw_rec.get("evidence", [])
+            rec_st = "supported" if rec_ev else "inferred"
+            recommendation_claims.append(
+                _make_claim(
+                    rec_text, rec_st, rec_ev, sources_by_locator, sources_list, knowledge_roots, read_only_commands,
+                    run_dir=run_dir, basename_cache=basename_cache,
+                )
+            )
+    elif isinstance(raw_rec, Sequence) and not isinstance(raw_rec, (str, bytes)):
+        for r in raw_rec:
+            if isinstance(r, Mapping):
+                text = str(r.get("text", "")).strip()
+                if not text:
+                    continue
+                ev = r.get("evidence", [])
+                st = "supported" if ev else "inferred"
+                recommendation_claims.append(
+                    _make_claim(
+                        text, st, ev, sources_by_locator, sources_list, knowledge_roots, read_only_commands,
+                        run_dir=run_dir, basename_cache=basename_cache,
+                    )
+                )
+
+    # objective <- requested_deliverable
     rd = raw.get("requested_deliverable")
     if isinstance(rd, Mapping):
         rd_text = str(rd.get("text", "")).strip() or "Perform requested task"
@@ -481,17 +510,23 @@ def _convert_research_json(
         run_dir=run_dir,
         basename_cache=basename_cache,
     )
-    requested_action = _make_claim(
-        rd_text,
-        "supported" if rd_evidence else "inferred",
-        rd_evidence,
-        sources_by_locator,
-        sources_list,
-        knowledge_roots,
-        read_only_commands,
-        run_dir=run_dir,
-        basename_cache=basename_cache,
-    )
+
+    # requested_action: from the recommendation's first claim when present;
+    # otherwise keep today's behavior (same as objective).
+    if recommendation_claims:
+        requested_action = dict(recommendation_claims[0])
+    else:
+        requested_action = _make_claim(
+            rd_text,
+            "supported" if rd_evidence else "inferred",
+            rd_evidence,
+            sources_by_locator,
+            sources_list,
+            knowledge_roots,
+            read_only_commands,
+            run_dir=run_dir,
+            basename_cache=basename_cache,
+        )
 
     # constraints <- constraints
     constraints_claims = []
@@ -573,31 +608,55 @@ def _convert_research_json(
     if isinstance(ownership, Mapping):
         verdict = str(ownership.get("verdict", "")).strip()
         ev = ownership.get("evidence", [])
+        reasoning = str(ownership.get("reasoning", "") or "").strip()
+        first_sentence = ""
+        if reasoning:
+            for part in reasoning.replace("\n", " ").split("."):
+                candidate = part.strip()
+                if candidate:
+                    first_sentence = candidate
+                    break
         if verdict:
+            claim_text = f"Owner: {verdict} — {first_sentence}" if first_sentence else f"Owner: {verdict}"
             st = "supported" if ev else "inferred"
             stakeholders_claims.append(
                 _make_claim(
-                    f"Owner: {verdict}", st, ev, sources_by_locator, sources_list, knowledge_roots, read_only_commands,
+                    claim_text, st, ev, sources_by_locator, sources_list, knowledge_roots, read_only_commands,
                     run_dir=run_dir, basename_cache=basename_cache,
                 )
             )
 
     # open_questions <- open_questions (status unknown)
-    has_open_questions = False
+    has_blocking_question = False
     open_questions_claims = []
     raw_oq = raw.get("open_questions", [])
     if isinstance(raw_oq, Sequence) and not isinstance(raw_oq, (str, bytes)):
         for q in raw_oq:
-            q_text = str(q.get("text", "") if isinstance(q, Mapping) else q).strip()
+            if isinstance(q, Mapping):
+                q_text = str(q.get("text", "")).strip()
+                is_blocking = bool(q.get("blocking", False))
+            else:
+                q_text = str(q or "").strip()
+                is_blocking = False
             if q_text:
-                has_open_questions = True
+                if is_blocking:
+                    has_blocking_question = True
+                    text_to_record = f"{q_text} (blocking)"
+                else:
+                    text_to_record = q_text
                 open_questions_claims.append({
-                    "text": q_text,
+                    "text": text_to_record,
                     "status": "unknown",
                     "source_refs": [],
                 })
 
-    research_status = "inconclusive" if (has_unresolved_entity or has_open_questions) else "sufficient"
+    is_undetermined_owner = False
+    if isinstance(ownership, Mapping):
+        verdict_val = str(ownership.get("verdict", "")).strip().lower()
+        if verdict_val == "undetermined":
+            is_undetermined_owner = True
+
+    research_status = "inconclusive" if (has_blocking_question or is_undetermined_owner) else "sufficient"
 
     draft: dict[str, Any] = {
         "schema_version": DRAFT_SCHEMA,
@@ -617,6 +676,8 @@ def _convert_research_json(
         "open_questions": open_questions_claims,
         "scheduling_recommendations": [],
     }
+    if recommendation_claims:
+        draft["recommendation"] = recommendation_claims
     return draft, sources_list
 
 
