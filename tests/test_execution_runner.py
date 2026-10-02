@@ -29,10 +29,15 @@ from foxhound.agent_profiles import (
 )
 from foxhound.candidate_inbox import CandidateInbox
 from foxhound.execution_runner import (
+    CONTEXT_EXHAUSTED_EXIT_CODE,
     ExecutionRunnerConfig,
     ExecutionRunnerError,
     ExecutionRunResult,
+    NO_PROGRESS_EXIT_CODE,
+    STARTUP_EXIT_CODE,
+    TIMEOUT_EXIT_CODE,
     _exclusive_lock,
+    _minutes,
     _runner_lock_path,
     _transcript_session_id,
     agent_prompt,
@@ -1179,13 +1184,134 @@ class ExecutionRunnerTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            (result.outcome, result.exit_code), ("context_exhausted", 124)
+            (result.outcome, result.exit_code),
+            ("context_exhausted", CONTEXT_EXHAUSTED_EXIT_CODE),
         )
+        self.assertLess(monotonic.value, general_profile().timeout_seconds)
         state = self.service.get(1)
         self.assertEqual(state.status, WorkflowStatus.PARKED)
         self.assertEqual(state.last_failure_reason, "context_exhausted")
         self.assertIsNone(state.next_attempt_at)
         self.assertIsNone(self.service.claim_next())
+
+    def test_context_refusal_mid_run_terminates_before_timeout(self):
+        self._ready()
+        monotonic = MutableMonotonic()
+        profile = parse_profile({
+            **general_profile().document(),
+            "profile_id": "short-heartbeat",
+            "heartbeat_seconds": 5,
+        })
+        registry = AgentProfileRegistry((general_profile(), profile))
+
+        class MidRunWriterProcess:
+            def __init__(self, transcript):
+                self.pid = 4242
+                self.transcript = transcript
+                self.poll_count = 0
+                self.terminated = False
+
+            def poll(self):
+                if self.terminated:
+                    return -15
+                self.poll_count += 1
+                if self.poll_count == 2:
+                    self.transcript.write(
+                        b"context filter: light needs ~200000 tokens, skipping host-a(140032)\n"
+                    )
+                    self.transcript.flush()
+                return None
+
+        def popen(*_args, **kwargs):
+            transcript = kwargs["stdout"]
+            transcript.write(b"agent starting\n")
+            transcript.flush()
+            return MidRunWriterProcess(transcript)
+
+        result = run_once(
+            self._config(profile_registry=registry),
+            popen=popen,
+            clock=monotonic,
+            sleep=monotonic.sleep,
+            run_id_factory=lambda: "e" * 32,
+            terminate=self._terminator,
+        )
+
+        self.assertEqual(
+            (result.outcome, result.exit_code),
+            ("context_exhausted", CONTEXT_EXHAUSTED_EXIT_CODE),
+        )
+        self.assertLess(monotonic.value, general_profile().timeout_seconds)
+        state = self.service.get(1)
+        self.assertEqual(state.status, WorkflowStatus.PARKED)
+        self.assertEqual(state.last_failure_reason, "context_exhausted")
+
+    def test_run_without_refusal_is_not_terminated_early(self):
+        self._ready()
+        monotonic = MutableMonotonic()
+
+        class NormalProcess:
+            def __init__(self, transcript):
+                self.pid = 4242
+                self.transcript = transcript
+                self.poll_count = 0
+                self.terminated = False
+
+            def poll(self):
+                if self.terminated:
+                    return -15
+                self.poll_count += 1
+                self.transcript.write(b"working normal step...\n")
+                self.transcript.flush()
+                return None
+
+        def popen(*_args, **kwargs):
+            transcript = kwargs["stdout"]
+            transcript.write(b"agent started\n")
+            transcript.flush()
+            return NormalProcess(transcript)
+
+        result = run_once(
+            self._config(),
+            popen=popen,
+            clock=monotonic,
+            sleep=monotonic.sleep,
+            run_id_factory=lambda: "e" * 32,
+            terminate=self._terminator,
+        )
+
+        self.assertEqual(
+            (result.outcome, result.exit_code),
+            ("timeout", TIMEOUT_EXIT_CODE),
+        )
+        self.assertEqual(monotonic.value, general_profile().timeout_seconds)
+        state = self.service.get(1)
+        self.assertEqual(state.status, WorkflowStatus.QUEUED)
+        self.assertEqual(state.last_failure_reason, "timeout")
+
+    def test_context_scan_reads_bounded_tail(self):
+        from foxhound.execution_runner import _scan_context_refusal, _CONTEXT_EVIDENCE_BYTES
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            transcript_path = Path(temp_dir) / "transcript.log"
+            # Write a large transcript exceeding _CONTEXT_EVIDENCE_BYTES
+            padding = b"some line\n" * ((_CONTEXT_EVIDENCE_BYTES // 10) + 100)
+            refusal = b"context filter: heavy needs 500000 tokens, skipping node-1(140032)\n"
+            transcript_path.write_bytes(padding + refusal)
+
+            class DummyHandle:
+                def flush(self):
+                    pass
+
+            found, new_offset, overlap = _scan_context_refusal(
+                transcript_path,
+                DummyHandle(),
+                offset=0,
+                overlap=b"",
+            )
+            self.assertTrue(found)
+            self.assertEqual(new_offset, len(padding) + len(refusal))
 
     def test_recorded_result_wins_a_race_with_process_failure(self):
         self._ready()

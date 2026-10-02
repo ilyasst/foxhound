@@ -86,6 +86,7 @@ from .worker_resolution import (
 NO_PROGRESS_EXIT_CODE = 70
 STARTUP_EXIT_CODE = 71
 TIMEOUT_EXIT_CODE = 124
+CONTEXT_EXHAUSTED_EXIT_CODE = 138
 _RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _RUNNER_SLOT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
 # A gateway refusal with a measured request size is authoritative evidence
@@ -98,6 +99,9 @@ _CONTEXT_FILTER_REFUSAL = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _CONTEXT_EVIDENCE_BYTES = 256 * 1024
+#: Overlap retained between successive incremental reads so a refusal line
+#: split across two reads is still matched.
+_CONTEXT_OVERLAP_BYTES = 1024
 from .hermes_session import (
     _SESSION_ID_LINE,
     _SESSION_SUMMARY_LINE,
@@ -782,6 +786,9 @@ def _run_claim(
         next_heartbeat = started + profile.heartbeat_seconds
         corrective_attempts = 0
         last_attempt_had_text_tool_call = False
+        context_exhausted = False
+        transcript_offset = 0
+        transcript_overlap = b""
         while True:
             current = service.get(claim.task_id)
             terminal = _terminal_result(initial, current, claim.task_id)
@@ -828,6 +835,32 @@ def _run_claim(
                         claim.task_id, forced,
                     )
                 next_heartbeat = now + profile.heartbeat_seconds
+
+                if transcript is not None:
+                    found, transcript_offset, transcript_overlap = _scan_context_refusal(
+                        directory / TRANSCRIPT_NAME,
+                        transcript,
+                        offset=transcript_offset,
+                        overlap=transcript_overlap,
+                    )
+                    if found:
+                        current = service.get(claim.task_id)
+                        terminal = _terminal_result(initial, current, claim.task_id)
+                        if terminal is None:
+                            forced = terminate(
+                                process, profile.kill_grace_seconds,
+                                sleep=sleep, clock=clock,
+                            )
+                            return _failure_result(
+                                service,
+                                claim,
+                                initial,
+                                reason="context_exhausted",
+                                outcome="context_exhausted",
+                                exit_code=CONTEXT_EXHAUSTED_EXIT_CODE,
+                                run_id=run_id,
+                                forced=forced,
+                            )
 
             child_exit = process.poll()
             if child_exit is not None:
@@ -915,12 +948,14 @@ def _run_claim(
                     process, profile.kill_grace_seconds,
                     sleep=sleep, clock=clock
                 )
-                reason = (
-                    "context_exhausted"
-                    if _context_window_exhausted(
-                        directory / TRANSCRIPT_NAME, transcript
-                    ) else "timeout"
-                )
+                if _context_window_exhausted(
+                    directory / TRANSCRIPT_NAME, transcript
+                ):
+                    reason = "context_exhausted"
+                    exit_code = CONTEXT_EXHAUSTED_EXIT_CODE
+                else:
+                    reason = "timeout"
+                    exit_code = TIMEOUT_EXIT_CODE
                 evidence = None
                 if reason == "timeout":
                     # What the pass left is read once, here, while the run
@@ -940,7 +975,7 @@ def _run_claim(
                     initial,
                     reason=reason,
                     outcome=reason,
-                    exit_code=TIMEOUT_EXIT_CODE,
+                    exit_code=exit_code,
                     run_id=run_id,
                     forced=forced,
                     evidence=evidence,
@@ -1203,6 +1238,48 @@ def _open_transcript(directory: Path):
         )
 
     return open(directory / TRANSCRIPT_NAME, "wb", opener=opener)
+
+
+def _scan_context_refusal(
+    path: Path,
+    transcript: object,
+    *,
+    offset: int,
+    overlap: bytes,
+) -> tuple[bool, int, bytes]:
+    """Incrementally scan newly appended transcript bytes for gateway refusal.
+
+    Retains up to ``_CONTEXT_OVERLAP_BYTES`` from the previous read chunk to
+    ensure refusals split across read boundaries are matched. Reads are bounded
+    to avoid unbounded memory consumption on large transcripts.
+    """
+    if transcript is None:
+        return False, offset, overlap
+    try:
+        if hasattr(transcript, "flush"):
+            transcript.flush()
+        file_size = path.stat().st_size
+    except OSError:
+        return False, offset, overlap
+    if file_size <= offset:
+        return False, offset, overlap
+
+    # Read bytes appended since last offset, prepending overlap from prior read.
+    # To keep each poll bounded (same tail bound as _context_window_exhausted),
+    # read at most _CONTEXT_EVIDENCE_BYTES.
+    read_len = min(file_size - offset, _CONTEXT_EVIDENCE_BYTES)
+    read_start = file_size - read_len if (file_size - offset) > _CONTEXT_EVIDENCE_BYTES else offset
+    try:
+        with path.open("rb") as handle:
+            handle.seek(read_start)
+            chunk = handle.read(file_size - read_start)
+    except OSError:
+        return False, offset, overlap
+
+    scanned_data = overlap + chunk
+    found = _CONTEXT_FILTER_REFUSAL.search(scanned_data) is not None
+    new_overlap = chunk[-_CONTEXT_OVERLAP_BYTES:] if len(chunk) >= _CONTEXT_OVERLAP_BYTES else chunk
+    return found, file_size, new_overlap
 
 
 def _context_window_exhausted(path: Path, transcript: object) -> bool:
