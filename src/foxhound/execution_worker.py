@@ -119,6 +119,66 @@ def _local_today() -> str:
 
 
 
+def _read_guide(
+    state: "ExecutionRunState",
+    task_id: int,
+    task_version: int,
+) -> dict[str, str] | None:
+    try:
+        from . import task_research
+        with closing(sqlite3.connect(state.database_path, timeout=5)) as connection:
+            connection.row_factory = sqlite3.Row
+            found = task_research.version_document(connection, task_id, task_version)
+        if not found:
+            return None
+        _job_id, document = found
+        if not isinstance(document, dict):
+            return None
+        report = document.get("report")
+        if not isinstance(report, dict):
+            return None
+        guide = report.get("guide")
+        if not isinstance(guide, dict):
+            return None
+        guide_text = guide.get("text")
+        source_refs = guide.get("source_refs")
+        if not isinstance(guide_text, str) or not isinstance(source_refs, list) or not source_refs:
+            return None
+        first_ref = source_refs[0]
+        sources = document.get("sources")
+        if not isinstance(sources, list):
+            return None
+        matching_source = None
+        for s in sources:
+            if isinstance(s, dict) and s.get("source_id") == first_ref:
+                matching_source = s
+                break
+        if not matching_source:
+            return None
+        locator = matching_source.get("locator")
+        if not isinstance(locator, dict):
+            return None
+        namespace = locator.get("namespace")
+        resource = locator.get("resource")
+        if not isinstance(namespace, str) or not isinstance(resource, str):
+            return None
+        guide_id = f"{namespace}:{resource}"
+        # Name the file outright when it is in the KB root this run already
+        # has; an agent should not have to work out what "kb:" means.
+        if namespace == "kb" and state.knowledge_root:
+            guide_id = str(Path(state.knowledge_root) / resource)
+        return {
+            "guide": guide_id,
+            "reason": guide_text,
+            "instruction": (
+                f"A house procedure applies: {guide_id}. "
+                "Read it first and follow it; in your result, say where you deviated from it and why."
+            ),
+        }
+    except Exception:
+        return None
+
+
 def _read_research(
     state: "ExecutionRunState",
     task_id: int,
@@ -503,6 +563,9 @@ class ExecutionWorker:
         research_doc = _read_research(state, task.id, task.version)
         if research_doc is not None:
             result["research"] = research_doc
+        guide_info = _read_guide(state, task.id, task.version)
+        if guide_info is not None:
+            result["guide"] = guide_info
         return result
 
     def _instructions(self, state: ExecutionRunState) -> dict[str, Any]:
