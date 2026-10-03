@@ -51,7 +51,7 @@ from .contracts.task_candidate import (
 )
 
 
-SCHEMA_VERSION = 68
+SCHEMA_VERSION = 69
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 _CUMULATIVE_SCHEMA_VERSIONS = {
@@ -3649,6 +3649,42 @@ END;
 # A proposal holds a plan at its Start card until the reader decides; the
 # answer is kept so later research cannot reopen it and so the proposals can
 # be evaluated. Purely additive.
+#: v69 (#762): a forge source that closes answers its task. The lifecycle
+#: records that as its own resolution, so a closed review is never mistaken
+#: for a reader decision. SQLite cannot widen a CHECK in place: rebuild.
+_SCHEMA_V69 = (
+    """
+CREATE TABLE task_candidate_lifecycle_v69 (
+    candidate_id    TEXT PRIMARY KEY,
+    source_revision TEXT NOT NULL,
+    task_version    INTEGER NOT NULL CHECK(task_version >= 1),
+    state           TEXT NOT NULL CHECK(state IN ('active','withdrawn')),
+    resolution      TEXT NOT NULL CHECK(
+                        resolution IN (
+                            'current','preserved_open','reader_conflict',
+                            'closed_by_source'
+                        )
+                    ),
+    changed_at      TEXT,
+    decided_at      TEXT NOT NULL,
+    FOREIGN KEY(candidate_id) REFERENCES task_candidate_bindings(candidate_id),
+    FOREIGN KEY(candidate_id, source_revision)
+        REFERENCES candidate_revision_history(candidate_id, source_revision)
+);
+""",
+    """
+INSERT INTO task_candidate_lifecycle_v69(
+    candidate_id,source_revision,task_version,state,resolution,
+    changed_at,decided_at
+)
+SELECT candidate_id,source_revision,task_version,state,resolution,
+       changed_at,decided_at
+FROM task_candidate_lifecycle;
+""",
+    "DROP TABLE task_candidate_lifecycle;",
+    "ALTER TABLE task_candidate_lifecycle_v69 RENAME TO task_candidate_lifecycle;",
+)
+
 _SCHEMA_V68 = (
     """
 CREATE TABLE IF NOT EXISTS ownership_reviews (
@@ -5531,6 +5567,18 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 68
+            if version == 68:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V69:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 69")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 69
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:

@@ -1922,6 +1922,72 @@ class NativeCandidateIntakeTests(unittest.TestCase):
 
         self.assertEqual(execution.get(1).status, WorkflowStatus.CANCELLED)
 
+    def _withdraw_review(self, generation: int = 2):
+        withdrawn = review_candidate("a" * 40, generation=generation)
+        withdrawn["lifecycle"]["state"] = "withdrawn"
+        withdrawn["source"]["revision"] = hashlib.sha256(
+            json.dumps(withdrawn, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        self.inbox.import_feed(feed(1, withdrawn))
+        return self.intake()
+
+    def _review_lifecycle(self):
+        with closing(sqlite3.connect(self.database)) as connection:
+            return connection.execute(
+                "SELECT resolution,task_version FROM task_candidate_lifecycle"
+            ).fetchone(), connection.execute(
+                "SELECT state FROM work_items WHERE task_id=1"
+            ).fetchone()[0]
+
+    def test_forge_withdrawal_closes_the_task(self):
+        """A merged pull request answers its review task (#762)."""
+        self.activate()
+        self.inbox.import_feed(feed(0, review_candidate("a" * 40)))
+        self.intake()
+
+        self.assertEqual(self._withdraw_review().candidates_withdrawn, 1)
+
+        task = self.ledger.get(1)
+        self.assertEqual(task.status, TaskStatus.DONE)
+        lifecycle, work_state = self._review_lifecycle()
+        self.assertEqual(lifecycle, ("closed_by_source", task.version))
+        self.assertEqual(work_state, "closed")
+
+    def test_forge_withdrawal_closes_a_task_waiting_for_review(self):
+        self.activate()
+        self.inbox.import_feed(feed(0, review_candidate("a" * 40)))
+        self.intake()
+        execution = TaskExecutionService(self.database, clock=lambda: NOW)
+        scheduled = execution.schedule(1, expected_task_version=1)
+        self.assertIsNotNone(scheduled.status)
+
+        self._withdraw_review()
+
+        self.assertEqual(self.ledger.get(1).status, TaskStatus.DONE)
+        self.assertIn(
+            execution.get(1).status,
+            (WorkflowStatus.COMPLETED, WorkflowStatus.CANCELLED),
+        )
+        self.assertEqual(execution.schedule_new().scheduled, 0)
+
+    def test_forge_withdrawal_leaves_a_running_pass_alone(self):
+        self.activate()
+        self.inbox.import_feed(feed(0, review_candidate("a" * 40)))
+        self.intake()
+        execution = TaskExecutionService(self.database, clock=lambda: NOW)
+        scheduled = execution.schedule(1, expected_task_version=1)
+        if scheduled.status == WorkflowStatus.AWAITING_START:
+            execution.start_action(
+                1, expected_version=scheduled.version, action="start")
+        self.assertIsNotNone(execution.claim_next())
+        self.assertEqual(execution.get(1).status, WorkflowStatus.RUNNING)
+
+        self._withdraw_review()
+
+        self.assertEqual(self.ledger.get(1).status, TaskStatus.OPEN)
+        lifecycle, _ = self._review_lifecycle()
+        self.assertEqual(lifecycle[0], "reader_conflict")
+
     def test_already_active_execution_is_preserved_as_withdrawal_conflict(self):
         self.activate()
         active = lifecycle_candidate(1, generation=1)
