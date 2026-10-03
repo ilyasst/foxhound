@@ -8,6 +8,7 @@ from contextlib import closing
 from unittest import mock
 
 import test_research_gate_planning as base
+from foxhound.candidate_inbox import SCHEMA_VERSION
 from foxhound.task_execution import WorkflowStatus
 from foxhound.task_research_gate import (
     ownership_review_status,
@@ -54,7 +55,8 @@ class OwnershipReviewTests(base.ResearchGatePlanningTests):
                 "SELECT name FROM sqlite_master WHERE type='table'")}
             self.assertIn("ownership_reviews", tables)
             self.assertEqual(
-                connection.execute("PRAGMA user_version").fetchone()[0], 71)
+                connection.execute("PRAGMA user_version").fetchone()[0],
+                SCHEMA_VERSION)
 
     def test_reader_task_named_other_is_held_at_start(self):
         service = self._researched("Owner: other:Person B — assigned in the meeting")

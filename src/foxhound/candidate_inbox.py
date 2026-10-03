@@ -5682,7 +5682,13 @@ class CandidateInbox:
                     connection.execute("PRAGMA foreign_keys = ON")
                 version = 71
             if version == 71:
-                connection.execute("PRAGMA foreign_keys = ON")
+                # Older steps renamed execution_review_cards through
+                # `_v10`-style names with legacy_alter_table on, and a
+                # database migrated through them can still carry references
+                # to those names. Adding a column re-validates the schema, so
+                # it runs under the same setting the v70 step uses.
+                connection.execute("PRAGMA foreign_keys = OFF")
+                connection.execute("PRAGMA legacy_alter_table = ON")
                 connection.execute("BEGIN IMMEDIATE")
                 try:
                     for statement in _SCHEMA_V72:
@@ -5693,6 +5699,9 @@ class CandidateInbox:
                 except Exception:
                     connection.rollback()
                     raise
+                finally:
+                    connection.execute("PRAGMA legacy_alter_table = OFF")
+                    connection.execute("PRAGMA foreign_keys = ON")
                 version = 72
             self._require_schema(connection)
 
