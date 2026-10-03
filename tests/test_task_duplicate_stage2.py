@@ -7,6 +7,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from foxhound import migrate_database
 from foxhound.knowledge_client import (
@@ -512,6 +513,37 @@ class StageTwoTests(unittest.TestCase):
         self.assertEqual((first.related, unchanged.pairs_claimed, revised.related),
                          (1, 0, 1))
         self.assertEqual(len(agent.calls), 2)
+
+    def test_main_builds_knowledge_config_with_stage_two_timeout(self) -> None:
+        token_path = Path(self.directory.name) / "knowledge.token"
+        token_path.write_text("synthetic-token", encoding="utf-8")
+        argv = [
+            "--database", str(self.database),
+            "--model", "synthetic-model",
+            "--endpoint", "http://127.0.0.1:8800",
+            "--gw-endpoint", "http://127.0.0.1:8789",
+            "--gw-alias", "synthetic",
+            "--gw-token-file", str(token_path),
+        ]
+        with mock.patch("foxhound.task_duplicate_stage2.load_knowledge_config") as mock_load_config, \
+                mock.patch("foxhound.task_duplicate_stage2.GwKnowledgeClient") as mock_client, \
+                mock.patch("foxhound.task_duplicate_stage2.run_database") as mock_run:
+            mock_config = object()
+            mock_load_config.return_value = mock_config
+            mock_run.return_value = stage2.StageTwoResult(
+                pairs_claimed=0, same=0, related=0, different=0, retries=0
+            )
+
+            exit_code = stage2.main(argv)
+
+            self.assertEqual(exit_code, 0)
+            mock_load_config.assert_called_once_with(
+                "http://127.0.0.1:8789",
+                "synthetic",
+                token_path,
+                timeout_seconds=25.0,
+            )
+            mock_client.assert_called_once_with(mock_config)
 
 
 if __name__ == "__main__":

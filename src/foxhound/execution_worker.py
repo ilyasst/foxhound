@@ -92,7 +92,7 @@ REPOSITORY_RECEIPTS_SCHEMA = "foxhound.repository-action-receipts"
 WORKER_SCHEMA_VERSION = 1
 
 #: meaning-based ranking on the knowledge service can take several seconds per layer
-WORKER_KNOWLEDGE_TIMEOUT_SECONDS = 10.0
+WORKER_KNOWLEDGE_TIMEOUT_SECONDS = 25.0
 STATE_ENV = "FOXHOUND_EXECUTION_STATE"
 GW_ENDPOINT_ENV = "FOXHOUND_GW_ENDPOINT"
 GW_ALIAS_ENV = "FOXHOUND_GW_ALIAS"
