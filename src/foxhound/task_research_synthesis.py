@@ -203,11 +203,17 @@ RESEARCH_DRAFT_RESPONSE_FORMAT = {
 
 
 class SynthesisError(RuntimeError):
-    """A safe fixed-code refusal; message contains no task or evidence text."""
+    """A safe fixed-code refusal; message contains no task or evidence text.
 
-    def __init__(self, code: str) -> None:
-        super().__init__(code)
+    `detail` may name the offending field and the rule it broke, so an agent
+    can fix its draft instead of guessing. It never carries draft content:
+    only field paths and fixed wording.
+    """
+
+    def __init__(self, code: str, detail: str | None = None) -> None:
+        super().__init__(code if detail is None else f"{code}: {detail}")
         self.code = code
+        self.detail = detail
 
 
 @dataclass(frozen=True)
@@ -710,9 +716,15 @@ def validate_draft(value: object, sources: list[dict[str, object]]) -> dict[str,
     """Temporary exact #742 draft validator for pre-merge integration.
 
     Once #742 is present, callers should inject ``task_research.validate_draft``.
+    Every refusal names the field and the rule, never the content.
     """
-    if not isinstance(value, Mapping) or value.get("schema_version") != DRAFT_SCHEMA:
-        raise SynthesisError("invalid_draft")
+    def bad(detail: str) -> SynthesisError:
+        return SynthesisError("invalid_draft", detail)
+
+    if not isinstance(value, Mapping):
+        raise bad("the draft is not a JSON object")
+    if value.get("schema_version") != DRAFT_SCHEMA:
+        raise bad(f"schema_version must be {DRAFT_SCHEMA}")
     fields = {
         "schema_version", "research_status", "objective", "requested_action",
         "current_state", "expected_deliverables", "timeline", "decisions",
@@ -720,36 +732,56 @@ def validate_draft(value: object, sources: list[dict[str, object]]) -> dict[str,
         "findings", "conflicts", "open_questions", "scheduling_recommendations",
     }
     allowed_fields = fields | {"recommendation", "guide", "deadline", "effort"}
-    if not (fields <= set(value) <= allowed_fields) or value.get("research_status") not in RESEARCH_STATUSES:
-        raise SynthesisError("invalid_draft")
+    missing = sorted(fields - set(value))
+    if missing:
+        raise bad("missing fields: " + ", ".join(missing))
+    unknown = sorted(str(key) for key in set(value) - allowed_fields)
+    if unknown:
+        raise bad("unknown fields: " + ", ".join(unknown))
+    if value.get("research_status") not in RESEARCH_STATUSES:
+        raise bad("research_status must be one of " + ", ".join(sorted(RESEARCH_STATUSES)))
     source_ids = {str(item["source_id"]) for item in sources}
 
-    def claim(item: object) -> dict[str, object]:
-        if not isinstance(item, Mapping) or set(item) != {"text", "status", "source_refs"}:
-            raise SynthesisError("invalid_draft")
+    def claim(item: object, where: str, extra: frozenset[str] = frozenset()) -> dict[str, object]:
+        base = {"text", "status", "source_refs"}
+        if not isinstance(item, Mapping):
+            raise bad(f"{where} must be an object with text, status and source_refs")
+        keys = set(item)
+        if not base <= keys or keys - base - extra:
+            wanted = ", ".join(sorted(base | extra))
+            raise bad(f"{where} must have exactly the keys {wanted}")
         text = item.get("text")
         status = item.get("status")
         refs = item.get("source_refs")
-        if (not isinstance(text, str) or not text or text != text.strip() or len(text) > 8_000
-                or status not in CLAIM_STATUSES or not isinstance(refs, list)
-                or len(refs) > 16 or len(set(refs)) != len(refs)
-                or any(ref not in source_ids for ref in refs)
-                or (status not in {"unknown", "unsourced"} and not refs)):
-            raise SynthesisError("invalid_draft")
-        return {"text": text, "status": status, "source_refs": refs}
+        if not isinstance(text, str) or not text or text != text.strip():
+            raise bad(f"{where}.text must be non-empty text without surrounding spaces")
+        if len(text) > 8_000:
+            raise bad(f"{where}.text is longer than 8000 characters")
+        if status not in CLAIM_STATUSES:
+            raise bad(f"{where}.status must be one of " + ", ".join(sorted(CLAIM_STATUSES)))
+        if not isinstance(refs, list) or len(refs) > 16 or len(set(refs)) != len(refs):
+            raise bad(f"{where}.source_refs must be a list of at most 16 distinct source ids")
+        if any(ref not in source_ids for ref in refs):
+            raise bad(f"{where}.source_refs names a source that is not in the sources list")
+        if status not in {"unknown", "unsourced"} and not refs:
+            raise bad(f"{where} has status {status} but no source_refs")
+        result_claim: dict[str, object] = {"text": text, "status": status, "source_refs": refs}
+        for key in sorted(extra & keys):
+            result_claim[key] = item[key]
+        return result_claim
 
-    def detail_text(item: object, *, maximum: int = 500) -> str:
+    def detail_text(item: object, where: str, *, maximum: int = 500) -> str:
         if (not isinstance(item, str) or not item or item != item.strip()
                 or len(item) > maximum or any(
                     ord(char) < 32 and char not in "\n\t" for char in item
                 )):
-            raise SynthesisError("invalid_draft")
+            raise bad(f"{where} must be plain text of at most {maximum} characters")
         return item
 
     result: dict[str, object] = {
         "research_status": value["research_status"],
-        "objective": claim(value.get("objective")),
-        "requested_action": claim(value.get("requested_action")),
+        "objective": claim(value.get("objective"), "objective"),
+        "requested_action": claim(value.get("requested_action"), "requested_action"),
     }
     sections = (
         "current_state", "expected_deliverables", "timeline", "decisions",
@@ -759,28 +791,45 @@ def validate_draft(value: object, sources: list[dict[str, object]]) -> dict[str,
     for name in sections:
         items = value.get(name)
         if not isinstance(items, list) or len(items) > 32:
-            raise SynthesisError("invalid_draft")
-        result[name] = [claim(item) for item in items]
+            raise bad(f"{name} must be a list of at most 32 claims")
+        result[name] = [claim(item, f"{name}[{index}]") for index, item in enumerate(items)]
     if "recommendation" in value:
         rec_items = value.get("recommendation")
         if not isinstance(rec_items, list) or len(rec_items) > 32:
-            raise SynthesisError("invalid_draft")
-        result["recommendation"] = [claim(item) for item in rec_items]
+            raise bad("recommendation must be a list of at most 32 claims")
+        result["recommendation"] = [
+            claim(item, f"recommendation[{index}]") for index, item in enumerate(rec_items)]
     if "guide" in value:
-        result["guide"] = claim(value.get("guide"))
+        result["guide"] = claim(value.get("guide"), "guide")
+    # A deadline carries its date and an effort its size beside the claim
+    # (#846). Requiring the bare claim shape here refused every report that
+    # had either, and agents deleted them to get through.
     if "deadline" in value:
-        result["deadline"] = claim(value.get("deadline"))
+        deadline = claim(value.get("deadline"), "deadline", frozenset({"date"}))
+        if "date" in deadline:
+            date_value = deadline["date"]
+            try:
+                datetime.strptime(str(date_value), "%Y-%m-%d")
+            except ValueError as exc:
+                raise bad("deadline.date must be YYYY-MM-DD") from exc
+        result["deadline"] = deadline
     if "effort" in value:
-        result["effort"] = claim(value.get("effort"))
+        effort = claim(value.get("effort"), "effort", frozenset({"size"}))
+        if "size" in effort and effort["size"] not in {"hour", "day", "week"}:
+            raise bad("effort.size must be hour, day or week")
+        result["effort"] = effort
     recommendations = value.get("scheduling_recommendations")
     if not isinstance(recommendations, list) or len(recommendations) > 3:
-        raise SynthesisError("invalid_draft")
+        raise bad("scheduling_recommendations must be a list of at most 3 items")
     parsed = []
-    for item in recommendations:
+    for index, item in enumerate(recommendations):
+        where = f"scheduling_recommendations[{index}]"
         if not isinstance(item, Mapping):
-            raise SynthesisError("invalid_draft")
+            raise bad(f"{where} must be an object")
         kind = item.get("type")
         confidence = item.get("confidence")
+        if kind not in RECOMMENDATION_TYPES:
+            raise bad(f"{where}.type must be one of " + ", ".join(sorted(RECOMMENDATION_TYPES)))
         expected = {"type", "confidence", "rationale"}
         if kind == "after_task_completed":
             expected.add("related_task_id")
@@ -788,30 +837,33 @@ def validate_draft(value: object, sources: list[dict[str, object]]) -> dict[str,
             expected.add("not_before")
         elif kind == "create_prerequisite":
             expected.add("prerequisite_text")
-        if (kind not in RECOMMENDATION_TYPES or set(item) != expected
-                or isinstance(confidence, bool)
-                or not isinstance(confidence, (int, float))
+        if set(item) != expected:
+            raise bad(f"{where} must have exactly the keys " + ", ".join(sorted(expected)))
+        if (isinstance(confidence, bool) or not isinstance(confidence, (int, float))
                 or not math.isfinite(confidence) or not 0 <= confidence <= 1):
-            raise SynthesisError("invalid_draft")
-        row = {"type": kind, "confidence": float(confidence), "rationale": claim(item["rationale"])}
+            raise bad(f"{where}.confidence must be a number from 0 to 1")
+        row = {"type": kind, "confidence": float(confidence),
+               "rationale": claim(item["rationale"], f"{where}.rationale")}
         extra_keys = expected - {"type", "confidence", "rationale"}
         if extra_keys:
             detail = next(iter(extra_keys))
-            detail_value = item.get(detail) if detail == "related_task_id" else detail_text(item.get(detail))
             if detail == "related_task_id":
                 val = item.get(detail)
                 if not isinstance(val, int) or isinstance(val, bool) or val < 1:
-                    raise SynthesisError("invalid_draft")
-            if detail == "not_before":
-                if not isinstance(detail_value, str) or not detail_value.endswith("Z"):
-                    raise SynthesisError("invalid_draft")
-                try:
-                    timestamp = datetime.fromisoformat(detail_value[:-1] + "+00:00")
-                except ValueError as exc:
-                    raise SynthesisError("invalid_draft") from exc
-                if timestamp.tzinfo is None or timestamp.utcoffset() is None:
-                    raise SynthesisError("invalid_draft")
-            row[detail] = item.get(detail) if detail == "related_task_id" else detail_value
+                    raise bad(f"{where}.related_task_id must be a positive task number")
+                row[detail] = val
+            else:
+                detail_value = detail_text(item.get(detail), f"{where}.{detail}")
+                if detail == "not_before":
+                    if not detail_value.endswith("Z"):
+                        raise bad(f"{where}.not_before must be a UTC timestamp ending in Z")
+                    try:
+                        timestamp = datetime.fromisoformat(detail_value[:-1] + "+00:00")
+                    except ValueError as exc:
+                        raise bad(f"{where}.not_before is not a valid timestamp") from exc
+                    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+                        raise bad(f"{where}.not_before must carry a timezone")
+                row[detail] = detail_value
         parsed.append(row)
     result["scheduling_recommendations"] = parsed
     return result
