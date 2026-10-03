@@ -922,16 +922,20 @@ def _convert_research_json(
         for q in raw_oq:
             if isinstance(q, Mapping):
                 q_text = str(q.get("text", "")).strip()
-                is_blocking = bool(q.get("blocking", False))
+                kind = str(q.get("kind", "")).strip().lower()
+                if kind not in {"for_reader", "task_work", "blocking"}:
+                    kind = "blocking" if q.get("blocking") is True else "for_reader"
             else:
                 q_text = str(q or "").strip()
-                is_blocking = False
+                kind = "for_reader"
             if q_text:
-                if is_blocking:
+                if kind == "blocking":
                     has_blocking_question = True
                     text_to_record = f"{q_text} (blocking)"
+                elif kind == "task_work":
+                    text_to_record = f"{q_text} (task work)"
                 else:
-                    text_to_record = q_text
+                    text_to_record = f"{q_text} (for the reader)"
                 open_questions_claims.append({
                     "text": text_to_record,
                     "status": "unknown",
