@@ -5005,3 +5005,22 @@ class RetiredRunSummaryTests(ExecutionCardTests):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StartCardKindTests(unittest.TestCase):
+    """A workflow back at its Start gate is a Start card, result or not."""
+
+    def _row(self, status, *, last_result_id="r1"):
+        from foxhound.execution_cards import _kind_for_workflow
+        return _kind_for_workflow({
+            "status": status, "phase": "plan", "outcome": "completed",
+            "last_result_id": last_result_id, "steer_while_running": 0,
+        })
+
+    def test_awaiting_start_with_an_earlier_result_is_a_start_card(self):
+        from foxhound.execution_cards import ExecutionCardKind
+        self.assertEqual(self._row(WorkflowStatus.AWAITING_START),
+                         ExecutionCardKind.START)
+        self.assertEqual(self._row(WorkflowStatus.AWAITING_START,
+                                   last_result_id=None),
+                         ExecutionCardKind.START)

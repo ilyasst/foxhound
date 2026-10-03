@@ -9,6 +9,7 @@ import json
 import os
 import re
 import secrets
+import sys
 import sqlite3
 import stat
 import urllib.parse
@@ -694,7 +695,18 @@ class ExecutionCardService:
                     ),
                 ).fetchall()
                 for row in rows:
-                    kind = _kind_for_workflow(row)
+                    try:
+                        kind = _kind_for_workflow(row)
+                    except TaskLedgerError:
+                        # One workflow in a state no card describes must not
+                        # stop every other card from being made (#616). It
+                        # is reported, and stays eligible for a later fix.
+                        print(
+                            "foxhound execution card schedule: workflow "
+                            f"{int(row['task_id'])} has no card kind; skipped",
+                            file=sys.stderr,
+                        )
+                        continue
                     result_id = (
                         None
                         if kind in {ExecutionCardKind.START, ExecutionCardKind.STEER}
@@ -3395,6 +3407,11 @@ def _kind_for_workflow(row: Mapping[str, object]) -> ExecutionCardKind:
             # query and no card kind at all — which raised, and took the
             # whole sweep down with it, including cards that were fine.
             or row["status"] == WorkflowStatus.PARKED
+            # The same holds for a workflow sent back to its Start gate
+            # after it already produced a result: a reader's Discuss that
+            # research then held for an ownership proposal (#800) is exactly
+            # that, and it took every card down for hours.
+            or row["status"] == WorkflowStatus.AWAITING_START
         )
     ):
         return ExecutionCardKind.START
