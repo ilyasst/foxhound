@@ -1046,7 +1046,7 @@ class TaskExecutionService:
                 from .task_forge_close_backfill import close_forge_withdrawn_task
 
                 withdrawn_forge_tasks = connection.execute(
-                    "SELECT t.id, b.candidate_id, c.source_kind "
+                    "SELECT t.id, t.version, b.candidate_id, c.source_kind, c.source_item_id "
                     "FROM tasks AS t "
                     "JOIN task_candidate_bindings AS b ON b.task_id = t.id AND b.relation = 'accepted' "
                     "JOIN candidate_inbox AS c ON c.candidate_id = b.candidate_id "
@@ -1069,6 +1069,7 @@ class TaskExecutionService:
                         task_id=int(row_w["id"]),
                         candidate_id=str(row_w["candidate_id"]),
                         source_kind=str(row_w["source_kind"]),
+                        item_id=str(row_w["source_item_id"]),
                         now=now,
                     )
 

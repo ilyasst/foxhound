@@ -16,8 +16,8 @@ from .task_bootstrap import TaskBootstrapConfigError, _private_database
 from .task_ledger import TaskLedger, TaskLedgerError
 
 
-def _candidate_stub(source_kind: str) -> object:
-    return SimpleNamespace(source=SimpleNamespace(kind=source_kind))
+def _candidate_stub(source_kind: str, item_id: str) -> object:
+    return SimpleNamespace(source=SimpleNamespace(kind=source_kind, item_id=item_id))
 
 
 def close_forge_withdrawn_task(
@@ -26,6 +26,7 @@ def close_forge_withdrawn_task(
     task_id: int,
     candidate_id: str,
     source_kind: str,
+    item_id: str,
     now: str,
 ) -> int | None:
     """Close an open task withdrawn with reader_conflict if not running.
@@ -46,7 +47,7 @@ def close_forge_withdrawn_task(
     if wf is not None and wf["status"] == "running":
         return None
 
-    stub = _candidate_stub(source_kind)
+    stub = _candidate_stub(source_kind, item_id)
     new_version = TaskLedger._close_for_forge_source(
         connection,
         candidate=stub,  # type: ignore[arg-type]
@@ -88,7 +89,7 @@ def run_forge_close_backfill(
         inbox._require_current_schema(connection)
 
         query = [
-            "SELECT t.id, t.version, t.status, b.candidate_id, c.source_kind ",
+            "SELECT t.id, t.version, t.status, b.candidate_id, c.source_kind, c.source_item_id ",
             "FROM tasks AS t ",
             "JOIN task_candidate_bindings AS b ON b.task_id = t.id AND b.relation = 'accepted' ",
             "JOIN candidate_inbox AS c ON c.candidate_id = b.candidate_id ",
@@ -156,6 +157,7 @@ def run_forge_close_backfill(
                     task_id=task_id,
                     candidate_id=candidate_id,
                     source_kind=source_kind,
+                    item_id=str(row["source_item_id"]),
                     now=timestamp,
                 )
                 if version is None:
