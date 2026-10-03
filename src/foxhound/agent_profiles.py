@@ -154,12 +154,19 @@ class AgentProfile:
             "and recommended action, re-verify only what you change or doubt, and say in your work "
             "where you depart from it and why. Do not redo research it already covers.\n\n"
         )
+        contacts_section = (
+            "Never invent contact details. Use an email address or phone number only "
+            "if it appears in `research` or in a source you read, and cite where; never "
+            "build one from a person's name. When you have no address for someone, write "
+            "their name with \"(address to confirm)\" and say so in your result.\n\n"
+        )
         return (
             PHASE_CONTRACT_PRECEDENCE
             + budget_sentence
             + handoff_section
             + where_things_are_section
             + research_section
+            + contacts_section
             + self.prompt_template.replace(WORKER_COMMAND_TOKEN, worker_command)
         )
 
@@ -1280,7 +1287,7 @@ GENERAL_PROFILE_RELEASE_REVISION = (
     "e872e60cd96be5dc6e3b092d7e077e10f6bc67e3925552a7fd640154f1373bfc"
 )
 GENERAL_PROFILE_RELEASE_PROMPT_SHA256 = (
-    "5e70f211df40e45b39a346ec36b1d3502b9d18169af64c491fa5cd42b53f2e74"
+    "4903de871e1fecd35a19f625cbc96af20afe5df20a5b1256eb0351727da95606"
 )
 
 
