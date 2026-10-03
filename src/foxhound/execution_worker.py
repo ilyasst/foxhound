@@ -279,7 +279,7 @@ def _local_calendar() -> dict[str, object]:
     }
 
 
-def _worker_operations(phase: WorkflowPhase) -> list[str]:
+def _worker_operations(phase: WorkflowPhase, *, origin_kind: str | None = None) -> list[str]:
     operations = ["context", "search", "draft", "record", "release"]
     # A working tree is available in every phase, planning included. It is a
     # clone in the run's own directory and causes no external effect; nothing
@@ -294,7 +294,9 @@ def _worker_operations(phase: WorkflowPhase) -> list[str]:
     # Read-only thread access is available in plan and execute, not just
     # external_action: the point is to read review feedback *before* repeating
     # the work, and by external_action the work is already done.
-    if phase in (WorkflowPhase.PLAN, WorkflowPhase.EXECUTE):
+    # Thread reading is backed only by forge APIs, so offer it only when the
+    # task originates from a forge issue or pull-request review.
+    if phase in (WorkflowPhase.PLAN, WorkflowPhase.EXECUTE) and origin_kind in {"issue", "review_request"}:
         operations.append("thread")
     return operations
 
@@ -483,7 +485,10 @@ class ExecutionWorker:
                 # identical reviewed profile works on hosts with different
                 # mounts or with no optional root at all.
                 "deployment_roots": dict(state.deployment_roots),
-                "worker_operations": _worker_operations(state.phase),
+                "worker_operations": _worker_operations(
+                    state.phase,
+                    origin_kind=origin.kind if origin is not None else None,
+                ),
                 "external_effects_allowed": (
                     state.phase is WorkflowPhase.EXTERNAL_ACTION
                 ),
@@ -947,12 +952,11 @@ class ExecutionWorker:
         """
         state, service = self._active()
         origin = TaskLedger(state.database_path).origin(state.task_id)
-        if origin is None:
-            raise ExecutionWorkerClaimError(
-                "this task has no origin, so it names no thread to read")
-        if origin.system != "gw":
-            raise ExecutionWorkerClaimError(
-                "thread reading is only available for forge-bound tasks")
+        kind = origin.kind if origin is not None else None
+        if origin is None or origin.system != "gw" or origin.kind not in {"issue", "review_request"}:
+            raise ExecutionWorkerDraftError(
+                f"`thread` reads only GitHub issue and pull-request threads; this task's origin is {kind or 'none'}. For an email thread use the `outlook` research client (`outlook thread <UID>`)."
+            )
 
         repository = origin.record_id
         try:
@@ -961,7 +965,7 @@ class ExecutionWorker:
                     repository=repository,
                     number=origin.item_id,
                 )
-            elif origin.kind == "review_request":
+            else:
                 # The item_id for a review_request contains the PR number
                 # followed by a state separator (e.g., "7/<when>").
                 pr_number = origin.item_id.split("/", 1)[0]
@@ -969,9 +973,6 @@ class ExecutionWorker:
                     repository=repository,
                     number=pr_number,
                 )
-            else:
-                raise ExecutionWorkerClaimError(
-                    f"thread reading is not available for {origin.kind!r}")
         except forge_thread.ForgeThreadError as exc:
             raise ExecutionWorkerClaimError(str(exc)) from exc
 

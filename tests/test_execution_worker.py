@@ -496,7 +496,7 @@ class ExecutionWorkerTests(unittest.TestCase):
                 "deployment_roots": {},
                 "worker_operations": [
                     "context", "search", "draft", "record", "release",
-                    "act.worktree", "thread",
+                    "act.worktree",
                 ],
                 "external_effects_allowed": False,
             },
@@ -3400,21 +3400,28 @@ class ThreadReadTests(unittest.TestCase):
 
     def test_thread_operation_is_available_in_plan(self):
         from foxhound.execution_worker import _worker_operations
-        ops = _worker_operations(WorkflowPhase.PLAN)
+        ops = _worker_operations(WorkflowPhase.PLAN, origin_kind="issue")
         self.assertIn("thread", ops)
 
     def test_thread_operation_is_available_in_execute(self):
         from foxhound.execution_worker import _worker_operations
-        ops = _worker_operations(WorkflowPhase.EXECUTE)
+        ops = _worker_operations(WorkflowPhase.EXECUTE, origin_kind="issue")
         self.assertIn("thread", ops)
 
     def test_thread_operation_is_not_available_in_external_action(self):
         from foxhound.execution_worker import _worker_operations
-        ops = _worker_operations(WorkflowPhase.EXTERNAL_ACTION)
+        ops = _worker_operations(WorkflowPhase.EXTERNAL_ACTION, origin_kind="issue")
         self.assertNotIn("thread", ops)
 
-    def test_no_origin_refuses_thread_read(self):
-        with (\
+    def test_thread_operation_is_not_available_for_other_origins(self):
+        from foxhound.execution_worker import _worker_operations
+        self.assertNotIn("thread", _worker_operations(WorkflowPhase.PLAN, origin_kind="email"))
+        self.assertNotIn("thread", _worker_operations(WorkflowPhase.EXECUTE, origin_kind="email"))
+        self.assertNotIn("thread", _worker_operations(WorkflowPhase.PLAN, origin_kind=None))
+        self.assertIn("thread", _worker_operations(WorkflowPhase.PLAN, origin_kind="review_request"))
+
+    def test_context_capabilities_reflect_origin(self):
+        with (
             mock.patch(
                 "foxhound.execution_worker._local_today",
                 return_value="2030-01-02",
@@ -3422,9 +3429,79 @@ class ThreadReadTests(unittest.TestCase):
             knowledge_server() as endpoint,
         ):
             worker = self._worker(endpoint)
-            with self.assertRaises(ExecutionWorkerClaimError) as caught:
+            # Default setUp has no origin bound
+            ctx_no_origin = worker.context()
+            self.assertNotIn("thread", ctx_no_origin["capabilities"]["worker_operations"])
+
+            self._bind_origin("email")
+            ctx_email = worker.context()
+            self.assertNotIn("thread", ctx_email["capabilities"]["worker_operations"])
+
+    def test_context_capabilities_include_thread_for_issue_origin(self):
+        self._bind_origin("issue")
+        with (
+            mock.patch(
+                "foxhound.execution_worker._local_today",
+                return_value="2030-01-02",
+            ),
+            knowledge_server() as endpoint,
+        ):
+            worker = self._worker(endpoint)
+            ctx = worker.context()
+            self.assertIn("thread", ctx["capabilities"]["worker_operations"])
+
+    def test_no_origin_refuses_thread_read(self):
+        with (
+            mock.patch(
+                "foxhound.execution_worker._local_today",
+                return_value="2030-01-02",
+            ),
+            knowledge_server() as endpoint,
+        ):
+            worker = self._worker(endpoint)
+            with self.assertRaises(ExecutionWorkerDraftError) as caught:
                 worker.read_thread()
-        self.assertIn("no origin", str(caught.exception))
+        self.assertIn("this task's origin is none", str(caught.exception))
+        self.assertIn("outlook thread", str(caught.exception))
+
+    def test_email_origin_refuses_thread_read(self):
+        self._bind_origin("email")
+        with (
+            mock.patch(
+                "foxhound.execution_worker._local_today",
+                return_value="2030-01-02",
+            ),
+            knowledge_server() as endpoint,
+        ):
+            worker = self._worker(endpoint)
+            with self.assertRaises(ExecutionWorkerDraftError) as caught:
+                worker.read_thread()
+        self.assertIn("this task's origin is email", str(caught.exception))
+        self.assertIn("outlook thread", str(caught.exception))
+
+    def test_main_thread_email_origin_exits_65(self):
+        self._bind_origin("email")
+        token_file = self.run_directory / "token.txt"
+        token_file.write_text(TOKEN, encoding="utf-8")
+        token_file.chmod(0o600)
+        stderr = StringIO()
+        with (
+            mock.patch(
+                "foxhound.execution_worker._local_today",
+                return_value="2030-01-02",
+            ),
+            mock.patch.dict(os.environ, {
+                "FOXHOUND_EXECUTION_STATE": str(self.state_path),
+                "FOXHOUND_GW_ENDPOINT": "http://127.0.0.1:9",
+                "FOXHOUND_GW_ALIAS": "primary",
+                "FOXHOUND_GW_TOKEN_FILE": str(token_file),
+            }, clear=True),
+            redirect_stderr(stderr),
+        ):
+            exit_code = main(["thread"])
+        self.assertEqual(exit_code, 65)
+        self.assertIn("outlook thread", stderr.getvalue())
+        self.assertIn("this task's origin is email", stderr.getvalue())
 
     def test_no_prior_thread_returns_empty(self):
         # A task with no prior comments returns an empty thread
