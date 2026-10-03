@@ -1667,3 +1667,112 @@ def test_agent_synthesize_repair_turn_suggests_nearest_path(tmp_path: Path) -> N
     repair_msg = captured_queries[1]
     assert "Meeting_Notes_2025.md" in repair_msg
     assert "kb:Meeting_Notes_2026.md" in repair_msg
+
+
+def test_convert_research_json_scheduling(tmp_path: Path) -> None:
+    from foxhound.task_research import validate_draft
+    from foxhound.task_research_agent import _convert_research_json
+
+    kb_dir = tmp_path / "kb"
+    kb_dir.mkdir()
+    (kb_dir / "dep.md").write_text("Dependency notes\n")
+    (kb_dir / "date.md").write_text("Date notes\n")
+
+    k_roots = (("kb", str(kb_dir)),)
+
+    # 1. Valid cited items + 1 uncited item -> only 2 cited kept
+    raw = {
+        "ownership": {"verdict": "reader", "evidence": []},
+        "requested_deliverable": {"text": "Deliverable", "evidence": []},
+        "scheduling": [
+            {
+                "type": "after_task_completed",
+                "task": "T42",
+                "confidence": 0.85,
+                "reason": "Wait for T42 to complete",
+                "evidence": ["kb:dep.md"],
+            },
+            {
+                "type": "not_before",
+                "not_before": "2026-11-01",
+                "confidence": 0.9,
+                "reason": "Wait until November 1",
+                "evidence": ["kb:date.md"],
+            },
+            {
+                "type": "raise_priority",
+                "confidence": 0.7,
+                "reason": "Uncited priority raise",
+                "evidence": [],
+            },
+        ],
+    }
+
+    draft, sources = _convert_research_json(raw, k_roots)
+    recs = draft["scheduling_recommendations"]
+    assert len(recs) == 2
+    assert recs[0]["type"] == "after_task_completed"
+    assert recs[0]["related_task_id"] == 42
+    assert recs[0]["confidence"] == 0.85
+    assert recs[0]["rationale"]["text"] == "Wait for T42 to complete"
+    assert len(recs[0]["rationale"]["source_refs"]) == 1
+
+    assert recs[1]["type"] == "not_before"
+    assert recs[1]["not_before"] == "2026-11-01T00:00:00Z"
+    assert recs[1]["confidence"] == 0.9
+    assert recs[1]["rationale"]["text"] == "Wait until November 1"
+    assert len(recs[1]["rationale"]["source_refs"]) == 1
+
+    validate_draft(draft, sources)
+
+    # 2. Self-reference dropped
+    run_dir = tmp_path / "run_self_ref"
+    run_dir.mkdir()
+    (run_dir / "task.json").write_text(json.dumps({"task_id": 42}))
+
+    raw_self = {
+        "ownership": {"verdict": "reader", "evidence": []},
+        "requested_deliverable": {"text": "Deliverable", "evidence": []},
+        "scheduling": [
+            {
+                "type": "after_task_completed",
+                "task": "42",
+                "confidence": 0.9,
+                "reason": "Wait for self",
+                "evidence": ["kb:dep.md"],
+            },
+            {
+                "type": "after_task_completed",
+                "task": "T43",
+                "confidence": 0.95,
+                "reason": "Wait for 43",
+                "evidence": ["kb:dep.md"],
+            },
+        ],
+    }
+    draft_self, sources_self = _convert_research_json(raw_self, k_roots, run_dir=run_dir)
+    recs_self = draft_self["scheduling_recommendations"]
+    assert len(recs_self) == 1
+    assert recs_self[0]["related_task_id"] == 43
+    validate_draft(draft_self, sources_self)
+
+    # 3. Truncation to at most 3 items
+    raw_many = {
+        "ownership": {"verdict": "reader", "evidence": []},
+        "requested_deliverable": {"text": "Deliverable", "evidence": []},
+        "scheduling": [
+            {
+                "type": "after_task_completed",
+                "task": f"T{i}",
+                "confidence": 0.9,
+                "reason": f"Reason {i}",
+                "evidence": ["kb:dep.md"],
+            }
+            for i in range(1, 6)
+        ],
+    }
+    draft_many, sources_many = _convert_research_json(raw_many, k_roots)
+    recs_many = draft_many["scheduling_recommendations"]
+    assert len(recs_many) == 3
+    assert [r["related_task_id"] for r in recs_many] == [1, 2, 3]
+    validate_draft(draft_many, sources_many)

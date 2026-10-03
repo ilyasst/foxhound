@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, Sequence
@@ -905,6 +906,87 @@ def _convert_research_json(
 
     research_status = "inconclusive" if (has_blocking_question or is_undetermined_owner) else "sufficient"
 
+    # scheduling <- scheduling
+    scheduling_recommendations: list[dict[str, Any]] = []
+    current_task_id: int | None = None
+    if run_dir:
+        t_path = Path(run_dir) / "task.json"
+        if t_path.exists():
+            try:
+                t_data = json.loads(t_path.read_text(encoding="utf-8"))
+                if isinstance(t_data, Mapping):
+                    tid = t_data.get("task_id")
+                    if isinstance(tid, int) and not isinstance(tid, bool) and tid >= 1:
+                        current_task_id = tid
+            except Exception:
+                pass
+
+    raw_scheduling = raw.get("scheduling", [])
+    if isinstance(raw_scheduling, Sequence) and not isinstance(raw_scheduling, (str, bytes)):
+        for item in raw_scheduling:
+            if not isinstance(item, Mapping):
+                continue
+            kind = str(item.get("type", "")).strip()
+            if kind not in {"after_task_completed", "not_before", "raise_priority"}:
+                continue
+
+            reason = str(item.get("reason", "")).strip()
+            ev = item.get("evidence", [])
+            claim = _make_claim(
+                reason, "supported", ev, sources_by_locator, sources_list, knowledge_roots, read_only_commands,
+                run_dir=run_dir, basename_cache=basename_cache,
+                degrade=degrade, stats=stats,
+            )
+            if not claim["source_refs"]:
+                continue
+
+            conf_val = item.get("confidence")
+            if isinstance(conf_val, (int, float)) and not isinstance(conf_val, bool):
+                conf_float = max(0.0, min(1.0, float(conf_val)))
+            else:
+                conf_float = 0.0
+
+            rec_item: dict[str, Any] = {
+                "type": kind,
+                "confidence": conf_float,
+                "rationale": claim,
+            }
+
+            if kind == "after_task_completed":
+                task_val = item.get("task")
+                pred_id: int | None = None
+                if isinstance(task_val, int) and not isinstance(task_val, bool):
+                    pred_id = task_val
+                elif isinstance(task_val, str):
+                    m = re.match(r"^T?(\d+)$", task_val.strip())
+                    if m:
+                        pred_id = int(m.group(1))
+                if pred_id is None or pred_id < 1:
+                    continue
+                if current_task_id is not None and pred_id == current_task_id:
+                    continue
+                rec_item["related_task_id"] = pred_id
+
+            elif kind == "not_before":
+                nb_val = item.get("not_before")
+                if not isinstance(nb_val, str):
+                    continue
+                nb_str = nb_val.strip()
+                try:
+                    if len(nb_str) == 10 and re.match(r"^\d{4}-\d{2}-\d{2}$", nb_str):
+                        nb_parsed = datetime.fromisoformat(nb_str + "T00:00:00+00:00")
+                    else:
+                        nb_parsed = datetime.fromisoformat(nb_str.replace("Z", "+00:00"))
+                    if nb_parsed.tzinfo is None:
+                        nb_parsed = nb_parsed.replace(tzinfo=timezone.utc)
+                    rec_item["not_before"] = nb_parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+                except ValueError:
+                    continue
+
+            scheduling_recommendations.append(rec_item)
+            if len(scheduling_recommendations) == 3:
+                break
+
     draft: dict[str, Any] = {
         "schema_version": DRAFT_SCHEMA,
         "research_status": research_status,
@@ -921,7 +1003,7 @@ def _convert_research_json(
         "findings": findings_claims,
         "conflicts": [],
         "open_questions": open_questions_claims,
-        "scheduling_recommendations": [],
+        "scheduling_recommendations": scheduling_recommendations,
     }
     if guide_claim is not None:
         draft["guide"] = guide_claim
@@ -1075,6 +1157,11 @@ def check_research_output(
 
     if isinstance(raw_research.get("recommendation"), Mapping):
         check_evidence(raw_research["recommendation"].get("evidence"), "recommendation.evidence")
+
+    if isinstance(raw_research.get("scheduling"), Sequence) and not isinstance(raw_research.get("scheduling"), (str, bytes)):
+        for i, s in enumerate(raw_research["scheduling"]):
+            if isinstance(s, Mapping):
+                check_evidence(s.get("evidence"), f"scheduling[{i}].evidence")
 
     draft = None
     sources = None
