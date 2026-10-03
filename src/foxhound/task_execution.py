@@ -823,6 +823,13 @@ class TaskExecutionService:
                     # must keep ending in a cancellation rather than becoming
                     # an immediate re-schedule. The event says the task was
                     # reopened, which is the thing actually being asked.
+                    #
+                    # A reconciliation-cancelled workflow (where `_cancel_stale`
+                    # cancelled the workflow because task_version advanced) is safe
+                    # to re-schedule: a revision should cost a re-plan, never the
+                    # task. A reader drop writes 'task_dropped' and a done writes
+                    # 'task_completed', which must not match. Each task version
+                    # is re-scheduled at most once.
                     "AND (EXISTS(SELECT 1 FROM task_events AS reopened "
                     "WHERE reopened.task_id=t.id "
                     "AND reopened.kind='status_changed' "
@@ -833,13 +840,21 @@ class TaskExecutionService:
                     "JOIN candidate_inbox AS source "
                     "ON source.candidate_id=review.candidate_id "
                     "WHERE review.task_id=t.id AND review.relation='accepted' "
-                    "AND source.source_kind='review_request')))) "
+                    "AND source.source_kind='review_request') "
+                    "OR (w.status='cancelled' "
+                    "AND w.updated_at < ? "
+                    "AND (SELECT e.kind FROM task_execution_events AS e "
+                    "WHERE e.task_id=t.id ORDER BY e.sequence DESC LIMIT 1)='cancelled' "
+                    "AND NOT EXISTS(SELECT 1 FROM task_execution_events AS e "
+                    "WHERE e.task_id=t.id AND e.kind='scheduled' "
+                    "AND e.task_version=t.version))))) "
                     "AND NOT EXISTS("
                     " SELECT 1 FROM task_candidate_bindings AS b JOIN "
                     " task_candidate_lifecycle AS l ON l.candidate_id=b.candidate_id "
                     " WHERE b.task_id=t.id AND b.relation='accepted' "
                     " AND l.state='withdrawn' AND l.resolution='preserved_open'"
-                    ")"
+                    ")",
+                    (now,),
                 ).fetchone()[0])
                 waiting_statuses = tuple(sorted(READER_WAITING_STATUSES))
                 waiting_marks = ",".join("?" for _ in waiting_statuses)
@@ -960,6 +975,13 @@ class TaskExecutionService:
                     # must keep ending in a cancellation rather than becoming
                     # an immediate re-schedule. The event says the task was
                     # reopened, which is the thing actually being asked.
+                    #
+                    # A reconciliation-cancelled workflow (where `_cancel_stale`
+                    # cancelled the workflow because task_version advanced) is safe
+                    # to re-schedule: a revision should cost a re-plan, never the
+                    # task. A reader drop writes 'task_dropped' and a done writes
+                    # 'task_completed', which must not match. Each task version
+                    # is re-scheduled at most once.
                     "AND (EXISTS(SELECT 1 FROM task_events AS reopened "
                     "WHERE reopened.task_id=t.id "
                     "AND reopened.kind='status_changed' "
@@ -970,7 +992,14 @@ class TaskExecutionService:
                     "JOIN candidate_inbox AS source "
                     "ON source.candidate_id=review.candidate_id "
                     "WHERE review.task_id=t.id AND review.relation='accepted' "
-                    "AND source.source_kind='review_request')))) "
+                    "AND source.source_kind='review_request') "
+                    "OR (w.status='cancelled' "
+                    "AND w.updated_at < ? "
+                    "AND (SELECT e.kind FROM task_execution_events AS e "
+                    "WHERE e.task_id=t.id ORDER BY e.sequence DESC LIMIT 1)='cancelled' "
+                    "AND NOT EXISTS(SELECT 1 FROM task_execution_events AS e "
+                    "WHERE e.task_id=t.id AND e.kind='scheduled' "
+                    "AND e.task_version=t.version))))) "
                     "AND NOT EXISTS("
                     " SELECT 1 FROM task_candidate_bindings AS blocked JOIN "
                     " task_candidate_lifecycle AS l "
@@ -978,7 +1007,8 @@ class TaskExecutionService:
                     " WHERE blocked.task_id=t.id AND blocked.relation='accepted' "
                     " AND l.state='withdrawn' AND l.resolution='preserved_open'"
                     f") ORDER BY {_SOURCE_QUEUE_ORDER_SQL}"
-                    "t.id"
+                    "t.id",
+                    (now,),
                 )
                 scheduled = 0
                 capped = 0
