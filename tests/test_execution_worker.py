@@ -33,7 +33,9 @@ from foxhound.execution_worker import (
     ExecutionWorkerClaimError,
     ExecutionWorkerConfigError,
     ExecutionWorkerDraftError,
+    WORKER_KNOWLEDGE_TIMEOUT_SECONDS,
     load_knowledge_config,
+    load_worker_from_environment,
     load_result_draft,
     load_run_state,
     main,
@@ -245,6 +247,20 @@ class ExecutionWorkerTests(unittest.TestCase):
                 "http://127.0.0.1:8001", "synthetic", token,
                 timeout_seconds=31,
             )
+
+    def test_load_worker_from_environment_uses_worker_knowledge_timeout(self):
+        token = self.root / "knowledge.token"
+        token.write_text(TOKEN, encoding="utf-8")
+        token.chmod(0o600)
+        environ = {
+            "FOXHOUND_EXECUTION_STATE": str(self.state_path),
+            "FOXHOUND_GW_ENDPOINT": "http://127.0.0.1:8001",
+            "FOXHOUND_GW_ALIAS": "synthetic",
+            "FOXHOUND_GW_TOKEN_FILE": str(token),
+        }
+        worker = load_worker_from_environment(environ)
+        self.assertEqual(worker._knowledge_config.timeout_seconds, 10.0)
+        self.assertEqual(worker._knowledge_config.timeout_seconds, WORKER_KNOWLEDGE_TIMEOUT_SECONDS)
 
     def _write_state(
         self,
