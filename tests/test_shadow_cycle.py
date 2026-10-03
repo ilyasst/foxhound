@@ -14,7 +14,12 @@ from pathlib import Path
 from unittest import mock
 
 from foxhound import CandidateInbox, migrate_database
-from foxhound.shadow_cycle import ShadowCycleError, run_cycle
+from foxhound.shadow_cycle import (
+    ShadowCycleAbsentOutboxError,
+    ShadowCycleError,
+    ShadowCycleUnreadableOutboxError,
+    run_cycle,
+)
 from foxhound.task_shadow_feed_import import TaskShadowFeedImportError
 
 
@@ -254,6 +259,120 @@ class ShadowCycleTests(unittest.TestCase):
         self.assertEqual(refused.stderr.strip(), "Foxhound shadow cycle failed")
         self.assertNotIn(str(self.root), refused.stderr)
         self.assertNotIn("private-stream-name", refused.stderr)
+
+    def test_absent_candidate_outbox_is_reported_before_database_touch(self):
+        """An enrolment that has not yet produced its first page is normal."""
+        absent = self.root / "nonexistent-candidate-outbox"
+
+        with self.assertRaisesRegex(
+            ShadowCycleAbsentOutboxError,
+            "Candidate outbox.*not been created",
+        ):
+            run_cycle(
+                candidate_outbox_dir=absent,
+                observation_outbox_dir=self.observations,
+                database_path=self.database,
+                stream_id="primary",
+            )
+        self.assertFalse(self.database.exists())
+
+    def test_absent_observation_outbox_is_reported_before_database_touch(self):
+        absent = self.root / "nonexistent-observation-outbox"
+
+        with self.assertRaisesRegex(
+            ShadowCycleAbsentOutboxError,
+            "Observation outbox.*not been created",
+        ):
+            run_cycle(
+                candidate_outbox_dir=self.candidates,
+                observation_outbox_dir=absent,
+                database_path=self.database,
+                stream_id="primary",
+            )
+        self.assertFalse(self.database.exists())
+
+    def test_absent_outbox_cli_exits_with_distinct_message(self):
+        absent = self.root / "nonexistent-candidate-outbox"
+        environment = dict(os.environ)
+        environment["PYTHONPATH"] = str(SOURCE_ROOT)
+        process = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "foxhound.shadow_cycle",
+                "--candidate-outbox",
+                str(absent),
+                "--observation-outbox",
+                str(self.observations),
+                "--database",
+                str(self.database),
+                "--stream-id",
+                "primary",
+            ],
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(process.returncode, 1)
+        self.assertIn("Candidate outbox", process.stderr)
+        self.assertIn("not been created", process.stderr)
+        self.assertNotEqual(
+            process.stderr.strip(),
+            "Foxhound shadow cycle failed",
+        )
+        self.assertNotIn("primary", process.stderr)
+
+    def test_unreadable_outbox_is_reported_before_database_touch(self):
+        """Permission or I/O errors are distinct from absent."""
+        import stat as stat_module
+        unreadable = private_dir(self.root, "unreadable-outbox")
+        # Remove read permission from the directory
+        unreadable.chmod(0o000)
+        self.addCleanup(lambda: unreadable.chmod(0o700))
+
+        with self.assertRaises(ShadowCycleUnreadableOutboxError):
+            run_cycle(
+                candidate_outbox_dir=unreadable,
+                observation_outbox_dir=self.observations,
+                database_path=self.database,
+                stream_id="primary",
+            )
+        self.assertFalse(self.database.exists())
+
+    def test_unreadable_outbox_cli_exits_with_distinct_message(self):
+        import stat as stat_module
+        unreadable = private_dir(self.root, "unreadable-outbox")
+        unreadable.chmod(0o000)
+        self.addCleanup(lambda: unreadable.chmod(0o700))
+        environment = dict(os.environ)
+        environment["PYTHONPATH"] = str(SOURCE_ROOT)
+        process = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "foxhound.shadow_cycle",
+                "--candidate-outbox",
+                str(unreadable),
+                "--observation-outbox",
+                str(self.observations),
+                "--database",
+                str(self.database),
+                "--stream-id",
+                "primary",
+            ],
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(process.returncode, 1)
+        self.assertIn("outbox", process.stderr)
+        self.assertNotEqual(
+            process.stderr.strip(),
+            "Foxhound shadow cycle failed",
+        )
+        self.assertNotIn("primary", process.stderr)
 
 
 if __name__ == "__main__":

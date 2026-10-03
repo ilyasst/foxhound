@@ -31,6 +31,14 @@ class ShadowCycleError(RuntimeError):
     """A complete shadow cycle cannot be run safely."""
 
 
+class ShadowCycleAbsentOutboxError(ShadowCycleError):
+    """An outbox directory has not been created yet."""
+
+
+class ShadowCycleUnreadableOutboxError(ShadowCycleError):
+    """An outbox directory exists but cannot be read."""
+
+
 @dataclass(frozen=True)
 class ShadowCycleResult:
     receipt_sequence: int
@@ -121,11 +129,31 @@ def run_cycle(
     )
 
 
+def _check_outbox_accessible(path: Path, label: str) -> None:
+    """Raise a distinct error for absent vs unreadable outbox directories."""
+    if not path.exists():
+        raise ShadowCycleAbsentOutboxError(
+            f"{label} has not been created yet"
+        )
+    try:
+        path.iterdir()
+    except PermissionError:
+        raise ShadowCycleUnreadableOutboxError(
+            f"{label} cannot be read"
+        )
+    except OSError:
+        raise ShadowCycleUnreadableOutboxError(
+            f"{label} is unreadable"
+        )
+
+
 def _validate_locations(
     candidate_outbox_dir: Path,
     observation_outbox_dir: Path,
     database_path: Path,
 ) -> tuple[Path, Path, Path]:
+    _check_outbox_accessible(candidate_outbox_dir, "Candidate outbox")
+    _check_outbox_accessible(observation_outbox_dir, "Observation outbox")
     try:
         candidate_outbox = candidate_feed_import._require_private_directory(
             Path(candidate_outbox_dir), "candidate outbox"
@@ -235,6 +263,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             database_path=args.database,
             stream_id=args.stream_id,
         )
+    except ShadowCycleAbsentOutboxError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    except ShadowCycleUnreadableOutboxError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     except ShadowCycleError:
         print("Foxhound shadow cycle failed", file=sys.stderr)
         return 1
