@@ -385,11 +385,38 @@ class TaskResearchSynthesisTests(unittest.TestCase):
     def test_unknown_fields_and_malformed_claims_are_refused(self):
         document = draft()
         document["publisher_owned"] = {"generated_at": "2030-01-01T00:00:00Z"}
-        with self.assertRaisesRegex(SynthesisError, "^invalid_draft$"):
+        with self.assertRaisesRegex(SynthesisError, "^invalid_draft"):
             synthesize(
                 context(), knowledge=Knowledge(), config=config(),
                 opener=Opener(json.dumps(document)),
             )
+
+    def test_refusal_names_the_field_and_rule(self):
+        document = draft()
+        document["publisher_owned"] = {"generated_at": "2030-01-01T00:00:00Z"}
+        with self.assertRaises(SynthesisError) as caught:
+            synthesize(
+                context(), knowledge=Knowledge(), config=config(),
+                opener=Opener(json.dumps(document)),
+            )
+        self.assertEqual(caught.exception.code, "invalid_draft")
+        self.assertIn("unknown fields: publisher_owned", str(caught.exception))
+
+    def test_deadline_and_effort_carry_their_date_and_size(self):
+        from foxhound.task_research_synthesis import validate_draft
+        document = draft()
+        refs = document["objective"]["source_refs"]
+        sources = [{"source_id": ref} for ref in refs]
+        document["deadline"] = {"text": "Due per the call", "status": "supported",
+                                "source_refs": refs, "date": "2030-02-01"}
+        document["effort"] = {"text": "A day of work", "status": "supported",
+                              "source_refs": refs, "size": "day"}
+        result = validate_draft(document, sources)
+        self.assertEqual(result["deadline"]["date"], "2030-02-01")
+        self.assertEqual(result["effort"]["size"], "day")
+        document["effort"]["size"] = "month"
+        with self.assertRaisesRegex(SynthesisError, "effort.size must be hour, day or week"):
+            validate_draft(document, sources)
 
     def test_empty_retrieval_is_refused_before_model(self):
         class EmptyKnowledge:
@@ -463,7 +490,7 @@ class TaskResearchSynthesisTests(unittest.TestCase):
             {"type": "raise_priority", "confidence": 0.7, "rationale": claim("R3")},
             {"type": "raise_priority", "confidence": 0.7, "rationale": claim("R4")},
         ]
-        with self.assertRaisesRegex(SynthesisError, "^invalid_draft$"):
+        with self.assertRaisesRegex(SynthesisError, "^invalid_draft"):
             synthesize(context(), knowledge=Knowledge(), config=config(), opener=Opener(json.dumps(doc3)))
 
         # Test raise_priority with extra target rejected
@@ -471,7 +498,7 @@ class TaskResearchSynthesisTests(unittest.TestCase):
         doc4["scheduling_recommendations"] = [
             {"type": "raise_priority", "target": "high", "confidence": 0.7, "rationale": claim("R1")},
         ]
-        with self.assertRaisesRegex(SynthesisError, "^invalid_draft$"):
+        with self.assertRaisesRegex(SynthesisError, "^invalid_draft"):
             synthesize(context(), knowledge=Knowledge(), config=config(), opener=Opener(json.dumps(doc4)))
 
         # Test not_before without Z rejected
@@ -479,7 +506,7 @@ class TaskResearchSynthesisTests(unittest.TestCase):
         doc5["scheduling_recommendations"] = [
             {"type": "not_before", "not_before": "2030-03-01T00:00:00+00:00", "confidence": 0.7, "rationale": claim("R1")},
         ]
-        with self.assertRaisesRegex(SynthesisError, "^invalid_draft$"):
+        with self.assertRaisesRegex(SynthesisError, "^invalid_draft"):
             synthesize(context(), knowledge=Knowledge(), config=config(), opener=Opener(json.dumps(doc5)))
 
     def test_adversarial_paths_rejected(self):
