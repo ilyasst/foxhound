@@ -16,12 +16,14 @@ import os
 import re
 import shutil
 import sys
+import sqlite3
 import stat
 import subprocess
 import tempfile
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -353,6 +355,22 @@ def run_once(
                 print(
                     "foxhound research runner: scheduling recommendations "
                     f"not applied: {type(exc).__name__}",
+                    file=sys.stderr,
+                )
+            # A cited deadline or effort is stored beside the task (#846):
+            # it orders the queue without revising the task.
+            try:
+                from .task_timing import record_research_timing
+                stamp = (clock() if clock else datetime.now(timezone.utc)).isoformat()
+                with closing(sqlite3.connect(db_path, timeout=10)) as timing_db:
+                    if record_research_timing(
+                        timing_db, task_id, job_id, published, stamp,
+                    ):
+                        timing_db.commit()
+            except Exception as exc:
+                print(
+                    "foxhound research runner: research timing not stored: "
+                    f"{type(exc).__name__}",
                     file=sys.stderr,
                 )
 
