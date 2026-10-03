@@ -168,6 +168,50 @@ class TaskResearchTests(unittest.TestCase):
             self.assertEqual(state, "parked" if attempt == 3 else "queued")
         self.assertIsNone(self.store.claim("worker-synthetic"))
 
+    def test_claim_supersedes_stale_task_version_or_non_open_task(self):
+        job1 = self._request()
+        # Bump task version to 2
+        with sqlite3.connect(self.database) as connection:
+            connection.execute("UPDATE tasks SET version=2 WHERE id=1")
+
+        # Claiming should see job1 is stale, cancel it as superseded, and return None
+        claimed = self.store.claim("worker-synthetic")
+        self.assertIsNone(claimed)
+
+        with sqlite3.connect(self.database) as connection:
+            row = connection.execute(
+                "SELECT state, failure_code FROM task_research_jobs WHERE job_id=?", (job1.job_id,)
+            ).fetchone()
+            self.assertEqual(tuple(row), ("canceled", "superseded"))
+
+            events = connection.execute(
+                "SELECT kind, from_state, to_state FROM task_research_events WHERE job_id=? ORDER BY occurred_at",
+                (job1.job_id,),
+            ).fetchall()
+            self.assertIn(("canceled", "queued", "canceled"), [tuple(e) for e in events])
+
+        # A current-version job can still be requested and claimed normally
+        job2 = self._request(snapshot(version=2))
+        claimed2 = self.store.claim("worker-synthetic")
+        self.assertIsNotNone(claimed2)
+        assert claimed2 is not None
+        self.assertEqual(claimed2.job.job_id, job2.job_id)
+
+    def test_claim_supersedes_closed_task(self):
+        job = self._request()
+        # Close task
+        with sqlite3.connect(self.database) as connection:
+            connection.execute("UPDATE tasks SET status='done' WHERE id=1")
+
+        claimed = self.store.claim("worker-synthetic")
+        self.assertIsNone(claimed)
+
+        with sqlite3.connect(self.database) as connection:
+            row = connection.execute(
+                "SELECT state, failure_code FROM task_research_jobs WHERE job_id=?", (job.job_id,)
+            ).fetchone()
+            self.assertEqual(tuple(row), ("canceled", "superseded"))
+
     def test_model_timeout_requeues_without_consuming_attempts(self):
         job = self._request()
         for _ in range(5):

@@ -394,16 +394,15 @@ class TaskResearchRunnerTests(unittest.TestCase):
             opener=_Opener(_draft()),
             clock=lambda: NOW,
         )
-        self.assertTrue(result.claimed)
+        self.assertFalse(result.claimed)
         self.assertFalse(result.completed)
-        self.assertIn(result.failure_code, {"source_refused", "runtime_failed", "unexpected_error"})
 
         with closing(sqlite3.connect(self.paths["database"])) as connection:
             job = connection.execute(
                 "SELECT state, attempts, failure_code FROM task_research_jobs WHERE task_id=1"
             ).fetchone()
-        self.assertEqual(job[0], "queued")
-        self.assertEqual(job[1], 1)
+        self.assertEqual(job[0], "canceled")
+        self.assertEqual(job[2], "superseded")
 
     def test_unsafe_scratch_path_rejection(self) -> None:
         _queue_job(self.paths)
