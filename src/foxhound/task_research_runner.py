@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import stat
 import subprocess
 import tempfile
@@ -138,6 +139,7 @@ def run_once(
     hermes_command: str | None = None,
     agent_toolsets: str = "terminal,file,web,browser",
     agent_max_turns: int = 120,
+    apply_scheduling: bool = False,
     agent_timeout: int = 3600,
     knowledge_roots: tuple[tuple[str, str], ...] = (),
     read_only_commands: tuple[dict[str, str], ...] = (),
@@ -332,7 +334,7 @@ def run_once(
             )
 
         # Publish synthesized report using the existing receipt boundary
-        store.publish(
+        published = store.publish(
             job_id=job_id,
             token=token,
             draft=synthesis_result.draft,
@@ -340,6 +342,19 @@ def run_once(
             provenance=synthesis_result.provenance,
             coverage=synthesis_result.coverage,
         )
+        if apply_scheduling:
+            # The report is published either way: a recommendation that
+            # cannot be applied is still visible in Research.md, and must
+            # never turn a finished research pass into a failed one.
+            try:
+                from .task_research_scheduling import apply_published_recommendations
+                apply_published_recommendations(db_path, published)
+            except Exception as exc:
+                print(
+                    "foxhound research runner: scheduling recommendations "
+                    f"not applied: {type(exc).__name__}",
+                    file=sys.stderr,
+                )
 
         outcome = "degraded" if bool(synthesis_result.coverage.get("degraded")) else "success"
         _record_metrics(outcome)
@@ -444,6 +459,10 @@ def _parser() -> argparse.ArgumentParser:
         help="JSON string defining a read-only command: {name, command, description} (repeatable)",
     )
     parser.add_argument(
+        "--apply-scheduling", action="store_true",
+        help="apply the published report's scheduling recommendations",
+    )
+    parser.add_argument(
         "--reader-alias",
         action="append",
         default=[],
@@ -537,6 +556,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             hermes_command=arguments.hermes_command,
             agent_toolsets=arguments.agent_toolsets,
             agent_max_turns=arguments.agent_max_turns,
+            apply_scheduling=arguments.apply_scheduling,
             agent_timeout=arguments.agent_timeout,
             knowledge_roots=knowledge_roots,
             read_only_commands=read_only_commands,

@@ -178,6 +178,30 @@ class TaskResearchRunnerTests(unittest.TestCase):
         self.assertFalse(result.completed)
         self.assertEqual(result.state, "idle")
 
+    def test_apply_scheduling_hands_the_published_report_over_and_never_fails_the_run(self) -> None:
+        from unittest import mock
+        _queue_job(self.paths)
+        seen = []
+        def boom(database, document):
+            seen.append(document)
+            raise RuntimeError("synthetic")
+        with mock.patch("foxhound.task_research_scheduling.apply_published_recommendations", boom):
+            result = run_once(
+                database=self.paths["database"],
+                cas_root=self.paths["cas_root"],
+                task_work_root=self.paths["task_work_root"],
+                scratch_root=self.paths["scratch_root"],
+                model="synthetic-model",
+                endpoint="http://127.0.0.1:8800",
+                knowledge_override=_Knowledge(),
+                opener=_Opener(_draft()),
+                clock=lambda: NOW,
+                apply_scheduling=True,
+            )
+        self.assertTrue(result.completed)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0]["task_identity"]["task_id"], 1)
+
     def test_successful_synthesis_and_publish(self) -> None:
         task_folder = _queue_job(self.paths)
         result = run_once(
