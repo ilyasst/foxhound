@@ -670,6 +670,7 @@ class TaskExecutionService:
         research_before_planning: object = None,
         research_wait_seconds: int | None = None,
         research_task_roots: tuple[Path, Path] | None = None,
+        deadline_ordering: bool = True,
     ) -> None:
         if (isinstance(max_attempts, bool)
                 or not isinstance(max_attempts, int)
@@ -805,6 +806,7 @@ class TaskExecutionService:
                 + ", ".join(sorted(overlap))
             )
         self._last_claim_research: Mapping[str, int] = {}
+        self._deadline_ordering = deadline_ordering
 
     def _profile_for(self, origin_kind: object) -> AgentProfile:
         """Which agent a task of this kind starts on.
@@ -1482,16 +1484,17 @@ class TaskExecutionService:
                     f"ORDER BY {_SOURCE_QUEUE_ORDER_SQL}"
                     "CASE w.queue_priority "
                     "WHEN 'raised' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END,"
-                    f"{_DEADLINE_BAND_SQL},"
+                    + (f"{_DEADLINE_BAND_SQL}," if self._deadline_ordering else "") +
                     "CASE WHEN w.failure_count=0 THEN 0 ELSE 1 END,"
                     "w.updated_at,w.task_id LIMIT ?",
                     (now, now, *(phase.value for phase in phases),
-                     now, now, MAX_CLAIM_SCAN),
+                     *( (now, now) if self._deadline_ordering else () ), MAX_CLAIM_SCAN),
                 ).fetchall()
                 today = stamp.date()
-                rows = _order_by_effective_deadline(
-                    connection, rows, today, self._reader_aliases
-                )
+                if self._deadline_ordering:
+                    rows = _order_by_effective_deadline(
+                        connection, rows, today, self._reader_aliases
+                    )
                 row = None
                 profile = None
                 deferred: list[int] = []
