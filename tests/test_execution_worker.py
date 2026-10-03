@@ -2766,6 +2766,117 @@ class ExecutionWorkerTests(unittest.TestCase):
         self.assertEqual(after.status, WorkflowStatus.RUNNING)
         self.assertEqual(after.version, self.claim.workflow_version)
 
+    def test_release_handoff_parks_workflow(self):
+        paths = self._enable_archive()
+        handoff_file = paths.working_directory / "handoff-plan.md"
+        handoff_file.write_text("Synthetic handoff notes for next run.", encoding="utf-8")
+        service = TaskExecutionService(self.database)
+
+        with knowledge_server() as endpoint:
+            receipt = self._worker(endpoint).release(handoff=True)
+
+        self.assertEqual(receipt["schema"], "foxhound.execution-release-receipt")
+        self.assertEqual(receipt["disposition"], "applied")
+        self.assertEqual(receipt["status"], "parked")
+        self.assertTrue(receipt["handoff"])
+
+        after = service.get(1)
+        self.assertIsNotNone(after)
+        self.assertEqual(after.status, WorkflowStatus.PARKED)
+        self.assertEqual(after.last_failure_reason, "budget_handoff")
+
+    def test_release_handoff_validates_handoff_note(self):
+        paths = self._enable_archive()
+        handoff_file = paths.working_directory / "handoff-plan.md"
+
+        # Missing file
+        with knowledge_server() as endpoint:
+            worker = self._worker(endpoint)
+            with self.assertRaisesRegex(
+                ExecutionWorkerDraftError,
+                r"handoff-plan\.md was not found in the task folder",
+            ):
+                worker.release(handoff=True)
+
+        # Empty file
+        handoff_file.write_text("   \n", encoding="utf-8")
+        with knowledge_server() as endpoint:
+            worker = self._worker(endpoint)
+            with self.assertRaisesRegex(
+                ExecutionWorkerDraftError,
+                r"handoff-plan\.md in the task folder is empty",
+            ):
+                worker.release(handoff=True)
+
+        # Stale file (older than claim anchor)
+        handoff_file.write_text("Synthetic handoff content", encoding="utf-8")
+        anchor = self.state_path.stat().st_mtime_ns
+        os.utime(handoff_file, ns=(anchor - 1_000_000, anchor - 1_000_000))
+        with knowledge_server() as endpoint:
+            worker = self._worker(endpoint)
+            with self.assertRaisesRegex(
+                ExecutionWorkerDraftError,
+                r"handoff-plan\.md was written before this run started",
+            ):
+                worker.release(handoff=True)
+
+    def test_release_handoff_does_not_record_even_with_result_inputs_present(self):
+        paths = self._enable_archive()
+        handoff_file = paths.working_directory / "handoff-plan.md"
+        handoff_file.write_text("Synthetic handoff notes.", encoding="utf-8")
+        self._write_result_inputs()
+        service = TaskExecutionService(self.database)
+
+        with knowledge_server() as endpoint:
+            receipt = self._worker(endpoint).release(handoff=True)
+
+        self.assertEqual(receipt["schema"], "foxhound.execution-release-receipt")
+        self.assertTrue(receipt["handoff"])
+        after = service.get(1)
+        self.assertIsNotNone(after)
+        self.assertEqual(after.status, WorkflowStatus.PARKED)
+        self.assertEqual(after.last_failure_reason, "budget_handoff")
+        self.assertIsNone(after.last_result_id)
+
+    def test_cli_release_handoff_and_plain_release(self):
+        # 1. Plain release
+        service = TaskExecutionService(self.database)
+        with knowledge_server() as endpoint:
+            with mock.patch(
+                "foxhound.execution_worker.load_worker_from_environment",
+                return_value=self._worker(endpoint),
+            ):
+                code = main(["release"])
+        self.assertEqual(code, 0)
+        after_release = service.get(1)
+        self.assertIsNotNone(after_release)
+        self.assertEqual(after_release.status, WorkflowStatus.QUEUED)
+
+        # 2. Release --handoff on a fresh claim
+        service = TaskExecutionService(
+            self.database, token_factory=lambda: CLAIM_TOKEN
+        )
+        claim2 = service.claim_next()
+        self.assertIsNotNone(claim2)
+        self.state_path.unlink()
+        self.claim = claim2
+        self._write_state()
+        paths = self._enable_archive()
+        handoff_file = paths.working_directory / "handoff-plan.md"
+        handoff_file.write_text("Synthetic notes for CLI handoff.", encoding="utf-8")
+
+        with knowledge_server() as endpoint:
+            with mock.patch(
+                "foxhound.execution_worker.load_worker_from_environment",
+                return_value=self._worker(endpoint),
+            ):
+                code = main(["release", "--handoff"])
+        self.assertEqual(code, 0)
+        after_handoff = service.get(1)
+        self.assertIsNotNone(after_handoff)
+        self.assertEqual(after_handoff.status, WorkflowStatus.PARKED)
+        self.assertEqual(after_handoff.last_failure_reason, "budget_handoff")
+
     def test_cli_failure_does_not_echo_private_configuration(self):
         private_value = "synthetic-private-config-value"
         output = StringIO()
