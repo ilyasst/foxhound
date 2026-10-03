@@ -12,6 +12,7 @@ from foxhound.task_archive import (
     TaskArchiveError,
     append_result,
     clear_missing_runtime_logs,
+    locate_handoff,
     prepare_task_archive,
     preserve_run_files,
     publish_deliverables,
@@ -321,6 +322,66 @@ class TaskArchiveTests(unittest.TestCase):
         self.assertIn("missing", message)
         self.assertNotIn(str(self.run), message)
         self.assertNotIn(str(paths.run_directory), message)
+
+    def test_locate_handoff_top_level_wins(self):
+        paths = self._paths()
+        task_folder = paths.working_directory
+        top_note = task_folder / "handoff-plan.md"
+        top_note.write_text("Top handoff note", encoding="utf-8")
+
+        run_note = paths.run_directory / "handoff-plan.md"
+        run_note.write_text("Run handoff note", encoding="utf-8")
+
+        self.assertEqual(locate_handoff(task_folder, "plan"), top_note)
+
+    def test_locate_handoff_run_note_newest_selected(self):
+        paths1 = self._run("1" * 32)
+        paths2 = self._run("2" * 32)
+        task_folder = paths1.working_directory
+
+        note1 = paths1.run_directory / "handoff-plan.md"
+        note1.write_text("Older run note", encoding="utf-8")
+        import os
+        os.utime(note1, ns=(1_000_000_000, 1_000_000_000))
+
+        note2 = paths2.run_directory / "handoff-plan.md"
+        note2.write_text("Newer run note", encoding="utf-8")
+        os.utime(note2, ns=(2_000_000_000, 2_000_000_000))
+
+        self.assertEqual(locate_handoff(task_folder, "plan"), note2)
+
+    def test_locate_handoff_ignores_symlinks_and_escapes(self):
+        paths = self._paths()
+        task_folder = paths.working_directory
+
+        outside_target = self.root / "outside-note.md"
+        outside_target.write_text("Outside note", encoding="utf-8")
+
+        # Top symlink pointing outside
+        top_note = task_folder / "handoff-plan.md"
+        top_note.symlink_to(outside_target)
+        self.assertIsNone(locate_handoff(task_folder, "plan"))
+        top_note.unlink()
+
+        # Run note symlink pointing outside
+        run_note = paths.run_directory / "handoff-plan.md"
+        run_note.symlink_to(outside_target)
+        self.assertIsNone(locate_handoff(task_folder, "plan"))
+        run_note.unlink()
+
+        # Run dir itself as symlink
+        symlink_run = (task_folder / "runs" / "symlink-run")
+        symlink_target = self.root / "fake-run"
+        symlink_target.mkdir()
+        (symlink_target / "handoff-plan.md").write_text("Secret", encoding="utf-8")
+        symlink_run.symlink_to(symlink_target)
+        self.assertIsNone(locate_handoff(task_folder, "plan"))
+
+    def test_locate_handoff_returns_none_when_empty_or_missing(self):
+        paths = self._paths()
+        task_folder = paths.working_directory
+        self.assertIsNone(locate_handoff(task_folder, "plan"))
+        self.assertIsNone(locate_handoff(task_folder / "non-existent", "plan"))
 
 
 if __name__ == "__main__":

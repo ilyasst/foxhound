@@ -535,6 +535,10 @@ class ExecutionWorkerTests(unittest.TestCase):
             context = worker.context()
         self.assertEqual(context["workflow"]["handoff"], "Small handoff note.")
         self.assertEqual(context["workflow"]["attempt_count"], 1)
+        self.assertEqual(
+            context["workspace"]["handoff_file"],
+            str(paths.working_directory / "handoff-plan.md"),
+        )
 
         # Truncation over 16384 bytes
         large_content = "A" * 20000
@@ -2819,6 +2823,27 @@ class ExecutionWorkerTests(unittest.TestCase):
                 r"handoff-plan\.md was written before this run started",
             ):
                 worker.release(handoff=True)
+
+    def test_release_handoff_accepts_note_in_run_folder(self):
+        paths = self._enable_archive()
+        run_handoff_file = paths.run_directory / "handoff-plan.md"
+        run_handoff_file.write_text("Synthetic handoff note in run folder", encoding="utf-8")
+        anchor = self.state_path.stat().st_mtime_ns
+        os.utime(run_handoff_file, ns=(anchor + 1_000_000, anchor + 1_000_000))
+
+        # Check that context delivers workflow.handoff when note is in run folder
+        with knowledge_server() as endpoint:
+            worker = self._worker(endpoint)
+            context = worker.context()
+        self.assertEqual(context["workflow"]["handoff"], "Synthetic handoff note in run folder")
+
+        # Now release with handoff
+        with knowledge_server() as endpoint:
+            worker = self._worker(endpoint)
+            receipt = worker.release(handoff=True)
+
+        self.assertEqual(receipt["status"], "parked")
+        self.assertTrue(receipt["handoff"])
 
     def test_release_handoff_does_not_record_even_with_result_inputs_present(self):
         paths = self._enable_archive()

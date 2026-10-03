@@ -191,9 +191,8 @@ class AgentProfileTests(unittest.TestCase):
         self.assertNotIn(WORKER_COMMAND_TOKEN, rendered_private)
         for expected in (
             "Hand your work forward.",
-            "workspace.task_folder",
-            "handoff-<phase>.md",
-            "handoff-plan.md",
+            "workspace.handoff_file",
+            "the task folder, not your run folder",
             "third of the way through your turn budget",
             "State what you established (with absolute paths)",
             "what you changed and where",

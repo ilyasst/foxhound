@@ -914,3 +914,43 @@ def _append_private(path: Path, value: str) -> None:
     finally:
         if "descriptor" in locals():
             os.close(descriptor)
+
+
+def locate_handoff(task_folder: Path, phase: str) -> Path | None:
+    """Locate the handoff note for a phase inside a task folder.
+
+    Agents work inside their run folder and sometimes leave the note there.
+    Returns the top-level handoff note if present and safe, otherwise the most
+    recently modified run note. Returns None if no note is found or on error.
+    """
+    try:
+        resolved_task_folder = task_folder.resolve(strict=True)
+        top = task_folder / f"handoff-{phase}.md"
+        if not top.is_symlink() and top.is_file():
+            if top.resolve(strict=True).is_relative_to(resolved_task_folder):
+                return top
+
+        runs_dir = task_folder / "runs"
+        if runs_dir.is_symlink() or not runs_dir.is_dir():
+            return None
+
+        newest_path: Path | None = None
+        newest_mtime_ns: int = -1
+
+        for run_entry in runs_dir.iterdir():
+            if run_entry.is_symlink() or not run_entry.is_dir():
+                continue
+            candidate = run_entry / f"handoff-{phase}.md"
+            if candidate.is_symlink() or not candidate.is_file():
+                continue
+            resolved_candidate = candidate.resolve(strict=True)
+            if not resolved_candidate.is_relative_to(resolved_task_folder):
+                continue
+            mtime_ns = candidate.stat().st_mtime_ns
+            if mtime_ns > newest_mtime_ns:
+                newest_mtime_ns = mtime_ns
+                newest_path = candidate
+
+        return newest_path
+    except OSError:
+        return None

@@ -2392,6 +2392,15 @@ class ExecutionCardTests(unittest.TestCase):
         excerpt = _handoff_excerpt(artifact_dir, task_id, "plan")
         self.assertEqual(excerpt, "")
 
+        # Run folder note excerpt when top note does not exist
+        empty_note.unlink()
+        run_folder = artifact_dir / f"T{task_id}-slug-one" / "runs" / "run-1"
+        run_folder.mkdir(parents=True, exist_ok=True)
+        run_note = run_folder / "handoff-plan.md"
+        run_note.write_text("Excerpt from run folder note", encoding="utf-8")
+        excerpt = _handoff_excerpt(artifact_dir, task_id, "plan")
+        self.assertEqual(excerpt, "Excerpt from run folder note")
+
     def test_other_failure_reasons_render_exactly_as_before(self):
         task_id = 1
         artifact_dir = Path(self.temporary.name) / "artifacts_other"
