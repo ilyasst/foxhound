@@ -91,6 +91,8 @@ REPOSITORY_RECEIPTS_NAME = "repository-action-receipts.json"
 REPOSITORY_RECEIPTS_SCHEMA = "foxhound.repository-action-receipts"
 WORKER_SCHEMA_VERSION = 1
 
+#: meaning-based ranking on the knowledge service can take several seconds per layer
+WORKER_KNOWLEDGE_TIMEOUT_SECONDS = 10.0
 STATE_ENV = "FOXHOUND_EXECUTION_STATE"
 GW_ENDPOINT_ENV = "FOXHOUND_GW_ENDPOINT"
 GW_ALIAS_ENV = "FOXHOUND_GW_ALIAS"
@@ -1714,7 +1716,9 @@ def load_worker_from_environment(
         raise ExecutionWorkerConfigError(
             "execution worker configuration is unavailable"
         )
-    config = load_knowledge_config(endpoint, alias, token_path)
+    config = load_knowledge_config(
+        endpoint, alias, token_path, timeout_seconds=WORKER_KNOWLEDGE_TIMEOUT_SECONDS
+    )
     return ExecutionWorker(
         state, config,
         policy=_workflow_policy(values.get(WORKFLOW_POLICY_ENV, "")),
