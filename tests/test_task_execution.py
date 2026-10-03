@@ -2103,7 +2103,90 @@ class TaskExecutionTests(unittest.TestCase):
             connection.commit()
         stale = self._grant_service("issue").schedule_new()
         self.assertEqual(stale.scheduled, 0)
-        self.assertEqual(self.service.get(1).status, WorkflowStatus.CANCELLED)
+        wf = self.service.get(1)
+        self.assertIsNotNone(wf)
+        assert wf is not None
+        self.assertEqual(wf.status, WorkflowStatus.CANCELLED)
+
+    def test_workflow_cancelled_by_cancel_stale_rescheduled_for_new_task_version(self):
+        """Reconciliation-cancelled workflow is safe to reschedule for new version."""
+        self._bind_origin(1, "issue")
+        self._schedule_and_start()
+        service = self._grant_service("issue")
+
+        # Task moved to version 2 while workflow at task_version 1
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute("UPDATE tasks SET version=2 WHERE id=1")
+            connection.commit()
+
+        # First schedule_new cancels stale workflow
+        first = service.schedule_new()
+        self.assertEqual(first.scheduled, 0)
+        wf1 = service.get(1)
+        self.assertIsNotNone(wf1)
+        assert wf1 is not None
+        self.assertEqual(wf1.status, WorkflowStatus.CANCELLED)
+        self.assertEqual(wf1.task_version, 1)
+
+        # Second schedule_new creates a workflow for version 2
+        self.clock.advance(seconds=1)
+        second = service.schedule_new()
+        self.assertEqual(second.scheduled, 1)
+        wf2 = service.get(1)
+        self.assertIsNotNone(wf2)
+        assert wf2 is not None
+        self.assertEqual(wf2.task_version, 2)
+
+        # Third schedule_new does not create a second workflow for the same version
+        self.clock.advance(seconds=1)
+        third = service.schedule_new()
+        self.assertEqual(third.scheduled, 0)
+        wf3 = service.get(1)
+        self.assertIsNotNone(wf3)
+        assert wf3 is not None
+        self.assertEqual(wf3.version, wf2.version)
+
+    def test_workflow_ended_by_reader_drop_or_done_is_not_rescheduled(self):
+        """A workflow ended by reader drop/done writes task_dropped/task_completed and is not rescheduled."""
+        self._bind_origin(1, "issue")
+        self._schedule_and_start()
+        service = self._grant_service("issue")
+
+        # Task moves to version 2
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute("UPDATE tasks SET version=2 WHERE id=1")
+            # Cancel workflow at version 1
+            connection.execute(
+                "UPDATE task_execution_workflows SET status='cancelled', "
+                "completed_at=? WHERE task_id=1",
+                (self._now(),),
+            )
+            # Latest event is task_dropped (reader drop)
+            connection.execute(
+                "INSERT INTO task_execution_events("
+                "task_id,kind,workflow_version,task_version,phase,status,"
+                "occurred_at,agent_profile_id,agent_profile_revision) "
+                "VALUES(1,'task_dropped',2,1,'plan','cancelled',?,'default',?)",
+                (self._now(), general_profile().revision),
+            )
+            connection.commit()
+
+        res = service.schedule_new()
+        self.assertEqual(res.scheduled, 0)
+
+        # Now test with task_completed
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "INSERT INTO task_execution_events("
+                "task_id,kind,workflow_version,task_version,phase,status,"
+                "occurred_at,agent_profile_id,agent_profile_revision) "
+                "VALUES(1,'task_completed',3,1,'plan','cancelled',?,'default',?)",
+                (self._now(), general_profile().revision),
+            )
+            connection.commit()
+
+        res2 = service.schedule_new()
+        self.assertEqual(res2.scheduled, 0)
 
     def test_a_resurfaced_issue_task_gets_a_fresh_workflow(self):
         """End to end: the reopen is worthless if no work is ever scheduled.
