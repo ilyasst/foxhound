@@ -49,9 +49,10 @@ from .contracts.task_candidate import (
     STRUCTURED_TASK_SCHEMA_VERSION,
     WORKING_GROUP_SCHEMA_VERSION,
 )
+from .card_presentations import _SCHEMA_V72, backfill_presentations
 
 
-SCHEMA_VERSION = 71
+SCHEMA_VERSION = 72
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 _CUMULATIVE_SCHEMA_VERSIONS = {
@@ -454,6 +455,23 @@ _SCHEMA_COLUMNS = {
         "work_revision_id",
         "steer_digest",
     ),
+    "execution_card_presentations": (
+        "card_id",
+        "surface",
+        "state",
+        "version",
+        "claim_token_digest",
+        "claim_expires_at",
+        "transport",
+        "message_ref",
+        "shown_at",
+        "last_presented_at",
+        "outcome",
+        "outcome_resolution",
+        "outcome_reported_at",
+        "created_at",
+        "updated_at",
+    ),
     "execution_review_card_events": (
         "sequence",
         "card_id",
@@ -589,10 +607,10 @@ _SCHEMA_V48_COLUMNS = {
         name == "task_execution_workflows"
         and column in {"steer_while_running", "current_run_id"}
     ) and not (
-        name == "execution_review_cards" and column == "steer_digest"
+        name == "execution_review_cards" and column in {"steer_digest", "decision_version", "resolved_by_surface"}
     ))
     for name, columns in _SCHEMA_COLUMNS.items()
-    if name not in {"execution_card_retractions", "execution_steer_digest_refreshes"}
+    if name not in {"execution_card_retractions", "execution_steer_digest_refreshes", "execution_card_presentations"}
 }
 
 _SCHEMA_V42_COLUMNS = {
@@ -796,6 +814,7 @@ _SCHEMA_V11_COLUMNS = {
 # earlier version is not asked to already have a column that did not exist at
 # that point.
 _SCHEMA_COLUMNS["execution_review_cards"] += ("summary_only",)
+_SCHEMA_COLUMNS["execution_review_cards"] += ("decision_version", "resolved_by_surface")
 
 # V56 appends the claiming-consumer identity to task review cards (ADR 0036).
 # Added here for the same reason as V54: historical schema maps derived above
@@ -986,6 +1005,7 @@ _SCHEMA_OBJECTS = {
     "execution_review_cards_one_active": "index",
     "execution_review_card_events_no_update": "trigger",
     "execution_review_card_events_no_delete": "trigger",
+    "execution_card_presentations_surface_state": "index",
     "candidate_feed_items_no_update": "trigger",
     "candidate_feed_items_no_delete": "trigger",
     "native_candidate_intakes_identity_immutable": "trigger",
@@ -5661,6 +5681,19 @@ class CandidateInbox:
                     connection.execute("PRAGMA legacy_alter_table = OFF")
                     connection.execute("PRAGMA foreign_keys = ON")
                 version = 71
+            if version == 71:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V72:
+                        connection.execute(statement)
+                    backfill_presentations(connection, self._now())
+                    connection.execute("PRAGMA user_version = 72")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 72
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:
