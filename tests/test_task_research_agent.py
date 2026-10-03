@@ -464,8 +464,70 @@ def test_agent_synthesize_open_questions_non_blocking_sufficient(tmp_path: Path)
     open_qs = result.draft["open_questions"]
     assert isinstance(open_qs, list) and len(open_qs) == 1
     assert open_qs[0]["status"] == "unknown"
-    assert open_qs[0]["text"] == "What is the timeline?"
+    assert open_qs[0]["text"] == "What is the timeline? (for the reader)"
     validate_draft(result.draft, list(result.sources))
+
+
+def test_open_questions_kind_and_legacy_status(tmp_path: Path) -> None:
+    from foxhound.task_research_agent import _convert_research_json
+
+    kb_dir = tmp_path / "kb"
+    kb_dir.mkdir()
+    k_roots = (("kb", str(kb_dir)),)
+
+    base = {
+        "ownership": {"verdict": "reader", "evidence": []},
+        "requested_deliverable": {"text": "Goal", "evidence": []},
+        "constraints": [],
+        "entities": [],
+        "facts": [],
+    }
+
+    # 1. for_reader-only -> "sufficient", suffix " (for the reader)"
+    raw_reader = dict(base, open_questions=[{"text": "What is the budget?", "kind": "for_reader"}])
+    draft, sources = _convert_research_json(raw_reader, k_roots)
+    assert draft["research_status"] == "sufficient"
+    assert draft["open_questions"][0]["text"] == "What is the budget? (for the reader)"
+    validate_draft(draft, sources)
+
+    # 2. task_work-only -> "sufficient", suffix " (task work)"
+    raw_work = dict(base, open_questions=[{"text": "Find meeting room capacity", "kind": "task_work"}])
+    draft, sources = _convert_research_json(raw_work, k_roots)
+    assert draft["research_status"] == "sufficient"
+    assert draft["open_questions"][0]["text"] == "Find meeting room capacity (task work)"
+    validate_draft(draft, sources)
+
+    # 3. one kind=blocking -> "inconclusive", suffix " (blocking)"
+    raw_blocking = dict(base, open_questions=[
+        {"text": "What is the budget?", "kind": "for_reader"},
+        {"text": "Which project repo?", "kind": "blocking"},
+    ])
+    draft, sources = _convert_research_json(raw_blocking, k_roots)
+    assert draft["research_status"] == "inconclusive"
+    assert draft["open_questions"][0]["text"] == "What is the budget? (for the reader)"
+    assert draft["open_questions"][1]["text"] == "Which project repo? (blocking)"
+    validate_draft(draft, sources)
+
+    # 4. legacy {"blocking": true} without kind -> "inconclusive", suffix " (blocking)"
+    raw_legacy_true = dict(base, open_questions=[{"text": "Missing key doc", "blocking": True}])
+    draft, sources = _convert_research_json(raw_legacy_true, k_roots)
+    assert draft["research_status"] == "inconclusive"
+    assert draft["open_questions"][0]["text"] == "Missing key doc (blocking)"
+    validate_draft(draft, sources)
+
+    # 5. legacy {"blocking": false} -> "sufficient", suffix " (for the reader)"
+    raw_legacy_false = dict(base, open_questions=[{"text": "Preferred time?", "blocking": False}])
+    draft, sources = _convert_research_json(raw_legacy_false, k_roots)
+    assert draft["research_status"] == "sufficient"
+    assert draft["open_questions"][0]["text"] == "Preferred time? (for the reader)"
+    validate_draft(draft, sources)
+
+    # 6. plain string -> "for_reader", suffix " (for the reader)"
+    raw_plain = dict(base, open_questions=["A plain question"])
+    draft, sources = _convert_research_json(raw_plain, k_roots)
+    assert draft["research_status"] == "sufficient"
+    assert draft["open_questions"][0]["text"] == "A plain question (for the reader)"
+    validate_draft(draft, sources)
 
 
 def test_agent_synthesize_timeout(tmp_path: Path) -> None:
@@ -1213,7 +1275,7 @@ def test_convert_research_json_features(tmp_path: Path) -> None:
     open_qs = draft["open_questions"]
     assert len(open_qs) == 2
     assert open_qs[0]["text"] == "Is the rubric finalized? (blocking)"
-    assert open_qs[1]["text"] == "Non-blocking question"
+    assert open_qs[1]["text"] == "Non-blocking question (for the reader)"
     assert "recommendation" in draft
     assert len(draft["recommendation"]) == 1
     assert draft["recommendation"][0]["text"] == "Follow up with Alice regarding the submissions"

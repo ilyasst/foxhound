@@ -65,7 +65,7 @@ Write `research.json` only in the current working directory (plus your own worki
   "constraints": [{"text": "...", "binding": true, "evidence": [...]}],
   "entities": [{"as_written": "...", "status": "verified|resolved|unresolved", "meaning": "...", "evidence": [...]}],
   "facts": [{"text": "...", "status": "confirmed|single-source|inferred|conflicting", "evidence": [...]}],
-  "open_questions": [{"text": "...", "blocking": true}],
+  "open_questions": [{"text": "...", "kind": "for_reader"}],
   "guide": {"path": "kb:Processes/...md", "reason": "...", "evidence": [...]},
   "deadline": {"date": "YYYY-MM-DD", "reason": "...", "evidence": [...]},
   "effort": {"size": "hour|day|week", "reason": "...", "evidence": [...]},
@@ -88,7 +88,7 @@ Each item in `evidence` is an object:
 - For web pages: `{"url": "https://...", "note": "..." (optional)}`
 (Legacy locator strings like `<root>:<path>#L<n>` or bare URLs are also accepted.)
 Never cite task.json.
-A claim with no evidence must have status `inferred` or be listed in `open_questions`. `open_questions` items can be strings or objects with `text` and `blocking` boolean (set `blocking: true` when the plan cannot be made correctly without the answer).
+A claim with no evidence must have status `inferred` or be listed in `open_questions`. Each open question has a `kind`: `for_reader` (a fact only the reader can supply; the plan should ask it), `task_work` (something doing the task itself will establish; the plan should do it), or `blocking` (no correct plan can be written at all without the answer AND neither the task's own work nor a question in the plan can resolve it — rare). Doubts about whether the task duplicates another task, or about who owns it, are NOT open questions: ownership goes in the ownership verdict; duplicates are handled elsewhere. Keep accepting plain strings.
 
 # Finish
 

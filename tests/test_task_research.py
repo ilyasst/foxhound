@@ -834,6 +834,110 @@ class TaskResearchTests(unittest.TestCase):
         rendered = render_markdown(doc)
         self.assertIn("## Findings", rendered)
         self.assertNotIn("Open Questions", rendered)
+        self.assertNotIn("Why:", rendered)
+
+    def test_render_markdown_inconclusive_why_section(self):
+        from foxhound.task_research import render_markdown
+        base_report = {
+            "objective": {"text": "Synthetic objective", "status": "supported", "source_refs": []},
+            "requested_action": {"text": "Synthetic action", "status": "supported", "source_refs": []},
+            "findings": [{"text": "Synthetic finding", "status": "supported", "source_refs": []}],
+        }
+        # Inconclusive with a blocking question
+        doc_blocking = {
+            "task_identity": {"task_id": 42, "task_version": 1},
+            "research_status": "inconclusive",
+            "report": {
+                **base_report,
+                "open_questions": [
+                    {"text": "Which project timeline applies? (blocking)", "status": "unknown", "source_refs": []},
+                    {"text": "Non-blocking question", "status": "unknown", "source_refs": []},
+                ],
+            },
+            "scheduling_recommendations": [],
+            "sources": [],
+        }
+        rendered_blocking = render_markdown(doc_blocking)
+        self.assertIn(
+            "Research status: **inconclusive**\n\nWhy:\n- Which project timeline applies?\n\n## Objective",
+            rendered_blocking,
+        )
+        self.assertNotIn("(blocking)", rendered_blocking)
+
+        # Inconclusive with owner undetermined
+        doc_owner = {
+            "task_identity": {"task_id": 42, "task_version": 1},
+            "research_status": "inconclusive",
+            "report": {
+                **base_report,
+                "stakeholders": [
+                    {"text": "Owner: undetermined — could not resolve from sources", "status": "supported", "source_refs": []},
+                ],
+            },
+            "scheduling_recommendations": [],
+            "sources": [],
+        }
+        rendered_owner = render_markdown(doc_owner)
+        self.assertIn(
+            "Research status: **inconclusive**\n\nWhy:\n- Owner could not be determined\n\n## Objective",
+            rendered_owner,
+        )
+
+        # Inconclusive with both blocking question and owner undetermined
+        doc_both = {
+            "task_identity": {"task_id": 42, "task_version": 1},
+            "research_status": "inconclusive",
+            "report": {
+                **base_report,
+                "open_questions": [
+                    {"text": "Which project timeline applies? (blocking)", "status": "unknown", "source_refs": []},
+                ],
+                "stakeholders": [
+                    {"text": "Owner: undetermined", "status": "supported", "source_refs": []},
+                ],
+            },
+            "scheduling_recommendations": [],
+            "sources": [],
+        }
+        rendered_both = render_markdown(doc_both)
+        self.assertIn(
+            "Why:\n- Which project timeline applies?\n- Owner could not be determined\n\n## Objective",
+            rendered_both,
+        )
+
+        # Inconclusive with neither -> single bullet "No blocking question recorded"
+        doc_none = {
+            "task_identity": {"task_id": 42, "task_version": 1},
+            "research_status": "inconclusive",
+            "report": base_report,
+            "scheduling_recommendations": [],
+            "sources": [],
+        }
+        rendered_none = render_markdown(doc_none)
+        self.assertIn(
+            "Research status: **inconclusive**\n\nWhy:\n- No blocking question recorded\n\n## Objective",
+            rendered_none,
+        )
+
+        # Sufficient status: byte identical, no Why:
+        doc_sufficient = {
+            "task_identity": {"task_id": 42, "task_version": 1},
+            "research_status": "sufficient",
+            "report": {
+                **base_report,
+                "open_questions": [
+                    {"text": "Which project timeline applies? (blocking)", "status": "unknown", "source_refs": []},
+                ],
+                "stakeholders": [
+                    {"text": "Owner: undetermined", "status": "supported", "source_refs": []},
+                ],
+            },
+            "scheduling_recommendations": [],
+            "sources": [],
+        }
+        rendered_sufficient = render_markdown(doc_sufficient)
+        self.assertNotIn("Why:", rendered_sufficient)
+        self.assertIn("Research status: **sufficient**\n\n## Objective", rendered_sufficient)
 
 
 if __name__ == "__main__":

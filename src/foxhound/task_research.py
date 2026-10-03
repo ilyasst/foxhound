@@ -373,10 +373,36 @@ def render_markdown(document: Mapping[str, object]) -> str:
         "",
         f"Task: `{identity['task_id']}` version {identity['task_version']}",
         f"Research status: **{document['research_status']}**",
-        "",
     ]
-    report = document["report"]
-    assert isinstance(report, Mapping)
+    status = document.get("research_status")
+    report = document.get("report")
+    if not isinstance(report, Mapping):
+        report = {}
+    if status != "sufficient":
+        bullets: list[str] = []
+        open_questions = report.get("open_questions")
+        if isinstance(open_questions, list):
+            for q in open_questions:
+                if isinstance(q, Mapping):
+                    text = str(q.get("text", "") or "")
+                    suffix = " (blocking)"
+                    if text.endswith(suffix):
+                        bullets.append(text[:-len(suffix)])
+        stakeholders = report.get("stakeholders")
+        if isinstance(stakeholders, list):
+            for s in stakeholders:
+                if isinstance(s, Mapping):
+                    text = str(s.get("text", "") or "")
+                    if text.startswith("Owner: undetermined"):
+                        bullets.append("Owner could not be determined")
+                        break
+        if not bullets:
+            bullets.append("No blocking question recorded")
+        lines.append("")
+        lines.append("Why:")
+        for bullet in bullets:
+            lines.append(f"- {bullet}")
+    lines.append("")
     for title, key in (("Objective", "objective"), ("Requested action", "requested_action")):
         claim = report[key]
         assert isinstance(claim, Mapping)
