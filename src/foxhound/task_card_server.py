@@ -720,11 +720,28 @@ class TaskCardApplication:
                 raise TaskCardServerRequestError(
                     "invalid_request", "task card action is invalid"
                 )
-            return _operation_document(self.cards.act(
+            result = self.cards.act(
                 _integer(request["card_id"], minimum=1),
                 expected_version=_integer(request["card_version"], minimum=1),
                 action=action,
-            ))
+            )
+            doc = _operation_document(result)
+            if result.accepted and action not in {"show_full_cards"}:
+                try:
+                    stats = self.cards.stats_global()
+                    doc["queue"] = {"review": stats.pending, "snoozed": stats.snoozed}
+                    if stats.pending == 0 and stats.snoozed == 0:
+                        doc["queue_line"] = "Nothing left for you."
+                    else:
+                        parts = []
+                        if stats.pending > 0:
+                            parts.append(f"{stats.pending} more waiting for you")
+                        if stats.snoozed > 0:
+                            parts.append(f"{stats.snoozed} snoozed")
+                        doc["queue_line"] = ", ".join(parts) + "."
+                except Exception:
+                    pass
+            return doc
         if operation == "view":
             request = _strict_request(
                 payload,

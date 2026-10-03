@@ -3292,6 +3292,38 @@ class TaskCardQueueProjectionTests(unittest.TestCase):
                 self.assertEqual(state, expected_state)
                 self.assertEqual(relation_count, expected_relations)
 
+    def test_action_route_includes_queue_line_for_completed_actions(self):
+        identity = self.app.resolve_consumer("Bearer " + TOKEN)
+        assert identity is not None
+        self.cards.requeue_unanswered(limit=10)
+        claim = self.cards.claim_next(
+            consumer_digest=identity.digest,
+            consumer_role=identity.role,
+        )
+        if not hasattr(claim, "card"):
+            self.fail("no card to claim")
+
+        self.cards.complete_delivery(
+            claim.card.id, expected_version=claim.card.version,
+            claim_token=claim.token, transport="test",
+            delivery_ref="test",
+        )
+
+        doc = self.app.dispatch(
+            "action",
+            request_document(
+                card_id=claim.card.id,
+                card_version=claim.card.version,
+                action="keep_open",
+            ),
+            authorization="Bearer " + TOKEN,
+        )
+        self.assertTrue(doc["ok"])
+        self.assertIn("queue", doc)
+        self.assertIn("queue_line", doc)
+        self.assertNotIn("Synthetic", doc["queue_line"])
+        self.assertTrue(doc["queue_line"] == "Nothing left for you." or "waiting for you" in doc["queue_line"])
+
     def test_resolve_refuses_unknown_action(self):
         """Unknown action strings are still refused with invalid_request."""
         card = self.cards.due(limit=1)[0]
