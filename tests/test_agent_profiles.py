@@ -200,6 +200,11 @@ class AgentProfileTests(unittest.TestCase):
             "unreviewed note to the next attempt",
             "workflow.handoff",
             "verify its claims, then continue from it",
+            "Where things are.",
+            "capabilities.deployment_roots",
+            "knowledge.root",
+            "guides.md",
+            "Repositories.md",
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, rendered_private)

@@ -140,10 +140,19 @@ class AgentProfile:
                 "for this phase: verify its claims, then continue from it instead of redoing "
                 "that work.\n\n"
             )
+        where_things_are_section = (
+            "Where things are. Your file-search tool searches your run folder unless "
+            "you give it a path, and your run folder holds only this run's files. Course, "
+            "project and shared documents live under the roots in `capabilities.deployment_roots`; "
+            "the knowledge base is at `knowledge.root` — start from its `guides.md` "
+            "(procedural guides) and `Repositories.md` (local checkouts). Search those roots "
+            "with an explicit path instead of the current directory.\n\n"
+        )
         return (
             PHASE_CONTRACT_PRECEDENCE
             + budget_sentence
             + handoff_section
+            + where_things_are_section
             + self.prompt_template.replace(WORKER_COMMAND_TOKEN, worker_command)
         )
 
@@ -1264,7 +1273,7 @@ GENERAL_PROFILE_RELEASE_REVISION = (
     "e872e60cd96be5dc6e3b092d7e077e10f6bc67e3925552a7fd640154f1373bfc"
 )
 GENERAL_PROFILE_RELEASE_PROMPT_SHA256 = (
-    "3ed2096306ebf2b3a443fe8c959763267c70a2fbeecceccbd7e39409ee5ad3d3"
+    "612e86096b527edd3ba5d42f39caf39e6015f9aff91d13759739f3b6a6acb97b"
 )
 
 
