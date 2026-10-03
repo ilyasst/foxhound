@@ -172,6 +172,46 @@ class AgentProfileTests(unittest.TestCase):
             with self.subTest(required=required):
                 self.assertIn(required, prompt)
 
+    def test_handoff_instruction_rendered_for_private_profile_and_deduplicated_for_general(self):
+        private_profile = AgentProfile(
+            profile_id="synthetic-private",
+            display_name="Synthetic Private",
+            runtime="hermes",
+            prompt_template=f"Do synthetic work. Call {WORKER_COMMAND_TOKEN} context.",
+            toolsets=("terminal",),
+            max_turns=30,
+            timeout_seconds=60,
+            claim_lease_seconds=600,
+            heartbeat_seconds=30,
+            kill_grace_seconds=10,
+            allowed_phases=("plan", "execute", "external_action"),
+        )
+        rendered_private = private_profile.render_prompt("synthetic-worker")
+        self.assertIn("synthetic-worker context", rendered_private)
+        self.assertNotIn(WORKER_COMMAND_TOKEN, rendered_private)
+        for expected in (
+            "Hand your work forward.",
+            "workspace.task_folder",
+            "handoff-<phase>.md",
+            "handoff-plan.md",
+            "third of the way through your turn budget",
+            "State what you established (with absolute paths)",
+            "what you changed and where",
+            "what remains, and the next concrete step",
+            "unreviewed note to the next attempt",
+            "workflow.handoff",
+            "verify its claims, then continue from it",
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, rendered_private)
+
+        # Built-in general profile already contains handoff instruction in its template
+        gen_profile = general_profile()
+        rendered_general = gen_profile.render_prompt("synthetic-worker")
+        self.assertEqual(rendered_general.count("handoff-<phase>.md"), 1)
+        self.assertIn("synthetic-worker context", rendered_general)
+        self.assertNotIn(WORKER_COMMAND_TOKEN, rendered_general)
+
     def test_phase_contract_precedence_does_not_move_a_profile_revision(self):
         """A published profile stays pinned when this text changes.
 

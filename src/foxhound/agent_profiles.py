@@ -124,8 +124,28 @@ class AgentProfile:
             f"You have a budget of {self.max_turns} turns; record your result "
             "no later than 10 turns before the budget ends, then stop.\n\n"
         )
-        return PHASE_CONTRACT_PRECEDENCE + budget_sentence + self.prompt_template.replace(
-            WORKER_COMMAND_TOKEN, worker_command)
+        handoff_section = ""
+        # Private profiles carry their own role text and never received the
+        # template-only instruction from #503. Skip if the template already has it.
+        if "handoff-<phase>.md" not in self.prompt_template:
+            handoff_section = (
+                "Hand your work forward. In `workspace.task_folder` (from `context`) "
+                "keep an owner-only `handoff-<phase>.md` for the current phase (for example "
+                "`handoff-plan.md`). Write it once you are about a third of the way through "
+                "your turn budget and update it after each significant step. State what you "
+                "established (with absolute paths), what you changed and where, what remains, "
+                "and the next concrete step. It is an unreviewed note to the next attempt if "
+                "this one stops early; it is not a result and never replaces recording one. "
+                "If `context` returns `workflow.handoff`, that is the previous attempt's note "
+                "for this phase: verify its claims, then continue from it instead of redoing "
+                "that work.\n\n"
+            )
+        return (
+            PHASE_CONTRACT_PRECEDENCE
+            + budget_sentence
+            + handoff_section
+            + self.prompt_template.replace(WORKER_COMMAND_TOKEN, worker_command)
+        )
 
     def public_summary(self, *, include_policy: bool = False) -> dict[str, Any]:
         result: dict[str, Any] = {
