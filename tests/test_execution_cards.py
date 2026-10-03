@@ -5213,6 +5213,25 @@ class StartCardKindTests(unittest.TestCase):
             "last_result_id": last_result_id, "steer_while_running": 0,
         })
 
+    def test_snoozed_execute_gate_with_a_plan_result_is_a_start_card(self):
+        """#616: snoozed in execute, carrying the plan's awaiting_plan result."""
+        from foxhound.execution_cards import ExecutionCardKind, _kind_for_workflow
+        kind = _kind_for_workflow({
+            "status": WorkflowStatus.SNOOZED, "phase": "execute",
+            "outcome": "awaiting_plan", "last_result_id": "r1",
+            "steer_while_running": 0,
+        })
+        self.assertEqual(kind, ExecutionCardKind.START)
+
+    def test_snoozed_plan_review_is_still_a_plan_review(self):
+        from foxhound.execution_cards import ExecutionCardKind, _kind_for_workflow
+        kind = _kind_for_workflow({
+            "status": WorkflowStatus.SNOOZED, "phase": "plan",
+            "outcome": "awaiting_plan", "last_result_id": "r1",
+            "steer_while_running": 0,
+        })
+        self.assertEqual(kind, ExecutionCardKind.PLAN_REVIEW)
+
     def test_awaiting_start_with_an_earlier_result_is_a_start_card(self):
         from foxhound.execution_cards import ExecutionCardKind
         self.assertEqual(self._row(WorkflowStatus.AWAITING_START),

@@ -3595,6 +3595,12 @@ def _kind_for_workflow(row: Mapping[str, object]) -> ExecutionCardKind:
         }
     ):
         return ExecutionCardKind.RESULT_REVIEW
+    if row["status"] in {WorkflowStatus.SNOOZED, WorkflowStatus.PARKED}:
+        # A snoozed or parked gate whose result belongs to another phase
+        # (#616: snoozed in execute, carrying the plan's awaiting_plan
+        # result) matches no review kind. Its question is the Start
+        # card's -- run this now? -- and asking it beats never asking.
+        return ExecutionCardKind.START
     raise TaskLedgerError("execution workflow cannot be rendered as a card")
 
 
