@@ -238,6 +238,11 @@ class TaskRecord:
     working_group: str | None = None
 
 
+#: Sources whose withdrawal means the work is answered: the issue closed or
+#: the pull request behind a review merged or closed (#762).
+_FORGE_SOURCE_KINDS = frozenset({"issue", "review_request"})
+
+
 @dataclass(frozen=True)
 class TransitionResult:
     """Content-free result for one optimistic lifecycle transition."""
@@ -1799,7 +1804,21 @@ class TaskLedger:
         version = int(task["version"])
         event_kind = "candidate_withdrawal_conflict"
         resolution = "reader_conflict"
-        if not reader_conflict:
+        closed = TaskLedger._close_for_forge_source(
+            connection, candidate=candidate, task=task, now=now,
+        )
+        if closed is not None:
+            # The issue closed or the pull request merged: that answers the
+            # task, whatever the reader edited and whatever was queued (#762).
+            version = closed
+            connection.execute(
+                "UPDATE work_items SET state='closed',updated_at=? "
+                "WHERE task_id=?",
+                (now, int(binding["task_id"])),
+            )
+            event_kind = "candidate_withdrawn"
+            resolution = "closed_by_source"
+        elif not reader_conflict:
             version += 1
             connection.execute(
                 "UPDATE tasks SET version=?,updated_at=? WHERE id=?",
@@ -1849,6 +1868,67 @@ class TaskLedger:
                 now,
             ),
         )
+
+    @staticmethod
+    def _close_for_forge_source(
+        connection: sqlite3.Connection,
+        *,
+        candidate: TaskCandidate,
+        task: sqlite3.Row,
+        now: str,
+    ) -> int | None:
+        """Close an open task whose forge source closed; its new version.
+
+        A run in progress is left to finish: killing it mid-write would lose
+        work the reader may still want, so that case keeps today's conflict
+        path. Every other workflow state is closed with the task, in the
+        caller's transaction. None means "not closed here".
+        """
+        if (
+            candidate.source.kind not in _FORGE_SOURCE_KINDS
+            or task["status"] != TaskStatus.OPEN
+        ):
+            return None
+        task_id = int(task["id"])
+        workflow = connection.execute(
+            "SELECT status,phase,version FROM task_execution_workflows "
+            "WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if workflow is not None and workflow["status"] == "running":
+            return None
+        if workflow is not None and workflow["status"] not in (
+            "completed", "cancelled",
+        ):
+            # Imported here: execution_cards imports this module.
+            from .execution_cards import _apply_review_lifecycle_action
+            result = _apply_review_lifecycle_action(
+                connection,
+                {
+                    "task_id": task_id,
+                    "task_version": int(task["version"]),
+                    "workflow_version": int(workflow["version"]),
+                    "phase": workflow["phase"],
+                },
+                action="done",
+                now=now,
+            )
+            if not result.accepted:
+                return None
+        else:
+            transition = _apply_task_transition(
+                connection,
+                task_id=task_id,
+                expected_version=int(task["version"]),
+                action="done",
+                now=now,
+            )
+            if not transition.accepted:
+                return None
+        row = connection.execute(
+            "SELECT version FROM tasks WHERE id=?", (task_id,),
+        ).fetchone()
+        return int(row["version"])
 
     @staticmethod
     def _apply_candidate_reactivation(
