@@ -124,6 +124,7 @@ before it existed is brought forward.
     "runner_slot": "primary",
     "knowledge_root": null,
     "deployment_roots": {},
+    "agent_forge_credentials": null,
     "task_work_root": null,
     "task_kb_root": null,
     "runtime_session_database": null,
@@ -193,10 +194,12 @@ before it existed is brought forward.
     }
   }
 }
-```
+``` Applied in the plan and execute phases only: an external_action run (the one phase allowed to publish, after the reader approved it) keeps the host environment so the worker can push and open the approved pull request.
 
 The two loopback placeholders in this public example must be replaced with
 the canonical IPv4 loopback address before private validation.
+
+`agent_forge_credentials` points to an absolute directory path containing `gh` (a `gh` CLI config directory holding a read-only fine-grained token) and `gitconfig` (a Git configuration file without a credential helper). When set, the agent's process environment is sanitised to remove ambient Git and GitHub credentials and instead uses the provided read-only configuration, protecting the operator's personal credentials from being used by the agent process itself. Unset preserves the current behaviour where the environment passes through.
 
 Set a disabled `card_service`, runner, or database consumer to exactly
 `{"enabled": false}`. The `execution_runners` list permits each running slot

@@ -80,10 +80,15 @@ class DeploymentConfigTests(unittest.TestCase):
             runner.pop("agent_model", None)
             runner.pop("agent_provider", None)
 
+    def _drop_version_15_keys(self, document: dict[str, object]) -> None:
+        for runner in document["execution_runners"]:  # type: ignore[index]
+            runner.pop("agent_forge_credentials", None)
+            runner.pop("deadline_ordering", None)
+
     def _document(self) -> dict[str, object]:
         return {
             "schema": "foxhound.deployment-config",
-            "schema_version": 14,
+            "schema_version": 15,
             "database": str(self.database),
             "agent_profile_directory": None,
             "card_service": {
@@ -122,6 +127,8 @@ class DeploymentConfigTests(unittest.TestCase):
                 "agent_provider": None,
                 "worker_command": "foxhound-task-worker",
                 "runner_slot": "primary",
+                "agent_forge_credentials": None,
+                "deadline_ordering": True,
                 "knowledge_root": None,
                 "deployment_roots": {},
                 "task_work_root": None,
@@ -139,6 +146,8 @@ class DeploymentConfigTests(unittest.TestCase):
                 "agent_provider": None,
                 "worker_command": "foxhound-task-worker",
                 "runner_slot": "secondary",
+                "agent_forge_credentials": None,
+                "deadline_ordering": True,
                 "knowledge_root": None,
                 "deployment_roots": {},
                 "task_work_root": None,
@@ -176,6 +185,12 @@ class DeploymentConfigTests(unittest.TestCase):
         }
 
     def _write_config(self, document: dict[str, object]) -> None:
+        version = document.get("schema_version", 15)
+        if version < 15:
+            for r in document.get("execution_runners", []):
+                if isinstance(r, dict):
+                    r.pop("agent_forge_credentials", None)
+                    r.pop("deadline_ordering", None)
         self.config_path.write_text(json.dumps(document), encoding="utf-8")
         self.config_path.chmod(0o600)
 
@@ -369,6 +384,7 @@ class DeploymentConfigTests(unittest.TestCase):
         document = self._document()
         document["schema_version"] = 13
         self._drop_agent_selection_keys(document)
+        self._drop_version_15_keys(document)
         self._write_config(document)
 
         config = load_deployment_config(self.config_path)
@@ -383,6 +399,7 @@ class DeploymentConfigTests(unittest.TestCase):
         document = self._document()
         document["schema_version"] = 12
         self._drop_agent_selection_keys(document)
+        self._drop_version_15_keys(document)
         self._drop_deployment_root_keys(document)
         self._write_config(document)
 
@@ -396,6 +413,7 @@ class DeploymentConfigTests(unittest.TestCase):
         document = self._document()
         document["schema_version"] = 1
         self._drop_agent_selection_keys(document)
+        self._drop_version_15_keys(document)
         self._drop_runtime_log_keys(document)
         self._drop_deployment_root_keys(document)
         del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
@@ -418,6 +436,7 @@ class DeploymentConfigTests(unittest.TestCase):
         document = self._document()
         document["schema_version"] = 2
         self._drop_agent_selection_keys(document)
+        self._drop_version_15_keys(document)
         self._drop_runtime_log_keys(document)
         self._drop_deployment_root_keys(document)
         del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
@@ -440,6 +459,7 @@ class DeploymentConfigTests(unittest.TestCase):
         document = self._document()
         document["schema_version"] = 3
         self._drop_agent_selection_keys(document)
+        self._drop_version_15_keys(document)
         self._drop_runtime_log_keys(document)
         self._drop_deployment_root_keys(document)
         del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
@@ -465,6 +485,7 @@ class DeploymentConfigTests(unittest.TestCase):
         document = self._document()
         document["schema_version"] = 4
         self._drop_agent_selection_keys(document)
+        self._drop_version_15_keys(document)
         self._drop_runtime_log_keys(document)
         self._drop_deployment_root_keys(document)
         del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
@@ -488,6 +509,7 @@ class DeploymentConfigTests(unittest.TestCase):
         document = self._document()
         document["schema_version"] = 5
         self._drop_agent_selection_keys(document)
+        self._drop_version_15_keys(document)
         self._drop_runtime_log_keys(document)
         self._drop_deployment_root_keys(document)
         del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
@@ -595,6 +617,7 @@ class DeploymentConfigTests(unittest.TestCase):
         document = self._document()
         document["schema_version"] = 9
         self._drop_agent_selection_keys(document)
+        self._drop_version_15_keys(document)
         self._drop_runtime_log_keys(document)
         self._drop_deployment_root_keys(document)
         del document["workflow"]["skip_planning_for"]  # type: ignore[index]
@@ -722,6 +745,7 @@ class DeploymentConfigTests(unittest.TestCase):
         document = self._document()
         document["schema_version"] = 6
         self._drop_agent_selection_keys(document)
+        self._drop_version_15_keys(document)
         self._drop_runtime_log_keys(document)
         self._drop_deployment_root_keys(document)
         del document["workflow"]["agent_profile_routes"]  # type: ignore[index]
