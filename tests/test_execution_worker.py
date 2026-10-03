@@ -2658,6 +2658,55 @@ class ExecutionWorkerTests(unittest.TestCase):
         self.assertEqual(receipt["status"], "awaiting_review")
         self.assertEqual(receipt["schema"], "foxhound.execution-result-receipt")
 
+    def test_search_cli_query_forms(self):
+        with knowledge_server() as endpoint:
+            worker = self._worker(endpoint)
+            # Neither query form -> 65 with usage message
+            errors = StringIO()
+            with redirect_stderr(errors):
+                with mock.patch(
+                    "foxhound.execution_worker.load_worker_from_environment",
+                    return_value=worker,
+                ):
+                    code = main(["search"])
+            self.assertEqual(code, 65)
+            self.assertIn("search needs a query: either positionally or as --query TEXT", errors.getvalue())
+
+            # Both query forms -> 65 with usage message
+            errors = StringIO()
+            with redirect_stderr(errors):
+                with mock.patch(
+                    "foxhound.execution_worker.load_worker_from_environment",
+                    return_value=worker,
+                ):
+                    code = main(["search", "foo", "--query", "bar"])
+            self.assertEqual(code, 65)
+            self.assertIn("search needs a query: either positionally or as --query TEXT", errors.getvalue())
+
+            # Positional query -> succeeds
+            out_pos = StringIO()
+            with redirect_stdout(out_pos):
+                with mock.patch(
+                    "foxhound.execution_worker.load_worker_from_environment",
+                    return_value=worker,
+                ):
+                    code = main(["search", "synthetic query", "--layer", "kb"])
+            self.assertEqual(code, 0)
+            res_pos = json.loads(out_pos.getvalue())
+
+            # Option query -> succeeds and matches positional query output
+            out_opt = StringIO()
+            with redirect_stdout(out_opt):
+                with mock.patch(
+                    "foxhound.execution_worker.load_worker_from_environment",
+                    return_value=worker,
+                ):
+                    code = main(["search", "--query", "synthetic query", "--layer", "kb"])
+            self.assertEqual(code, 0)
+            res_opt = json.loads(out_opt.getvalue())
+
+            self.assertEqual(res_pos, res_opt)
+
     def test_invalid_or_permissive_drafts_write_nothing(self):
         draft = self._write_draft(claim_token=CLAIM_TOKEN)
         with knowledge_server() as endpoint:
