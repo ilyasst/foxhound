@@ -1394,6 +1394,107 @@ class ExecutionWorkerTests(unittest.TestCase):
                 with self.assertRaises(ExecutionWorkerDraftError):
                     load_result_draft(self.run_directory, supplied)
 
+    def test_load_result_draft_refusal_messages(self):
+        # 1. Not a str
+        with self.assertRaises(ExecutionWorkerDraftError) as ctx:
+            load_result_draft(self.run_directory, 123)  # type: ignore[arg-type]
+        self.assertEqual(
+            str(ctx.exception),
+            "execution result draft name is not text; use `record --outcome OUTCOME`",
+        )
+
+        # 2. Absolute path outside run directory
+        outside = self.root / f"result-{RUN_ID}.json"
+        with self.assertRaises(ExecutionWorkerDraftError) as ctx:
+            load_result_draft(self.run_directory, str(outside))
+        self.assertEqual(
+            str(ctx.exception),
+            "execution result draft must be in the run directory; pass the bare file name returned by `draft`, or use `record --outcome OUTCOME`",
+        )
+
+        # 3. Relative path with a directory part
+        with self.assertRaises(ExecutionWorkerDraftError) as ctx:
+            load_result_draft(self.run_directory, f"nested/result-{RUN_ID}.json")
+        self.assertEqual(
+            str(ctx.exception),
+            "execution result draft must be a bare file name, not a path; pass the name returned by `draft`, or use `record --outcome OUTCOME`",
+        )
+
+        # 4. Name does not match the pattern
+        with self.assertRaises(ExecutionWorkerDraftError) as ctx:
+            load_result_draft(self.run_directory, "bad-draft-name.json")
+        self.assertEqual(
+            str(ctx.exception),
+            "execution result draft name 'bad-draft-name.json' is not a draft name (expected result-<32 hex>.json as returned by `draft`); use `record --outcome OUTCOME`",
+        )
+
+        # 5. FileNotFoundError: file does not exist
+        missing_name = f"result-{'f' * 32}.json"
+        with self.assertRaises(ExecutionWorkerDraftError) as ctx:
+            load_result_draft(self.run_directory, missing_name)
+        self.assertEqual(
+            str(ctx.exception),
+            f"execution result draft {missing_name!r} was not found in the run directory; run `draft --outcome OUTCOME` again or use `record --outcome OUTCOME`",
+        )
+
+        # 6. Read failure: exists but unreadable / bad permissions
+        unreadable = self._write_draft()
+        unreadable.chmod(0o644)
+        with self.assertRaises(ExecutionWorkerDraftError) as ctx:
+            load_result_draft(self.run_directory, unreadable.name)
+        self.assertEqual(
+            str(ctx.exception),
+            f"execution result draft {unreadable.name!r} could not be read as a private JSON file; run `draft --outcome OUTCOME` again; do not edit drafts by hand",
+        )
+
+        # 7. Field set wrong: missing and unexpected fields
+        bad_fields_path = self.run_directory / f"result-{'a' * 32}.json"
+        bad_doc = {
+            "schema": "foxhound.execution-result-draft",
+            "schema_version": 1,
+            "extra_field": "val",
+        }
+        bad_fields_path.write_text(json.dumps(bad_doc), encoding="utf-8")
+        bad_fields_path.chmod(0o600)
+        with self.assertRaises(ExecutionWorkerDraftError) as ctx:
+            load_result_draft(self.run_directory, bad_fields_path.name)
+        self.assertIn("execution result draft fields are wrong", str(ctx.exception))
+        self.assertIn("missing: ['deliverables', 'external_actions', 'outcome', 'questions', 'result_id', 'summary', 'work_markdown']", str(ctx.exception))
+        self.assertIn("unexpected: ['extra_field']", str(ctx.exception))
+        self.assertIn("; run `draft --outcome OUTCOME` again; do not edit drafts by hand", str(ctx.exception))
+
+        # 8. Schema / schema_version / result_id mismatch
+        mismatch_path = self.run_directory / f"result-{'b' * 32}.json"
+        doc_mismatch = {
+            "schema": "foxhound.execution-result-draft",
+            "schema_version": 1,
+            "result_id": "c" * 32,  # does not match file name 'b' * 32
+            "outcome": "awaiting_plan",
+            "summary": "Synthetic result summary",
+            "work_markdown": "# Synthetic work",
+            "questions": [],
+            "external_actions": [],
+            "deliverables": [],
+        }
+        mismatch_path.write_text(json.dumps(doc_mismatch), encoding="utf-8")
+        mismatch_path.chmod(0o600)
+        with self.assertRaises(ExecutionWorkerDraftError) as ctx:
+            load_result_draft(self.run_directory, mismatch_path.name)
+        self.assertEqual(
+            str(ctx.exception),
+            "execution result draft was not produced by this worker for this file name; run `draft --outcome OUTCOME` again; do not edit drafts by hand",
+        )
+
+    def test_load_result_draft_never_echoes_secret_content_in_summary(self):
+        secret = "SECRET_TOKEN_XYZ_987654321"
+        secret_draft = self._write_draft(
+            summary=f"Contains synthetic secret {secret}",
+            extra_bad_field="surprise",
+        )
+        with self.assertRaises(ExecutionWorkerDraftError) as ctx:
+            load_result_draft(self.run_directory, secret_draft.name)
+        self.assertNotIn(secret, str(ctx.exception))
+
     def test_draft_builds_private_schema_and_record_accepts_it(self):
         self._write_result_inputs()
         self._write_result_input(
@@ -2404,12 +2505,93 @@ class ExecutionWorkerTests(unittest.TestCase):
         self.assertEqual(output.getvalue(), "")
         self.assertNotIn(private_value, errors.getvalue())
 
+    def test_record_outcome_drafts_and_records_in_one_call(self):
+        self._write_result_inputs()
+        with knowledge_server() as endpoint:
+            worker = self._worker(endpoint)
+            receipt = worker.record_outcome(outcome="awaiting_plan")
+
+        self.assertEqual(receipt["status"], "awaiting_review")
+        for name in (
+            "result-summary.txt",
+            "result-work.md",
+        ):
+            self.assertFalse((self.run_directory / name).exists())
+
+    def test_record_outcome_supersedes_an_unconsumed_draft_of_this_run(self):
+        self._write_result_inputs()
+        with knowledge_server() as endpoint:
+            worker = self._worker(endpoint)
+            draft = worker.draft(outcome="awaiting_plan")
+            self.assertTrue((self.run_directory / draft["draft"]).exists())
+            receipt = worker.record_outcome(outcome="awaiting_plan")
+
+        self.assertEqual(receipt["status"], "awaiting_review")
+
+    def test_record_twice_returns_the_same_receipt(self):
+        self._write_result_inputs()
+        with knowledge_server() as endpoint:
+            worker = self._worker(endpoint)
+            first_receipt = worker.record_outcome(outcome="awaiting_plan")
+            second_receipt = worker.record_outcome(outcome="awaiting_plan")
+            self.assertEqual(first_receipt, second_receipt)
+            third_receipt = worker.record(f"result-{RUN_ID}.json")
+            self.assertEqual(first_receipt, third_receipt)
+
+    def test_record_outcome_invalid_inputs_raise_the_draft_error(self):
+        with knowledge_server() as endpoint:
+            worker = self._worker(endpoint)
+            with self.assertRaises(ExecutionWorkerDraftError):
+                worker.record_outcome(outcome="awaiting_plan")
+
+    def test_record_cli_requires_exactly_one_form(self):
+        output = StringIO()
+        errors = StringIO()
+        with knowledge_server() as endpoint:
+            with redirect_stdout(output), redirect_stderr(errors):
+                with mock.patch(
+                    "foxhound.execution_worker.load_worker_from_environment",
+                    return_value=self._worker(endpoint),
+                ):
+                    code = main(["record"])
+        self.assertEqual(code, 65)
+        self.assertIn("--outcome", errors.getvalue())
+
+        output = StringIO()
+        errors = StringIO()
+        with knowledge_server() as endpoint:
+            with redirect_stdout(output), redirect_stderr(errors):
+                with mock.patch(
+                    "foxhound.execution_worker.load_worker_from_environment",
+                    return_value=self._worker(endpoint),
+                ):
+                    code = main(["record", "x", "--outcome", "awaiting_plan"])
+        self.assertEqual(code, 65)
+        self.assertIn("--outcome", errors.getvalue())
+
+    def test_record_cli_outcome_form(self):
+        self._write_result_inputs()
+        output = StringIO()
+        errors = StringIO()
+        with knowledge_server() as endpoint:
+            with redirect_stdout(output), redirect_stderr(errors):
+                with mock.patch(
+                    "foxhound.execution_worker.load_worker_from_environment",
+                    return_value=self._worker(endpoint),
+                ):
+                    code = main(["record", "--outcome", "awaiting_plan"])
+        self.assertEqual(code, 0)
+        receipt = json.loads(output.getvalue())
+        self.assertEqual(receipt["status"], "awaiting_review")
+        self.assertEqual(receipt["schema"], "foxhound.execution-result-receipt")
+
     def test_invalid_or_permissive_drafts_write_nothing(self):
         draft = self._write_draft(claim_token=CLAIM_TOKEN)
         with knowledge_server() as endpoint:
             worker = self._worker(endpoint)
-            with self.assertRaises(ExecutionWorkerDraftError):
+            with self.assertRaises(ExecutionWorkerDraftError) as ctx:
                 worker.record(draft.name)
+            self.assertIn("execution result draft fields are wrong", str(ctx.exception))
         self.assertEqual(
             TaskExecutionService(self.database).get(1).status,
             WorkflowStatus.RUNNING,
@@ -2418,8 +2600,12 @@ class ExecutionWorkerTests(unittest.TestCase):
         draft = self._write_draft()
         draft.chmod(0o644)
         with knowledge_server() as endpoint:
-            with self.assertRaises(ExecutionWorkerDraftError):
+            with self.assertRaises(ExecutionWorkerDraftError) as ctx:
                 self._worker(endpoint).record(draft.name)
+            self.assertIn(
+                "could not be read as a private JSON file",
+                str(ctx.exception),
+            )
 
     def test_state_symlinks_and_permissive_modes_are_refused(self):
         self.state_path.chmod(0o644)

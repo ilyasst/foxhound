@@ -975,8 +975,44 @@ class ExecutionWorker:
             "review_count": len(thread_result.reviews),
         }
 
+    def _existing_receipt(self, name: str) -> dict[str, Any] | None:
+        target = self._state_path.parent / Path(name).name
+        if not target.exists():
+            return None
+        try:
+            receipt = _read_private_json(
+                target, maximum=MAX_DRAFT_BYTES, label="execution result receipt"
+            )
+        except (ExecutionWorkerConfigError, OSError):
+            return None
+        state = load_run_state(self._state_path)
+        if receipt.get("schema") == RESULT_RECEIPT_SCHEMA and receipt.get("result_id") == state.run_id:
+            return receipt
+        return None
+
+    def record_outcome(self, outcome: str) -> dict[str, Any]:
+        """Draft from the result inputs and record, in one call.
+
+        Splitting drafting and recording across two steps was a frequent source
+        of failed records because an agent had to copy a generated name between
+        calls.
+        """
+        run_id = load_run_state(self._state_path).run_id
+        target = self._state_path.parent / f"result-{run_id}.json"
+        existing = self._existing_receipt(target.name)
+        if existing is not None:
+            return existing
+        # An unconsumed draft from an earlier `draft` call in this run must yield to the result inputs on disk.
+        target.unlink(missing_ok=True)
+        ready = self.draft(outcome=outcome)
+        return self.record(ready["draft"])
+
     def record(self, draft_name: str) -> dict[str, Any]:
         state = load_run_state(self._state_path)
+        if isinstance(draft_name, str):
+            existing = self._existing_receipt(draft_name)
+            if existing is not None:
+                return existing
         service = TaskExecutionService(
             state.database_path,
             execution_grants=state.execution_grants,
@@ -1537,27 +1573,38 @@ def load_result_draft(
     run_directory: Path, name: str
 ) -> tuple[Path, dict[str, Any]]:
     if not isinstance(name, str):
-        raise ExecutionWorkerDraftError("execution result draft is invalid")
+        raise ExecutionWorkerDraftError(
+            "execution result draft name is not text; use `record --outcome OUTCOME`"
+        )
+    shown = Path(name).name[:80]
     supplied = Path(name)
     if supplied.is_absolute():
         if supplied.parent != run_directory:
             raise ExecutionWorkerDraftError(
-                "execution result draft is invalid"
+                "execution result draft must be in the run directory; pass the bare file name returned by `draft`, or use `record --outcome OUTCOME`"
             )
         name = supplied.name
     elif supplied.parent != Path("."):
-        raise ExecutionWorkerDraftError("execution result draft is invalid")
+        raise ExecutionWorkerDraftError(
+            "execution result draft must be a bare file name, not a path; pass the name returned by `draft`, or use `record --outcome OUTCOME`"
+        )
     match = _RESULT_NAME_RE.fullmatch(name)
     if match is None:
-        raise ExecutionWorkerDraftError("execution result draft is invalid")
+        raise ExecutionWorkerDraftError(
+            f"execution result draft name {shown!r} is not a draft name (expected result-<32 hex>.json as returned by `draft`); use `record --outcome OUTCOME`"
+        )
     path = run_directory / name
+    if not path.exists():
+        raise ExecutionWorkerDraftError(
+            f"execution result draft {shown!r} was not found in the run directory; run `draft --outcome OUTCOME` again or use `record --outcome OUTCOME`"
+        )
     try:
         document = _read_private_json(
             path, maximum=MAX_DRAFT_BYTES, label="execution result draft"
         )
     except ExecutionWorkerConfigError as exc:
         raise ExecutionWorkerDraftError(
-            "execution result draft is invalid"
+            f"execution result draft {shown!r} could not be read as a private JSON file; run `draft --outcome OUTCOME` again; do not edit drafts by hand"
         ) from exc
     fields = {
         "schema", "schema_version", "result_id", "outcome", "summary",
@@ -1566,10 +1613,14 @@ def load_result_draft(
     # A ready draft may predate structured evidence. It is private, short
     # lived, and already bound to this claim, so preserve it as an empty
     # collection rather than forcing an agent to recreate a correct result.
-    supplied = set(document)
+    supplied_fields = set(document)
     allowed_optionals = {"repository_references", "repository_impact", "voice_summary"}
-    if not (fields <= supplied <= fields | allowed_optionals):
-        raise ExecutionWorkerDraftError("execution result draft is invalid")
+    if not (fields <= supplied_fields <= fields | allowed_optionals):
+        missing = sorted(fields - supplied_fields)
+        unexpected = sorted(supplied_fields - fields - allowed_optionals)
+        raise ExecutionWorkerDraftError(
+            f"execution result draft fields are wrong (missing: {missing}, unexpected: {unexpected}); run `draft --outcome OUTCOME` again; do not edit drafts by hand"
+        )
     document.setdefault("repository_references", [])
     document.setdefault("repository_impact", True)
     document.setdefault("voice_summary", "")
@@ -1579,7 +1630,9 @@ def load_result_draft(
         or isinstance(document["schema_version"], bool)
         or document["result_id"] != match.group(1)
     ):
-        raise ExecutionWorkerDraftError("execution result draft is invalid")
+        raise ExecutionWorkerDraftError(
+            "execution result draft was not produced by this worker for this file name; run `draft --outcome OUTCOME` again; do not edit drafts by hand"
+        )
     return path, document
 
 
@@ -2646,8 +2699,9 @@ def _parser() -> argparse.ArgumentParser:
         help="comma-separated paths to validated result artifacts")
     thread = subcommands.add_parser(
         "thread", help="read comments and reviews on this task's own thread")
-    record = subcommands.add_parser("record")
-    record.add_argument("draft")
+    record = subcommands.add_parser("record", help="record this run's result: `record --outcome OUTCOME` (or `record DRAFT` with the name `draft` returned)")
+    record.add_argument("draft", nargs="?")
+    record.add_argument("--outcome", help="build the draft from the result inputs and record it in one step")
     draft = subcommands.add_parser(
         "draft", help="build a validated draft from private result inputs"
     )
@@ -2706,7 +2760,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.operation == "draft":
             result = worker.draft(outcome=args.outcome)
         elif args.operation == "record":
-            result = worker.record(args.draft)
+            if (args.draft is None) == (args.outcome is None):
+                raise ExecutionWorkerDraftError(
+                    "record needs exactly one of: --outcome OUTCOME (builds and records in one step) or DRAFT (the name `draft` returned); use `record --outcome OUTCOME`"
+                )
+            elif args.outcome is not None:
+                result = worker.record_outcome(args.outcome)
+            else:
+                result = worker.record(args.draft)
         else:
             result = worker.release()
     except ExecutionWorkerConfigError:
