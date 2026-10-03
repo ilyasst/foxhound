@@ -30,6 +30,7 @@ from .knowledge_client import (
 from .contracts import SourceSnapshotContractError
 from . import work_digest, voice_summary, tts_client
 from .task_execution import (
+    PHASE_OUTCOMES,
     ExecutionResultEnvelope,
     TaskExecutionService,
     WorkflowDisposition,
@@ -551,6 +552,7 @@ class ExecutionWorker:
                     claim_token=state.claim_token,
                 )),
                 "handoff": _read_handoff(state.task_work_directory, state.phase.value),
+                "result_contract": _result_contract(state, self._state_path.parent),
             },
             "operator": {
                 "revision": context.revision,
@@ -1165,21 +1167,23 @@ class ExecutionWorker:
         # The run directory stays a valid location so nothing that already
         # records keeps working by accident, but the task folder is tried
         # first because that is the intended home.
-        search_directories = _result_search_path(state, run_directory)
+        search_directories, search_roles = _result_search_path_with_roles(
+            state, run_directory
+        )
         task_folder_not_before = _claim_started_at(self._state_path)
         result_id = state.run_id
         draft = _repository_result(state, {
             "outcome": outcome,
             "summary": _read_result_text(
-                _locate_result(
-                    search_directories, "result-summary.txt",
+                _locate_required(
+                    search_directories, search_roles, "result-summary.txt",
                     task_folder_not_before=task_folder_not_before,
                 ),
                 label="execution result summary",
             ),
             "work_markdown": _read_result_text(
-                _locate_result(
-                    search_directories, "result-work.md",
+                _locate_required(
+                    search_directories, search_roles, "result-work.md",
                     task_folder_not_before=task_folder_not_before,
                 ),
                 label="execution result work",
@@ -1733,7 +1737,9 @@ def _read_private_json(
     return value
 
 
-def _result_search_path(state, run_directory: Path) -> tuple[Path, ...]:
+def _result_search_path_with_roles(
+    state, run_directory: Path
+) -> tuple[tuple[Path, ...], tuple[str, ...]]:
     """Where an authored result may legitimately live, in preference order.
 
     The task run directory first (when present): it is the dedicated folder
@@ -1746,21 +1752,53 @@ def _result_search_path(state, run_directory: Path) -> tuple[Path, ...]:
 
     A task folder is only offered when the workflow carries one; a claim
     without one falls back to the run directory alone rather than guessing.
+    It also returns a role label per directory for messages.
     """
     directories: list[Path] = []
+    roles: list[str] = []
     task_run_folder = getattr(state, "task_run_directory", None)
     if task_run_folder:
         candidate = Path(task_run_folder)
         if candidate.is_absolute():
             directories.append(candidate)
+            roles.append("task run folder")
     task_folder = getattr(state, "task_work_directory", None)
     if task_folder:
         candidate = Path(task_folder)
         if candidate.is_absolute() and candidate not in directories:
             directories.append(candidate)
+            roles.append("task folder")
     if run_directory not in directories:
         directories.append(run_directory)
-    return tuple(directories)
+        roles.append("run directory")
+    return tuple(directories), tuple(roles)
+
+
+def _result_search_path(state, run_directory: Path) -> tuple[Path, ...]:
+    """The directory search order for result files."""
+    directories, _ = _result_search_path_with_roles(state, run_directory)
+    return directories
+
+
+def _result_contract(state: ExecutionRunState, run_directory: Path) -> dict[str, object]:
+    directories = _result_search_path(state, run_directory)
+    return {
+        "directory": str(directories[0]),
+        "required": {
+            "result-summary.txt": "concise plain-text summary for the card",
+            "result-work.md": "the complete reviewable answer in Markdown",
+        },
+        "optional": {
+            "result-questions.json": "JSON array of strings: questions for the reader",
+            "result-deliverables.json": "JSON array of strings naming what was produced, in text the card can show",
+            "result-external-actions.json": 'JSON array of strings, or objects {"action": ..., "target": URL, "channel"?: ..., "requires"?: ...}',
+            "result-artifacts.json": "JSON array of file paths relative to the run directory, copied into the task folder",
+            "result-repository-references.json": "JSON array of objects naming verified pull requests, commits, and checks",
+            "result-repository-impact.json": "JSON boolean: explicit false for non-impacting repository executions; omit otherwise",
+        },
+        "outcomes": sorted(o.value for o in PHASE_OUTCOMES[state.phase]),
+        "record": f"{state.worker_command} record --outcome OUTCOME",
+    }
 
 
 def _claim_started_at(state_path: Path) -> int | None:
@@ -1799,6 +1837,37 @@ def _fenced_out(
         return candidate.stat().st_mtime_ns < task_folder_not_before
     except OSError:
         return True
+
+
+def _locate_required(
+    directories: tuple[Path, ...],
+    roles: tuple[str, ...],
+    name: str,
+    *,
+    task_folder_not_before: int | None = None,
+) -> Path:
+    fenced_out_role: str | None = None
+    for index, directory in enumerate(directories):
+        candidate = directory / name
+        try:
+            if candidate.is_file():
+                if _fenced_out(
+                    index, directories, candidate, task_folder_not_before
+                ):
+                    if fenced_out_role is None:
+                        fenced_out_role = roles[index]
+                    continue
+                return candidate
+        except OSError:
+            continue
+    if fenced_out_role is not None:
+        raise ExecutionWorkerDraftError(
+            f"{name} exists in the {fenced_out_role} but was written before this run started; write it again for this run"
+        )
+    searched_roles = ", ".join(roles)
+    raise ExecutionWorkerDraftError(
+        f"{name} not found in searched locations ({searched_roles}); write it to the directory named by `workflow.result_contract.directory` in `context`"
+    )
 
 
 def _locate_result(
