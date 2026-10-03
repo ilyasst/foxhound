@@ -3820,6 +3820,14 @@ def _card(
                     _problems_cache=problems_cache,
                 )
                 summary_val = _append_summary_note(summary_val, note)
+                # Why the queue raised it on its own, if it did (#910).
+                from .task_execution import auto_raise_reason
+                summary_val = _append_summary_note(
+                    summary_val,
+                    auto_raise_reason(
+                        connection, int(row["task_id"]), today, reader_aliases,
+                    ) or "",
+                )
             except Exception:
                 pass
         return ExecutionReviewCard(

@@ -5304,3 +5304,118 @@ class DependencyNoteCardTests(unittest.TestCase):
         due_cards = self.cards.due()
         indep_card = next(c for c in due_cards if c.task_id == 3)
         self.assertEqual(indep_card.summary, "")
+
+
+class AutoRaiseNoteCardTests(unittest.TestCase):
+    """Auto-raise notes in card summary."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.database = Path(self.temporary.name) / "foxhound.sqlite3"
+        self.clock = Clock()
+        migrate_database(self.database)
+        self.cards = ExecutionCardService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: DELIVERY_TOKEN,
+            reader_aliases=("Person A",),
+        )
+        self.execution = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: CLAIM_TOKEN,
+        )
+
+    def test_auto_raise_note_for_overdue_task(self) -> None:
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "INSERT INTO tasks(id, status, text, owner, owner_kind, owner_ref_version, owner_provisional, due, version, created_at, updated_at) "
+                "VALUES(1, 'open', 'Overdue task', 'Person A', 'person', 1, 0, ?, 1, ?, ?)",
+                ((NOW - timedelta(days=1)).date().isoformat(), NOW.isoformat(timespec="seconds"), NOW.isoformat(timespec="seconds")),
+            )
+            connection.commit()
+
+        self.execution.schedule(1, expected_task_version=1)
+        self.cards.schedule()
+        due_cards = self.cards.due()
+        card = next(c for c in due_cards if c.task_id == 1)
+        self.assertIn("Raised automatically: due", card.summary)
+        self.assertIn("(overdue)", card.summary)
+
+    def _task_due_in(self, days: int) -> None:
+        stamp = NOW.isoformat(timespec="seconds")
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "INSERT INTO tasks(id, status, text, owner, owner_kind, owner_ref_version, owner_provisional, due, version, created_at, updated_at) "
+                "VALUES(1, 'open', 'Some task', 'Person A', 'person', 1, 0, ?, 1, ?, ?)",
+                ((NOW + timedelta(days=days)).date().isoformat(), stamp, stamp),
+            )
+            connection.commit()
+        self.execution.schedule(1, expected_task_version=1)
+
+    def _summary(self) -> str:
+        self.cards.schedule()
+        return next(c for c in self.cards.due() if c.task_id == 1).summary
+
+    def test_no_auto_raise_note_outside_the_window(self) -> None:
+        self._task_due_in(5)
+        self.assertNotIn("Raised automatically", self._summary())
+
+    def test_no_auto_raise_note_when_the_reader_set_the_priority(self) -> None:
+        self._task_due_in(1)
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "UPDATE task_execution_workflows SET queue_priority='raised' WHERE task_id=1")
+            connection.commit()
+        self.assertNotIn("Raised automatically", self._summary())
+
+    def test_auto_raise_note_says_tomorrow(self) -> None:
+        self._task_due_in(1)
+        self.assertIn("(tomorrow).", self._summary())
+
+    def test_auto_raise_note_from_dependant(self) -> None:
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "INSERT INTO tasks(id, status, text, owner, owner_kind, owner_ref_version, owner_provisional, due, version, created_at, updated_at) "
+                "VALUES(1, 'open', 'Owned task', 'Person A', 'person', 1, 0, NULL, 1, ?, ?)",
+                (NOW.isoformat(timespec="seconds"), NOW.isoformat(timespec="seconds")),
+            )
+            connection.execute(
+                "INSERT INTO tasks(id, status, text, owner, owner_kind, owner_ref_version, owner_provisional, due, version, created_at, updated_at) "
+                "VALUES(2, 'open', 'Dependant task', 'Person B', 'person', 1, 0, ?, 1, ?, ?)",
+                (NOW.date().isoformat(), NOW.isoformat(timespec="seconds"), NOW.isoformat(timespec="seconds")),
+            )
+            connection.execute(
+                "INSERT INTO task_scheduling_conditions("
+                "task_id, task_version, kind, depends_on_task_id, not_before, state, change_set_id, created_at, updated_at) "
+                "VALUES(2, 1, 'after_task_completed', 1, NULL, 'active', 1, ?, ?)",
+                (NOW.isoformat(timespec="seconds"), NOW.isoformat(timespec="seconds")),
+            )
+            connection.commit()
+
+        self.execution.schedule(1, expected_task_version=1)
+        self.cards.schedule()
+        due_cards = self.cards.due()
+        card = next(c for c in due_cards if c.task_id == 1)
+        self.assertIn("Raised automatically: T2 depends on it and is due", card.summary)
+
+    def test_auto_raise_note_from_research(self) -> None:
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "INSERT INTO tasks(id, status, text, owner, owner_kind, owner_ref_version, owner_provisional, due, version, created_at, updated_at) "
+                "VALUES(1, 'open', 'Research task', 'Person A', 'person', 1, 0, NULL, 1, ?, ?)",
+                (NOW.isoformat(timespec="seconds"), NOW.isoformat(timespec="seconds")),
+            )
+            connection.execute(
+                "INSERT INTO task_timing(task_id, effort, researched_due, source_job_id, updated_at) "
+                "VALUES(1, 'day', ?, 'job1', ?)",
+                ((NOW + timedelta(days=1)).date().isoformat(), NOW.isoformat(timespec="seconds")),
+            )
+            connection.commit()
+
+        self.execution.schedule(1, expected_task_version=1)
+        self.cards.schedule()
+        due_cards = self.cards.due()
+        card = next(c for c in due_cards if c.task_id == 1)
+        self.assertIn("Raised automatically: research found a deadline of", card.summary)
