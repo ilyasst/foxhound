@@ -1417,6 +1417,65 @@ class TaskExecutionTests(unittest.TestCase):
         claims = [service.claim_next() for _ in range(4)]
         self.assertEqual([claim.task_id for claim in claims], [2, 3, 1, 4])
 
+    def test_claim_auto_raises_reader_owned_work_due_soon(self):
+        """A reader-owned task due within 48h is treated as raised priority (#771)."""
+        today = self.clock().date()
+        self._add_task(2, "Synthetic reader task due tomorrow")
+        self._add_task(3, "Synthetic raised task not due soon")
+        self._add_task(4, "Synthetic other-owned task due tomorrow")
+        now = self._now()
+        with closing(sqlite3.connect(self.database)) as connection:
+            # Task 2: reader-owned, due tomorrow (within 48h)
+            connection.execute(
+                "UPDATE tasks SET owner='Person A', owner_kind='person', "
+                "owner_ref_version=1, owner_provisional=0, due=? WHERE id=2",
+                ((today + timedelta(days=1)).isoformat(),),
+            )
+            # Task 3: reader-owned or anyone, raised priority, due in 10 days
+            connection.execute(
+                "UPDATE tasks SET due=? WHERE id=3",
+                ((today + timedelta(days=10)).isoformat(),),
+            )
+            # Task 4: owned by someone else, due tomorrow
+            connection.execute(
+                "UPDATE tasks SET owner='Person B', owner_kind='person', "
+                "owner_ref_version=1, owner_provisional=0, due=? WHERE id=4",
+                ((today + timedelta(days=1)).isoformat(),),
+            )
+            connection.commit()
+
+        # Task 1 is older normal task without due date
+        self._schedule_and_start()
+        for task_id in (4, 3, 2):
+            workflow = self.service.schedule(task_id, expected_task_version=1)
+            assert workflow is not None
+            self.service.start_action(
+                task_id, expected_version=workflow.version, action="start")
+
+        # Raise task 3 queue_priority
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "UPDATE task_execution_workflows SET queue_priority='raised' WHERE task_id=3"
+            )
+            connection.commit()
+
+        service = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: TOKEN,
+            execution_slot_cap=4,
+            profile_registry=self.service._profile_registry,
+            reader_aliases=("Person A",),
+        )
+        claims = [service.claim_next() for _ in range(4)]
+        self.assertTrue(all(claim is not None for claim in claims))
+        claim_task_ids = [claim.task_id for claim in claims if claim is not None]
+        # Task 2 is reader-owned & due tomorrow -> priority 0 (raised), band 0 -> claims first
+        # Task 3 is raised priority -> priority 0, band 2 (in 10 days) -> claims second
+        # Task 4 is other-owned & due tomorrow -> priority 1 (normal), band 0 -> claims before task 1 (normal, band 4)
+        # Task 1 is normal, no due date -> claims last
+        self.assertEqual(claim_task_ids, [2, 3, 4, 1])
+
     def test_claim_runs_predecessor_of_urgent_work_first(self):
         """Predecessor inherits urgent effective deadline band (#771)."""
         today = self.clock().date()

@@ -108,10 +108,17 @@ def _claim_queue_priority(queue_priority: str | None) -> int:
     return 2
 
 
+#: A task the reader owns is treated as raised once its effective deadline
+#: is this close (#771). Read only at claim time; nothing is written, so the
+#: reader's own raise and lower stay the only stored priority.
+AUTO_RAISE_WINDOW = timedelta(hours=48)
+
+
 def _order_by_effective_deadline(
     connection: sqlite3.Connection,
     rows: Sequence[sqlite3.Row],
     today: date,
+    reader_aliases: frozenset[str] = frozenset(),
 ) -> list[sqlite3.Row]:
     if not rows:
         return list(rows)
@@ -164,9 +171,15 @@ def _order_by_effective_deadline(
 
         def sort_key(row: sqlite3.Row) -> tuple[int, int, int]:
             tier = _claim_source_tier(row["origin_kind"])
-            prio = _claim_queue_priority(row["queue_priority"])
             eff_date = effective_map.get(int(row["task_id"]))
             eff_band = deadline_band(eff_date, today)
+            prio = _claim_queue_priority(row["queue_priority"])
+            if (
+                reader_owned(dict(row), reader_aliases)
+                and eff_date is not None
+                and eff_date <= today + timedelta(days=AUTO_RAISE_WINDOW.days)
+            ):
+                prio = 0
             return (tier, prio, eff_band)
 
         return sorted(rows, key=sort_key)
@@ -1389,7 +1402,7 @@ class TaskExecutionService:
                 # workflow, so it is deferred like any other per-task
                 # failure and the scan moves on.
                 rows = connection.execute(
-                    "SELECT w.*,t.text,t.owner,t.due,t.status AS task_status,"
+                    "SELECT w.*,t.text," + _OWNER_COLUMNS + "t.due,t.status AS task_status,"
                     "t.version AS current_task_version,("
                     " SELECT o.source_kind FROM task_candidate_bindings AS b "
                     " JOIN candidate_inbox AS o "
@@ -1422,7 +1435,9 @@ class TaskExecutionService:
                      now, now, MAX_CLAIM_SCAN),
                 ).fetchall()
                 today = stamp.date()
-                rows = _order_by_effective_deadline(connection, rows, today)
+                rows = _order_by_effective_deadline(
+                    connection, rows, today, self._reader_aliases
+                )
                 row = None
                 profile = None
                 deferred: list[int] = []
