@@ -964,6 +964,35 @@ class TaskExecutionService:
                     connection, now
                 )
 
+                from .task_forge_close_backfill import close_forge_withdrawn_task
+
+                withdrawn_forge_tasks = connection.execute(
+                    "SELECT t.id, b.candidate_id, c.source_kind "
+                    "FROM tasks AS t "
+                    "JOIN task_candidate_bindings AS b ON b.task_id = t.id AND b.relation = 'accepted' "
+                    "JOIN candidate_inbox AS c ON c.candidate_id = b.candidate_id "
+                    "JOIN task_candidate_lifecycle AS l ON l.candidate_id = b.candidate_id "
+                    "WHERE t.status = 'open' "
+                    "AND c.source_kind IN ('issue', 'review_request') "
+                    "AND l.state = 'withdrawn' "
+                    "AND l.resolution = 'reader_conflict' "
+                    # A running pass is left to finish (#843); skipping it
+                    # here keeps it from filling every bounded sweep.
+                    "AND NOT EXISTS (SELECT 1 FROM task_execution_workflows "
+                    "AS running WHERE running.task_id = t.id "
+                    "AND running.status = 'running') "
+                    "ORDER BY t.id "
+                    "LIMIT 20"
+                ).fetchall()
+                for row_w in withdrawn_forge_tasks:
+                    close_forge_withdrawn_task(
+                        connection,
+                        task_id=int(row_w["id"]),
+                        candidate_id=str(row_w["candidate_id"]),
+                        source_kind=str(row_w["source_kind"]),
+                        now=now,
+                    )
+
                 rows = connection.execute(
                     "SELECT t.id,t.version,w.task_id AS workflow_task_id,"
                     "w.version AS workflow_version," + _OWNER_COLUMNS + "("
