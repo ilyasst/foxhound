@@ -15,11 +15,12 @@ import stat
 import urllib.parse
 from contextlib import closing
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
+from . import task_deadline_problems
 from .legacy_roots import RootTranslations
 from .task_owner import normalized_owner
 from .task_research_gate import record_ownership_decision
@@ -773,9 +774,11 @@ class ExecutionCardService:
                 + "ORDER BY c.id LIMIT ?",
                 (now, limit),
             ).fetchall()
-        return tuple(
-            self._render_card(row) for row in rows if _current_card(row)
-        )
+            problems_cache = {}
+            return tuple(
+                self._render_card(row, connection=connection, problems_cache=problems_cache)
+                for row in rows if _current_card(row)
+            )
 
     def board(self, *, limit: int = BOARD_CARD_LIMIT) -> ExecutionBoard:
         """Project current unclaimed execution work without acquiring a lease."""
@@ -786,7 +789,11 @@ class ExecutionCardService:
             rows = connection.execute(
                 self._card_select() + " AND c.status='pending' ORDER BY c.id"
             ).fetchall()
-        cards = [self._render_card(row) for row in rows if _current_card(row)]
+            problems_cache = {}
+            cards = [
+                self._render_card(row, connection=connection, problems_cache=problems_cache)
+                for row in rows if _current_card(row)
+            ]
         totals: dict[str, int] = {
             status: 0 for status in EXECUTION_BOARD_STATUSES
         }
@@ -2140,6 +2147,18 @@ class ExecutionCardService:
                 return refused(refusal)
             outcome = row["result_outcome"]
             row = self._translated(row)
+            summary_text = "" if row["summary"] is None else str(row["summary"])
+            try:
+                today_val = self._clock_value().date()
+                note = _dependency_note(
+                    connection,
+                    int(str(row["task_id"])),
+                    self._reader_aliases,
+                    today_val,
+                )
+                summary_text = _append_summary_note(summary_text, note)
+            except Exception:
+                pass
             return ExecutionCardDetail(
                 ExecutionCardDisposition.UNCHANGED,
                 card_id,
@@ -2151,7 +2170,7 @@ class ExecutionCardService:
                 due_at=row["workflow_due_at"],
                 completed_at=row["workflow_completed_at"],
                 outcome=None if outcome is None else ExecutionOutcome(outcome),
-                summary="" if row["summary"] is None else str(row["summary"]),
+                summary=summary_text,
                 work_digest="" if row["work_digest"] is None else str(row["work_digest"]),
                 work_markdown="" if row["work_markdown"] is None else str(row["work_markdown"]),
                 deliverables=_stored_collection(row["deliverables_json"]),
@@ -3217,14 +3236,45 @@ class ExecutionCardService:
         return values
 
     def _render_card(
-        self, row: Mapping[str, object]
+        self,
+        row: Mapping[str, object],
+        *,
+        connection: sqlite3.Connection | None = None,
+        problems_cache: dict[tuple[int, date, tuple[str, ...]], task_deadline_problems.DeadlineProblems] | None = None,
     ) -> ExecutionReviewCard:
-        return _card(
-            self._translated(row),
-            self._profile_registry,
-            reader_aliases=self._reader_aliases,
-            condition_available=self._owner_condition is not None,
-        )
+        today_val: date | None = None
+        try:
+            today_val = self._clock_value().date()
+        except Exception:
+            pass
+        if connection is not None:
+            return _card(
+                self._translated(row),
+                self._profile_registry,
+                reader_aliases=self._reader_aliases,
+                condition_available=self._owner_condition is not None,
+                connection=connection,
+                today=today_val,
+                problems_cache=problems_cache,
+            )
+        try:
+            with closing(self._connect()) as conn:
+                return _card(
+                    self._translated(row),
+                    self._profile_registry,
+                    reader_aliases=self._reader_aliases,
+                    condition_available=self._owner_condition is not None,
+                    connection=conn,
+                    today=today_val,
+                    problems_cache=problems_cache,
+                )
+        except Exception:
+            return _card(
+                self._translated(row),
+                self._profile_registry,
+                reader_aliases=self._reader_aliases,
+                condition_available=self._owner_condition is not None,
+            )
 
     def _clock_value(self) -> datetime:
         value = self._clock()
@@ -3544,6 +3594,9 @@ def _card(
     *,
     reader_aliases: frozenset[str] = frozenset(),
     condition_available: bool = False,
+    connection: sqlite3.Connection | None = None,
+    today: date | None = None,
+    problems_cache: dict[tuple[int, date, tuple[str, ...]], task_deadline_problems.DeadlineProblems] | None = None,
 ) -> ExecutionReviewCard:
     try:
         kind = ExecutionCardKind(row["kind"])
@@ -3557,6 +3610,19 @@ def _card(
                 raise
             profile_name = profile_id
         owner_display = canonical_owner_display(row["owner"], row["owner_kind"])
+        summary_val = _ownership_summary(row, kind) or ("" if row["summary"] is None else str(row["summary"]))
+        if connection is not None and today is not None:
+            try:
+                note = _dependency_note(
+                    connection,
+                    int(str(row["task_id"])),
+                    reader_aliases,
+                    today,
+                    _problems_cache=problems_cache,
+                )
+                summary_val = _append_summary_note(summary_val, note)
+            except Exception:
+                pass
         return ExecutionReviewCard(
             id=int(row["id"]),
             task_id=int(row["task_id"]),
@@ -3598,7 +3664,7 @@ def _card(
                 condition_available=condition_available,
             )),
             owner_hold_reason=owner_hold_reason,
-            summary=_ownership_summary(row, kind) or ("" if row["summary"] is None else str(row["summary"])),
+            summary=summary_val,
             work_markdown=(
                 ""
                 if row["work_markdown"] is None
@@ -5772,3 +5838,64 @@ def _ownership_questions(
         f"and write: Follow up with {owner}.",
     )
 
+
+def _dependency_note(
+    connection: sqlite3.Connection,
+    task_id: int,
+    reader_aliases: Sequence[str] | set[str] | frozenset[str],
+    today: date,
+    *,
+    _problems_cache: dict[tuple[int, date, tuple[str, ...]], task_deadline_problems.DeadlineProblems] | None = None,
+) -> str:
+    """Return dependency warning note if any, or empty string."""
+    try:
+        norm_aliases = tuple(sorted(reader_aliases))
+        cache_key = (id(connection), today, norm_aliases)
+        if _problems_cache is not None and cache_key in _problems_cache:
+            problems = _problems_cache[cache_key]
+        else:
+            problems = task_deadline_problems.find_problems(connection, today, reader_aliases)
+            if _problems_cache is not None:
+                _problems_cache[cache_key] = problems
+
+        # Check foreign_blockers
+        for pred, dep in problems.foreign_blockers:
+            if dep == task_id:
+                owner_row = connection.execute(
+                    "SELECT owner FROM tasks WHERE id = ?", (pred,)
+                ).fetchone()
+                owner_name = "someone else"
+                if owner_row is not None:
+                    raw_owner = owner_row[0] if isinstance(owner_row, (tuple, list)) else owner_row["owner"]
+                    if raw_owner:
+                        owner_name = str(raw_owner)
+                return f"⚠ Waiting on T{pred}, owned by {owner_name}: consider following up with them."
+
+        # Check infeasible
+        infeasible_task_ids = {tid for tid, _dl in problems.infeasible}
+        if task_id in infeasible_task_ids:
+            pred_row = connection.execute(
+                "SELECT c.depends_on_task_id "
+                "FROM task_scheduling_conditions c "
+                "JOIN tasks t ON t.id = c.depends_on_task_id "
+                "WHERE c.task_id = ? AND c.kind = 'after_task_completed' "
+                "AND c.state = 'active' AND c.depends_on_task_id IS NOT NULL "
+                "AND t.status = 'open' "
+                "ORDER BY c.depends_on_task_id ASC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if pred_row is not None:
+                first_pred = pred_row[0] if isinstance(pred_row, (tuple, list)) else pred_row["depends_on_task_id"]
+                return f"⚠ This deadline cannot be met while T{first_pred} is still open."
+
+        return ""
+    except Exception:
+        return ""
+
+
+def _append_summary_note(summary: str, note: str) -> str:
+    if not note:
+        return summary
+    if not summary:
+        return note
+    return f"{summary}\n\n{note}"

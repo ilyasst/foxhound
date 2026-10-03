@@ -5024,3 +5024,68 @@ class StartCardKindTests(unittest.TestCase):
         self.assertEqual(self._row(WorkflowStatus.AWAITING_START,
                                    last_result_id=None),
                          ExecutionCardKind.START)
+
+
+class DependencyNoteCardTests(unittest.TestCase):
+    """Dependency warnings in card summary."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.database = Path(self.temporary.name) / "foxhound.sqlite3"
+        self.clock = Clock()
+        migrate_database(self.database)
+        self.cards = ExecutionCardService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: DELIVERY_TOKEN,
+            reader_aliases=("Person A",),
+        )
+        self.execution = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: CLAIM_TOKEN,
+        )
+
+    def test_foreign_blocker_note_appended_to_card_summary(self) -> None:
+        with closing(sqlite3.connect(self.database)) as connection:
+            # Predecessor owned by Person B, dependant owned by Person A (reader)
+            connection.execute(
+                "INSERT INTO tasks(id, status, text, owner, owner_kind, owner_ref_version, owner_provisional, due, version, created_at, updated_at) "
+                "VALUES(1, 'open', 'Predecessor task', 'Person B', 'person', 1, 0, NULL, 1, ?, ?)",
+                (NOW.isoformat(timespec="seconds"), NOW.isoformat(timespec="seconds")),
+            )
+            connection.execute(
+                "INSERT INTO tasks(id, status, text, owner, owner_kind, owner_ref_version, owner_provisional, due, version, created_at, updated_at) "
+                "VALUES(2, 'open', 'Dependant task', 'Person A', 'person', 1, 0, NULL, 1, ?, ?)",
+                (NOW.isoformat(timespec="seconds"), NOW.isoformat(timespec="seconds")),
+            )
+            # Active after_task_completed condition
+            connection.execute(
+                "INSERT INTO task_scheduling_conditions("
+                "task_id, task_version, kind, depends_on_task_id, not_before, state, change_set_id, created_at, updated_at) "
+                "VALUES(2, 1, 'after_task_completed', 1, NULL, 'active', 1, ?, ?)",
+                (NOW.isoformat(timespec="seconds"), NOW.isoformat(timespec="seconds")),
+            )
+            connection.commit()
+
+        self.execution.schedule(2, expected_task_version=1)
+        self.cards.schedule()
+        due_cards = self.cards.due()
+        self.assertTrue(due_cards)
+        dependant_card = next(c for c in due_cards if c.task_id == 2)
+        self.assertIn("Waiting on T", dependant_card.summary)
+
+        # A task with no problem has an unchanged summary
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "INSERT INTO tasks(id, status, text, owner, owner_kind, owner_ref_version, owner_provisional, due, version, created_at, updated_at) "
+                "VALUES(3, 'open', 'Independent task', 'Person A', 'person', 1, 0, NULL, 1, ?, ?)",
+                (NOW.isoformat(timespec="seconds"), NOW.isoformat(timespec="seconds")),
+            )
+            connection.commit()
+        self.execution.schedule(3, expected_task_version=1)
+        self.cards.schedule()
+        due_cards = self.cards.due()
+        indep_card = next(c for c in due_cards if c.task_id == 3)
+        self.assertEqual(indep_card.summary, "")
