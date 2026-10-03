@@ -43,10 +43,10 @@ OWNER_MEETING_SCHEMA_VERSION = 1
 WORKING_GROUPS_REQUEST_SCHEMA = "gw.working-groups-request"
 WORKING_GROUPS_RESPONSE_SCHEMA = "gw.working-groups"
 WORKING_GROUPS_SCHEMA_VERSION = 1
-LAYER_ORDER = ("kb", "secondary", "emails")
+LAYER_ORDER = ("kb", "secondary", "emails", "raw")
 
 _ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-_DOCUMENT_ID_RE = re.compile(r"^(kb|secondary|emails):(.+)$")
+_DOCUMENT_ID_RE = re.compile(r"^(kb|secondary|emails|raw):(.+)$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _DOMAIN_RE = re.compile(
     r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"

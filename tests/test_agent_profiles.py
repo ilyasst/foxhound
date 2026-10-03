@@ -292,6 +292,8 @@ class AgentProfileTests(unittest.TestCase):
             # did not stop the writing; it sent it to a shared checkout.
             "available in every phase, planning included",
             "Every other checkout on this host is read only for you",
+            "Knowledge base first. The knowledge base holds narrated versions",
+            "Use the `raw` search layer only to read or confirm",
             "Do not `cd` into one to commit, switch its branch, reset it",
             "The reviewable output of planning is still the plan",
         ):

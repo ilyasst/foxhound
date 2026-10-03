@@ -462,7 +462,7 @@ class ExecutionWorker:
                 # This is descriptive evidence from the worker, not authority
                 # supplied by task text.  It prevents a profile from routing
                 # work to an ambient Hermes tool that this run does not have.
-                "knowledge_layers": ["kb", "secondary", "emails"],
+                "knowledge_layers": ["kb", "secondary", "emails", "raw"],
                 # Installed, task-scoped local research clients.  These are
                 # named here so an agent does not have to guess from an
                 # ambient host path or mistake a zero-result GW search for a
@@ -2776,7 +2776,7 @@ def _parser() -> argparse.ArgumentParser:
     search.add_argument("query", nargs="?")
     search.add_argument("--query", dest="query_option")
     search.add_argument(
-        "--layer", action="append", choices=("kb", "secondary", "emails")
+        "--layer", action="append", choices=("kb", "secondary", "emails", "raw")
     )
     search.add_argument("--context-lines", type=int, default=0)
     search.add_argument("--max-matches-per-document", type=int)

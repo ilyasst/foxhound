@@ -148,6 +148,13 @@ class AgentProfile:
             "(procedural guides) and `Repositories.md` (local checkouts). Search those roots "
             "with an explicit path instead of the current directory.\n\n"
         )
+        knowledge_base_first_section = (
+            "Knowledge base first. The knowledge base holds narrated versions of meetings, "
+            "email threads and other sources; search it first. Use the `raw` search layer only "
+            "to read or confirm the original text of something you already found there, or "
+            "when the knowledge base has nothing; prefer following the source link a narration "
+            "gives over searching raw.\n\n"
+        )
         research_section = (
             "Research comes first. When `context` includes `research`, it is verified starting "
             "evidence for this task: read it before searching, build on its findings, constraints "
@@ -165,6 +172,7 @@ class AgentProfile:
             + budget_sentence
             + handoff_section
             + where_things_are_section
+            + knowledge_base_first_section
             + research_section
             + contacts_section
             + self.prompt_template.replace(WORKER_COMMAND_TOKEN, worker_command)
@@ -1287,7 +1295,7 @@ GENERAL_PROFILE_RELEASE_REVISION = (
     "e872e60cd96be5dc6e3b092d7e077e10f6bc67e3925552a7fd640154f1373bfc"
 )
 GENERAL_PROFILE_RELEASE_PROMPT_SHA256 = (
-    "4903de871e1fecd35a19f625cbc96af20afe5df20a5b1256eb0351727da95606"
+    "1e761339c40caa03c3467032e61201933b6accb14eceab036ad7a294a93f880c"
 )
 
 

@@ -391,14 +391,14 @@ class KnowledgeClientTests(unittest.TestCase):
         with server() as (endpoint, requests):
             result = client(endpoint).search(
                 "synthetic query",
-                layers=("emails", "kb"),
+                layers=("emails", "raw", "kb"),
                 context_lines=2,
                 max_matches_per_document=3,
                 max_results_per_layer=4,
             )
 
         self.assertEqual(result.document_count, 1)
-        self.assertEqual([layer.name for layer in result.layers], ["kb", "emails"])
+        self.assertEqual([layer.name for layer in result.layers], ["kb", "emails", "raw"])
         document = result.layers[0].documents[0]
         self.assertEqual(document.path, "Projects/alpha.md")
         self.assertEqual(document.excerpt, "A synthetic result.")
@@ -409,7 +409,7 @@ class KnowledgeClientTests(unittest.TestCase):
         self.assertEqual(requests[0]["document"], {
             "alias": "primary",
             "query": "synthetic query",
-            "layers": ["kb", "emails"],
+            "layers": ["kb", "emails", "raw"],
             "context_lines": 2,
             "max_matches_per_document": 3,
             "max_results_per_layer": 4,
