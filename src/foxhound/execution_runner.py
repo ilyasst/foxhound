@@ -141,6 +141,35 @@ _CORRECTIVE_TURN_PROMPT = (
 class ExecutionRunnerError(RuntimeError):
     """A content-free execution-runner failure."""
 
+def sanitized_agent_environment(base: Mapping[str, str], credentials_dir: Path) -> dict[str, str]:
+    """The agent environment with the host's forge write credentials removed (#588).
+
+    The phase gate only constrains what the worker offers; an agent with a
+    terminal and the host's credentials can push from any phase. Outside
+    external_action the agent (and the worker it runs, which inherits this
+    environment) gets the operator's read-only gh configuration and a
+    gitconfig without a credential helper instead.
+    """
+    if not credentials_dir.is_dir() or not (credentials_dir / "gitconfig").is_file():
+        raise ExecutionRunnerError(
+            "agent forge credentials directory or its gitconfig is missing")
+    env = dict(base)
+    drop = {
+        "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
+        "GIT_ASKPASS", "SSH_ASKPASS", "SSH_AUTH_SOCK",
+        "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"
+    }
+    for k in list(env.keys()):
+        if k in drop or k.startswith("GIT_CONFIG_KEY_") or k.startswith("GIT_CONFIG_VALUE_"):
+            env.pop(k)
+    env.update({
+        "GH_CONFIG_DIR": str(credentials_dir / "gh"),
+        "GIT_CONFIG_GLOBAL": str(credentials_dir / "gitconfig"),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+    })
+    return env
+
 
 class _TerminationRequested(Exception):
     def __init__(self, signum: int) -> None:
@@ -175,6 +204,9 @@ class ExecutionRunnerConfig:
     #: Named, deployment-configured roots an agent may refer to in portable
     #: profile guidance. Missing optional roots are deliberately omitted.
     deployment_roots: Mapping[str, Path] = field(default_factory=dict, repr=False)
+    #: Read-only forge credentials for every phase except external_action
+    #: (#588). None leaves the agent environment as the host's.
+    agent_forge_credentials: Path | None = field(default=None, repr=False)
     #: Explicit per-machine Syncthing destinations. They are a pair because a
     #: task must never become searchable without retaining its working evidence,
     #: or retain evidence without leaving the searchable task note.
@@ -734,6 +766,13 @@ def _run_claim(
         "CAPROUTE_WORK_ITEM_TYPE": "task",
         "CAPROUTE_WORK_ITEM_ID": str(claim.task_id),
     })
+    # Write credentials only where publishing is allowed: the worker that
+    # performs an approved external action runs inside this environment.
+    if (config.agent_forge_credentials is not None
+            and claim.phase is not WorkflowPhase.EXTERNAL_ACTION):
+        environment = sanitized_agent_environment(
+            environment, config.agent_forge_credentials)
+
     process: subprocess.Popen | None = None
     transcript = None
     forced = False
@@ -1777,6 +1816,7 @@ def _parser() -> argparse.ArgumentParser:
         "--agent-provider",
         help="inference provider serving --agent-model; requires it",
     )
+    parser.add_argument("--agent-forge-credentials", type=Path)
     parser.add_argument("--agent-profile-directory", type=Path)
     parser.add_argument("--default-agent-profile", default="general")
     parser.add_argument(
@@ -2018,6 +2058,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             workflow_policy=_read_workflow_policy(args.workflow_policy),
             knowledge_root=args.knowledge_root,
             deployment_roots=_deployment_roots(args.deployment_root),
+            agent_forge_credentials=args.agent_forge_credentials,
             task_work_root=args.task_work_root,
             task_kb_root=args.task_kb_root,
             runtime_session_database=args.runtime_session_database,

@@ -197,6 +197,7 @@ class ExecutionRunnerDeploymentConfig:
     worker_command: str | None = None
     runner_slot: str | None = None
     knowledge_root: Path | None = None
+    agent_forge_credentials: Path | None = None
     #: Named machine roots the worker publishes to the agent.  Deployment
     #: configuration, not profile policy: the same reviewed prompt names the
     #: root and each host resolves it.
@@ -254,6 +255,7 @@ class ExecutionRunnerDeploymentConfig:
         for name, root in sorted(self.deployment_roots.items()):
             result.extend(("--deployment-root", f"{name}={root}"))
         for option, path in (
+            ("--agent-forge-credentials", self.agent_forge_credentials),
             ("--knowledge-root", self.knowledge_root),
             ("--task-work-root", self.task_work_root),
             ("--task-kb-root", self.task_kb_root),
@@ -1011,6 +1013,7 @@ def _parse_execution_runner(
         fields.update({"agent_model", "agent_provider"})
     if version >= 15:
         fields.add("deadline_ordering")
+        fields.add("agent_forge_credentials")
     document = _object(value, fields)
     strings = tuple(document[key] for key in (
         "gw_endpoint", "gw_alias", "agent_command", "worker_command", "runner_slot"
@@ -1052,6 +1055,7 @@ def _parse_execution_runner(
         worker_command=strings[3],
         runner_slot=strings[4],
         knowledge_root=_optional_absolute_path(document["knowledge_root"]),
+        agent_forge_credentials=_optional_absolute_path(document.get("agent_forge_credentials")),
         deployment_roots=(
             _deployment_roots(document["deployment_roots"])
             if version >= 13 else {}
