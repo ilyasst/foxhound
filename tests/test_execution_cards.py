@@ -748,7 +748,7 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertEqual(
             [parse_execution_review_callback(value)[2] for value in callbacks],
             ["done", "start", "drop", "discuss", "comment_go", "snooze",
-             "reassign", "agent", "brief"],
+             "reassign"],
         )
         self.assertEqual(
             [[button["text"] for button in row]
@@ -757,10 +757,8 @@ class ExecutionCardTests(unittest.TestCase):
                 ["✅ Done", "▶️ Continue"],
                 ["🗑 Drop", "✏️ Update"],
                 ["💬 Comment and Go"],
-                SNOOZE_LABEL_ROW,
+                ["🕓 Snooze"],
                 ["👥 Reassign"],
-                ["🤖 Agent"],
-                ["📋 Task brief"],
             ],
         )
         self.assertTrue(all(
@@ -1571,13 +1569,7 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertIn("<b>Start this task?</b>", refreshed_body)
         # Choosing an agent shows on the card. Selecting one and seeing no
         # sign of it is indistinguishable from the tap not working.
-        self.assertIn("Synthetic Specialist", refreshed_body)
-        self.assertTrue(all(
-            parse_execution_review_callback(button["callback_data"])[1]
-            == selected.card_version
-            for row in refreshed_keyboard["inline_keyboard"]
-            for button in row
-        ))
+        self.assertNotIn("Synthetic Specialist", refreshed_body)
         after_task = self.ledger.get(1)
         self.assertEqual(
             (after_task.status, after_task.version),
@@ -3251,7 +3243,7 @@ class ExecutionCardTests(unittest.TestCase):
         # The gate names its agent. A reader who cannot see it cannot tell
         # that a pull request is about to be reviewed by a compatibility
         # profile, which is how one review was lost.
-        self.assertIn("<b>Agent:</b>", body)
+        self.assertNotIn("<b>Agent:</b>", body)
 
     def test_every_post_run_card_identifies_its_bound_agent(self):
         self._plan_review(1, "agent-plan")
