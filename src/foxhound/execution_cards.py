@@ -335,6 +335,7 @@ class ExecutionReviewCard:
     #: reader. Empty is normal and common: the summary is derived from a
     #: remote model and the card must read correctly without it.
     failure_digest: str = field(default="", repr=False)
+    handoff_excerpt: str = field(default="", repr=False)
     task_work_directory: str = field(default="", repr=False)
     task_kb_file: str = field(default="", repr=False)
     origin_sources: tuple["CardSourceEvidence", ...] = field(
@@ -1916,7 +1917,7 @@ class ExecutionCardService:
                 return refused(ExecutionCardRefusal.STALE_VERSION)
             if not _current_card(row):
                 return refused(ExecutionCardRefusal.STALE_VERSION)
-            card = _card(row, self._profile_registry)
+            card = _card(row, self._profile_registry, artifact_root=self._artifact_root)
         return ExecutionCardBrief(
             ExecutionCardDisposition.UNCHANGED,
             card_id,
@@ -3256,6 +3257,7 @@ class ExecutionCardService:
                 connection=connection,
                 today=today_val,
                 problems_cache=problems_cache,
+                artifact_root=self._artifact_root,
             )
         try:
             with closing(self._connect()) as conn:
@@ -3267,6 +3269,7 @@ class ExecutionCardService:
                     connection=conn,
                     today=today_val,
                     problems_cache=problems_cache,
+                    artifact_root=self._artifact_root,
                 )
         except Exception:
             return _card(
@@ -3274,6 +3277,7 @@ class ExecutionCardService:
                 self._profile_registry,
                 reader_aliases=self._reader_aliases,
                 condition_available=self._owner_condition is not None,
+                artifact_root=self._artifact_root,
             )
 
     def _clock_value(self) -> datetime:
@@ -3597,6 +3601,7 @@ def _card(
     connection: sqlite3.Connection | None = None,
     today: date | None = None,
     problems_cache: dict[tuple[int, date, tuple[str, ...]], task_deadline_problems.DeadlineProblems] | None = None,
+    artifact_root: Path | None = None,
 ) -> ExecutionReviewCard:
     try:
         kind = ExecutionCardKind(row["kind"])
@@ -3648,6 +3653,15 @@ def _card(
             failure_run_id=row["workflow_failure_run_id"],
             failure_digest=_bounded_failure_digest(
                 row["workflow_failure_digest"]
+            ),
+            handoff_excerpt=(
+                _handoff_excerpt(
+                    artifact_root,
+                    int(str(row["task_id"])),
+                    str(row["phase"]),
+                )
+                if str(row["workflow_failure_reason"] or "") == "budget_handoff"
+                else ""
             ),
             agent_profile_id=profile_id,
             agent_profile_revision=profile_revision,
@@ -4107,6 +4121,64 @@ def card_deliverables(card: ExecutionReviewCard) -> str:
     return _bounded_deliverables("\n".join(lines).strip())
 
 
+def _handoff_excerpt(
+    artifact_root: Path | None,
+    task_id: int,
+    phase: str,
+    *,
+    limit: int = 600,
+) -> str:
+    """Return a bounded handoff excerpt for a budget-stopped workflow run.
+
+    Returns "" unless:
+    - artifact_root is a directory.
+    - Exactly one non-symlink directory entry matches ^T{task_id}-[a-z0-9-]+$.
+    - <that dir>/handoff-{phase}.md is a regular non-symlink file whose resolved
+      path is inside artifact_root.
+    - It reads (at most 64 KiB, utf-8 with errors="replace") to non-empty text.
+    Collapse all whitespace runs to single spaces; if longer than limit, cut at
+    the last space before limit and append "…". Any OSError -> "".
+    """
+    if artifact_root is None:
+        return ""
+    try:
+        resolved_root = artifact_root.resolve(strict=True)
+        if not resolved_root.is_dir() or resolved_root.is_symlink():
+            return ""
+        pattern = re.compile(rf"^T{task_id}-[a-z0-9-]+$")
+        candidates = [
+            entry
+            for entry in resolved_root.iterdir()
+            if entry.is_dir()
+            and not entry.is_symlink()
+            and pattern.fullmatch(entry.name)
+        ]
+        if len(candidates) != 1:
+            return ""
+        task_dir = candidates[0]
+        note_file = task_dir / f"handoff-{phase}.md"
+        if not note_file.is_file() or note_file.is_symlink():
+            return ""
+        resolved_file = note_file.resolve(strict=True)
+        if not resolved_file.is_relative_to(resolved_root):
+            return ""
+        with open(resolved_file, "rb") as f:
+            raw = f.read(65536)
+        text = raw.decode("utf-8", errors="replace")
+        collapsed = " ".join(text.split()).strip()
+        if not collapsed:
+            return ""
+        if len(collapsed) > limit:
+            cut = collapsed[:limit]
+            last_space = cut.rfind(" ")
+            if last_space != -1:
+                cut = cut[:last_space]
+            return cut + "…"
+        return collapsed
+    except OSError:
+        return ""
+
+
 def _bounded_failure_digest(value: object) -> str:
     """A stored digest, or "" for anything that is not one.
 
@@ -4315,10 +4387,17 @@ def _start_card_lines(
                 "starting another run.",
             ]
         if card.failure_reason == "budget_handoff":
-            return lines + [
+            handoff_lines = [
                 "",
                 "stopped at its turn budget and left a handoff note",
             ]
+            if card.handoff_excerpt:
+                handoff_lines.extend([
+                    "",
+                    f"📝 <b>Handoff note:</b> {_escape(card.handoff_excerpt)}"
+                    if html else f"📝 Handoff note: {card.handoff_excerpt}",
+                ])
+            return lines + handoff_lines
         # The blanket claim that nothing was recorded is now checked rather
         # than asserted: a workflow can park in a phase that did record, and
         # telling the reader otherwise contradicts the line above it.

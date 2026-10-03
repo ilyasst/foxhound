@@ -48,6 +48,8 @@ from foxhound.execution_cards import (
     ExecutionReviewCard,
     _button_rows,
     _card_lines,
+    _handoff_excerpt,
+    _html_card_lines,
     _markdown_inline,
     parse_execution_agent_callback,
     parse_execution_review_callback,
@@ -2229,6 +2231,191 @@ class ExecutionCardTests(unittest.TestCase):
         self.assertIn("👥 Reassign", labels)
         self.assertTrue(any("Snooze" in label or "⏰" in label
                             for label in labels), labels)
+
+    def test_budget_handoff_card_renders_handoff_note_excerpt_and_digest(self):
+        """A run that stopped at budget with a handoff note displays both the
+        budget line, the failure digest, and the excerpt on plain and html cards."""
+        task_id = 1
+        artifact_dir = Path(self.temporary.name) / "artifacts"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        task_folder = artifact_dir / f"T{task_id}-synthetic-task"
+        task_folder.mkdir(parents=True, exist_ok=True)
+        handoff_file = task_folder / "handoff-plan.md"
+        handoff_file.write_text("Established step 1 <synthetic>.\nNext step: run step 2.", encoding="utf-8")
+
+        cards_service = ExecutionCardService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: DELIVERY_TOKEN,
+            artifact_root=artifact_dir,
+        )
+
+        self._schedule_workflow(task_id)
+        started = self.execution.start_action(
+            task_id, expected_version=self.execution.get(task_id).version, action="start"
+        )
+        claim = self.execution.claim_next()
+        self.assertIsNotNone(claim)
+        assert claim is not None
+        parked = self.execution.fail(
+            task_id,
+            expected_version=claim.workflow_version,
+            claim_token=claim.token,
+            reason="budget_handoff",
+        )
+        self.assertEqual(parked.status, WorkflowStatus.PARKED)
+
+        self.execution.record_failure_digest(
+            task_id,
+            workflow_version=parked.version,
+            phase=parked.phase,
+            run_id=None,
+            digest="Ran out of turns while exploring the codebase.",
+        )
+
+        self.assertEqual(cards_service.schedule().created, 1)
+        card = cards_service.claim_next().card
+
+        self.assertEqual(
+            card.handoff_excerpt,
+            "Established step 1 <synthetic>. Next step: run step 2.",
+        )
+
+        plain_lines = _card_lines(card)
+        plain_text = "\n".join(plain_lines)
+        self.assertIn("stopped at its turn budget and left a handoff note", plain_text)
+        self.assertIn("📝 Handoff note: Established step 1 <synthetic>. Next step: run step 2.", plain_text)
+        self.assertIn("🔍 Why it stopped: Ran out of turns while exploring the codebase.", plain_text)
+
+        html_lines = _html_card_lines(card)
+        html_text = "\n".join(html_lines)
+        self.assertIn("stopped at its turn budget and left a handoff note", html_text)
+        self.assertIn(
+            "📝 <b>Handoff note:</b> Established step 1 &lt;synthetic&gt;. Next step: run step 2.",
+            html_text,
+        )
+        self.assertIn("🔍 <b>Why it stopped:</b> Ran out of turns while exploring the codebase.", html_text)
+
+        budget_idx = plain_text.index("stopped at its turn budget and left a handoff note")
+        note_idx = plain_text.index("📝 Handoff note:")
+        digest_idx = plain_text.index("🔍 Why it stopped:")
+        self.assertLess(digest_idx, budget_idx)
+        self.assertLess(budget_idx, note_idx)
+
+    def test_budget_handoff_long_note_is_truncated_at_word_boundary(self):
+        task_id = 1
+        artifact_dir = Path(self.temporary.name) / "artifacts_trunc"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        task_folder = artifact_dir / f"T{task_id}-synthetic-task"
+        task_folder.mkdir(parents=True, exist_ok=True)
+        handoff_file = task_folder / "handoff-plan.md"
+        # 100 words of 10 characters = ~1100 chars
+        long_content = " ".join([f"word{i:05d}" for i in range(120)])
+        handoff_file.write_text(long_content, encoding="utf-8")
+
+        cards_service = ExecutionCardService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: DELIVERY_TOKEN,
+            artifact_root=artifact_dir,
+        )
+
+        self._schedule_workflow(task_id)
+        self.execution.start_action(
+            task_id, expected_version=self.execution.get(task_id).version, action="start"
+        )
+        claim = self.execution.claim_next()
+        self.assertIsNotNone(claim)
+        assert claim is not None
+        self.execution.fail(
+            task_id,
+            expected_version=claim.workflow_version,
+            claim_token=claim.token,
+            reason="budget_handoff",
+        )
+
+        self.assertEqual(cards_service.schedule().created, 1)
+        card = cards_service.claim_next().card
+
+        self.assertTrue(card.handoff_excerpt.endswith("…"))
+        self.assertLessEqual(len(card.handoff_excerpt), 600)
+        self.assertNotIn("word00119", card.handoff_excerpt)
+
+        plain_text = "\n".join(_card_lines(card))
+        self.assertIn(f"📝 Handoff note: {card.handoff_excerpt}", plain_text)
+
+    def test_budget_handoff_with_missing_or_empty_or_ambiguous_folder(self):
+        task_id = 1
+        artifact_dir = Path(self.temporary.name) / "artifacts_missing"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+
+        cards_service = ExecutionCardService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: DELIVERY_TOKEN,
+            artifact_root=artifact_dir,
+        )
+
+        self._schedule_workflow(task_id)
+        self.execution.start_action(
+            task_id, expected_version=self.execution.get(task_id).version, action="start"
+        )
+        claim = self.execution.claim_next()
+        self.assertIsNotNone(claim)
+        assert claim is not None
+        self.execution.fail(
+            task_id,
+            expected_version=claim.workflow_version,
+            claim_token=claim.token,
+            reason="budget_handoff",
+        )
+
+        # Missing folder
+        self.assertEqual(cards_service.schedule().created, 1)
+        claim_card = cards_service.claim_next()
+        card = claim_card.card
+        self.assertEqual(card.handoff_excerpt, "")
+        plain_text = "\n".join(_card_lines(card))
+        self.assertIn("stopped at its turn budget and left a handoff note", plain_text)
+        self.assertNotIn("Handoff note", plain_text)
+
+        # Ambiguous folders
+        (artifact_dir / f"T{task_id}-slug-one").mkdir(parents=True, exist_ok=True)
+        (artifact_dir / f"T{task_id}-slug-two").mkdir(parents=True, exist_ok=True)
+        excerpt = _handoff_excerpt(artifact_dir, task_id, "plan")
+        self.assertEqual(excerpt, "")
+
+        # Empty file
+        (artifact_dir / f"T{task_id}-slug-two").rmdir()
+        empty_note = artifact_dir / f"T{task_id}-slug-one" / "handoff-plan.md"
+        empty_note.write_text("   \n\t  ", encoding="utf-8")
+        excerpt = _handoff_excerpt(artifact_dir, task_id, "plan")
+        self.assertEqual(excerpt, "")
+
+    def test_other_failure_reasons_render_exactly_as_before(self):
+        task_id = 1
+        artifact_dir = Path(self.temporary.name) / "artifacts_other"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        task_folder = artifact_dir / f"T{task_id}-synthetic-task"
+        task_folder.mkdir(parents=True, exist_ok=True)
+        (task_folder / "handoff-plan.md").write_text("Should not appear", encoding="utf-8")
+
+        cards_service = ExecutionCardService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: DELIVERY_TOKEN,
+            artifact_root=artifact_dir,
+        )
+
+        parked = self._park(task_id)
+        self.assertEqual(parked.status, WorkflowStatus.PARKED)
+
+        self.assertEqual(cards_service.schedule().created, 1)
+        card = cards_service.claim_next().card
+        self.assertEqual(card.handoff_excerpt, "")
+        plain_text = "\n".join(_card_lines(card))
+        self.assertNotIn("stopped at its turn budget", plain_text)
+        self.assertNotIn("Handoff note", plain_text)
 
     def test_a_workflow_that_gave_up_says_so_instead_of_going_quiet(self):
         """Parking is the retry limiter, and it used to be terminal and
