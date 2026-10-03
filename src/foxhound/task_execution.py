@@ -16,7 +16,7 @@ import sqlite3
 from collections.abc import Iterable, Mapping
 from contextlib import closing
 from dataclasses import dataclass, field
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
 from typing import Callable, Sequence
@@ -27,6 +27,7 @@ from .card_provenance import (
     origin_payload_subquery,
     stored_origin_sources,
 )
+from .task_deadlines import TaskTiming, band as deadline_band, effective_deadlines
 from .task_owner import (
     confidently_other_owned,
     normalized_aliases,
@@ -89,6 +90,89 @@ _DEADLINE_BAND_SQL = (
     "WHEN t.due<=date(?,'+3 days') THEN 0 "
     "WHEN t.due<=date(?,'+14 days') THEN 1 ELSE 2 END"
 )
+
+
+def _claim_source_tier(origin_kind: str | None) -> int:
+    if origin_kind == "review_request":
+        return 0
+    if origin_kind == "issue":
+        return 2
+    return 1
+
+
+def _claim_queue_priority(queue_priority: str | None) -> int:
+    if queue_priority == "raised":
+        return 0
+    if queue_priority == "normal":
+        return 1
+    return 2
+
+
+def _order_by_effective_deadline(
+    connection: sqlite3.Connection,
+    rows: Sequence[sqlite3.Row],
+    today: date,
+) -> list[sqlite3.Row]:
+    if not rows:
+        return list(rows)
+    try:
+        dep_rows = connection.execute(
+            "SELECT depends_on_task_id, task_id FROM task_scheduling_conditions "
+            "WHERE kind='after_task_completed' AND state='active' "
+            "AND depends_on_task_id IS NOT NULL"
+        ).fetchall()
+        dependencies: list[tuple[int, int]] = []
+        dep_task_ids: set[int] = set()
+        for dep in dep_rows:
+            pred = int(dep["depends_on_task_id"])
+            dep_id = int(dep["task_id"])
+            dependencies.append((pred, dep_id))
+            dep_task_ids.add(pred)
+            dep_task_ids.add(dep_id)
+
+        all_task_ids = dep_task_ids | {int(r["task_id"]) for r in rows}
+        if not all_task_ids:
+            return list(rows)
+
+        placeholders = ",".join("?" for _ in all_task_ids)
+        task_rows = connection.execute(
+            f"SELECT id, due, status FROM tasks WHERE id IN ({placeholders})",
+            tuple(all_task_ids),
+        ).fetchall()
+
+        tasks_map: dict[int, TaskTiming] = {}
+        for tr in task_rows:
+            tid = int(tr["id"])
+            due_raw = tr["due"]
+            due_val: date | None = None
+            if due_raw:
+                try:
+                    due_val = date.fromisoformat(due_raw)
+                except (ValueError, TypeError):
+                    due_val = None
+            is_open = (tr["status"] == "open")
+            tasks_map[tid] = TaskTiming(due=due_val, effort=None, open=is_open)
+
+        # A candidate row whose task row vanished keeps its SQL position.
+        for r in rows:
+            tid = int(r["task_id"])
+            if tid not in tasks_map:
+                tasks_map[tid] = TaskTiming(due=None, effort=None, open=True)
+
+        res = effective_deadlines(tasks_map, dependencies, today)
+        effective_map = res.deadlines
+
+        def sort_key(row: sqlite3.Row) -> tuple[int, int, int]:
+            tier = _claim_source_tier(row["origin_kind"])
+            prio = _claim_queue_priority(row["queue_priority"])
+            eff_date = effective_map.get(int(row["task_id"]))
+            eff_band = deadline_band(eff_date, today)
+            return (tier, prio, eff_band)
+
+        return sorted(rows, key=sort_key)
+    except Exception:
+        return list(rows)
+
 
 DEFAULT_LEASE_SECONDS = 300
 MIN_LEASE_SECONDS = 5
@@ -1307,6 +1391,8 @@ class TaskExecutionService:
                     (now, now, *(phase.value for phase in phases),
                      now, now, MAX_CLAIM_SCAN),
                 ).fetchall()
+                today = stamp.date()
+                rows = _order_by_effective_deadline(connection, rows, today)
                 row = None
                 profile = None
                 deferred: list[int] = []
