@@ -1391,6 +1391,32 @@ class TaskExecutionTests(unittest.TestCase):
 
         self.assertEqual([claim.task_id for claim in claims], [5, 3, 4, 2])
 
+    def test_claim_runs_work_due_soon_before_older_work(self):
+        """Within one source tier and priority, the deadline band decides (#771)."""
+        today = self.clock().date()
+        self._add_task(2, "Synthetic task due tomorrow")
+        self._add_task(3, "Synthetic task due in ten days")
+        self._add_task(4, "Synthetic task due next month")
+        with closing(sqlite3.connect(self.database)) as connection:
+            for task_id, days in ((2, 1), (3, 10), (4, 40)):
+                connection.execute(
+                    "UPDATE tasks SET due=? WHERE id=?",
+                    ((today + timedelta(days=days)).isoformat(), task_id))
+            connection.commit()
+        # Task 1 (no due date) is the oldest and would otherwise go first.
+        self._schedule_and_start()
+        for task_id in (4, 3, 2):
+            workflow = self.service.schedule(task_id, expected_task_version=1)
+            self.service.start_action(
+                task_id, expected_version=workflow.version, action="start")
+        service = TaskExecutionService(
+            self.database, clock=self.clock, token_factory=lambda: TOKEN,
+            execution_slot_cap=4,
+            profile_registry=self.service._profile_registry,
+        )
+        claims = [service.claim_next() for _ in range(4)]
+        self.assertEqual([claim.task_id for claim in claims], [2, 3, 1, 4])
+
     def test_new_work_and_reader_waiting_have_separate_gw_caps(self):
         with closing(sqlite3.connect(self.database)) as connection:
             for task_id in range(2, 36):

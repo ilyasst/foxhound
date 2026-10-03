@@ -80,6 +80,16 @@ _SOURCE_QUEUE_ORDER_SQL = (
     "WHEN 'issue' THEN 2 ELSE 1 END,"
 )
 
+#: The queue's deadline bands (#771): 0 overdue or due within 3 days, 1 due
+#: within 14 days, 2 later or no due date. `due` is an ISO date, so text
+#: comparison against SQLite's date() is chronological. Takes `now` twice.
+#: Mirrors `task_deadlines.band`, which a dependency-aware ordering will use.
+_DEADLINE_BAND_SQL = (
+    "CASE WHEN t.due IS NULL THEN 2 "
+    "WHEN t.due<=date(?,'+3 days') THEN 0 "
+    "WHEN t.due<=date(?,'+14 days') THEN 1 ELSE 2 END"
+)
+
 DEFAULT_LEASE_SECONDS = 300
 MIN_LEASE_SECONDS = 5
 MAX_LEASE_SECONDS = 3_600
@@ -1286,13 +1296,16 @@ class TaskExecutionService:
                     ") "
                     f"AND w.phase IN ({placeholders}) "
                     "AND t.status='open' AND t.version=w.task_version "
+                    # Source tier, then the reader's raise, then how soon
+                    # the task is due (#771), then the retry tie-breakers.
                     f"ORDER BY {_SOURCE_QUEUE_ORDER_SQL}"
                     "CASE w.queue_priority "
                     "WHEN 'raised' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END,"
+                    f"{_DEADLINE_BAND_SQL},"
                     "CASE WHEN w.failure_count=0 THEN 0 ELSE 1 END,"
                     "w.updated_at,w.task_id LIMIT ?",
                     (now, now, *(phase.value for phase in phases),
-                     MAX_CLAIM_SCAN),
+                     now, now, MAX_CLAIM_SCAN),
                 ).fetchall()
                 row = None
                 profile = None
