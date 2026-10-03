@@ -129,9 +129,9 @@ class AgentProfile:
         # template-only instruction from #503. Skip if the template already has it.
         if "handoff-<phase>.md" not in self.prompt_template:
             handoff_section = (
-                "Hand your work forward. In `workspace.task_folder` (from `context`) "
-                "keep an owner-only `handoff-<phase>.md` for the current phase (for example "
-                "`handoff-plan.md`). Write it once you are about a third of the way through "
+                "Hand your work forward. Keep an owner-only note at exactly the path "
+                "`context` gives as `workspace.handoff_file` (the task folder, not your run folder). "
+                "Write it once you are about a third of the way through "
                 "your turn budget and update it after each significant step. State what you "
                 "established (with absolute paths), what you changed and where, what remains, "
                 "and the next concrete step. It is an unreviewed note to the next attempt if "

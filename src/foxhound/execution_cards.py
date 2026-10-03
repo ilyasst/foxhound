@@ -63,7 +63,7 @@ from .task_ledger import (
     TransitionDisposition,
     _apply_task_transition,
 )
-from .task_archive import MAX_ARTIFACT_BYTES, review_links
+from .task_archive import MAX_ARTIFACT_BYTES, locate_handoff, review_links
 from .task_owner import canonical_owner_display, normalized_owner
 
 
@@ -4156,8 +4156,8 @@ def _handoff_excerpt(
         if len(candidates) != 1:
             return ""
         task_dir = candidates[0]
-        note_file = task_dir / f"handoff-{phase}.md"
-        if not note_file.is_file() or note_file.is_symlink():
+        note_file = locate_handoff(task_dir, phase)
+        if note_file is None or not note_file.is_file() or note_file.is_symlink():
             return ""
         resolved_file = note_file.resolve(strict=True)
         if not resolved_file.is_relative_to(resolved_root):

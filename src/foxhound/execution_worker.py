@@ -66,6 +66,7 @@ from .task_archive import (
     TaskArchiveError,
     TaskArchivePaths,
     append_result,
+    locate_handoff,
     preserve_run_files,
     recorded_artifacts,
 )
@@ -219,8 +220,8 @@ def _read_research(
 def _read_handoff(task_work_directory: str | None, phase: str) -> str | None:
     if not task_work_directory:
         return None
-    path = Path(task_work_directory) / f"handoff-{phase}.md"
-    if not path.is_file():
+    path = locate_handoff(Path(task_work_directory), phase)
+    if path is None or not path.is_file():
         return None
     try:
         raw = path.read_bytes()
@@ -521,6 +522,11 @@ class ExecutionWorker:
             "workspace": {
                 "task_folder": state.task_work_directory,
                 "run_folder": state.task_run_directory,
+                "handoff_file": (
+                    str(Path(state.task_work_directory) / f"handoff-{state.phase.value}.md")
+                    if state.task_work_directory
+                    else None
+                ),
             },
             "workflow": {
                 "version": state.workflow_version,
@@ -1295,21 +1301,19 @@ class ExecutionWorker:
         if handoff:
             phase_value = state.phase.value if hasattr(state.phase, "value") else str(state.phase)
             note_filename = f"handoff-{phase_value}.md"
+            not_found_msg = (
+                f"{note_filename} was not found in the task folder; write what you established, "
+                f"what changed, what remains and the next step at workspace.handoff_file, then call `release --handoff` again"
+            )
             if not state.task_work_directory:
-                raise ExecutionWorkerDraftError(
-                    f"{note_filename} was not found in the task folder; write what you established, what changed, what remains and the next step there, then call `release --handoff` again"
-                )
-            note_path = Path(state.task_work_directory) / note_filename
-            if not note_path.is_file():
-                raise ExecutionWorkerDraftError(
-                    f"{note_filename} was not found in the task folder; write what you established, what changed, what remains and the next step there, then call `release --handoff` again"
-                )
+                raise ExecutionWorkerDraftError(not_found_msg)
+            note_path = locate_handoff(Path(state.task_work_directory), phase_value)
+            if note_path is None or not note_path.is_file():
+                raise ExecutionWorkerDraftError(not_found_msg)
             try:
                 raw = note_path.read_bytes()
             except OSError:
-                raise ExecutionWorkerDraftError(
-                    f"{note_filename} was not found in the task folder; write what you established, what changed, what remains and the next step there, then call `release --handoff` again"
-                )
+                raise ExecutionWorkerDraftError(not_found_msg)
             if not raw.strip():
                 raise ExecutionWorkerDraftError(
                     f"{note_filename} in the task folder is empty; write what you established, what changed, what remains and the next step there, then call `release --handoff` again"
@@ -1325,9 +1329,7 @@ class ExecutionWorker:
                         f"{note_filename} was written before this run started; update it for this run first"
                     )
             except OSError:
-                raise ExecutionWorkerDraftError(
-                    f"{note_filename} was not found in the task folder; write what you established, what changed, what remains and the next step there, then call `release --handoff` again"
-                )
+                raise ExecutionWorkerDraftError(not_found_msg)
             result = service.fail(
                 state.task_id,
                 expected_version=state.workflow_version,
