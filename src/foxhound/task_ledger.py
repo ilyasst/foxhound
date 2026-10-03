@@ -1916,6 +1916,12 @@ class TaskLedger:
         ).fetchone()
         if workflow is not None and workflow["status"] == "running":
             return None
+        # How the item ended (#912): an issue closed as not planned or a pull
+        # request closed unmerged drops the task; anything else, or no reason
+        # (older gw, backfill), marks it done.
+        lifecycle = getattr(candidate, "lifecycle", None)
+        reason = getattr(lifecycle, "reason", None)
+        action = "drop" if reason in {"issue_not_planned", "pr_closed"} else "done"
         if workflow is not None and workflow["status"] not in (
             "completed", "cancelled",
         ):
@@ -1929,7 +1935,7 @@ class TaskLedger:
                     "workflow_version": int(workflow["version"]),
                     "phase": workflow["phase"],
                 },
-                action="done",
+                action=action,
                 now=now,
             )
             if not result.accepted:
@@ -1939,7 +1945,7 @@ class TaskLedger:
                 connection,
                 task_id=task_id,
                 expected_version=int(task["version"]),
-                action="done",
+                action=action,
                 now=now,
             )
             if not transition.accepted:

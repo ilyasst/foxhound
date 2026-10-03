@@ -57,6 +57,9 @@ _WORKING_GROUP_SCHEMA_VERSIONS = frozenset({
     WORKING_GROUP_SCHEMA_VERSION,
 })
 LIFECYCLE_STATES = frozenset({"active", "withdrawn"})
+LIFECYCLE_REASONS = frozenset({
+    "issue_completed", "issue_not_planned", "pr_merged", "pr_closed"
+})
 SOURCE_SYSTEMS = frozenset({"gw"})
 #: ``issue`` is a forge issue nominated for work. Its ``record_id`` is the
 #: repository's canonical locator and its ``item_id`` the issue number, so the
@@ -182,6 +185,7 @@ class CandidateLifecycle:
     state: str
     generation: int
     changed_at: str | None
+    reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -330,6 +334,8 @@ def task_candidate_document(candidate: TaskCandidate) -> dict[str, Any]:
             "generation": candidate.lifecycle.generation,
             "changed_at": candidate.lifecycle.changed_at,
         }
+        if candidate.lifecycle.reason is not None:
+            document["lifecycle"]["reason"] = candidate.lifecycle.reason
     return document
 
 
@@ -653,10 +659,11 @@ def parse_task_candidate(document: object) -> TaskCandidate:
         WORKING_GROUP_SCHEMA_VERSION,
     }:
         lifecycle_doc = _object(root["lifecycle"], "candidate.lifecycle")
-        _exact_fields(
+        _required_and_allowed_fields(
             lifecycle_doc,
             "candidate.lifecycle",
             {"state", "generation", "changed_at"},
+            {"state", "generation", "changed_at", "reason"},
         )
         state = _choice(
             lifecycle_doc["state"],
@@ -675,7 +682,12 @@ def parse_task_candidate(document: object) -> TaskCandidate:
         changed_at = _aware_timestamp(
             lifecycle_doc["changed_at"], "candidate.lifecycle.changed_at"
         )
-        lifecycle = CandidateLifecycle(state, generation, changed_at)
+        reason = None
+        if "reason" in lifecycle_doc:
+            raw_reason = lifecycle_doc["reason"]
+            if raw_reason in LIFECYCLE_REASONS:
+                reason = raw_reason
+        lifecycle = CandidateLifecycle(state, generation, changed_at, reason)
     return TaskCandidate(
         candidate_id=candidate_id,
         source=source,
