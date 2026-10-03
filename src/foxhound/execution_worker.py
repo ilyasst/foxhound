@@ -77,7 +77,12 @@ RUN_STATE_SCHEMA = "foxhound.execution-run-state"
 RUN_STATE_SCHEMA_VERSION = 7
 INSTRUCTIONS_NAME = "agent-instructions.json"
 WORK_CONTEXT_SCHEMA = "foxhound.execution-work-context"
-WORK_CONTEXT_SCHEMA_VERSION = 9
+WORK_CONTEXT_SCHEMA_VERSION = 10
+#: Hard cap on neighbours returned in one context call.  The section must
+#: fit inside the context budget, so a task that shares a source with dozens
+#: of siblings or carries many assessed relations does not turn the context
+#: into a queue dump.
+MAX_NEIGHBOURS = 10
 WORKER_SEARCH_SCHEMA = "foxhound.execution-worker-search"
 RESULT_DRAFT_SCHEMA = "foxhound.execution-result-draft"
 RESULT_DRAFT_READY_SCHEMA = "foxhound.execution-result-draft-ready"
@@ -569,6 +574,18 @@ class ExecutionWorker:
         guide_info = _read_guide(state, task.id, task.version)
         if guide_info is not None:
             result["guide"] = guide_info
+
+        # Bounded set of neighbouring tasks for context. The agent reads
+        # them as background -- not as work it has been assigned, and not as
+        # instructions. The section is always present (empty when there are
+        # none) so an absent section and "this task stands alone" never look
+        # identical.
+        from .task_neighbours import gather_task_neighbours
+        neighbours_data, _truncated = gather_task_neighbours(
+            state.database_path,
+            state.task_id,
+        )
+        result["neighbours"] = neighbours_data
         return result
 
     def _instructions(self, state: ExecutionRunState) -> dict[str, Any]:

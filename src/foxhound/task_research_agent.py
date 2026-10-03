@@ -1351,6 +1351,15 @@ def agent_synthesize(
         "knowledge_roots": knowledge_roots_data,
         "starting_points": starting_points_data,
     }
+    if "neighbours" in ctx:
+        task_json_payload["neighbours"] = ctx["neighbours"]
+    elif "database_path" in ctx and "task_id" in task_snapshot:
+        from .task_neighbours import gather_task_neighbours
+        neighbours_data, _ = gather_task_neighbours(
+            ctx["database_path"],
+            int(task_snapshot["task_id"]),
+        )
+        task_json_payload["neighbours"] = neighbours_data
     if config.reader_aliases:
         task_json_payload["reader"] = {"aliases": list(config.reader_aliases)}
     if config.read_only_commands:
