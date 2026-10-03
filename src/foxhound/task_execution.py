@@ -2201,7 +2201,13 @@ class TaskExecutionService:
         return None if row is None else _workflow(row)
 
     def board(self, *, limit: int = 100) -> WorkflowBoard:
-        """Return current workflow state without claiming or mutating it."""
+        """Return current workflow state without claiming or mutating it.
+
+        ``limit`` bounds the active rows. Workflows completed within
+        :data:`RECENT_COMPLETED_WINDOW` follow them, newest first, under their
+        own bound of :data:`RECENT_COMPLETED_MAX`; the ``completed`` total
+        counts the same window, so rows and totals describe one set.
+        """
         if (isinstance(limit, bool) or not isinstance(limit, int)
                 or not 1 <= limit <= 100):
             raise TaskLedgerError("workflow board limit is invalid")
@@ -2222,9 +2228,33 @@ class TaskExecutionService:
                 "WHEN 'parked' THEN 4 ELSE 5 END,w.updated_at,w.task_id LIMIT ?",
                 (limit,),
             ).fetchall()
+            # Recently completed work, read separately so it never takes a row
+            # from active work: a reader reopens yesterday's result to re-read
+            # it, and an active board at its limit would otherwise show none.
+            # Cancelled work is not included -- it is mostly bulk cleanup and
+            # would bury what finished.
+            cutoff = (self._clock_value() - RECENT_COMPLETED_WINDOW).isoformat(
+                timespec="seconds")
+            completed_total = int(connection.execute(
+                "SELECT COUNT(*) FROM task_execution_workflows "
+                "WHERE status='completed' AND COALESCE(completed_at,updated_at)>=?",
+                (cutoff,),
+            ).fetchone()[0])
+            rows = list(rows) + connection.execute(
+                "SELECT w.task_id,w.version,w.status,w.phase,"
+                "COALESCE(w.completed_at,w.updated_at) AS updated_at,"
+                "w.agent_profile_id,t.text,COALESCE(t.owner,'') AS owner "
+                "FROM task_execution_workflows AS w JOIN tasks AS t ON t.id=w.task_id "
+                "WHERE w.status='completed' "
+                "AND COALESCE(w.completed_at,w.updated_at)>=? "
+                "ORDER BY COALESCE(w.completed_at,w.updated_at) DESC,w.task_id DESC "
+                "LIMIT ?",
+                (cutoff, RECENT_COMPLETED_MAX),
+            ).fetchall()
         totals = {status: 0 for status in WORKFLOW_BOARD_STATUSES}
         for row in grouped:
             totals[_workflow_board_status(WorkflowStatus(row["status"]), WorkflowPhase(row["phase"]))] += int(row["total"])
+        totals["completed"] = completed_total
         entries = tuple(WorkflowBoardEntry(
             task_id=int(row["task_id"]), workflow_version=int(row["version"]),
             board_status=_workflow_board_status(WorkflowStatus(row["status"]), WorkflowPhase(row["phase"])),
@@ -3682,6 +3712,7 @@ def _workflow_board_status(status: WorkflowStatus, phase: WorkflowPhase) -> str:
         WorkflowStatus.RUNNING: "running",
         WorkflowStatus.SNOOZED: "snoozed",
         WorkflowStatus.PARKED: "parked",
+        WorkflowStatus.COMPLETED: "completed",
     }[status]
 
 
@@ -3698,6 +3729,12 @@ WORK_BODY_PROJECTION_MAX = 16_000
 #: sized against these.
 BOARD_TEXT_MAX = 300
 BOARD_SUMMARY_MAX = 200
+
+#: How far back the workflow board reaches for completed work, and how many
+#: completed rows it adds after the active ones. The rows are bounded like any
+#: other board row, so the reply stays inside `max_response_bytes`.
+RECENT_COMPLETED_WINDOW = timedelta(days=7)
+RECENT_COMPLETED_MAX = 30
 BOARD_OWNER_MAX = 120
 
 

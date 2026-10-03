@@ -862,6 +862,9 @@ the same credential may read `POST /v1/execution-workflows/board` and one
 version-fenced `POST /v1/execution-workflows/detail`. These bounded,
 non-mutating routes project current workflow columns and allowlisted result
 detail; they do not expose raw transcripts, paths, or another consumer's card.
+The board's `limit` bounds its active rows; workflows completed in the last
+seven days follow them, newest first, up to thirty rows, and the `completed`
+column total counts that same window. Cancelled workflows are not listed.
 
 The same execution `queue_view` credential may also request bounded priority
 for one exact ready workflow at `POST /v1/execution-workflows/priority` with

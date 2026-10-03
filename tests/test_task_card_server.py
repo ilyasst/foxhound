@@ -102,6 +102,7 @@ from foxhound.task_execution import (
     BOARD_OWNER_MAX,
     BOARD_SUMMARY_MAX,
     BOARD_TEXT_MAX,
+    RECENT_COMPLETED_MAX,
     WORKFLOW_BOARD_STATUSES,
     WORK_BODY_PROJECTION_MAX,
     WorkflowBoard,
@@ -780,6 +781,89 @@ class TaskCardServerTests(unittest.TestCase):
                 "workflow_board", request_document(limit=10),
                 authorization=f"Bearer {TOKEN}",
             )
+
+    def test_workflow_board_lists_recently_completed_work_after_active_work(self):
+        queue = "q" * 43
+        for task_id in (1, 2, 3, 4):
+            self.execution.schedule(task_id, expected_task_version=1)
+        app = TaskCardApplication(
+            self.cards, {DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: queue},
+            execution_cards=self.execution_cards, execution_workflows=self.execution,
+            execution_tokens={DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: queue},
+        )
+        recent = (NOW - timedelta(days=1)).isoformat(timespec="seconds")
+        newest = (NOW - timedelta(hours=2)).isoformat(timespec="seconds")
+        stale = (NOW - timedelta(days=8)).isoformat(timespec="seconds")
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            for task_id, status, finished in (
+                (2, "completed", recent), (3, "completed", stale), (4, "cancelled", newest),
+            ):
+                connection.execute(
+                    "UPDATE task_execution_workflows SET status=?,completed_at=?,"
+                    "updated_at=? WHERE task_id=?",
+                    (status, finished, finished, task_id),
+                )
+                connection.execute(
+                    "UPDATE tasks SET status='done' WHERE id=?", (task_id,))
+        board = app.dispatch(
+            "workflow_board", request_document(limit=10),
+            authorization=f"Bearer {queue}",
+        )
+        rows = {row["task_id"]: row for row in board["workflows"]}
+        totals = {column["status"]: column["total"] for column in board["columns"]}
+        # Completed inside the window: listed, counted, dated by completion.
+        self.assertEqual(rows[2]["board_status"], "completed")
+        self.assertEqual(rows[2]["state_since"], recent)
+        self.assertEqual(totals["completed"], 1)
+        # Completed before the window, and cancelled work: neither.
+        self.assertNotIn(3, rows)
+        self.assertNotIn(4, rows)
+        self.assertEqual(totals["cancelled"], 0)
+        # Active work comes first and keeps its full limit.
+        self.assertEqual([row["task_id"] for row in board["workflows"]], [1, 2])
+        narrow = app.dispatch(
+            "workflow_board", request_document(limit=1),
+            authorization=f"Bearer {queue}",
+        )
+        self.assertEqual(
+            [(row["task_id"], row["board_status"]) for row in narrow["workflows"]],
+            [(1, "ready_to_start"), (2, "completed")],
+        )
+
+    def test_workflow_board_bounds_its_completed_rows(self):
+        queue = "q" * 43
+        app = TaskCardApplication(
+            self.cards, {DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: queue},
+            execution_cards=self.execution_cards, execution_workflows=self.execution,
+            execution_tokens={DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: queue},
+        )
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            for index in range(RECENT_COMPLETED_MAX + 5):
+                connection.execute(
+                    "INSERT INTO tasks(status,text,owner,due,version,created_at,"
+                    "updated_at,closed_at) VALUES('open',?,NULL,NULL,1,?,?,NULL)",
+                    (f"Finished synthetic task {index}", NOW.isoformat(), NOW.isoformat()),
+                )
+        task_ids = range(5, 5 + RECENT_COMPLETED_MAX + 5)
+        for task_id in task_ids:
+            self.execution.schedule(task_id, expected_task_version=1)
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            for offset, task_id in enumerate(task_ids):
+                finished = (NOW - timedelta(minutes=offset)).isoformat(timespec="seconds")
+                connection.execute(
+                    "UPDATE task_execution_workflows SET status='completed',"
+                    "completed_at=?,updated_at=? WHERE task_id=?",
+                    (finished, finished, task_id),
+                )
+        board = app.dispatch(
+            "workflow_board", request_document(limit=100),
+            authorization=f"Bearer {queue}",
+        )
+        completed = [row for row in board["workflows"] if row["board_status"] == "completed"]
+        self.assertEqual(len(completed), RECENT_COMPLETED_MAX)
+        # Newest first, and the total still counts everything in the window.
+        self.assertEqual(completed[0]["task_id"], 5)
+        self.assertEqual(board["columns"][8], {"status": "completed", "total": RECENT_COMPLETED_MAX + 5})
 
     def test_execution_queue_resolve_is_strict_and_queue_view_only(self):
         card = self._queue_card()
