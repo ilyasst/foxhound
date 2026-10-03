@@ -708,6 +708,46 @@ def _convert_research_json(
         if claim["source_refs"]:
             guide_claim = claim
 
+    # deadline <- deadline
+    deadline_claim = None
+    raw_deadline = raw.get("deadline")
+    if isinstance(raw_deadline, Mapping):
+        date_str = str(raw_deadline.get("date", "")).strip()
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", date_str):
+            try:
+                datetime.fromisoformat(date_str)
+                valid_date = True
+            except ValueError:
+                valid_date = False
+            if valid_date:
+                dl_reason = str(raw_deadline.get("reason", "")).strip()
+                dl_ev = raw_deadline.get("evidence", [])
+                claim = _make_claim(
+                    dl_reason, "supported", dl_ev, sources_by_locator, sources_list, knowledge_roots, read_only_commands,
+                    run_dir=run_dir, basename_cache=basename_cache,
+                    degrade=degrade, stats=stats,
+                )
+                if claim["source_refs"]:
+                    claim["date"] = date_str
+                    deadline_claim = claim
+
+    # effort <- effort
+    effort_claim = None
+    raw_effort = raw.get("effort")
+    if isinstance(raw_effort, Mapping):
+        size_str = str(raw_effort.get("size", "")).strip()
+        if size_str in {"hour", "day", "week"}:
+            eff_reason = str(raw_effort.get("reason", "")).strip()
+            eff_ev = raw_effort.get("evidence", [])
+            claim = _make_claim(
+                eff_reason, "supported", eff_ev, sources_by_locator, sources_list, knowledge_roots, read_only_commands,
+                run_dir=run_dir, basename_cache=basename_cache,
+                degrade=degrade, stats=stats,
+            )
+            if claim["source_refs"]:
+                claim["size"] = size_str
+                effort_claim = claim
+
     # recommendation <- recommendation
     recommendation_claims = []
     raw_rec = raw.get("recommendation")
@@ -1007,6 +1047,10 @@ def _convert_research_json(
     }
     if guide_claim is not None:
         draft["guide"] = guide_claim
+    if deadline_claim is not None:
+        draft["deadline"] = deadline_claim
+    if effort_claim is not None:
+        draft["effort"] = effort_claim
     if recommendation_claims:
         draft["recommendation"] = recommendation_claims
     return draft, sources_list
@@ -1154,6 +1198,16 @@ def check_research_output(
             check_evidence([guide_obj["path"]], "guide.path")
         if "evidence" in guide_obj and guide_obj["evidence"] is not None:
             check_evidence(guide_obj.get("evidence"), "guide.evidence")
+
+    if isinstance(raw_research.get("deadline"), Mapping):
+        dl_obj = raw_research["deadline"]
+        if "evidence" in dl_obj and dl_obj["evidence"] is not None:
+            check_evidence(dl_obj.get("evidence"), "deadline.evidence")
+
+    if isinstance(raw_research.get("effort"), Mapping):
+        eff_obj = raw_research["effort"]
+        if "evidence" in eff_obj and eff_obj["evidence"] is not None:
+            check_evidence(eff_obj.get("evidence"), "effort.evidence")
 
     if isinstance(raw_research.get("recommendation"), Mapping):
         check_evidence(raw_research["recommendation"].get("evidence"), "recommendation.evidence")

@@ -1275,6 +1275,58 @@ def test_convert_research_json_features(tmp_path: Path) -> None:
     }
     draft_unmap, sources_unmap = _convert_research_json(raw_unmappable_guide, k_roots)
     assert "guide" not in draft_unmap
+
+    # deadline and effort conversions
+    raw_timing = dict(raw3)
+    raw_timing["deadline"] = {
+        "date": "2026-12-01",
+        "reason": "Due date moved by instructor",
+        "evidence": ["kb:note.md"],
+    }
+    raw_timing["effort"] = {
+        "size": "day",
+        "reason": "One day needed for review",
+        "evidence": ["kb:note.md"],
+    }
+    draft_timing, sources_timing = _convert_research_json(raw_timing, k_roots)
+    assert "deadline" in draft_timing
+    assert draft_timing["deadline"]["date"] == "2026-12-01"
+    assert draft_timing["deadline"]["text"] == "Due date moved by instructor"
+    assert "effort" in draft_timing
+    assert draft_timing["effort"]["size"] == "day"
+    assert draft_timing["effort"]["text"] == "One day needed for review"
+    validate_draft(draft_timing, sources_timing)
+
+    # invalid date / size or unmappable evidence are dropped
+    raw_invalid_timing = dict(raw3)
+    raw_invalid_timing["deadline"] = {
+        "date": "not-a-date",
+        "reason": "Invalid date",
+        "evidence": ["kb:note.md"],
+    }
+    raw_invalid_timing["effort"] = {
+        "size": "month",
+        "reason": "Invalid size",
+        "evidence": ["kb:note.md"],
+    }
+    draft_inv, _ = _convert_research_json(raw_invalid_timing, k_roots)
+    assert "deadline" not in draft_inv
+    assert "effort" not in draft_inv
+
+    raw_uncited_timing = dict(raw3)
+    raw_uncited_timing["deadline"] = {
+        "date": "2026-12-01",
+        "reason": "Uncited date",
+        "evidence": ["kb:nonexistent.md"],
+    }
+    raw_uncited_timing["effort"] = {
+        "size": "day",
+        "reason": "Uncited size",
+        "evidence": ["kb:nonexistent.md"],
+    }
+    draft_uncited, _ = _convert_research_json(raw_uncited_timing, k_roots)
+    assert "deadline" not in draft_uncited
+    assert "effort" not in draft_uncited
     published_doc3 = {
         "schema_version": 1,
         "task_identity": {"task_id": 123, "task_version": 1},

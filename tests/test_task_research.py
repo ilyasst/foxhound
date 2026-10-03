@@ -753,6 +753,70 @@ class TaskResearchTests(unittest.TestCase):
         find_idx = rendered.index("## Findings")
         self.assertTrue(req_idx < guide_idx < find_idx)
 
+    def test_validate_draft_and_render_markdown_with_timing(self):
+        from foxhound.task_research import consumer_projection, render_markdown, validate_draft
+        srcs = sources()
+        doc = {
+            "schema_version": DRAFT_SCHEMA,
+            "research_status": "sufficient",
+            "objective": {"text": "Synthetic objective", "status": "supported", "source_refs": ["src-001"]},
+            "requested_action": {"text": "Synthetic action", "status": "supported", "source_refs": ["src-001"]},
+            "current_state": [],
+            "expected_deliverables": [],
+            "timeline": [],
+            "decisions": [],
+            "dependencies": [],
+            "constraints": [],
+            "stakeholders": [],
+            "related_entities": [],
+            "findings": [{"text": "Synthetic finding", "status": "supported", "source_refs": ["src-001"]}],
+            "conflicts": [],
+            "open_questions": [],
+            "scheduling_recommendations": [],
+            "deadline": {
+                "text": "Target completion date changed to 2026-11-15",
+                "status": "supported",
+                "source_refs": ["src-001"],
+                "date": "2026-11-15",
+            },
+            "effort": {
+                "text": "Estimated implementation effort is one day",
+                "status": "supported",
+                "source_refs": ["src-001"],
+                "size": "day",
+            },
+        }
+        validated = validate_draft(doc, srcs)
+        self.assertIn("deadline", validated)
+        self.assertIn("effort", validated)
+        dl_val = validated["deadline"]
+        assert isinstance(dl_val, dict)
+        self.assertEqual(dl_val["date"], "2026-11-15")
+        eff_val = validated["effort"]
+        assert isinstance(eff_val, dict)
+        self.assertEqual(eff_val["size"], "day")
+
+        published = {
+            "task_identity": {"task_id": 42, "task_version": 1},
+            "research_status": "sufficient",
+            "report": validated,
+            "scheduling_recommendations": [],
+            "sources": srcs,
+        }
+        rendered = render_markdown(published)
+        self.assertIn("## Timing", rendered)
+        self.assertIn("- Deadline: 2026-11-15 — Target completion date changed to 2026-11-15 (supported) [src-001]", rendered)
+        self.assertIn("- Effort: day — Estimated implementation effort is one day (supported) [src-001]", rendered)
+
+        req_idx = rendered.index("## Requested action")
+        timing_idx = rendered.index("## Timing")
+        find_idx = rendered.index("## Findings")
+        self.assertTrue(req_idx < timing_idx < find_idx)
+
+        proj = consumer_projection(published)
+        self.assertIn("deadline", proj)
+        self.assertIn("effort", proj)
+
     def test_render_markdown_omits_open_questions(self):
         from foxhound.task_research import render_markdown
         doc = {
