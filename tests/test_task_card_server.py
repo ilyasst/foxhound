@@ -3816,3 +3816,48 @@ class SourceRoutingClaimTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class QueueReplyBoundTests(unittest.TestCase):
+    """#708: a queue reply is one the service can emit, whatever the cards."""
+
+    @staticmethod
+    def _card(index: int, *, fill: str = "é"):
+        from types import SimpleNamespace as NS
+        record = NS(text=fill * 3000, requires="x" * 200, channel="x" * 200,
+                    label="x" * 200, recipient="x" * 200, subject="x" * 500)
+        return NS(
+            id=index, version=1,
+            kind=NS(value="plan_review"), phase=NS(value="plan"),
+            task_text=fill * 2000, owner="o" * 200, summary=fill * 3000,
+            work_digest=fill * 3000, questions=tuple(fill * 1000 for _ in range(32)),
+            external_actions=tuple(record for _ in range(32)),
+            deliverables=tuple(record for _ in range(32)),
+        )
+
+    def test_full_page_of_worst_case_cards_fits_the_reply_limit(self):
+        from foxhound.task_card_server import (
+            QUEUE_ENVELOPE_RESERVE, TaskCardServerLimits, _bounded_queue_rows,
+        )
+        limit = TaskCardServerLimits().max_response_bytes
+        rows = _bounded_queue_rows(
+            [self._card(i) for i in range(1000)], limit - QUEUE_ENVELOPE_RESERVE)
+        document = {"schema": "x" * 64, "schema_version": 1, "ok": True, "cards": rows}
+        body = json.dumps(document, ensure_ascii=False, separators=(",", ":")).encode()
+        self.assertLessEqual(len(body), limit)
+        # The first card is shortened, not dropped: the queue is never hidden.
+        self.assertGreaterEqual(len(rows), 1)
+        self.assertEqual(rows[0]["id"], 0)
+
+    def test_realistic_cards_are_all_returned(self):
+        from types import SimpleNamespace as NS
+        from foxhound.task_card_server import (
+            QUEUE_ENVELOPE_RESERVE, TaskCardServerLimits, _bounded_queue_rows,
+        )
+        card = NS(id=1, version=1, kind=NS(value="plan_review"), phase=NS(value="plan"),
+                  task_text="t" * 300, owner="o", summary="s" * 800, work_digest="w" * 400,
+                  questions=("q",), external_actions=(), deliverables=())
+        cards = [NS(**{**vars(card), "id": i}) for i in range(40)]
+        rows = _bounded_queue_rows(
+            cards, TaskCardServerLimits().max_response_bytes - QUEUE_ENVELOPE_RESERVE)
+        self.assertEqual([row["id"] for row in rows], list(range(40)))
