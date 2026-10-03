@@ -8,8 +8,9 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
+import sqlite3
 import sys
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 from .task_cards import TaskCardService
 from .task_bootstrap import TaskBootstrapConfigError, _private_database
@@ -22,7 +23,7 @@ HEALTH_SCHEMA = "foxhound.delivery-health"
 # their measured context did not fit; 4 adds `admission`. Consumers must not
 # infer any of them from a missing aggregate field. 6 adds `admission.preserved_open`.
 # 7 adds `execution_cards.review_backpressure` and `delivery.recent_surface_full_releases`.
-HEALTH_SCHEMA_VERSION = 7
+HEALTH_SCHEMA_VERSION = 8
 MAX_THRESHOLD_SECONDS = 7 * 24 * 60 * 60
 MAX_RECENT_FAILURES = 10_000
 
@@ -69,6 +70,12 @@ class ExecutionDeliveryCardHealth(DeliveryCardHealth):
 
 
 @dataclass(frozen=True)
+class OrphanedTasksHealth:
+    count: int
+    oldest_age_seconds: int | None
+
+
+@dataclass(frozen=True)
 class AdmissionHealth:
     """Open tasks the scheduler has not given a workflow row yet.
 
@@ -95,6 +102,7 @@ class DeliveryHealthPolicy:
     #: Generous against the scheduler's own five-minute cadence, so an
     #: ordinary wait between intake and the next pass never alerts.
     max_unadmitted_age_seconds: int = 1800
+    max_orphaned_task_age_seconds: int = 7200
 
     def validate(self) -> None:
         for value in (
@@ -102,6 +110,7 @@ class DeliveryHealthPolicy:
             self.failure_window_seconds,
             self.max_last_delivery_age_seconds,
             self.max_unadmitted_age_seconds,
+            self.max_orphaned_task_age_seconds,
         ):
             if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= MAX_THRESHOLD_SECONDS:
                 raise ValueError("delivery health time threshold is invalid")
@@ -125,6 +134,7 @@ class DeliveryHealth:
     workflows: ExecutionReadiness
     superseded_profiles: SupersededProfileHealth
     admission: AdmissionHealth
+    orphaned_tasks: OrphanedTasksHealth
     alerts: tuple[str, ...]
 
     @property
@@ -150,6 +160,7 @@ class DeliveryHealth:
             "workflows": asdict(self.workflows),
             "superseded_profiles": asdict(self.superseded_profiles),
             "admission": asdict(self.admission),
+            "orphaned_tasks": asdict(self.orphaned_tasks),
         }
 
 
@@ -191,6 +202,7 @@ def collect_delivery_health(
                 connection, now, policy
             )
             admission = _admission_health(connection, now)
+            orphaned_tasks = _orphaned_tasks_health(connection, now)
         execution = TaskExecutionService(database, clock=lambda: now)
         workflows = execution.readiness()
         superseded = execution.superseded_profile_revisions()
@@ -233,6 +245,12 @@ def collect_delivery_health(
         > policy.max_unadmitted_age_seconds
     ):
         alerts.append("admission_stalled")
+    if (
+        orphaned_tasks.count > 0
+        and orphaned_tasks.oldest_age_seconds is not None
+        and orphaned_tasks.oldest_age_seconds > policy.max_orphaned_task_age_seconds
+    ):
+        alerts.append("orphaned_tasks")
     return DeliveryHealth(
         task_cards=task_cards,
         execution_cards=execution_cards,
@@ -250,11 +268,12 @@ def collect_delivery_health(
             running=sum(row.running for row in superseded),
         ),
         admission=admission,
+        orphaned_tasks=orphaned_tasks,
         alerts=tuple(alerts),
     )
 
 
-def _admission_health(connection: object, now: datetime) -> AdmissionHealth:
+def _admission_health(connection: Any, now: datetime) -> AdmissionHealth:
     """Count open tasks with no workflow row, and age the oldest.
 
     The predicate mirrors the `eligible` count in
@@ -294,8 +313,50 @@ def _admission_health(connection: object, now: datetime) -> AdmissionHealth:
     )
 
 
+def _orphaned_tasks_health(connection: Any, now: datetime) -> OrphanedTasksHealth:
+    """Count open tasks with no active workflow or card, excluding parked/dropped."""
+    row = connection.execute(
+        "SELECT COUNT(*) AS count, MIN(t.updated_at) AS oldest "
+        "FROM tasks AS t "
+        "WHERE t.status='open' "
+        "AND NOT EXISTS ("
+        " SELECT 1 FROM task_execution_workflows AS w "
+        " WHERE w.task_id=t.id AND w.status NOT IN ('completed','cancelled')"
+        ") "
+        "AND NOT EXISTS ("
+        " SELECT 1 FROM execution_review_cards AS ec "
+        " WHERE ec.task_id=t.id AND ec.status IN ('pending','delivering','delivered')"
+        ") "
+        "AND NOT EXISTS ("
+        " SELECT 1 FROM task_review_cards AS tc "
+        " WHERE tc.task_id=t.id AND tc.status='pending'"
+        ") "
+        "AND NOT EXISTS ("
+        " SELECT 1 FROM task_candidate_bindings AS b JOIN "
+        " task_candidate_lifecycle AS l ON l.candidate_id=b.candidate_id "
+        " WHERE b.task_id=t.id AND b.relation='accepted' "
+        " AND l.state='withdrawn' AND l.resolution='preserved_open'"
+        ") "
+        "AND ("
+        " (SELECT e.kind FROM task_execution_events AS e "
+        "  WHERE e.task_id=t.id ORDER BY e.sequence DESC LIMIT 1) IS NULL"
+        " OR (SELECT e.kind FROM task_execution_events AS e "
+        "  WHERE e.task_id=t.id ORDER BY e.sequence DESC LIMIT 1) != 'task_dropped'"
+        ")"
+    ).fetchone()
+    count = int(row["count"] or 0)
+    oldest = row["oldest"]
+    return OrphanedTasksHealth(
+        count=count,
+        oldest_age_seconds=(
+            None if not count or oldest is None
+            else _age(now, _timestamp(oldest))
+        ),
+    )
+
+
 def _card_health(
-    connection: object,
+    connection: Any,
     table: str,
     pending_time_column: str,
     now: datetime,
