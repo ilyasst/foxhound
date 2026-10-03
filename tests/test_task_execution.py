@@ -395,6 +395,17 @@ class TaskExecutionTests(unittest.TestCase):
                 "ALTER TABLE execution_review_cards DROP COLUMN "
                 "consumer_digest"
             )
+            # v72 added these (#903); a database at an older version has
+            # not got them yet.
+            connection.execute("DROP TABLE execution_card_presentations")
+            connection.execute(
+                "ALTER TABLE execution_review_cards DROP COLUMN "
+                "decision_version"
+            )
+            connection.execute(
+                "ALTER TABLE execution_review_cards DROP COLUMN "
+                "resolved_by_surface"
+            )
             # v35 added these; a database at an older version has not got
             # them yet.
             connection.execute(
