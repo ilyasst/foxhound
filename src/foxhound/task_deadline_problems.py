@@ -95,6 +95,8 @@ def find_problems(
         else:
             tasks_map[tid] = TaskTiming(due=None, effort=None, open=True)
 
+    from .task_timing import with_research_timing
+    tasks_map = with_research_timing(connection, tasks_map)
     deadline_result = effective_deadlines(tasks_map, dependencies, today=today)
 
     # Cycles: list of lists -> tuple of tuples

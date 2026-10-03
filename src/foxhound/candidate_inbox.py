@@ -51,7 +51,7 @@ from .contracts.task_candidate import (
 )
 
 
-SCHEMA_VERSION = 69
+SCHEMA_VERSION = 70
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 _CUMULATIVE_SCHEMA_VERSIONS = {
@@ -894,6 +894,9 @@ _SCHEMA_COLUMNS.update({
         "candidate_id", "verdict", "confidence", "citations_json",
         "latency_ms", "prompt_tokens", "completion_tokens", "verified_at",
         "proposal_id",
+    ),
+    "task_timing": (
+        "task_id", "effort", "researched_due", "source_job_id", "updated_at",
     ),
 })
 
@@ -3649,6 +3652,21 @@ END;
 # A proposal holds a plan at its Start card until the reader decides; the
 # answer is kept so later research cannot reopen it and so the proposals can
 # be evaluated. Purely additive.
+#: v70 (#846): research timing lives beside the task, never in it: an
+#: effort size or a cited deadline is not a revision, so it must not version
+#: the task or stale its workflow. Purely additive.
+_SCHEMA_V70 = (
+    """
+CREATE TABLE IF NOT EXISTS task_timing (
+    task_id         INTEGER PRIMARY KEY REFERENCES tasks(id),
+    effort          TEXT CHECK(effort IS NULL OR effort IN ('hour','day','week')),
+    researched_due  TEXT CHECK(researched_due IS NULL OR researched_due GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+    source_job_id   TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+""",
+)
+
 #: v69 (#762): a forge source that closes answers its task. The lifecycle
 #: records that as its own resolution, so a closed review is never mistaken
 #: for a reader decision. SQLite cannot widen a CHECK in place: rebuild.
@@ -5579,6 +5597,18 @@ class CandidateInbox:
                     connection.rollback()
                     raise
                 version = 69
+            if version == 69:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V70:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 70")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 70
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:

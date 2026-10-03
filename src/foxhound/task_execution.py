@@ -166,6 +166,8 @@ def _order_by_effective_deadline(
             if tid not in tasks_map:
                 tasks_map[tid] = TaskTiming(due=None, effort=None, open=True)
 
+        from .task_timing import with_research_timing
+        tasks_map = with_research_timing(connection, tasks_map)
         res = effective_deadlines(tasks_map, dependencies, today)
         effective_map = res.deadlines
 
