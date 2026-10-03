@@ -682,6 +682,9 @@ class ExecutionRunnerTests(unittest.TestCase):
             corrective[corrective.index("--query") + 1],
             _CORRECTIVE_TURN_PROMPT,
         )
+        self.assertIn("release --handoff", _CORRECTIVE_TURN_PROMPT)
+        self.assertIn("record --outcome OUTCOME", _CORRECTIVE_TURN_PROMPT)
+        self.assertIn("handoff-<phase>.md", _CORRECTIVE_TURN_PROMPT)
 
     def test_a_missing_or_malformed_session_id_does_not_retry(self):
         self._ready()

@@ -129,10 +129,10 @@ _RESULT_SUMMARY_NAME = "result-summary.txt"
 #: timeout itself is still enforced on the monotonic clock.
 _wall_clock: Callable[[], float] = time.time
 _CORRECTIVE_TURN_PROMPT = (
-    "The previous turn ended without recording a result. "
-    "Do no new work. Call the worker tool now to record the result already "
-    "prepared (if a plan or result file was already written in the task folder, "
-    "record that) or release the claim. Call the tool; do not write the call as text."
+    "The previous turn ended without recording a result. Do no new work. Close the pass now with exactly one worker call: "
+    "if a result is ready (or a plan or result file is already written), record it with `record --outcome OUTCOME`; "
+    "if in-scope work is unfinished, first write or update `handoff-<phase>.md` in the task folder with what you established, what changed and where, what remains and the next step, then call `release --handoff`; "
+    "otherwise call `release`. Call the tool; do not write the call as text."
 )
 
 
@@ -480,7 +480,7 @@ def corrective_argv(
 
     Hermes retains the task context in the named session.  The corrective
     prompt deliberately does not repeat it, and its one-turn budget permits
-    only the closing ``record`` or ``release`` operation.
+    only the closing ``record``, ``release``, or ``release --handoff`` operation.
     """
     if (
         not isinstance(profile, AgentProfile)
