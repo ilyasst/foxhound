@@ -18,7 +18,7 @@ import sys
 from contextlib import closing
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Sequence
 
 from .knowledge_client import (
@@ -162,6 +162,11 @@ def _read_guide(
         namespace = locator.get("namespace")
         resource = locator.get("resource")
         if not isinstance(namespace, str) or not isinstance(resource, str):
+            return None
+        # The index is not a procedure. Reports published before the
+        # Researcher stopped citing it as a "guide" must not tell a pass
+        # to follow guides.md.
+        if PurePosixPath(resource).name.lower() == "guides.md":
             return None
         guide_id = f"{namespace}:{resource}"
         # Name the file outright when it is in the KB root this run already

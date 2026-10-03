@@ -1338,6 +1338,17 @@ def test_convert_research_json_features(tmp_path: Path) -> None:
     draft_unmap, sources_unmap = _convert_research_json(raw_unmappable_guide, k_roots)
     assert "guide" not in draft_unmap
 
+    # "No guide applies", citing only the index, is not a guide.
+    (kb_dir / "guides.md").write_text("# Guides\n", encoding="utf-8")
+    for negative in (
+        {"path": "kb:guides.md", "reason": "No KB guide matches", "evidence": []},
+        {"reason": "No KB guide matches", "evidence": ["kb:guides.md"]},
+    ):
+        raw_negative = dict(raw3)
+        raw_negative["guide"] = negative
+        draft_neg, _ = _convert_research_json(raw_negative, k_roots)
+        assert "guide" not in draft_neg
+
     # deadline and effort conversions
     raw_timing = dict(raw3)
     raw_timing["deadline"] = {
