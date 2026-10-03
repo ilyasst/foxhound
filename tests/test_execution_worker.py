@@ -3085,6 +3085,143 @@ class ExecutionWorkerTests(unittest.TestCase):
             self.assertIn("issue comment body: not found at", err)
             self.assertNotIn("configuration unavailable", err)
 
+    # ---- Knowledge search: diagnosable outcomes ----
+
+    def test_search_success_has_ok_status_with_results(self):
+        """A successful search with documents returns status 'ok'."""
+        with knowledge_server() as endpoint:
+            worker = self._worker(endpoint)
+            result = worker.search("synthetic query", max_results_per_layer=2)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["layers"][0]["documents"][0]["excerpt"],
+                         "Synthetic evidence.")
+
+    def test_search_empty_results_have_ok_status_not_refusal(self):
+        """An empty search result is 'ok' (not a refusal), so the agent
+        knows to refine its query or read the knowledge base directly."""
+        empty_result = execution_worker.KnowledgeSearchResult(layers=())
+        with mock.patch.object(
+            execution_worker.GwKnowledgeClient, "search",
+            return_value=empty_result,
+        ):
+            with knowledge_server() as endpoint:
+                worker = self._worker(endpoint)
+                result = worker.search("no-match-query")
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["layers"], [])
+
+    def test_search_config_error_returns_refused_config(self):
+        """An inactive or stale knowledge config is diagnosable, not generic."""
+        with mock.patch.object(
+            execution_worker.GwKnowledgeClient, "search",
+            side_effect=execution_worker.KnowledgeConfigError("synthetic"),
+        ):
+            with knowledge_server() as endpoint:
+                worker = self._worker(endpoint)
+                result = worker.search("synthetic query")
+
+        self.assertEqual(result["status"], "refused_config")
+
+    def test_search_request_error_returns_refused_request(self):
+        """An invalid query is diagnosable as a request problem."""
+        with mock.patch.object(
+            execution_worker.GwKnowledgeClient, "search",
+            side_effect=execution_worker.KnowledgeRequestError("synthetic"),
+        ):
+            with knowledge_server() as endpoint:
+                worker = self._worker(endpoint)
+                result = worker.search("synthetic query")
+
+        self.assertEqual(result["status"], "refused_request")
+
+    def test_search_response_error_returns_refused_response(self):
+        """A malformed server response is diagnosable."""
+        with mock.patch.object(
+            execution_worker.GwKnowledgeClient, "search",
+            side_effect=execution_worker.KnowledgeResponseError("synthetic"),
+        ):
+            with knowledge_server() as endpoint:
+                worker = self._worker(endpoint)
+                result = worker.search("synthetic query")
+
+        self.assertEqual(result["status"], "refused_response")
+
+    def test_search_transport_error_returns_refused_transport(self):
+        """A transport/protocol failure is diagnosable."""
+        with mock.patch.object(
+            execution_worker.GwKnowledgeClient, "search",
+            side_effect=execution_worker.KnowledgeTransportError("synthetic"),
+        ):
+            with knowledge_server() as endpoint:
+                worker = self._worker(endpoint)
+                result = worker.search("synthetic query")
+
+        self.assertEqual(result["status"], "refused_transport")
+
+    def test_search_across_multiple_layers(self):
+        """Search across kb, secondary, and emails layers returns per-layer results."""
+        from foxhound.knowledge_client import KnowledgeLayer, KnowledgeDocument
+        kb_doc = KnowledgeDocument(
+            id="kb:Projects/alpha.md", path="Projects/alpha.md",
+            kb_path="Projects/alpha.md", excerpt="KB evidence.",
+            section=None, ranking_score=0.25,
+        )
+        secondary_doc = KnowledgeDocument(
+            id="secondary:notes.md", path="notes.md",
+            excerpt="Secondary evidence.", ranking_score=0.20,
+        )
+        mock_result = execution_worker.KnowledgeSearchResult(
+            layers=(
+                KnowledgeLayer(
+                    name="kb", total_results=2, truncated=False,
+                    documents=(kb_doc,),
+                ),
+                KnowledgeLayer(
+                    name="secondary", total_results=1, truncated=False,
+                    documents=(secondary_doc,),
+                ),
+                KnowledgeLayer(
+                    name="emails", total_results=0, truncated=False,
+                    documents=(),
+                ),
+            ),
+        )
+        with mock.patch.object(
+            execution_worker.GwKnowledgeClient, "search",
+            return_value=mock_result,
+        ):
+            with knowledge_server() as endpoint:
+                worker = self._worker(endpoint)
+                result = worker.search(
+                    "synthetic query",
+                    layers=("kb", "secondary", "emails"),
+                )
+
+        self.assertEqual(result["status"], "ok")
+        layer_names = [layer["name"] for layer in result["layers"]]
+        self.assertEqual(layer_names, ["kb", "secondary", "emails"])
+        self.assertEqual(
+            result["layers"][0]["documents"][0]["excerpt"],
+            "KB evidence.",
+        )
+        self.assertEqual(
+            result["layers"][1]["documents"][0]["excerpt"],
+            "Secondary evidence.",
+        )
+        self.assertEqual(result["layers"][2]["total_results"], 0)
+
+    def test_search_result_contains_no_private_credentials(self):
+        """Search output must not leak the claim token or database path."""
+        with knowledge_server() as endpoint:
+            worker = self._worker(endpoint)
+            result = worker.search("synthetic query")
+
+        rendered = json.dumps(result)
+        self.assertNotIn(CLAIM_TOKEN, rendered)
+        self.assertNotIn(str(self.database), rendered)
+
 
 class ResultLocationTests(unittest.TestCase):
     """A result is authored where the reader will look for it."""
