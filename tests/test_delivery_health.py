@@ -380,6 +380,71 @@ class DeliveryHealthTests(unittest.TestCase):
         self.assertIsNone(health.admission.oldest_unadmitted_age_seconds)
         self.assertEqual(health.admission.preserved_open, 1)
 
+    def test_orphaned_task_alerts_when_older_than_two_hours(self) -> None:
+        """An open task with a cancelled workflow and no card older than 2 h alerts."""
+        self._open_task(1, created=NOW - timedelta(hours=3), workflow=True)
+        # Cancel the workflow and update task updated_at
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "UPDATE task_execution_workflows SET status='cancelled', completed_at=?, updated_at=? WHERE task_id=1",
+                (self._time(NOW - timedelta(hours=3)), self._time(NOW - timedelta(hours=3))),
+            )
+            connection.execute(
+                "UPDATE tasks SET updated_at=? WHERE id=1",
+                (self._time(NOW - timedelta(hours=3)),),
+            )
+
+        health = collect_delivery_health(self.database, clock=lambda: NOW)
+        self.assertFalse(health.ok)
+        self.assertIn("orphaned_tasks", health.alerts)
+        self.assertEqual(health.orphaned_tasks.count, 1)
+        self.assertEqual(health.orphaned_tasks.oldest_age_seconds, 3 * 3600)
+
+        doc = health.document()
+        orphaned_doc = doc["orphaned_tasks"]
+        assert isinstance(orphaned_doc, dict)
+        self.assertEqual(orphaned_doc["count"], 1)
+        self.assertEqual(orphaned_doc["oldest_age_seconds"], 3 * 3600)
+
+    def test_queued_workflow_does_not_alert_orphaned_task(self) -> None:
+        """A task with a queued workflow produces no orphaned alert."""
+        self._open_task(1, created=NOW - timedelta(hours=3), workflow=True)
+
+        health = collect_delivery_health(self.database, clock=lambda: NOW)
+        self.assertEqual(health.orphaned_tasks.count, 0)
+        self.assertIsNone(health.orphaned_tasks.oldest_age_seconds)
+        self.assertNotIn("orphaned_tasks", health.alerts)
+
+    def test_dropped_or_withdrawn_preserved_task_not_counted_as_orphaned(self) -> None:
+        """A dropped/withdrawn-preserved task is not counted in orphaned tasks."""
+        # 1. Withdrawn-preserved task
+        self._open_task(1, created=NOW - timedelta(hours=3))
+        self._withdraw_preserving_task(1)
+
+        # 2. Task whose workflow ended by a reader drop
+        self._open_task(2, created=NOW - timedelta(hours=3), workflow=True)
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "UPDATE task_execution_workflows SET status='cancelled', completed_at=?, updated_at=? WHERE task_id=2",
+                (self._time(NOW - timedelta(hours=3)), self._time(NOW - timedelta(hours=3))),
+            )
+            connection.execute(
+                "UPDATE tasks SET updated_at=? WHERE id=2",
+                (self._time(NOW - timedelta(hours=3)),),
+            )
+            connection.execute(
+                "INSERT INTO task_execution_events("
+                "task_id,kind,workflow_version,task_version,phase,status,"
+                "occurred_at,agent_profile_id,agent_profile_revision) "
+                "VALUES(2,'task_dropped',1,1,'plan','cancelled',?,'default',?)",
+                (self._time(NOW - timedelta(hours=3)), "a" * 64),
+            )
+
+        health = collect_delivery_health(self.database, clock=lambda: NOW)
+        self.assertEqual(health.orphaned_tasks.count, 0)
+        self.assertIsNone(health.orphaned_tasks.oldest_age_seconds)
+        self.assertNotIn("orphaned_tasks", health.alerts)
+
     def test_review_backpressure_suppresses_delivery_stale_and_pending_age_exceeded(self) -> None:
         consumer = "a" * 64
         self._open_task(1, created=NOW - timedelta(minutes=30), workflow=True)
@@ -412,7 +477,7 @@ class DeliveryHealthTests(unittest.TestCase):
         self.assertEqual(health.recent_surface_full_releases, 1)
 
         doc = health.document()
-        self.assertEqual(doc["schema_version"], 7)
+        self.assertEqual(doc["schema_version"], 8)
         self.assertTrue(doc["execution_cards"]["review_backpressure"])
         self.assertEqual(doc["delivery"]["recent_surface_full_releases"], 1)
         self.assertEqual(doc["delivery"]["surface_full"], 1)
