@@ -252,7 +252,8 @@ class TaskCardServerLimits:
     max_body_bytes: int = 16 * 1024
     #: Sized against the largest reply this service offers to build: a board at
     #: its maximum `limit` of 100 rows, each bounded by the constants above,
-    #: measures ~80 KiB at worst. 64 KiB was below that, so the board route
+    #: measures ~80 KiB at worst (the workflow board adds at most
+    #: `RECENT_COMPLETED_MAX` completed rows of the same bounded shape). 64 KiB was below that, so the board route
     #: refused the bound it advertised once a queue grew into it. Consumers
     #: guard their own reads at 256 KiB, which this stays under.
     max_response_bytes: int = 192 * 1024
