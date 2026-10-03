@@ -4314,6 +4314,11 @@ def _start_card_lines(
                 "retries are stopped; reduce its scope or split it before "
                 "starting another run.",
             ]
+        if card.failure_reason == "budget_handoff":
+            return lines + [
+                "",
+                "stopped at its turn budget and left a handoff note",
+            ]
         # The blanket claim that nothing was recorded is now checked rather
         # than asserted: a workflow can park in a phase that did record, and
         # telling the reader otherwise contradicts the line above it.

@@ -30,7 +30,10 @@ from foxhound.execution_cards import (
 from foxhound.task_execution import (
     AWAITING_READER_CAP,
     EXECUTION_SLOT_CAP,
+    PARK_RETRY_INTERVAL,
     PLAN_READY_CAP,
+    RETRY_BASE_SECONDS,
+    RETRY_MAX_SECONDS,
     UNBOUNDED_CAP,
     WORK_IN_PROGRESS_CAP,
     ExecutionOutcome,
@@ -2733,6 +2736,127 @@ class TaskExecutionTests(unittest.TestCase):
         # Workflow status remains AWAITING_REVIEW
         state = self.service.get(1)
         self.assertEqual(state.status, WorkflowStatus.AWAITING_REVIEW)
+
+    def test_budget_handoff_parks_immediately_at_ordinary_backoff_and_retries(self):
+        self._schedule_and_start()
+        claim = self._claim()
+        self.assertIsNotNone(claim)
+        assert claim is not None
+        now_dt = self.clock()
+
+        parked = self.service.fail(
+            1,
+            expected_version=claim.workflow_version,
+            claim_token=claim.token,
+            reason="budget_handoff",
+        )
+
+        self.assertEqual(parked.status, WorkflowStatus.PARKED)
+        expected_next = (now_dt + timedelta(seconds=60)).isoformat(timespec="seconds")
+        self.assertEqual(parked.next_attempt_at, expected_next)
+        state = self.service.get(1)
+        self.assertIsNotNone(state)
+        assert state is not None
+        self.assertEqual(state.failure_count, 1)
+        self.assertEqual(state.last_failure_reason, "budget_handoff")
+        self.assertEqual(state.status, WorkflowStatus.PARKED)
+
+        # Before next_attempt_at passes, it cannot be claimed
+        self.assertIsNone(self.service.claim_next())
+
+        # Advance past next_attempt_at; a parked workflow is claimable again
+        self.clock.advance(seconds=61)
+        resumed_claim = self.service.claim_next()
+        self.assertIsNotNone(resumed_claim)
+        assert resumed_claim is not None
+        self.assertEqual(resumed_claim.task_id, 1)
+
+    def test_budget_handoff_at_max_attempts_parks_at_standard_retry_interval(self):
+        self._schedule_and_start()
+        # Default max_attempts is 3. Drive consecutive budget_handoff failures.
+        for _ in range(1, self.service._max_attempts):
+            claim = self._claim()
+            self.assertIsNotNone(claim)
+            assert claim is not None
+            now_dt = self.clock()
+            res = self.service.fail(
+                1,
+                expected_version=claim.workflow_version,
+                claim_token=claim.token,
+                reason="budget_handoff",
+            )
+            self.assertEqual(res.status, WorkflowStatus.PARKED)
+            expected_delay = min(
+                RETRY_MAX_SECONDS,
+                RETRY_BASE_SECONDS * (2 ** (1 - 1)),
+            )
+            expected_next = (now_dt + timedelta(seconds=expected_delay)).isoformat(
+                timespec="seconds"
+            )
+            self.assertEqual(res.next_attempt_at, expected_next)
+            # Advance past ordinary backoff to re-claim
+            self.clock.advance(seconds=3601)
+
+        # Final attempt reaching max_attempts
+        final_claim = self._claim()
+        self.assertIsNotNone(final_claim)
+        assert final_claim is not None
+        now_dt = self.clock()
+        parked = self.service.fail(
+            1,
+            expected_version=final_claim.workflow_version,
+            claim_token=final_claim.token,
+            reason="budget_handoff",
+        )
+        self.assertEqual(parked.status, WorkflowStatus.PARKED)
+        expected_next = (now_dt + PARK_RETRY_INTERVAL).isoformat(timespec="seconds")
+        self.assertEqual(parked.next_attempt_at, expected_next)
+
+    def test_budget_handoff_reader_continue_resets_unanswered_bound(self):
+        self._schedule_and_start()
+        # Drive 2 budget_handoff parks (max_attempts - 1)
+        for _ in range(2):
+            claim = self._claim()
+            self.assertIsNotNone(claim)
+            assert claim is not None
+            res = self.service.fail(
+                1,
+                expected_version=claim.workflow_version,
+                claim_token=claim.token,
+                reason="budget_handoff",
+            )
+            self.assertEqual(res.status, WorkflowStatus.PARKED)
+            self.clock.advance(seconds=3601)
+
+        # Reader clicks Continue
+        state = self.service.get(1)
+        self.assertIsNotNone(state)
+        assert state is not None
+        resumed = self.service.start_action(
+            1, expected_version=state.version, action="start"
+        )
+        self.assertEqual(resumed.status, WorkflowStatus.QUEUED)
+
+        # The next budget_handoff parks at ordinary backoff again, not PARK_RETRY_INTERVAL
+        claim = self._claim()
+        self.assertIsNotNone(claim)
+        assert claim is not None
+        now_dt = self.clock()
+        res = self.service.fail(
+            1,
+            expected_version=claim.workflow_version,
+            claim_token=claim.token,
+            reason="budget_handoff",
+        )
+        self.assertEqual(res.status, WorkflowStatus.PARKED)
+        expected_delay = min(
+            RETRY_MAX_SECONDS,
+            RETRY_BASE_SECONDS * (2 ** (1 - 1)),
+        )
+        expected_next = (now_dt + timedelta(seconds=expected_delay)).isoformat(
+            timespec="seconds"
+        )
+        self.assertEqual(res.next_attempt_at, expected_next)
 
     def test_context_exhaustion_parks_immediately_and_is_countable(self):
         self._schedule_and_start()

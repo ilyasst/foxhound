@@ -420,6 +420,74 @@ class CandidateInboxTests(unittest.TestCase):
                     "DELETE FROM execution_review_card_events WHERE card_id=1"
                 )
 
+    def test_version_seventy_one_migration_preserves_workflows_and_admits_budget_handoff(self):
+        # Initialize a database up to v70 and insert tasks and workflows
+        now = NOW.isoformat(timespec="seconds")
+        # Run standard migration first to get a working v70 database, then rollback to v70 shape
+        migrate_database(self.database)
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute(
+                "INSERT INTO tasks(id,status,text,owner,due,version,created_at,updated_at) "
+                "VALUES(1,'open','T1','Person A',NULL,1,?,?)",
+                (now, now),
+            )
+            connection.execute(
+                "INSERT INTO task_execution_workflows("
+                "task_id,task_version,status,phase,version,failure_count,"
+                "last_failure_reason,parked_at,created_at,updated_at) "
+                "VALUES(1,1,'parked','plan',1,1,'context_exhausted',?,?,?)",
+                (now, now, now),
+            )
+            # Revert the table definition to v70 (which didn't include budget_handoff)
+            # and set user_version = 70
+            definition = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='task_execution_workflows'"
+            ).fetchone()[0]
+            v70_sql = definition.replace(",'budget_handoff'", "")
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute("PRAGMA legacy_alter_table = ON")
+            connection.execute("DROP INDEX task_execution_workflows_ready")
+            connection.execute("DROP INDEX task_execution_workflows_priority_ready")
+            connection.execute("ALTER TABLE task_execution_workflows RENAME TO task_execution_workflows_old")
+            connection.execute(v70_sql)
+            connection.execute("INSERT INTO task_execution_workflows SELECT * FROM task_execution_workflows_old")
+            connection.execute("DROP TABLE task_execution_workflows_old")
+            from foxhound.candidate_inbox import _SCHEMA_V8, _SCHEMA_V32
+            connection.execute(_SCHEMA_V8[1])
+            connection.execute(_SCHEMA_V32[1])
+            connection.execute("PRAGMA user_version = 70")
+            connection.commit()
+            connection.execute("PRAGMA legacy_alter_table = OFF")
+            connection.execute("PRAGMA foreign_keys = ON")
+
+            # Verify that v70 rejects budget_handoff
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "UPDATE task_execution_workflows SET last_failure_reason='budget_handoff' WHERE task_id=1"
+                )
+
+        # Migrate from 69 to 70
+        migrate_database(self.database)
+
+        with closing(sqlite3.connect(self.database)) as connection:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            self.assertEqual(version, SCHEMA_VERSION)
+            # Pre-existing row was preserved
+            row = connection.execute(
+                "SELECT task_id, status, last_failure_reason FROM task_execution_workflows WHERE task_id=1"
+            ).fetchone()
+            self.assertEqual(row, (1, "parked", "context_exhausted"))
+
+            # Now accepts budget_handoff
+            connection.execute(
+                "UPDATE task_execution_workflows SET last_failure_reason='budget_handoff' WHERE task_id=1"
+            )
+            updated_reason = connection.execute(
+                "SELECT last_failure_reason FROM task_execution_workflows WHERE task_id=1"
+            ).fetchone()[0]
+            self.assertEqual(updated_reason, "budget_handoff")
+
     def test_fresh_and_migrated_databases_end_up_in_the_same_shape(self):
         fresh_database = Path(self.temporary.name) / "fresh.sqlite3"
         migrate_database(fresh_database)

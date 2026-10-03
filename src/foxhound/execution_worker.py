@@ -1290,8 +1290,60 @@ class ExecutionWorker:
             "draft": draft_name,
         }
 
-    def release(self) -> dict[str, Any]:
+    def release(self, *, handoff: bool = False) -> dict[str, Any]:
         state, service = self._active()
+        if handoff:
+            phase_value = state.phase.value if hasattr(state.phase, "value") else str(state.phase)
+            note_filename = f"handoff-{phase_value}.md"
+            if not state.task_work_directory:
+                raise ExecutionWorkerDraftError(
+                    f"{note_filename} was not found in the task folder; write what you established, what changed, what remains and the next step there, then call `release --handoff` again"
+                )
+            note_path = Path(state.task_work_directory) / note_filename
+            if not note_path.is_file():
+                raise ExecutionWorkerDraftError(
+                    f"{note_filename} was not found in the task folder; write what you established, what changed, what remains and the next step there, then call `release --handoff` again"
+                )
+            try:
+                raw = note_path.read_bytes()
+            except OSError:
+                raise ExecutionWorkerDraftError(
+                    f"{note_filename} was not found in the task folder; write what you established, what changed, what remains and the next step there, then call `release --handoff` again"
+                )
+            if not raw.strip():
+                raise ExecutionWorkerDraftError(
+                    f"{note_filename} in the task folder is empty; write what you established, what changed, what remains and the next step there, then call `release --handoff` again"
+                )
+            anchor = _claim_started_at(self._state_path)
+            if anchor is None:
+                raise ExecutionWorkerDraftError(
+                    f"{note_filename} was written before this run started; update it for this run first"
+                )
+            try:
+                if note_path.stat().st_mtime_ns < anchor:
+                    raise ExecutionWorkerDraftError(
+                        f"{note_filename} was written before this run started; update it for this run first"
+                    )
+            except OSError:
+                raise ExecutionWorkerDraftError(
+                    f"{note_filename} was not found in the task folder; write what you established, what changed, what remains and the next step there, then call `release --handoff` again"
+                )
+            result = service.fail(
+                state.task_id,
+                expected_version=state.workflow_version,
+                claim_token=state.claim_token,
+                reason="budget_handoff",
+            )
+            if result.disposition is WorkflowDisposition.REFUSED:
+                raise ExecutionWorkerClaimError("execution claim is unavailable")
+            return {
+                "schema": "foxhound.execution-release-receipt",
+                "schema_version": WORKER_SCHEMA_VERSION,
+                "disposition": result.disposition.value,
+                "status": result.status.value if result.status else None,
+                "handoff": True,
+            }
+
         if _result_inputs_present(
             _result_search_path(state, self._state_path.parent),
             task_folder_not_before=_claim_started_at(self._state_path),
@@ -2782,7 +2834,14 @@ def _parser() -> argparse.ArgumentParser:
     draft.add_argument(
         "--outcome", required=True, help="result outcome for the current phase"
     )
-    subcommands.add_parser("release")
+    release = subcommands.add_parser(
+        "release", help="release this claim without recording a result"
+    )
+    release.add_argument(
+        "--handoff",
+        action="store_true",
+        help="this pass ran out of turns with work incomplete; hand the task back with the note in handoff-<phase>.md",
+    )
     # Answerable without a run. The runner uses it to check, before it
     # claims anything, that the worker an agent would reach can read the
     # run state it is about to write.
@@ -2843,7 +2902,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 result = worker.record(args.draft)
         else:
-            result = worker.release()
+            result = worker.release(handoff=args.handoff)
     except ExecutionWorkerConfigError:
         print("foxhound task worker: configuration unavailable", file=sys.stderr)
         return 78
