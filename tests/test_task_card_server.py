@@ -410,7 +410,7 @@ class TaskCardServerTests(unittest.TestCase):
         )
         self.assertEqual(
             (board["schema"], board["schema_version"], board["ok"]),
-            (EXECUTION_BOARD_SCHEMA, 2, True),
+            (EXECUTION_BOARD_SCHEMA, 3, True),
         )
         self.assertEqual(board["columns"][0],
                          {"status": "ready_to_start", "total": 1})
@@ -420,7 +420,7 @@ class TaskCardServerTests(unittest.TestCase):
         self.assertEqual(set(card), {
             "id", "version", "task_id", "workflow_version", "handle",
             "board_status", "delivery_status", "kind", "phase", "task",
-            "owner", "agent", "source", "summary", "state_since",
+            "owner", "agent", "source", "summary", "state_since", "kind_label",
         })
         self.assertEqual(
             (card["task_id"], card["workflow_version"]),
@@ -458,13 +458,98 @@ class TaskCardServerTests(unittest.TestCase):
             )
             self.assertEqual(status, 200)
             self.assertEqual((board["schema"], board["schema_version"]),
-                             (EXECUTION_BOARD_SCHEMA, 2))
+                             (EXECUTION_BOARD_SCHEMA, 3))
+            # Every row names its decision; controls stay on the detail.
+            card = board["cards"][0]
+            self.assertEqual(card["kind_label"], "Ready to start")
+            self.assertNotIn("actions", card)
             status, _, refused = request(
                 endpoint, "/v1/execution-cards/board",
                 request_document(limit=1), token=TOKEN,
             )
             self.assertEqual((status, refused["error"]["code"]),
                              (403, "role_forbidden"))
+
+    def test_published_controls_are_the_chat_keyboard_minus_sub_menus(self):
+        self.execution.schedule(1, expected_task_version=1)
+        self.execution_cards.schedule()
+        card = self.execution_cards.due(limit=1)[0]
+        from foxhound.execution_cards import published_controls, render_execution_review_card
+        _, keyboard = render_execution_review_card(card)
+        keyboard_labels = [button["text"] for row in keyboard["inline_keyboard"] for button in row]
+        controls = published_controls(card)
+        # Same labels, same order; sub-menus (agent picker, brief) left out.
+        self.assertEqual(
+            [control["label"] for control in controls],
+            [label for label in keyboard_labels
+             if not any(word in label for word in ("Agent", "Task brief", "Deliverables"))],
+        )
+        by_action = {control["action"]: control for control in controls}
+        self.assertEqual(by_action["start"]["style"], "primary")
+        self.assertEqual(by_action["drop"]["style"], "destructive")
+        self.assertEqual(by_action["discussion"]["input"], "note")
+        self.assertEqual(by_action["comment_and_go"]["input"], "note")
+        self.assertEqual(by_action["snooze"]["input"], "interval")
+        self.assertEqual(
+            [choice["action"] for choice in by_action["snooze"]["choices"]],
+            ["snooze_1d", "snooze_7d", "snooze_14d", "snooze_30d"],
+        )
+
+    def test_card_detail_publishes_kind_and_controls(self):
+        queue = "q" * 43
+        self.execution.schedule(1, expected_task_version=1)
+        self.execution_cards.schedule()
+        card = self.execution_cards.due(limit=1)[0]
+        app = TaskCardApplication(
+            self.cards, {DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: queue},
+            execution_cards=self.execution_cards,
+            execution_tokens={DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: queue},
+        )
+        detail = app.dispatch("execution_detail", request_document(
+            card_id=card.id, card_version=card.version,
+        ), authorization=f"Bearer {queue}")
+        self.assertEqual(detail["schema_version"], 5)
+        self.assertEqual((detail["kind"], detail["kind_label"]), ("start", "Ready to start"))
+        from foxhound.execution_cards import published_controls
+        self.assertEqual(detail["actions"], list(published_controls(card)))
+        refused = app.dispatch("execution_detail", request_document(
+            card_id=card.id, card_version=card.version + 9,
+        ), authorization=f"Bearer {queue}")
+        self.assertFalse(refused["ok"])
+        self.assertEqual(refused["actions"], [])
+
+    def test_workflow_board_names_the_review_the_card_names(self):
+        queue = "q" * 43
+        workflow = self.execution.schedule(1, expected_task_version=1)
+        self.execution.start_action(1, expected_version=workflow.version, action="start")
+        run = self.execution.claim_next()
+        # An execute run that stops awaiting an external action.
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute("UPDATE task_execution_workflows SET phase='execute' WHERE task_id=1")
+        run = self.execution.get(1)
+        self.execution.record_result(ExecutionResultEnvelope(
+            result_id="synthetic-external", task_id=1, task_version=1,
+            workflow_version=run.version, phase="execute",
+            claim_token=WORKFLOW_TOKEN, outcome="awaiting_external",
+            summary="Synthetic send.", work_markdown="Synthetic work.",
+        ))
+        self.execution_cards.schedule()
+        app = TaskCardApplication(
+            self.cards, {DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: queue},
+            execution_cards=self.execution_cards, execution_workflows=self.execution,
+            execution_tokens={DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: queue},
+        )
+        board = app.dispatch("workflow_board", request_document(limit=10),
+                             authorization=f"Bearer {queue}")
+        cards = app.dispatch("execution_board", request_document(limit=10),
+                             authorization=f"Bearer {queue}")
+        row = next(item for item in board["workflows"] if item["task_id"] == 1)
+        card = next(item for item in cards["cards"] if item["task_id"] == 1)
+        self.assertEqual(card["kind"], "external_review")
+        self.assertEqual(row["board_status"], "external_review")
+        self.assertEqual(card["kind_label"], "Approve sending")
+        totals = {column["status"]: column["total"] for column in board["columns"]}
+        self.assertEqual((totals["external_review"], totals["result_review"]), (1, 0))
 
     def test_execution_deliverables_route_is_a_delivered_card_read(self):
         workflow = self.execution.schedule(1, expected_task_version=1)

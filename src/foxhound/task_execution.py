@@ -2216,15 +2216,19 @@ class TaskExecutionService:
             raise TaskLedgerError("workflow board limit is invalid")
         where = " WHERE t.status='open' AND w.status NOT IN ('completed','cancelled')"
         with closing(self._connect()) as connection:
+            # Totals are counted per row rather than grouped in SQL: which
+            # review a workflow waits on depends on its open card and its last
+            # result, and the count has to agree with the rows exactly.
             grouped = connection.execute(
-                "SELECT w.status,w.phase,COUNT(*) AS total "
-                "FROM task_execution_workflows AS w JOIN tasks AS t ON t.id=w.task_id"
-                + where + " GROUP BY w.status,w.phase"
+                "SELECT w.status,w.phase," + _REVIEW_SOURCE_COLUMNS
+                + "FROM task_execution_workflows AS w JOIN tasks AS t ON t.id=w.task_id"
+                + where
             ).fetchall()
             rows = connection.execute(
                 "SELECT w.task_id,w.version,w.status,w.phase,w.updated_at,"
-                "w.agent_profile_id,t.text,COALESCE(t.owner,'') AS owner "
-                "FROM task_execution_workflows AS w JOIN tasks AS t ON t.id=w.task_id"
+                "w.agent_profile_id,t.text,COALESCE(t.owner,'') AS owner,"
+                + _REVIEW_SOURCE_COLUMNS
+                + "FROM task_execution_workflows AS w JOIN tasks AS t ON t.id=w.task_id"
                 + where + " ORDER BY CASE w.status "
                 "WHEN 'running' THEN 0 WHEN 'awaiting_review' THEN 1 "
                 "WHEN 'queued' THEN 2 WHEN 'awaiting_start' THEN 3 "
@@ -2246,8 +2250,9 @@ class TaskExecutionService:
             rows = list(rows) + connection.execute(
                 "SELECT w.task_id,w.version,w.status,w.phase,"
                 "COALESCE(w.completed_at,w.updated_at) AS updated_at,"
-                "w.agent_profile_id,t.text,COALESCE(t.owner,'') AS owner "
-                "FROM task_execution_workflows AS w JOIN tasks AS t ON t.id=w.task_id "
+                "w.agent_profile_id,t.text,COALESCE(t.owner,'') AS owner,"
+                + _REVIEW_SOURCE_COLUMNS
+                + "FROM task_execution_workflows AS w JOIN tasks AS t ON t.id=w.task_id "
                 "WHERE w.status='completed' "
                 "AND COALESCE(w.completed_at,w.updated_at)>=? "
                 "ORDER BY COALESCE(w.completed_at,w.updated_at) DESC,w.task_id DESC "
@@ -2256,11 +2261,11 @@ class TaskExecutionService:
             ).fetchall()
         totals = {status: 0 for status in WORKFLOW_BOARD_STATUSES}
         for row in grouped:
-            totals[_workflow_board_status(WorkflowStatus(row["status"]), WorkflowPhase(row["phase"]))] += int(row["total"])
+            totals[_board_status_for_row(row)] += 1
         totals["completed"] = completed_total
         entries = tuple(WorkflowBoardEntry(
             task_id=int(row["task_id"]), workflow_version=int(row["version"]),
-            board_status=_workflow_board_status(WorkflowStatus(row["status"]), WorkflowPhase(row["phase"])),
+            board_status=_board_status_for_row(row),
             phase=WorkflowPhase(row["phase"]),
             task=_board_text(row["text"], BOARD_TEXT_MAX),
             owner=_board_text(row["owner"], BOARD_OWNER_MAX),
@@ -3702,7 +3707,57 @@ def _apply_review_action(
     )
 
 
-def _workflow_board_status(status: WorkflowStatus, phase: WorkflowPhase) -> str:
+def review_kind_for_result(phase: object, outcome: object) -> str | None:
+    """The review a result asks the reader for, or None when it asks none.
+
+    The one place this is decided. The card scheduler raises a card of this
+    kind and the workflow board labels the workflow with it; each used to
+    derive it separately -- the board from the phase alone -- and a run that
+    finished `execute` awaiting an external action was a "result review" on
+    the board and an "approve sending" card everywhere else.
+    """
+    if phase == WorkflowPhase.PLAN and outcome == ExecutionOutcome.AWAITING_PLAN:
+        return "plan_review"
+    if phase == WorkflowPhase.EXECUTE and outcome == ExecutionOutcome.AWAITING_EXTERNAL:
+        return "external_review"
+    if outcome in {
+        ExecutionOutcome.COMPLETED,
+        ExecutionOutcome.DECLINED,
+        ExecutionOutcome.INELIGIBLE,
+    }:
+        return "result_review"
+    return None
+
+
+# Read beside each board row: the kind of the workflow's open review card, and
+# the outcome of its last result. Subqueries rather than joins, so a row can
+# never be duplicated by more than one card.
+_REVIEW_SOURCE_COLUMNS = (
+    "(SELECT c.kind FROM execution_review_cards AS c WHERE c.task_id=w.task_id "
+    "AND c.workflow_version=w.version "
+    "AND c.status IN ('pending','delivering','delivered') "
+    "AND c.kind IN ('plan_review','external_review','result_review') "
+    "ORDER BY c.id DESC LIMIT 1) AS card_kind,"
+    "(SELECT r.outcome FROM task_execution_results AS r "
+    "WHERE r.result_id=w.last_result_id) AS result_outcome "
+)
+
+
+def _board_status_for_row(row: Mapping[str, object]) -> str:
+    """A board row's status: the open card's kind first, then its result's."""
+    status = WorkflowStatus(row["status"])
+    phase = WorkflowPhase(row["phase"])
+    review = None
+    if status is WorkflowStatus.AWAITING_REVIEW:
+        review = row["card_kind"] or review_kind_for_result(phase, row["result_outcome"])
+    return _workflow_board_status(status, phase, review)
+
+
+def _workflow_board_status(
+    status: WorkflowStatus, phase: WorkflowPhase, review: str | None = None,
+) -> str:
+    if status is WorkflowStatus.AWAITING_REVIEW and review is not None:
+        return review
     if status is WorkflowStatus.AWAITING_REVIEW:
         return {
             WorkflowPhase.PLAN: "plan_review",

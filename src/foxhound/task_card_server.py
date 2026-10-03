@@ -27,6 +27,8 @@ from .agent_profiles import AgentProfileError, load_registry
 from .card_provenance import provenance_document
 from .execution_cards import (
     AGENT_SELECTION_TOKEN_CHARS,
+    EXECUTION_KIND_LABELS,
+    published_controls,
     ExecutionCardOperationResult,
     ExecutionCardPresentation,
     ExecutionCardArtifacts,
@@ -116,11 +118,14 @@ WORKFLOW_ARTIFACTS_SCHEMA = "foxhound.execution-workflow-service.artifacts"
 WORKFLOW_ARTIFACTS_SCHEMA_VERSION = 1
 EXECUTION_VIEW_SCHEMA = "foxhound.execution-card-service.view"
 EXECUTION_DETAIL_SCHEMA = "foxhound.execution-card-service.detail"
-EXECUTION_DETAIL_SCHEMA_VERSION = 4
+# Version 5 adds `kind`, `kind_label` and `actions`: the decision and its
+# controls, published so every surface offers the same choices under the
+# same labels (#897). The board document (version 3) carries `kind_label`.
+EXECUTION_DETAIL_SCHEMA_VERSION = 5
 EXECUTION_QUEUE_SCHEMA = "foxhound.execution-card-service.queue"
 EXECUTION_QUEUE_SCHEMA_VERSION = 1
 EXECUTION_BOARD_SCHEMA = "foxhound.execution-card-service.board"
-EXECUTION_BOARD_SCHEMA_VERSION = 2
+EXECUTION_BOARD_SCHEMA_VERSION = 3
 EXECUTION_RESOLVE_SCHEMA = "foxhound.execution-card-service.resolve"
 EXECUTION_RESOLVE_SCHEMA_VERSION = 1
 EXECUTION_AGENT_OPTIONS_SCHEMA = (
@@ -2019,6 +2024,10 @@ def _execution_board_card_document(card: Any) -> dict[str, Any]:
         "source": _queue_projection_text(card.origin_kind, 80),
         "summary": _queue_projection_text(card.summary, BOARD_SUMMARY_MAX),
         "state_since": _queue_projection_text(card.created_at, 64),
+        # The decision's name only. Its controls ride on the card detail:
+        # a full board of them would push this reply past
+        # `max_response_bytes`, which is how the board once went dark.
+        "kind_label": EXECUTION_KIND_LABELS[card.kind],
     }
 
 
@@ -2253,6 +2262,10 @@ def _execution_detail_document(result: ExecutionCardDetail) -> dict[str, Any]:
         "failure_reason": result.failure_reason,
         "failure_exit_code": result.failure_exit_code,
         "failure_run_id": result.failure_run_id,
+        "kind": None if result.kind is None else result.kind.value,
+        "kind_label": (None if result.kind is None
+                       else EXECUTION_KIND_LABELS[result.kind]),
+        "actions": list(result.controls) if result.accepted else [],
         "refusal": None if result.refusal is None else result.refusal.value,
     }
     if not result.accepted:
