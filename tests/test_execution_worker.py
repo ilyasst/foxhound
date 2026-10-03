@@ -478,7 +478,7 @@ class ExecutionWorkerTests(unittest.TestCase):
         self.assertEqual(
             context["capabilities"],
             {
-                "knowledge_layers": ["kb", "secondary", "emails"],
+                "knowledge_layers": ["kb", "secondary", "emails", "raw"],
                 "local_research_clients": {
                     "outlook": [
                         "folders", "inbox", "search", "read", "thread",
@@ -2706,6 +2706,24 @@ class ExecutionWorkerTests(unittest.TestCase):
             res_opt = json.loads(out_opt.getvalue())
 
             self.assertEqual(res_pos, res_opt)
+
+            # Layer raw -> passes layers=("raw",) to knowledge client
+            with mock.patch("foxhound.execution_worker.GwKnowledgeClient.search") as mock_search:
+                mock_search.return_value = mock.Mock(
+                    document_count=0,
+                    layers=(),
+                    exclusions=mock.Mock(excluded_document_count=0, reasons=()),
+                )
+                with redirect_stdout(StringIO()):
+                    with mock.patch(
+                        "foxhound.execution_worker.load_worker_from_environment",
+                        return_value=worker,
+                    ):
+                        code = main(["search", "x", "--layer", "raw"])
+                self.assertEqual(code, 0)
+                mock_search.assert_called_once()
+                layers_arg = mock_search.call_args.kwargs.get("layers")
+                self.assertEqual(list(layers_arg) if layers_arg is not None else None, ["raw"])
 
     def test_invalid_or_permissive_drafts_write_nothing(self):
         draft = self._write_draft(claim_token=CLAIM_TOKEN)
