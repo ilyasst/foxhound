@@ -27,7 +27,12 @@ from .card_provenance import (
     origin_payload_subquery,
     stored_origin_sources,
 )
-from .task_deadlines import TaskTiming, band as deadline_band, effective_deadlines
+from .task_deadlines import (
+    TaskTiming,
+    _effort_to_days,
+    band as deadline_band,
+    effective_deadlines,
+)
 from .task_owner import (
     confidently_other_owned,
     normalized_aliases,
@@ -114,6 +119,51 @@ def _claim_queue_priority(queue_priority: str | None) -> int:
 AUTO_RAISE_WINDOW = timedelta(hours=48)
 
 
+def _deadline_graph(
+    connection: sqlite3.Connection,
+    task_ids: set[int],
+) -> tuple[dict[int, TaskTiming], list[tuple[int, int]]]:
+    """The inputs the queue's effective deadlines are computed from.
+
+    Active ``after_task_completed`` dependencies, and the timing of the given
+    tasks plus every task in those dependencies, with cited research timing
+    folded in (#853).
+    """
+    dep_rows = connection.execute(
+        "SELECT depends_on_task_id, task_id FROM task_scheduling_conditions "
+        "WHERE kind='after_task_completed' AND state='active' "
+        "AND depends_on_task_id IS NOT NULL"
+    ).fetchall()
+    dependencies: list[tuple[int, int]] = []
+    all_task_ids = set(task_ids)
+    for dep in dep_rows:
+        pred = int(dep[0])
+        dep_id = int(dep[1])
+        dependencies.append((pred, dep_id))
+        all_task_ids.update((pred, dep_id))
+    tasks_map: dict[int, TaskTiming] = {}
+    if all_task_ids:
+        placeholders = ",".join("?" for _ in all_task_ids)
+        for tid, due_raw, status in connection.execute(
+            f"SELECT id, due, status FROM tasks WHERE id IN ({placeholders})",
+            tuple(all_task_ids),
+        ).fetchall():
+            tasks_map[int(tid)] = TaskTiming(
+                due=_date_or_none(due_raw), effort=None, open=(status == "open"))
+    # A task whose row vanished keeps no deadline of its own.
+    for tid in task_ids:
+        tasks_map.setdefault(tid, TaskTiming(due=None, effort=None, open=True))
+    from .task_timing import with_research_timing
+    return with_research_timing(connection, tasks_map), dependencies
+
+
+def _date_or_none(value: object) -> date | None:
+    try:
+        return date.fromisoformat(str(value)) if value else None
+    except (ValueError, TypeError):
+        return None
+
+
 def _order_by_effective_deadline(
     connection: sqlite3.Connection,
     rows: Sequence[sqlite3.Row],
@@ -123,53 +173,9 @@ def _order_by_effective_deadline(
     if not rows:
         return list(rows)
     try:
-        dep_rows = connection.execute(
-            "SELECT depends_on_task_id, task_id FROM task_scheduling_conditions "
-            "WHERE kind='after_task_completed' AND state='active' "
-            "AND depends_on_task_id IS NOT NULL"
-        ).fetchall()
-        dependencies: list[tuple[int, int]] = []
-        dep_task_ids: set[int] = set()
-        for dep in dep_rows:
-            pred = int(dep["depends_on_task_id"])
-            dep_id = int(dep["task_id"])
-            dependencies.append((pred, dep_id))
-            dep_task_ids.add(pred)
-            dep_task_ids.add(dep_id)
-
-        all_task_ids = dep_task_ids | {int(r["task_id"]) for r in rows}
-        if not all_task_ids:
-            return list(rows)
-
-        placeholders = ",".join("?" for _ in all_task_ids)
-        task_rows = connection.execute(
-            f"SELECT id, due, status FROM tasks WHERE id IN ({placeholders})",
-            tuple(all_task_ids),
-        ).fetchall()
-
-        tasks_map: dict[int, TaskTiming] = {}
-        for tr in task_rows:
-            tid = int(tr["id"])
-            due_raw = tr["due"]
-            due_val: date | None = None
-            if due_raw:
-                try:
-                    due_val = date.fromisoformat(due_raw)
-                except (ValueError, TypeError):
-                    due_val = None
-            is_open = (tr["status"] == "open")
-            tasks_map[tid] = TaskTiming(due=due_val, effort=None, open=is_open)
-
-        # A candidate row whose task row vanished keeps its SQL position.
-        for r in rows:
-            tid = int(r["task_id"])
-            if tid not in tasks_map:
-                tasks_map[tid] = TaskTiming(due=None, effort=None, open=True)
-
-        from .task_timing import with_research_timing
-        tasks_map = with_research_timing(connection, tasks_map)
-        res = effective_deadlines(tasks_map, dependencies, today)
-        effective_map = res.deadlines
+        tasks_map, dependencies = _deadline_graph(
+            connection, {int(r["task_id"]) for r in rows})
+        effective_map = effective_deadlines(tasks_map, dependencies, today).deadlines
 
         def sort_key(row: sqlite3.Row) -> tuple[int, int, int]:
             tier = _claim_source_tier(row["origin_kind"])
@@ -187,6 +193,52 @@ def _order_by_effective_deadline(
         return sorted(rows, key=sort_key)
     except Exception:
         return list(rows)
+
+
+def auto_raise_reason(
+    connection: sqlite3.Connection,
+    task_id: int,
+    today: date,
+    reader_aliases: frozenset[str] = frozenset(),
+) -> str | None:
+    """Why the claim treats this task as raised, or None when it does not (#910).
+
+    The same rule as `_order_by_effective_deadline`: a task the reader owns,
+    not raised or lowered by the reader, whose effective deadline is within
+    `AUTO_RAISE_WINDOW`. The reason names where that deadline comes from: the
+    task's own due date, a cited research deadline, or a task depending on it.
+    """
+    row = connection.execute(
+        "SELECT t.*, w.queue_priority FROM tasks t "
+        "LEFT JOIN task_execution_workflows w ON w.task_id=t.id WHERE t.id=?",
+        (task_id,),
+    ).fetchone()
+    if row is None or row["queue_priority"] in ("raised", "lowered"):
+        return None
+    if not reader_owned(dict(row), reader_aliases):
+        return None
+    tasks_map, dependencies = _deadline_graph(connection, {task_id})
+    deadlines = effective_deadlines(tasks_map, dependencies, today).deadlines
+    effective = deadlines.get(task_id)
+    if effective is None or effective > today + timedelta(days=AUTO_RAISE_WINDOW.days):
+        return None
+    days = (effective - today).days
+    when = ("overdue" if days < 0 else "today" if days == 0
+            else "tomorrow" if days == 1 else f"in {days} days")
+    if _date_or_none(row["due"]) == effective:
+        return f"Raised automatically: due {effective.isoformat()} ({when})."
+    if tasks_map[task_id].due == effective:
+        return ("Raised automatically: research found a deadline of "
+                f"{effective.isoformat()} ({when}).")
+    for pred, dependant in sorted(dependencies):
+        dependant_deadline = deadlines.get(dependant)
+        if pred == task_id and dependant_deadline is not None and (
+            dependant_deadline - timedelta(days=_effort_to_days(tasks_map[dependant].effort))
+            == effective
+        ):
+            return (f"Raised automatically: T{dependant} depends on it and is "
+                    f"due {dependant_deadline.isoformat()}.")
+    return f"Raised automatically: due {effective.isoformat()} ({when})."
 
 
 DEFAULT_LEASE_SECONDS = 300
