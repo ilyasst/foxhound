@@ -4185,12 +4185,12 @@ def _result_instruction(value: object) -> int | None:
 
 
 def _artifact_records(value: object) -> list[dict[str, object]]:
-    if (
-        not isinstance(value, Sequence)
-        or isinstance(value, (str, bytes))
-        or len(value) > 100
-    ):
-        raise ValueError("execution result artifacts are invalid")
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise TypeError("execution result artifacts is invalid")
+    if len(value) > 100:
+        raise ValueError(
+            f"execution result artifacts has {len(value)} items; the limit is 100"
+        )
     records: list[dict[str, object]] = []
     paths: set[str] = set()
     for item in value:
@@ -4198,7 +4198,7 @@ def _artifact_records(value: object) -> list[dict[str, object]]:
             "relative_path", "name", "size_bytes", "content_digest",
             "run_directory",
         }:
-            raise ValueError("execution result artifacts are invalid")
+            raise ValueError("execution result artifacts item is invalid")
         path = item["relative_path"]
         name = item["name"]
         size = item["size_bytes"]
@@ -4225,7 +4225,7 @@ def _artifact_records(value: object) -> list[dict[str, object]]:
             or not _DIGEST_RE.fullmatch(digest)
             or _result_path(run, "artifact run directory") is None
         ):
-            raise ValueError("execution result artifacts are invalid")
+            raise ValueError("execution result artifacts item is invalid")
         paths.add(path)
         records.append({
             "relative_path": path,
@@ -4240,10 +4240,14 @@ def _artifact_records(value: object) -> list[dict[str, object]]:
 def _result_path(value: object, label: str) -> str | None:
     if value is None:
         return None
+    if not isinstance(value, str):
+        raise TypeError(f"execution result {label} is invalid")
+    if len(value) > 4_096:
+        raise ValueError(
+            f"execution result {label} is {len(value)} characters; the limit is 4096"
+        )
     if (
-        not isinstance(value, str)
-        or not value.startswith("/")
-        or len(value) > 4_096
+        not value.startswith("/")
         or "\0" in value
         or any(ord(character) < 32 for character in value)
     ):
@@ -4347,8 +4351,15 @@ def _initial_phase(
 def _bounded_text(
     value: object, label: str, maximum: int, *, single_line: bool
 ) -> str:
-    if not isinstance(value, str) or not value or len(value) > maximum:
-        raise ValueError(f"execution result {label} is invalid")
+    if not isinstance(value, str):
+        raise TypeError(f"execution result {label} is invalid")
+    if not value:
+        raise ValueError(f"execution result {label} is empty")
+    if len(value) > maximum:
+        raise ValueError(
+            f"execution result {label} is {len(value)} characters; "
+            f"the limit is {maximum}"
+        )
     if value != value.strip():
         raise ValueError(f"execution result {label} is invalid")
     if any(
@@ -4357,7 +4368,7 @@ def _bounded_text(
     ):
         raise ValueError(f"execution result {label} is invalid")
     if single_line and any(char in value for char in "\r\n"):
-        raise ValueError(f"execution result {label} is invalid")
+        raise ValueError(f"execution result {label} must be a single line")
     return value
 
 
@@ -4365,12 +4376,15 @@ def _text_collection(
     value: Sequence[str], label: str, maximum: int, *, single_line: bool
 ) -> tuple[str, ...]:
     if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
-        raise ValueError(f"execution result {label} are invalid")
+        raise TypeError(f"execution result {label} is invalid")
     items = tuple(value)
     if len(items) > MAX_COLLECTION_ITEMS:
-        raise ValueError(f"execution result {label} are invalid")
+        raise ValueError(
+            f"execution result {label} has {len(items)} items; "
+            f"the limit is {MAX_COLLECTION_ITEMS}"
+        )
     return tuple(
-        _bounded_text(item, label, maximum, single_line=single_line)
+        _bounded_text(item, f"{label} item", maximum, single_line=single_line)
         for item in items
     )
 
@@ -4414,31 +4428,39 @@ def _structured_collection(
     so a large object cannot arrive through a field that was never read.
     """
     if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
-        raise ValueError(f"execution result {label} are invalid")
+        raise TypeError(f"execution result {label} is invalid")
     items = tuple(value)
     if len(items) > MAX_COLLECTION_ITEMS:
-        raise ValueError(f"execution result {label} are invalid")
+        raise ValueError(
+            f"execution result {label} has {len(items)} items; "
+            f"the limit is {MAX_COLLECTION_ITEMS}"
+        )
     records: list[object] = []
     for item in items:
         if isinstance(item, str):
             records.append(
-                _bounded_text(item, label, maximum, single_line=False))
+                _bounded_text(
+                    item, f"{label} item", maximum, single_line=False
+                )
+            )
             continue
         if not isinstance(item, dict):
-            raise ValueError(f"execution result {label} are invalid")
+            raise TypeError(f"execution result {label} item is invalid")
         text = _record_text(item, aliases)
         if text is None:
-            raise ValueError(f"execution result {label} are invalid")
+            raise ValueError(f"execution result {label} item is invalid")
         record = {
             primary: _bounded_text(
-                text, label, maximum, single_line=False),
+                text, f"{label} item", maximum, single_line=False
+            ),
         }
         for name in optional:
             supplied = item.get(name)
             if supplied is None:
                 continue
             record[name] = _bounded_text(
-                supplied, label, MAX_QUESTION_CHARS, single_line=True)
+                supplied, f"{label} item {name}", MAX_QUESTION_CHARS, single_line=True
+            )
         unknown = set(item) - set(aliases) - set(optional)
         if unknown:
             allowed = sorted(set(aliases) | set(optional))
@@ -4461,19 +4483,22 @@ def _repository_references(value: object) -> tuple[dict[str, str], ...]:
     links again and recreate the ambiguity this field removes.
     """
     if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
-        raise ValueError("execution result repository references are invalid")
+        raise TypeError("execution result repository references is invalid")
     items = tuple(value)
     if len(items) > MAX_REPOSITORY_REFERENCES:
-        raise ValueError("execution result repository references are invalid")
+        raise ValueError(
+            f"execution result repository references has {len(items)} items; "
+            f"the limit is {MAX_REPOSITORY_REFERENCES}"
+        )
     references: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
     for item in items:
         if not isinstance(item, dict) or set(item) != {"kind", "url"}:
-            raise ValueError("execution result repository references are invalid")
+            raise ValueError("execution result repository references item is invalid")
         kind, url = item.get("kind"), item.get("url")
         pattern = _REPOSITORY_REFERENCE_PATTERNS.get(kind)
         if not isinstance(url, str) or pattern is None or not pattern.fullmatch(url):
-            raise ValueError("execution result repository references are invalid")
+            raise ValueError("execution result repository references item is invalid")
         reference = (kind, url)
         if reference not in seen:
             seen.add(reference)

@@ -42,6 +42,7 @@ from foxhound.task_execution import (
     WorkflowDisposition,
     WorkflowPhase,
     _structured_collection,
+    _validated_result,
     WorkflowPriority,
     WorkflowRefusal,
     WorkflowStatus,
@@ -3107,6 +3108,79 @@ class PriorFailureEvidenceTests(TaskExecutionTests):
                 aliases=("action", "title", "text"),
                 optional=("requires", "channel", "target"),
             )
+
+    def test_validated_result_field_validation_messages(self):
+        secret_token = "s" * 32
+        base = {
+            "result_id": "0123456789abcdef0123456789abcdef",
+            "task_id": 1,
+            "task_version": 1,
+            "workflow_version": 1,
+            "phase": "plan",
+            "claim_token": secret_token,
+            "outcome": "awaiting_plan",
+            "summary": "Synthetic summary",
+            "work_markdown": "Synthetic work",
+            "questions": [],
+            "external_actions": [],
+            "deliverables": [],
+            "repository_references": [],
+            "repository_impact": False,
+        }
+
+        # Over-long summary
+        secret_summary_payload = "SENSITIVE_SECRET_SUMMARY_PAYLOAD_" + ("a" * 1250)
+        with self.assertRaises(ValueError) as ctx:
+            _validated_result(ExecutionResultEnvelope(**{**base, "summary": secret_summary_payload}))
+        msg = str(ctx.exception)
+        self.assertIn("execution result summary is 1283 characters; the limit is 1200", msg)
+        self.assertNotIn("SENSITIVE", msg)
+        self.assertNotIn(secret_summary_payload, msg)
+
+        # Over-long work markdown
+        secret_work_payload = "SENSITIVE_SECRET_WORK_PAYLOAD_" + ("w" * 131100)
+        with self.assertRaises(ValueError) as ctx:
+            _validated_result(ExecutionResultEnvelope(**{**base, "work_markdown": secret_work_payload}))
+        msg = str(ctx.exception)
+        self.assertIn("execution result work markdown is 131130 characters; the limit is 131072", msg)
+        self.assertNotIn("SENSITIVE", msg)
+        self.assertNotIn(secret_work_payload, msg)
+
+        # Too many questions
+        too_many_q = [f"Synthetic question {i}?" for i in range(25)]
+        with self.assertRaises(ValueError) as ctx:
+            _validated_result(ExecutionResultEnvelope(**{**base, "questions": too_many_q}))
+        msg = str(ctx.exception)
+        self.assertIn("execution result questions has 25 items; the limit is 20", msg)
+        self.assertNotIn("Synthetic question", msg)
+
+        # Over-long deliverable item
+        secret_deliverable = "SENSITIVE_SECRET_DELIVERABLE_" + ("d" * 16050)
+        with self.assertRaises(ValueError) as ctx:
+            _validated_result(ExecutionResultEnvelope(**{**base, "deliverables": [secret_deliverable]}))
+        msg = str(ctx.exception)
+        self.assertIn("execution result deliverables item is 16079 characters; the limit is 16000", msg)
+        self.assertNotIn("SENSITIVE", msg)
+        self.assertNotIn(secret_deliverable, msg)
+
+        # Over-long question item
+        secret_question = "SENSITIVE_QUESTION_" + ("q" * 1050)
+        with self.assertRaises(ValueError) as ctx:
+            _validated_result(ExecutionResultEnvelope(**{**base, "questions": [secret_question]}))
+        msg = str(ctx.exception)
+        self.assertIn("execution result questions item is 1069 characters; the limit is 1000", msg)
+        self.assertNotIn("SENSITIVE", msg)
+        self.assertNotIn(secret_question, msg)
+
+        # Empty summary
+        with self.assertRaises(ValueError) as ctx:
+            _validated_result(ExecutionResultEnvelope(**{**base, "summary": ""}))
+        self.assertEqual(str(ctx.exception), "execution result summary is empty")
+
+        # Multiline where single line is required (question item)
+        with self.assertRaises(ValueError) as ctx:
+            _validated_result(ExecutionResultEnvelope(**{**base, "questions": ["Line 1\nLine 2"]}))
+        self.assertEqual(str(ctx.exception), "execution result questions item must be a single line")
 
 
 if __name__ == "__main__":
