@@ -1421,6 +1421,34 @@ class TaskExecutionTests(unittest.TestCase):
         claims = [service.claim_next() for _ in range(4)]
         self.assertEqual([claim.task_id for claim in claims], [2, 3, 1, 4])
 
+    def test_claim_runs_older_work_first_when_deadline_ordering_disabled(self):
+        today = self.clock().date()
+        self._add_task(2, "Synthetic task due tomorrow")
+        self._add_task(3, "Synthetic task due in ten days")
+        self._add_task(4, "Synthetic task due next month")
+        with closing(sqlite3.connect(self.database)) as connection:
+            for task_id, days in ((2, 1), (3, 10), (4, 40)):
+                connection.execute(
+                    "UPDATE tasks SET due=? WHERE id=?",
+                    ((today + timedelta(days=days)).isoformat(), task_id))
+            connection.commit()
+        self._schedule_and_start()
+        for task_id in (2, 3, 4):
+            workflow = self.service.schedule(task_id, expected_task_version=1)
+            if workflow is None:
+                continue
+            self.service.start_action(
+                task_id, expected_version=workflow.version, action="start")
+        service = TaskExecutionService(
+            self.database, clock=self.clock, token_factory=lambda: TOKEN,
+            execution_slot_cap=4,
+            profile_registry=self.service._profile_registry,
+            deadline_ordering=False,
+        )
+        claims = [service.claim_next() for _ in range(4)]
+        # updated_at order: 1, 2, 3, 4 (because 1 was scheduled first, then 2, 3, 4)
+        self.assertEqual([claim.task_id for claim in claims if claim is not None], [1, 2, 3, 4])
+
     def test_claim_auto_raises_reader_owned_work_due_soon(self):
         """A reader-owned task due within 48h is treated as raised priority (#771)."""
         today = self.clock().date()

@@ -205,6 +205,7 @@ class ExecutionRunnerDeploymentConfig:
     task_kb_root: Path | None = None
     runtime_session_database: Path | None = None
     runtime_log_retention_bytes: int | None = None
+    deadline_ordering: bool = True
 
     def argv(
         self,
@@ -248,6 +249,8 @@ class ExecutionRunnerDeploymentConfig:
                 result.extend((option, selection))
         for source_kind, profile_id in workflow.agent_profile_routes:
             result.extend(("--profile-route", f"{source_kind}={profile_id}"))
+        if not self.deadline_ordering:
+            result.append("--no-deadline-ordering")
         for name, root in sorted(self.deployment_roots.items()):
             result.extend(("--deployment-root", f"{name}={root}"))
         for option, path in (
@@ -1006,6 +1009,8 @@ def _parse_execution_runner(
         fields.add("deployment_roots")
     if version >= 14:
         fields.update({"agent_model", "agent_provider"})
+    if version >= 15:
+        fields.add("deadline_ordering")
     document = _object(value, fields)
     strings = tuple(document[key] for key in (
         "gw_endpoint", "gw_alias", "agent_command", "worker_command", "runner_slot"
@@ -1054,6 +1059,7 @@ def _parse_execution_runner(
         task_work_root=_optional_absolute_path(document["task_work_root"]),
         task_kb_root=_optional_absolute_path(document["task_kb_root"]),
         runtime_session_database=runtime_database,
+        deadline_ordering=_optional_bool(document.get("deadline_ordering", True)),
         runtime_log_retention_bytes=retention,
     )
 

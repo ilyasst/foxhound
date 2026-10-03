@@ -198,6 +198,7 @@ class ExecutionRunnerConfig:
     research_before_planning: tuple[str, ...] = ()
     reader_aliases: tuple[str, ...] = ()
     research_wait_seconds: int | None = None
+    deadline_ordering: bool = True
 
     def __post_init__(self) -> None:
         if (
@@ -564,6 +565,7 @@ def run_once(
         research_wait_seconds=config.research_wait_seconds,
         research_task_roots=research_task_roots,
         reader_aliases=config.reader_aliases,
+        deadline_ordering=config.deadline_ordering,
     )
     terminator = terminate or _terminate_process_group
     with _exclusive_lock(_runner_lock_path(root, config.runner_slot)) as acquired:
@@ -1889,6 +1891,12 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--no-deadline-ordering",
+        action="store_false",
+        dest="deadline_ordering",
+        help="disable deadline ordering",
+    )
+    parser.add_argument(
         "--cleanup",
         action="store_true",
         help=(
@@ -2023,6 +2031,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             research_before_planning=tuple(args.research_before_planning or ()),
             research_wait_seconds=args.research_wait_seconds,
             reader_aliases=tuple(args.reader_alias or ()),
+            deadline_ordering=args.deadline_ordering,
         )
         # Before anything is claimed. A worker that cannot parse the run
         # state this runner writes fails every run at the agent's first tool
