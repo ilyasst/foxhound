@@ -205,6 +205,10 @@ class AgentProfileTests(unittest.TestCase):
             "knowledge.root",
             "guides.md",
             "Repositories.md",
+            "Research comes first.",
+            "When `context` includes `research`",
+            "verified starting evidence for this task",
+            "Do not redo research it already covers",
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, rendered_private)
