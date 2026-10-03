@@ -1779,8 +1779,77 @@ class ExecutionWorkerTests(unittest.TestCase):
             self._age_task_input(path)
 
         with knowledge_server() as endpoint:
-            with self.assertRaises(ExecutionWorkerDraftError):
+            with self.assertRaisesRegex(
+                ExecutionWorkerDraftError,
+                "result-summary.txt exists in the task folder but was written before this run started; write it again for this run",
+            ):
                 self._worker(endpoint).draft(outcome="awaiting_plan")
+
+    def test_draft_refuses_when_summary_missing_naming_roles_and_contract(self):
+        """When a required input is missing, the message names searched roles and contract."""
+        self._enable_archive()
+        with knowledge_server() as endpoint:
+            with self.assertRaisesRegex(
+                ExecutionWorkerDraftError,
+                r"result-summary\.txt not found in searched locations \(task run folder, task folder, run directory\); write it to the directory named by `workflow\.result_contract\.directory` in `context`",
+            ):
+                self._worker(endpoint).draft(outcome="awaiting_plan")
+
+    def test_context_includes_result_contract_with_phase_outcomes(self):
+        with knowledge_server() as endpoint:
+            worker = self._worker(endpoint)
+            context = worker.context()
+
+        contract = context["workflow"]["result_contract"]
+        self.assertEqual(
+            contract["directory"],
+            str(self.run_directory),
+        )
+        self.assertEqual(
+            contract["outcomes"],
+            ["awaiting_plan", "completed", "ineligible"],
+        )
+        self.assertEqual(
+            contract["record"],
+            f"{WORKER_COMMAND} record --outcome OUTCOME",
+        )
+        self.assertIn("result-summary.txt", contract["required"])
+        self.assertIn("result-work.md", contract["required"])
+        self.assertIn("result-questions.json", contract["optional"])
+        self.assertIn("result-deliverables.json", contract["optional"])
+        self.assertIn("result-external-actions.json", contract["optional"])
+        self.assertIn("result-artifacts.json", contract["optional"])
+        self.assertIn("result-repository-references.json", contract["optional"])
+        self.assertIn("result-repository-impact.json", contract["optional"])
+
+        # Switch to EXECUTE phase
+        state_doc = json.loads(self.state_path.read_text(encoding="utf-8"))
+        state_doc["phase"] = WorkflowPhase.EXECUTE.value
+        self.state_path.write_text(json.dumps(state_doc), encoding="utf-8")
+
+        with knowledge_server() as endpoint:
+            worker = self._worker(endpoint)
+            context = worker.context()
+
+        contract = context["workflow"]["result_contract"]
+        self.assertEqual(
+            contract["outcomes"],
+            ["awaiting_external", "completed", "declined", "ineligible"],
+        )
+
+        # Switch to EXTERNAL_ACTION phase
+        state_doc["phase"] = WorkflowPhase.EXTERNAL_ACTION.value
+        self.state_path.write_text(json.dumps(state_doc), encoding="utf-8")
+
+        with knowledge_server() as endpoint:
+            worker = self._worker(endpoint)
+            context = worker.context()
+
+        contract = context["workflow"]["result_contract"]
+        self.assertEqual(
+            contract["outcomes"],
+            ["completed", "declined", "ineligible"],
+        )
 
     def test_release_sees_result_inputs_authored_in_the_task_folder(self):
         """Releasing must not silently drop work authored where it belongs.
@@ -2961,6 +3030,48 @@ class ResultLocationTests(unittest.TestCase):
 
         self.assertIn("readable by others", reason)
         self.assertIn("600", reason)
+
+    def test_locate_required_missing_says_which_roles_were_searched(self):
+        order, roles = execution_worker._result_search_path_with_roles(
+            self._state(str(self.task), str(self.task_run)), self.run
+        )
+        with self.assertRaises(ExecutionWorkerDraftError) as cm:
+            execution_worker._locate_required(
+                order, roles, "result-summary.txt"
+            )
+        message = str(cm.exception)
+        self.assertIn("result-summary.txt not found in searched locations (task run folder, task folder, run directory)", message)
+        self.assertIn("write it to the directory named by `workflow.result_contract.directory` in `context`", message)
+
+    def test_locate_required_stale_task_input_says_written_before_run(self):
+        stale = self._write(self.task, "result-summary.txt")
+        order, roles = execution_worker._result_search_path_with_roles(
+            self._state(str(self.task)), self.run
+        )
+        with self.assertRaises(ExecutionWorkerDraftError) as cm:
+            execution_worker._locate_required(
+                order, roles, "result-summary.txt",
+                task_folder_not_before=stale.stat().st_mtime_ns + 1,
+            )
+        self.assertEqual(
+            str(cm.exception),
+            "result-summary.txt exists in the task folder but was written before this run started; write it again for this run",
+        )
+
+    def test_locate_required_stale_task_run_input_says_written_before_run(self):
+        stale = self._write(self.task_run, "result-summary.txt")
+        order, roles = execution_worker._result_search_path_with_roles(
+            self._state(str(self.task), str(self.task_run)), self.run
+        )
+        with self.assertRaises(ExecutionWorkerDraftError) as cm:
+            execution_worker._locate_required(
+                order, roles, "result-summary.txt",
+                task_folder_not_before=stale.stat().st_mtime_ns + 1,
+            )
+        self.assertEqual(
+            str(cm.exception),
+            "result-summary.txt exists in the task run folder but was written before this run started; write it again for this run",
+        )
 
     def test_the_reported_path_prefers_where_the_reader_was_aiming(self):
         """With nothing written anywhere, name the task folder, not scratch."""

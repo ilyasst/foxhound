@@ -3820,28 +3820,33 @@ def _running_guard(
     return None
 
 
+#: Each workflow phase mapped to the outcomes a worker may legitimately record.
+#: Hoisted to module scope so result-contract construction and result validation
+#: read from the same source of truth.
+PHASE_OUTCOMES: Mapping[WorkflowPhase, frozenset[ExecutionOutcome]] = {
+    WorkflowPhase.PLAN: frozenset({
+        ExecutionOutcome.AWAITING_PLAN,
+        ExecutionOutcome.COMPLETED,
+        ExecutionOutcome.INELIGIBLE,
+    }),
+    WorkflowPhase.EXECUTE: frozenset({
+        ExecutionOutcome.AWAITING_EXTERNAL,
+        ExecutionOutcome.COMPLETED,
+        ExecutionOutcome.DECLINED,
+        ExecutionOutcome.INELIGIBLE,
+    }),
+    WorkflowPhase.EXTERNAL_ACTION: frozenset({
+        ExecutionOutcome.COMPLETED,
+        ExecutionOutcome.DECLINED,
+        ExecutionOutcome.INELIGIBLE,
+    }),
+}
+
+
 def _result_target(
     phase: WorkflowPhase, outcome: ExecutionOutcome
 ) -> WorkflowStatus | None:
-    allowed = {
-        WorkflowPhase.PLAN: {
-            ExecutionOutcome.AWAITING_PLAN,
-            ExecutionOutcome.COMPLETED,
-            ExecutionOutcome.INELIGIBLE,
-        },
-        WorkflowPhase.EXECUTE: {
-            ExecutionOutcome.AWAITING_EXTERNAL,
-            ExecutionOutcome.COMPLETED,
-            ExecutionOutcome.DECLINED,
-            ExecutionOutcome.INELIGIBLE,
-        },
-        WorkflowPhase.EXTERNAL_ACTION: {
-            ExecutionOutcome.COMPLETED,
-            ExecutionOutcome.DECLINED,
-            ExecutionOutcome.INELIGIBLE,
-        },
-    }
-    if outcome not in allowed[phase]:
+    if outcome not in PHASE_OUTCOMES[phase]:
         return None
     return WorkflowStatus.AWAITING_REVIEW
 
