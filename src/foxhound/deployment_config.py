@@ -589,6 +589,25 @@ class DeploymentConfig:
         return argv + ["--limit", str(limit)]
 
 
+def component_command(
+    config: DeploymentConfig,
+    component: str,
+    *,
+    script_directory: Path,
+) -> tuple[list[str], dict[str, str]]:
+    """Return the absolute command argv and environment variables for a component."""
+    argv = list(config.argv(component))
+    extra_env: dict[str, str] = {}
+    if (component.startswith("execution-runner")
+            and not config.workflow.voice_summaries):
+        extra_env["FOXHOUND_VOICE_SUMMARIES"] = "0"
+    executable = script_directory / argv[0]
+    if not executable.is_file():
+        raise DeploymentConfigError("deployment executable is unavailable")
+    argv[0] = str(executable)
+    return argv, extra_env
+
+
 def execute_component(config: DeploymentConfig, component: str) -> None:
     """Replace this process with a declared component from this release.
 
@@ -597,17 +616,17 @@ def execute_component(config: DeploymentConfig, component: str) -> None:
     adjacent path is deliberate: consulting ``PATH`` could select a command
     from a different checkout or release.
     """
-    argv = config.argv(component)
-    if (component.startswith("execution-runner")
-            and not config.workflow.voice_summaries):
-        # Inherited by the agent and its task worker: no summary model call
-        # and no speech synthesis for this host's results.
-        os.environ["FOXHOUND_VOICE_SUMMARIES"] = "0"
+    raw_argv = config.argv(component)
+    script_directory = Path(sys.argv[0]).resolve().parent
+    argv, extra_env = component_command(
+        config,
+        component,
+        script_directory=script_directory,
+    )
+    for key, value in extra_env.items():
+        os.environ[key] = value
     try:
-        executable = Path(sys.argv[0]).resolve().parent / argv[0]
-        if not executable.is_file():
-            raise DeploymentConfigError("deployment executable is unavailable")
-        os.execv(str(executable), argv)
+        os.execv(argv[0], raw_argv)
     except OSError as exc:
         raise DeploymentConfigError("deployment executable is unavailable") from exc
 
