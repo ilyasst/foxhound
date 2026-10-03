@@ -1936,50 +1936,21 @@ def test_agent_synthesize_task_json_runtime_and_due_in_days(tmp_path: Path) -> N
         },
     }
 
-    # Case 1: due in the future
-    ctx_future = {
+    # Case 1: task snapshot has due date; task.json drops due and due_in_days, keeps runtime
+    ctx = {
         "task_snapshot": {
             "task_id": 101,
             "title": "Future task",
             "due": "2026-05-15",
         },
     }
-    run_dir_1 = tmp_path / "run_future"
+    run_dir = tmp_path / "run_due"
     with mock.patch("foxhound.task_research_agent._clock", return_value=fake_runtime):
-        agent_synthesize(ctx_future, config=config, bound_sources=None, run_dir=run_dir_1)
+        agent_synthesize(ctx, config=config, bound_sources=None, run_dir=run_dir)
 
-    task_json_1 = json.loads((run_dir_1 / "task.json").read_text())
-    assert task_json_1["runtime"] == fake_runtime
-    assert task_json_1["due_in_days"] == 5
-
-    # Case 2: overdue (due in past)
-    ctx_past = {
-        "task_snapshot": {
-            "task_id": 102,
-            "title": "Overdue task",
-            "due": "2026-05-08",
-        },
-    }
-    run_dir_2 = tmp_path / "run_past"
-    with mock.patch("foxhound.task_research_agent._clock", return_value=fake_runtime):
-        agent_synthesize(ctx_past, config=config, bound_sources=None, run_dir=run_dir_2)
-
-    task_json_2 = json.loads((run_dir_2 / "task.json").read_text())
-    assert task_json_2["runtime"] == fake_runtime
-    assert task_json_2["due_in_days"] == -2
-
-    # Case 3: no due date or malformed due date
-    ctx_nodue = {
-        "task_snapshot": {
-            "task_id": 103,
-            "title": "No due task",
-            "due": "not-a-valid-date",
-        },
-    }
-    run_dir_3 = tmp_path / "run_nodue"
-    with mock.patch("foxhound.task_research_agent._clock", return_value=fake_runtime):
-        agent_synthesize(ctx_nodue, config=config, bound_sources=None, run_dir=run_dir_3)
-
-    task_json_3 = json.loads((run_dir_3 / "task.json").read_text())
-    assert task_json_3["runtime"] == fake_runtime
-    assert "due_in_days" not in task_json_3
+    task_json = json.loads((run_dir / "task.json").read_text())
+    assert task_json["runtime"] == fake_runtime
+    assert "due" not in task_json
+    assert "due_in_days" not in task_json
+    assert task_json["task_id"] == 101
+    assert task_json["title"] == "Future task"
