@@ -1961,9 +1961,11 @@ class NativeCandidateIntakeTests(unittest.TestCase):
 
         self.assertEqual(execution.get(1).status, WorkflowStatus.CANCELLED)
 
-    def _withdraw_review(self, generation: int = 2):
+    def _withdraw_review(self, generation: int = 2, reason: str | None = None):
         withdrawn = review_candidate("a" * 40, generation=generation)
         withdrawn["lifecycle"]["state"] = "withdrawn"
+        if reason is not None:
+            withdrawn["lifecycle"]["reason"] = reason
         withdrawn["source"]["revision"] = hashlib.sha256(
             json.dumps(withdrawn, sort_keys=True).encode("utf-8")
         ).hexdigest()
@@ -1991,6 +1993,32 @@ class NativeCandidateIntakeTests(unittest.TestCase):
         lifecycle, work_state = self._review_lifecycle()
         self.assertEqual(lifecycle, ("closed_by_source", task.version))
         self.assertEqual(work_state, "closed")
+
+    def test_forge_withdrawal_reason_decides_done_or_dropped(self):
+        """How the item ended decides the close (#912); unknown means done."""
+        for reason, expected in (
+            ("pr_merged", TaskStatus.DONE),
+            ("pr_closed", TaskStatus.DROPPED),
+            ("issue_not_planned", TaskStatus.DROPPED),
+            ("something_new", TaskStatus.DONE),
+        ):
+            with self.subTest(reason=reason):
+                self.tearDown()
+                self.setUp()
+                self.activate()
+                self.inbox.import_feed(feed(0, review_candidate("a" * 40)))
+                self.intake()
+
+                self.assertEqual(
+                    self._withdraw_review(reason=reason).candidates_withdrawn, 1)
+
+                task = self.ledger.get(1)
+                self.assertEqual(task.status, expected)
+                with closing(sqlite3.connect(self.database)) as connection:
+                    kinds = [row[0] for row in connection.execute(
+                        "SELECT kind FROM task_events WHERE task_id=1 "
+                        "ORDER BY sequence")]
+                self.assertIn("status_changed", kinds)
 
     def test_forge_withdrawal_closes_a_task_waiting_for_review(self):
         self.activate()
