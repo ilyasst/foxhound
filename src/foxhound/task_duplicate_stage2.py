@@ -33,6 +33,8 @@ DETECTOR = "agent-verified-v1"
 DEFAULT_LIMIT = 10
 DEFAULT_DAILY_BUDGET = 50
 DEFAULT_TIMEOUT_SECONDS = 600.0
+#: meaning-based ranking on the knowledge service can take several seconds per layer
+STAGE_TWO_KNOWLEDGE_TIMEOUT_SECONDS = 25.0
 MAX_CITATIONS = 5
 MAX_EXCERPT = 1_200
 MAX_MODEL_RESPONSE_BYTES = 256 * 1024
@@ -741,7 +743,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     try:
         knowledge = GwKnowledgeClient(load_knowledge_config(
-            arguments.gw_endpoint, arguments.gw_alias, arguments.gw_token_file
+            arguments.gw_endpoint,
+            arguments.gw_alias,
+            arguments.gw_token_file,
+            timeout_seconds=STAGE_TWO_KNOWLEDGE_TIMEOUT_SECONDS,
         ))
         agent = LocalVerificationAgent(
             model=arguments.model,

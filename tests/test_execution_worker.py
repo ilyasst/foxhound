@@ -259,7 +259,7 @@ class ExecutionWorkerTests(unittest.TestCase):
             "FOXHOUND_GW_TOKEN_FILE": str(token),
         }
         worker = load_worker_from_environment(environ)
-        self.assertEqual(worker._knowledge_config.timeout_seconds, 10.0)
+        self.assertEqual(worker._knowledge_config.timeout_seconds, 25.0)
         self.assertEqual(worker._knowledge_config.timeout_seconds, WORKER_KNOWLEDGE_TIMEOUT_SECONDS)
 
     def _write_state(
