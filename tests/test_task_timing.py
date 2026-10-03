@@ -39,7 +39,7 @@ class TaskTimingTests(unittest.TestCase):
     def test_schema_v70_created_and_version_updated(self):
         with closing(sqlite3.connect(self.db_path)) as conn:
             v = conn.execute("PRAGMA user_version").fetchone()[0]
-            self.assertEqual(v, 70)
+            self.assertEqual(v, SCHEMA_VERSION)
             self.assertEqual(v, SCHEMA_VERSION)
             tables = {
                 r[0]
@@ -64,7 +64,7 @@ class TaskTimingTests(unittest.TestCase):
 
             with closing(sqlite3.connect(mig_db)) as conn:
                 v = conn.execute("PRAGMA user_version").fetchone()[0]
-                self.assertEqual(v, 70)
+                self.assertEqual(v, SCHEMA_VERSION)
                 tables = {
                     r[0]
                     for r in conn.execute(
