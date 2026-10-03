@@ -23,6 +23,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from .change_reviews import ChangeReviewService, render_change_review_card
 from .agent_profiles import AgentProfileError, load_registry
 from .card_provenance import provenance_document
 from .execution_cards import (
@@ -186,6 +187,10 @@ ROUTES = {
     "/v1/task-cards/delivery-failed": "delivery_failed",
     "/v1/task-cards/action": "action",
     "/v1/task-cards/view": "view",
+    "/v1/change-review-cards/claim": "change_review_claim",
+    "/v1/change-review-cards/delivered": "change_review_delivered",
+    "/v1/change-review-cards/delivery-failed": "change_review_delivery_failed",
+    "/v1/change-review-cards/action": "change_review_action",
     "/v1/scheduling-cards/claim": "scheduling_claim",
     "/v1/scheduling-cards/delivered": "scheduling_delivered",
     "/v1/scheduling-cards/delivery-failed": "scheduling_delivery_failed",
@@ -318,6 +323,7 @@ class TaskCardApplication:
         execution_cards: ExecutionCardService | None = None,
         execution_workflows: TaskExecutionService | None = None,
         scheduling_cards: TaskSchedulingService | None = None,
+        change_reviews: ChangeReviewService | None = None,
         execution_tokens: str | Mapping[str, str] | None = None,
         limits: TaskCardServerLimits | None = None,
     ) -> None:
@@ -345,6 +351,7 @@ class TaskCardApplication:
         self.execution_cards = execution_cards
         self.execution_workflows = execution_workflows
         self.scheduling_cards = scheduling_cards
+        self.change_reviews = change_reviews
         # `tokens` maps role -> bearer token. A bare string is today's
         # single shared token, normalized to role `drip` -- this is what
         # keeps an existing single-token deployment behaving exactly as it
@@ -734,6 +741,101 @@ class TaskCardApplication:
                 expected_version=_integer(request["card_version"], minimum=1),
                 expanded=view == DUPLICATE_EXPAND,
             ))
+        if operation == "change_review_claim":
+            request = _request(payload, required={"lease_seconds"})
+            identity = self.resolve_consumer(authorization)
+            if identity is None:
+                raise TaskCardServerRequestError(
+                    "consumer_unresolved",
+                    "change review card consumer role is unresolved",
+                    HTTPStatus.FORBIDDEN,
+                )
+            claim = self._change_reviews_service().claim_next(
+                lease_seconds=_integer(
+                    request["lease_seconds"], minimum=5, maximum=300
+                ),
+                consumer_digest=identity.digest,
+            )
+            if claim is None:
+                return {
+                    "schema": SCHEDULING_CLAIM_SCHEMA,
+                    "schema_version": SERVICE_VERSION,
+                    "ok": True,
+                    "status": "empty",
+                    "claim": None,
+                }
+            body, reply_markup = render_change_review_card(claim.card)
+            return {
+                "schema": SCHEDULING_CLAIM_SCHEMA,
+                "schema_version": SERVICE_VERSION,
+                "ok": True,
+                "status": "claimed",
+                "claim": {
+                    "card_id": claim.card.card_id,
+                    "card_version": claim.card.version,
+                    "claim_token": claim.token,
+                    "expires_at": claim.expires_at,
+                    "delivery_key": (
+                        f"foxhound-change-review-card-{claim.card.card_id}-"
+                        f"v{claim.card.version}"
+                    ),
+                    "body": body,
+                    "reply_markup": reply_markup,
+                },
+            }
+        if operation == "change_review_delivered":
+            request = _request(
+                payload,
+                required={
+                    "card_id", "card_version", "claim_token", "transport",
+                    "delivery_ref",
+                },
+            )
+            return _scheduling_operation_document(
+                self._change_reviews_service().complete_delivery(
+                    _integer(request["card_id"], minimum=1),
+                    expected_version=_integer(
+                        request["card_version"], minimum=1
+                    ),
+                    claim_token=_secret(request["claim_token"]),
+                    transport=_opaque(request["transport"], maximum=64),
+                    delivery_ref=_opaque(
+                        request["delivery_ref"], maximum=200
+                    ),
+                )
+            )
+        if operation == "change_review_delivery_failed":
+            request = _request(
+                payload,
+                required={"card_id", "card_version", "claim_token"},
+            )
+            return _scheduling_operation_document(
+                self._change_reviews_service().fail_delivery(
+                    _integer(request["card_id"], minimum=1),
+                    expected_version=_integer(
+                        request["card_version"], minimum=1
+                    ),
+                    claim_token=_secret(request["claim_token"]),
+                )
+            )
+        if operation == "change_review_action":
+            request = _request(
+                payload, required={"card_id", "card_version", "action"}
+            )
+            action = request["action"]
+            if not isinstance(action, str) or action not in {"keep", "undo"}:
+                raise TaskCardServerRequestError(
+                    "invalid_request", "change review card action is invalid"
+                )
+            return _scheduling_operation_document(
+                self._change_reviews_service().act(
+                    _integer(request["card_id"], minimum=1),
+                    expected_version=_integer(
+                        request["card_version"], minimum=1
+                    ),
+                    action=action,
+                )
+            )
         if operation == "scheduling_claim":
             request = _request(payload, required={"lease_seconds"})
             identity = self.resolve_consumer(authorization)
@@ -1437,6 +1539,15 @@ class TaskCardApplication:
                 HTTPStatus.SERVICE_UNAVAILABLE,
             )
         return self.scheduling_cards
+
+    def _change_reviews_service(self) -> ChangeReviewService:
+        if self.change_reviews is None:
+            raise TaskCardServerRequestError(
+                "service_unavailable",
+                "change review service is unavailable",
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+        return self.change_reviews
 
 
 class _TaskCardHTTPServer(HTTPServer):
@@ -2614,12 +2725,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         execution_workflows.readiness()
         scheduling_cards = TaskSchedulingService(arguments.database)
+        change_reviews = ChangeReviewService(arguments.database)
         app = TaskCardApplication(
             cards,
             load_role_tokens(arguments.token_file),
             execution_cards=execution_cards,
             execution_workflows=execution_workflows,
             scheduling_cards=scheduling_cards,
+            change_reviews=change_reviews,
             execution_tokens=(
                 load_role_tokens(
                     arguments.execution_token_file,

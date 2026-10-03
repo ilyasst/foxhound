@@ -240,6 +240,59 @@ class TaskCardServerTests(unittest.TestCase):
             execution_cards=self.execution_cards,
         )
 
+    def test_change_review_card_http_delivery_and_undo(self):
+        from types import SimpleNamespace
+        from foxhound.change_reviews import ChangeReviewService
+        from foxhound.task_ledger import TaskLedger
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.row_factory = sqlite3.Row
+            task = connection.execute("SELECT * FROM tasks WHERE id=1").fetchone()
+            TaskLedger._close_for_forge_source(
+                connection,
+                candidate=SimpleNamespace(
+                    source=SimpleNamespace(kind="review_request", item_id="32"),
+                    lifecycle=SimpleNamespace(reason="pr_merged")),
+                task=task, now=self.clock().isoformat(timespec="seconds"))
+        app = TaskCardApplication(
+            self.cards, TOKEN,
+            change_reviews=ChangeReviewService(
+                self.database, clock=self.clock, token_factory=lambda: "h" * 43),
+        )
+        with running_server(app) as endpoint:
+            status, _, first = request(
+                endpoint, "/v1/change-review-cards/claim",
+                request_document(lease_seconds=60),
+            )
+            self.assertEqual((200, SCHEDULING_CLAIM_SCHEMA, "claimed"), (
+                status, first["schema"], first["status"]))
+            claim = first["claim"]
+            self.assertIn("Pull request #32 was merged", claim["body"])
+            self.assertEqual(
+                [b["callback_data"].split("|")[0] for b in claim["reply_markup"]["inline_keyboard"][0]],
+                ["fhc", "fhc"])
+            status, _, delivered = request(
+                endpoint, "/v1/change-review-cards/delivered",
+                request_document(
+                    card_id=claim["card_id"], card_version=claim["card_version"],
+                    claim_token=claim["claim_token"], transport="synthetic",
+                    delivery_ref="change-review-message-one"),
+            )
+            self.assertEqual((200, True, SCHEDULING_OPERATION_SCHEMA, "applied"), (
+                status, delivered["ok"], delivered["schema"], delivered["disposition"]))
+            status, _, undone = request(
+                endpoint, "/v1/change-review-cards/action",
+                request_document(card_id=claim["card_id"],
+                                 card_version=claim["card_version"], action="undo"),
+            )
+            self.assertEqual((200, True), (status, undone["ok"]))
+            self.assertEqual(
+                set(undone),
+                {"schema", "schema_version", "ok", "disposition", "card_id",
+                 "card_version", "refusal"})
+        with closing(sqlite3.connect(self.database)) as connection:
+            self.assertEqual(connection.execute(
+                "SELECT status FROM tasks WHERE id=1").fetchone()[0], "open")
+
     def test_scheduling_card_http_delivery_keep_undo_and_requeue(self):
         workflow = self.execution.schedule(1, expected_task_version=1)
         with closing(sqlite3.connect(self.database)) as connection, connection:

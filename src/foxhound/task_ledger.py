@@ -1922,6 +1922,16 @@ class TaskLedger:
         lifecycle = getattr(candidate, "lifecycle", None)
         reason = getattr(lifecycle, "reason", None)
         action = "drop" if reason in {"issue_not_planned", "pr_closed"} else "done"
+        before_state = {
+            "task": {"version": int(task["version"]), "status": task["status"]},
+        }
+        if workflow is not None:
+            before_state["workflow"] = {
+                "version": int(workflow["version"]),
+                "status": workflow["status"],
+                "phase": workflow["phase"],
+            }
+
         if workflow is not None and workflow["status"] not in (
             "completed", "cancelled",
         ):
@@ -1950,10 +1960,36 @@ class TaskLedger:
             )
             if not transition.accepted:
                 return None
-        row = connection.execute(
-            "SELECT version FROM tasks WHERE id=?", (task_id,),
+
+        after_task = connection.execute(
+            "SELECT version, status FROM tasks WHERE id=?", (task_id,),
         ).fetchone()
-        return int(row["version"])
+        after_state = {
+            "task": {"version": int(after_task["version"]), "status": after_task["status"]},
+        }
+
+        after_workflow = connection.execute(
+            "SELECT version, status, phase FROM task_execution_workflows WHERE task_id=?", (task_id,),
+        ).fetchone()
+        if after_workflow is not None:
+            after_state["workflow"] = {
+                "version": int(after_workflow["version"]),
+                "status": after_workflow["status"],
+                "phase": after_workflow["phase"],
+            }
+
+        from .change_reviews import record
+        record(
+            connection,
+            kind="source_closed",
+            task_id=task_id,
+            before=before_state,
+            after=after_state,
+            summary=_source_closed_summary(candidate),
+            now=now,
+        )
+
+        return int(after_task["version"])
 
     @staticmethod
     def _apply_candidate_reactivation(
@@ -2466,6 +2502,20 @@ def _bound_source(
     if row is None:
         return None, None
     return row["candidate_id"], row["source_revision"]
+
+
+def _source_closed_summary(candidate: object) -> str:
+    """What closed the task, for its Keep/Undo card (#844)."""
+    source = getattr(candidate, "source", None)
+    number = getattr(source, "item_id", None)
+    reason = getattr(getattr(candidate, "lifecycle", None), "reason", None)
+    if getattr(source, "kind", None) == "review_request":
+        what = f"Pull request #{number}" if number else "Its pull request"
+        return what + (" was closed without merging" if reason == "pr_closed"
+                       else " was merged" if reason == "pr_merged" else " was closed")
+    what = f"Issue #{number}" if number else "Its issue"
+    return what + (" was closed as not planned" if reason == "issue_not_planned"
+                   else " was closed")
 
 
 def _apply_task_transition(

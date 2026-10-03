@@ -51,7 +51,7 @@ from .contracts.task_candidate import (
 )
 
 
-SCHEMA_VERSION = 71
+SCHEMA_VERSION = 72
 _STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 _CUMULATIVE_SCHEMA_VERSIONS = {
@@ -897,6 +897,12 @@ _SCHEMA_COLUMNS.update({
     ),
     "task_timing": (
         "task_id", "effort", "researched_due", "source_job_id", "updated_at",
+    ),
+    "automatic_change_reviews": (
+        "id", "kind", "task_id", "before_state", "after_state", "summary",
+        "version", "status", "claim_token_digest", "claim_expires_at",
+        "consumer_digest", "transport", "delivery_ref", "resolved_at",
+        "created_at", "updated_at",
     ),
 })
 
@@ -3667,6 +3673,36 @@ CREATE TABLE IF NOT EXISTS task_timing (
 """,
 )
 
+#: v72 (#844): Keep/Undo reviews of automatic changes (first kind:
+#: source_closed). Purely additive.
+_SCHEMA_V72 = (
+    """CREATE TABLE IF NOT EXISTS automatic_change_reviews (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind               TEXT NOT NULL,
+    task_id            INTEGER NOT NULL REFERENCES tasks(id),
+    before_state       TEXT NOT NULL,
+    after_state        TEXT NOT NULL,
+    summary            TEXT NOT NULL,
+    version            INTEGER NOT NULL CHECK(version >= 1),
+    status             TEXT NOT NULL CHECK(status IN (
+                           'pending','delivering','delivered','kept','undone'
+                       )),
+    claim_token_digest TEXT CHECK(
+                           claim_token_digest IS NULL
+                           OR length(claim_token_digest)=64
+                       ),
+    claim_expires_at   TEXT,
+    consumer_digest    TEXT,
+    transport          TEXT,
+    delivery_ref       TEXT,
+    resolved_at        TEXT,
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL
+);""",
+    "CREATE INDEX IF NOT EXISTS automatic_change_reviews_status "
+    "ON automatic_change_reviews(status, id);",
+)
+
 #: v69 (#762): a forge source that closes answers its task. The lifecycle
 #: records that as its own resolution, so a closed review is never mistaken
 #: for a reader decision. SQLite cannot widen a CHECK in place: rebuild.
@@ -5661,6 +5697,18 @@ class CandidateInbox:
                     connection.execute("PRAGMA legacy_alter_table = OFF")
                     connection.execute("PRAGMA foreign_keys = ON")
                 version = 71
+            if version == 71:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _SCHEMA_V72:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version = 72")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = 72
             self._require_schema(connection)
 
     def import_document(self, document: object) -> ImportResult:
