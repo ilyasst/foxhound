@@ -55,17 +55,18 @@ class StageOneTests(unittest.TestCase):
               speaker: str | None = "SPK_1",
               registry: str | None = "registry-synthetic",
               provisional: bool = False,
-              working_group: str | None = None) -> None:
+              working_group: str | None = None,
+              owner_person_id: str | None = None) -> None:
         candidate_id = f"candidate-{task_id}"
         revision = f"{task_id:064x}"
         self.connection.execute(
             "INSERT INTO tasks(id,status,text,version,created_at,updated_at,"
             "owner_ref_version,owner_kind,owner_speaker_id,"
             "owner_canonical_speaker_id,owner_speaker_registry_id,"
-            "owner_pinned,owner_provisional,working_group) VALUES(?, 'open', ?, 1, ?, ?,"
-            "1,'person',?,?,?,0,?,?)",
+            "owner_pinned,owner_provisional,working_group,owner_person_id) VALUES(?, 'open', ?, 1, ?, ?,"
+            "1,'person',?,?,?,0,?,?,?)",
             (task_id, text, NOW, NOW, speaker, speaker, registry,
-             int(provisional), working_group),
+             int(provisional), working_group, owner_person_id),
         )
         self.connection.execute(
             "INSERT INTO candidate_inbox(candidate_id,source_system,source_kind,"
@@ -710,3 +711,124 @@ class ParticipantSignalTests(StageOneTests):
         self.assertIn("1-2", scores)
         self.assertIn("3-4", scores)
         self.assertEqual(scores["1-2"], scores["3-4"])
+
+    def test_guess_language(self) -> None:
+        self.assertEqual(
+            stage1.guess_language("Répondre aux commentaires de Benoît sur le projet de demande de brevet"),
+            "fr",
+        )
+        self.assertEqual(
+            stage1.guess_language("Send the final technical comment to the patent agent for the application"),
+            "en",
+        )
+        self.assertIsNone(stage1.guess_language("OK"))
+
+    def test_names(self) -> None:
+        names = stage1._names("Répondre aux commentaires de Benoît sur la demande de TP3 et VAL-483 et XML")
+        self.assertIn("benoit", names)
+        self.assertIn("tp3", names)
+        self.assertIn("val-483", names)
+        self.assertIn("xml", names)
+        # First word capitalized should not be included
+        names_first = stage1._names("Benoît a répondu")
+        self.assertNotIn("benoit", names_first)
+
+    def test_cross_language_embedding_candidate_queued_with_shared_name(self) -> None:
+        # Cross-language pair (FR and EN) with shared distinctive name and similarity 0.78
+        # Calibrated threshold set above 0.78 (e.g. cos(20 deg) ~ 0.9397)
+        # Cosine of angle for similarity 0.78: angle = acos(0.78)
+        angle_078 = math.degrees(math.acos(0.78))
+        text_fr = "Répondre aux commentaires de Benoît sur la demande de brevet"
+        text_en = "Send the final comment to Benoit about the patent application"
+        text_en_no_name = "Send the other technical comments for the patent application"
+        text_fr_no_name = "Répondre aux commentaires sur le projet de demande"
+        texts = {
+            10: text_fr,
+            11: text_en,
+            12: text_en_no_name,
+            13: text_fr_no_name,
+            3: "Confirmed calibration alpha",
+            4: "Confirmed calibration beta",
+            5: "Rejected calibration alpha",
+            6: "Rejected calibration beta",
+        }
+        # FR task 10 and EN task 11 share the distinctive name "Benoît" / "Benoit"
+        self._task(10, text_fr, speaker=None, registry=None)
+        self._task(11, text_en, speaker=None, registry=None)
+        # FR task 13 and EN task 12 have NO shared name
+        self._task(12, text_en_no_name, speaker=None, registry=None)
+        self._task(13, text_fr_no_name, speaker=None, registry=None)
+
+        # Label pairs for calibration: threshold will be around cos(20 deg) ~ 0.9397 > 0.78
+        self._task(3, texts[3], speaker=None, registry=None)
+        self._task(4, texts[4], speaker=None, registry=None)
+        self._task(5, texts[5], speaker=None, registry=None)
+        self._task(6, texts[6], speaker=None, registry=None)
+        self._label(3, 4, proposals.Decision.CONFIRMED)
+        self._label(5, 6, proposals.Decision.REJECTED)
+
+        backend = FakeEmbeddings({
+            texts[10]: vector(0),
+            texts[11]: vector(angle_078),   # sim(10, 11) == 0.78
+            texts[12]: vector(angle_078),   # sim(13, 12) == 0.78
+            texts[13]: vector(0),
+            texts[3]: vector(0),
+            texts[4]: vector(20),           # calibration pos sim = cos(20) ~ 0.9397
+            texts[5]: vector(0),
+            texts[6]: vector(40),           # calibration neg sim = cos(40) ~ 0.766
+        })
+
+        stage1.enqueue(self.connection, 10, now=NOW)
+        result = stage1.run(self.connection, now=NOW, backend=backend)
+        self.assertIsNotNone(result.threshold)
+        assert result.threshold is not None
+        self.assertGreater(result.threshold, 0.78)
+
+        # 10 (FR) and 11 (EN) with shared distinctive name -> queued candidate with route "embedding"
+        pair = self.connection.execute(
+            "SELECT id FROM task_duplicate_candidates "
+            "WHERE (left_task_id=10 AND right_task_id=11) OR (left_task_id=11 AND right_task_id=10)"
+        ).fetchone()
+        self.assertIsNotNone(pair)
+        routes = self.connection.execute(
+            "SELECT route, score FROM task_duplicate_candidate_routes WHERE candidate_id=?",
+            (int(pair["id"]),),
+        ).fetchall()
+        self.assertIn("embedding", {row["route"] for row in routes})
+
+        # FR/EN pair at 0.78 with NO shared name is not queued (13 and 12)
+        self.connection.execute("DELETE FROM task_duplicate_candidates")
+        self.connection.execute("DELETE FROM task_duplicate_candidate_routes")
+        stage1.enqueue(self.connection, 13, now=NOW)
+        stage1.run(self.connection, now=NOW, backend=backend)
+        pair_no_name = self.connection.execute(
+            "SELECT id FROM task_duplicate_candidates "
+            "WHERE (left_task_id=13 AND right_task_id=12) OR (left_task_id=12 AND right_task_id=13)"
+        ).fetchone()
+        self.assertIsNone(pair_no_name)
+
+        # A same-language pair at 0.78 is not queued (e.g. 11 and 12, or two EN tasks)
+        # Use texts with no shared significant words to avoid triggering the "words" route
+        text_en_a = "Review the architecture proposal completely"
+        text_en_b = "Send the summary of technical comments"
+        self.connection.execute("UPDATE tasks SET text=? WHERE id=11", (text_en_a,))
+        self.connection.execute("UPDATE tasks SET text=? WHERE id=12", (text_en_b,))
+        self.connection.execute("DELETE FROM task_duplicate_candidates")
+        self.connection.execute("DELETE FROM task_duplicate_candidate_routes")
+        backend_same_lang = FakeEmbeddings({
+            text_en_a: vector(0),
+            text_en_b: vector(angle_078),
+            texts[10]: vector(0),
+            texts[13]: vector(0),
+            texts[3]: vector(0),
+            texts[4]: vector(20),
+            texts[5]: vector(0),
+            texts[6]: vector(40),
+        })
+        stage1.enqueue(self.connection, 11, now=NOW)
+        stage1.run(self.connection, now=NOW, backend=backend_same_lang)
+        pair_same_lang = self.connection.execute(
+            "SELECT id FROM task_duplicate_candidates "
+            "WHERE (left_task_id=11 AND right_task_id=12) OR (left_task_id=12 AND right_task_id=11)"
+        ).fetchone()
+        self.assertIsNone(pair_same_lang)
