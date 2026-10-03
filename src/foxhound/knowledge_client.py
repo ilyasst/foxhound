@@ -547,12 +547,19 @@ def _parse_execution_context(value: object, alias: str) -> ExecutionContext:
             "GW execution context response identity is invalid"
         )
     variables = _object(root["variables"], "execution context variables")
-    _exact_fields(
+    # gw#1337 adds an optional "owners" projection (instance owner ids and
+    # aliases). Foxhound does not use it yet; tolerate it rather than refuse
+    # the whole context, which took the card service down on a gw upgrade.
+    _required_and_allowed_fields(
         variables,
         "execution context variables",
         {
             "display_name", "operator_context", "self_aliases",
             "institution_domains",
+        },
+        {
+            "display_name", "operator_context", "self_aliases",
+            "institution_domains", "owners",
         },
     )
     display_name = _text(
@@ -578,13 +585,24 @@ def _parse_execution_context(value: object, alias: str) -> ExecutionContext:
         raise KnowledgeResponseError(
             "GW execution context institution domains are invalid"
         )
+    signed = {
+        "display_name": display_name,
+        "operator_context": operator_context,
+        "self_aliases": list(self_aliases),
+        "institution_domains": list(institution_domains),
+    }
+    if "owners" in variables:
+        # Not used here yet, but part of what gw's revision covers.
+        owners = variables["owners"]
+        if not isinstance(owners, list) or len(owners) > 32 or not all(
+            isinstance(owner, dict) and set(owner) == {"id", "aliases"}
+            for owner in owners
+        ):
+            raise KnowledgeResponseError(
+                "GW execution context owners are invalid")
+        signed["owners"] = owners
     canonical = json.dumps(
-        {
-            "display_name": display_name,
-            "operator_context": operator_context,
-            "self_aliases": list(self_aliases),
-            "institution_domains": list(institution_domains),
-        },
+        signed,
         ensure_ascii=True,
         separators=(",", ":"),
         sort_keys=True,
@@ -821,6 +839,15 @@ def _exact_fields(
     value: Mapping[str, Any], field_name: str, expected: set[str]
 ) -> None:
     if set(value) != expected:
+        raise KnowledgeResponseError(f"GW knowledge {field_name} fields are invalid")
+
+
+def _required_and_allowed_fields(
+    value: Mapping[str, Any], field_name: str, required: set[str],
+    allowed: set[str],
+) -> None:
+    keys = set(value)
+    if not required <= keys or not keys <= allowed:
         raise KnowledgeResponseError(f"GW knowledge {field_name} fields are invalid")
 
 
