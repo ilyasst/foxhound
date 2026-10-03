@@ -47,6 +47,7 @@ foxhound-work-first-runner = "foxhound.work_first_runner:main"
 foxhound-agent-dispatch = "foxhound.agent_dispatch:main"
 foxhound-task-bulk-drop = "foxhound.task_bulk_drop:main"
 foxhound-task-forge-close-backfill = "foxhound.task_forge_close_backfill:main"
+foxhound-run-reminder = "foxhound.run_reminder:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
