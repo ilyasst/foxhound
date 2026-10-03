@@ -43,6 +43,7 @@ from .card_provenance import (
 )
 from .knowledge_client import KnowledgeClientError, OwnerUpcomingMeeting
 from .task_execution import (
+    review_kind_for_result,
     ExecutionOutcome,
     REVIEW_SNOOZE_ACTIONS,
     TaskExecutionService,
@@ -511,6 +512,9 @@ class ExecutionCardDetail:
     failure_reason: str | None = None
     failure_exit_code: int | None = None
     failure_run_id: str | None = None
+    #: What the card asks, and the controls every surface offers for it.
+    kind: ExecutionCardKind | None = None
+    controls: tuple[dict[str, object], ...] = field(default=(), repr=False)
     refusal: ExecutionCardRefusal | None = None
 
     @property
@@ -2248,6 +2252,7 @@ class ExecutionCardService:
             if refusal is not None:
                 return refused(refusal)
             outcome = row["result_outcome"]
+            card = self._render_card(row, connection=connection)
             row = self._translated(row)
             summary_text = "" if row["summary"] is None else str(row["summary"])
             try:
@@ -2281,6 +2286,8 @@ class ExecutionCardService:
                 failure_reason=row["workflow_failure_reason"],
                 failure_exit_code=row["workflow_failure_exit_code"],
                 failure_run_id=row["workflow_failure_run_id"],
+                kind=card.kind,
+                controls=published_controls(card),
             )
 
     def select_agent(
@@ -3415,6 +3422,93 @@ def execution_board_status(card: ExecutionReviewCard) -> str:
     }[status]
 
 
+def _approvable_body(complete_html: str) -> bool:
+    """Whether a card's full body fits, so approving it shows what is approved."""
+    return len(complete_html.encode("utf-8")) <= MAX_CARD_BODY_BYTES
+
+
+#: The decision a card asks for, named once for every surface.
+EXECUTION_KIND_LABELS: dict[ExecutionCardKind, str] = {
+    ExecutionCardKind.START: "Ready to start",
+    ExecutionCardKind.PLAN_REVIEW: "Plan review",
+    ExecutionCardKind.EXTERNAL_REVIEW: "Approve sending",
+    ExecutionCardKind.RESULT_REVIEW: "Result review",
+    ExecutionCardKind.STEER: "Running",
+}
+
+#: How each chat control is submitted by a surface that uses the resolve
+#: route: the action verb, and the input the reader must give first. A
+#: control absent here (the agent picker, the task brief, the deliverables
+#: list) opens a chat sub-menu rather than deciding anything, and is not
+#: published.
+_PUBLISHED_CONTROLS: dict[str, tuple[str, str | None]] = {
+    "done": ("done", None),
+    "drop": ("drop", None),
+    "start": ("start", None),
+    "approve": ("approve", None),
+    "revise": ("revise", None),
+    "discuss": ("discussion", "note"),
+    "comment_go": ("comment_and_go", "note"),
+    "reassign": ("reassignment", "owner"),
+    "snooze": ("snooze", "interval"),
+    OWNER_HOLD_ACTION: (OWNER_HOLD_ACTION, None),
+}
+
+#: The intervals behind the one Snooze control, with the words a surface shows.
+SNOOZE_CHOICES: tuple[tuple[str, str], ...] = (
+    ("1 day", "snooze_1d"),
+    ("1 week", "snooze_7d"),
+    ("2 weeks", "snooze_14d"),
+    ("1 month", "snooze_30d"),
+)
+
+#: The control a surface should make most prominent, per kind of decision.
+_PRIMARY_ACTION: dict[ExecutionCardKind, str] = {
+    ExecutionCardKind.START: "start",
+    ExecutionCardKind.PLAN_REVIEW: "approve",
+    ExecutionCardKind.EXTERNAL_REVIEW: "approve",
+    ExecutionCardKind.RESULT_REVIEW: "done",
+    ExecutionCardKind.STEER: "discussion",
+}
+
+
+def published_controls(card: ExecutionReviewCard) -> tuple[dict[str, object], ...]:
+    """The card's decisions, exactly as the chat keyboard offers them.
+
+    Built from the same rows `render_execution_review_card` turns into the
+    keyboard, so every surface shows the same choices under the same labels
+    and none keeps a table of its own. Order is the keyboard's.
+    """
+    if not isinstance(card, ExecutionReviewCard):
+        raise TaskLedgerError("execution review card is invalid")
+    approvable = _approvable_body("\n".join(_html_card_lines(card)))
+    primary = _PRIMARY_ACTION.get(card.kind)
+    controls: list[dict[str, object]] = []
+    for row in _button_rows(card, approvable=approvable):
+        for label, verb in row:
+            published = _PUBLISHED_CONTROLS.get(verb)
+            if published is None:
+                continue
+            action, needs = published
+            control: dict[str, object] = {
+                "action": action,
+                "label": label,
+                "input": needs,
+                "style": (
+                    "primary" if action == primary
+                    else "destructive" if action in {"drop", "cancel"}
+                    else "secondary"
+                ),
+            }
+            if needs == "interval":
+                control["choices"] = [
+                    {"action": choice, "label": text}
+                    for text, choice in SNOOZE_CHOICES
+                ]
+            controls.append(control)
+    return tuple(controls)
+
+
 def render_execution_review_card(
     card: ExecutionReviewCard,
 ) -> tuple[str, dict[str, list[list[dict[str, str]]]]]:
@@ -3422,7 +3516,7 @@ def render_execution_review_card(
         raise TaskLedgerError("execution review card is invalid")
     plain = "\n".join(_card_lines(card))
     complete = "\n".join(_html_card_lines(card))
-    approvable = len(complete.encode("utf-8")) <= MAX_CARD_BODY_BYTES
+    approvable = _approvable_body(complete)
     body = (
         complete
         if approvable
@@ -3570,28 +3664,21 @@ def _kind_for_workflow(row: Mapping[str, object]) -> ExecutionCardKind:
         )
     ):
         return ExecutionCardKind.START
+    # Which review the result asks for is decided in one place, shared with
+    # the workflow board, so a card and the board never name it differently.
+    # Only the statuses a review card may be raised in are decided here.
+    review = review_kind_for_result(row["phase"], row["outcome"])
     if (
-        row["status"] in {WorkflowStatus.AWAITING_REVIEW, WorkflowStatus.SNOOZED}
-        and row["phase"] == WorkflowPhase.PLAN
-        and row["outcome"] == ExecutionOutcome.AWAITING_PLAN
+        review in {"plan_review", "external_review"}
+        and row["status"] in {WorkflowStatus.AWAITING_REVIEW, WorkflowStatus.SNOOZED}
     ):
-        return ExecutionCardKind.PLAN_REVIEW
+        return ExecutionCardKind(review)
     if (
-        row["status"] in {WorkflowStatus.AWAITING_REVIEW, WorkflowStatus.SNOOZED}
-        and row["phase"] == WorkflowPhase.EXECUTE
-        and row["outcome"] == ExecutionOutcome.AWAITING_EXTERNAL
-    ):
-        return ExecutionCardKind.EXTERNAL_REVIEW
-    if (
-        row["status"] in {
+        review == "result_review"
+        and row["status"] in {
             WorkflowStatus.AWAITING_REVIEW,
             WorkflowStatus.COMPLETED,
             WorkflowStatus.SNOOZED,
-        }
-        and row["outcome"] in {
-            ExecutionOutcome.COMPLETED,
-            ExecutionOutcome.DECLINED,
-            ExecutionOutcome.INELIGIBLE,
         }
     ):
         return ExecutionCardKind.RESULT_REVIEW

@@ -857,6 +857,16 @@ prompts, logs, private paths, credentials, profile identifiers, and unbounded
 work-product text are never exposed. This follows ADR 0041's aggregate-scoped
 second-consumer decision and creates no new authority.
 
+Execution board rows (board version 3) carry `kind_label`, the card's
+decision named once, and card detail (detail version 5) carries `kind`,
+`kind_label` and `actions`: its controls exactly as the
+chat keyboard offers them (`action`, `label`, the `input` a reader must give
+first, a `style`, and for Snooze its interval `choices`). A surface renders
+these rather than keeping its own table, so every surface offers the same
+choices under the same words. The workflow board names an awaiting-review
+workflow by its open card's kind, or by the same outcome rule the card
+scheduler uses, never by phase alone.
+
 For a console that needs actual work rather than reader-card delivery state,
 the same credential may read `POST /v1/execution-workflows/board` and one
 version-fenced `POST /v1/execution-workflows/detail`. These bounded,
