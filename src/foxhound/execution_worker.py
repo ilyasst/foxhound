@@ -2756,7 +2756,8 @@ def _parser() -> argparse.ArgumentParser:
     subcommands = parser.add_subparsers(dest="operation", required=True)
     subcommands.add_parser("context")
     search = subcommands.add_parser("search")
-    search.add_argument("query")
+    search.add_argument("query", nargs="?")
+    search.add_argument("--query", dest="query_option")
     search.add_argument(
         "--layer", action="append", choices=("kb", "secondary", "emails")
     )
@@ -2849,8 +2850,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.operation == "context":
             result = worker.context()
         elif args.operation == "search":
+            if (args.query is None) == (args.query_option is None):
+                raise ExecutionWorkerDraftError(
+                    "search needs a query: either positionally or as --query TEXT"
+                )
+            query = args.query if args.query is not None else args.query_option
             result = worker.search(
-                args.query,
+                query,
                 layers=args.layer or ("kb",),
                 context_lines=args.context_lines,
                 max_matches_per_document=args.max_matches_per_document,
