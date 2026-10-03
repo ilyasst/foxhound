@@ -463,6 +463,17 @@ class KnowledgeClientTests(unittest.TestCase):
             )
 
         self.assertEqual([layer.name for layer in result.layers], ["emails"])
+        self.assertIn(
+            "1 more in layers this search did not include", result.summary)
+        self.assertIn("3 more in folders excluded from search", result.summary)
+
+    def test_search_summary_without_exclusions(self):
+        with server() as (endpoint, _requests):
+            result = client(endpoint).search(
+                "synthetic query", layers=("emails",)
+            )
+        self.assertRegex(result.summary, r"^\d+ match(es)?, \d+ shown")
+        self.assertNotIn("excluded", result.summary)
 
     def test_search_exclusion_metadata_remains_strict_and_content_free(self):
         invalid = (

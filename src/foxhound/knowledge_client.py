@@ -125,6 +125,7 @@ class KnowledgeLayer:
 @dataclass(frozen=True)
 class KnowledgeSearchResult:
     layers: tuple[KnowledgeLayer, ...]
+    summary: str = ""
 
     @property
     def document_count(self) -> int:
@@ -493,7 +494,32 @@ def _parse_search_response(
             truncated=layer["truncated"],
             documents=parsed_documents,
         ))
-    return KnowledgeSearchResult(tuple(parsed_layers))
+
+    summary = _search_summary(parsed_layers, root.get("excluded"))
+    return KnowledgeSearchResult(tuple(parsed_layers), summary=summary)
+
+
+def _search_summary(layers, excluded) -> str:
+    """What the search found and what it could not show, in one line (#190).
+
+    An empty result and a result the agent was not shown call for opposite
+    moves (stop and ask, or narrow and retry), so the counts are spelled out
+    with the remedy for each kind of loss.
+    """
+    matches = sum(layer.total_results for layer in layers)
+    shown = sum(len(layer.documents) for layer in layers)
+    parts = [f"{matches} {'match' if matches == 1 else 'matches'}, {shown} shown"]
+    if matches > shown:
+        parts.append("narrow the query to see the rest")
+    if excluded:
+        if excluded["declined"]:
+            parts.append(
+                f"{excluded['declined']} more in layers this search did not "
+                "include: ask for those layers")
+        if excluded["hits"]:
+            parts.append(
+                f"{excluded['hits']} more in folders excluded from search")
+    return "; ".join(parts)
 
 
 def _parse_execution_context(value: object, alias: str) -> ExecutionContext:

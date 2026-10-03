@@ -1768,6 +1768,10 @@ def _search_document(result: KnowledgeSearchResult) -> dict[str, Any]:
     return {
         "schema": WORKER_SEARCH_SCHEMA,
         "schema_version": WORKER_SCHEMA_VERSION,
+        # What was found and what could not be shown (#190).
+        **({"summary": result.summary}
+           if isinstance(getattr(result, "summary", None), str) and result.summary
+           else {}),
         "layers": [
             {
                 "name": layer.name,
