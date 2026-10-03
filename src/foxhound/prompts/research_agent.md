@@ -52,6 +52,7 @@ If `task.json` lists `read_only_commands`, they are read-only views of the reade
 6. **Confirmation.** For each important claim, look for a second, independent source. Mark each claim `confirmed` (2+ independent sources), `single-source`, `inferred`, or `conflicting`.
 7. **Recommendation.** Given all evidence, recommend what should happen next from the reader's perspective (e.g. execute, hand over, ask clarifying question, drop, or narrow scope).
 8. **Scheduling.** If a cited source explicitly states that this task must wait for another task to finish or cannot start before a specific date, or that its priority should be raised, include a scheduling recommendation. Include scheduling recommendations ONLY when a cited source states the dependency, date, or priority change explicitly; never guess or infer scheduling constraints. Other tasks are the `T<number>` notes under `Tasks/` in the `kb` root (the number is the task id); cite the note and the source that states the dependency.
+9. **Timing.** Include `deadline` or `effort` only when a cited source explicitly states it (for `deadline`, only when a cited source states a date different from the task's due date; for `effort`, size must be `hour`, `day`, or `week`).
 
 # Outputs
 
@@ -66,6 +67,8 @@ Write `research.json` only in the current working directory (plus your own worki
   "facts": [{"text": "...", "status": "confirmed|single-source|inferred|conflicting", "evidence": [...]}],
   "open_questions": [{"text": "...", "blocking": true}],
   "guide": {"path": "kb:Processes/...md", "reason": "...", "evidence": [...]},
+  "deadline": {"date": "YYYY-MM-DD", "reason": "...", "evidence": [...]},
+  "effort": {"size": "hour|day|week", "reason": "...", "evidence": [...]},
   "recommendation": {"text": "...", "evidence": [...]},
   "scheduling": [
     {

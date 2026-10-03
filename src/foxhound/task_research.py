@@ -181,10 +181,18 @@ def task_input_digest(document: object) -> str:
     return _digest(_canonical_bytes(normalize_task_snapshot(document)))
 
 
-def _claim(value: object, name: str, source_ids: set[str]) -> dict[str, object]:
+def _claim(
+    value: object,
+    name: str,
+    source_ids: set[str],
+    allowed_extra_keys: set[str] | None = None,
+) -> dict[str, object]:
     if not isinstance(value, Mapping):
         raise ResearchError(f"invalid {name}")
-    if set(value) != {"text", "status", "source_refs"}:
+    allowed_keys = {"text", "status", "source_refs"}
+    if allowed_extra_keys:
+        allowed_keys = allowed_keys | allowed_extra_keys
+    if set(value) - allowed_keys or {"text", "status", "source_refs"} - set(value):
         raise ResearchError(f"invalid {name}")
     text = _text(value.get("text"), name, 8_000)
     status = value.get("status")
@@ -265,7 +273,7 @@ def validate_draft(document: object, sources: list[dict[str, object]]) -> dict[s
         "current_state", "expected_deliverables", "timeline", "decisions",
         "dependencies", "constraints", "stakeholders", "related_entities",
         "findings", "conflicts", "open_questions", "scheduling_recommendations",
-        "recommendation", "guide",
+        "recommendation", "guide", "deadline", "effort",
     }
     if set(document) - allowed:
         raise ResearchError("draft contains publisher-owned or unknown fields")
@@ -299,6 +307,28 @@ def validate_draft(document: object, sources: list[dict[str, object]]) -> dict[s
         ]
     if "guide" in document:
         result["guide"] = _claim(document.get("guide"), "guide claim", source_ids)
+    if "deadline" in document:
+        dl_raw = document.get("deadline")
+        dl_res = _claim(dl_raw, "deadline claim", source_ids, allowed_extra_keys={"date"})
+        if isinstance(dl_raw, Mapping) and "date" in dl_raw:
+            date_val = dl_raw["date"]
+            if not isinstance(date_val, str) or not re.match(r"^\d{4}-\d{2}-\d{2}$", date_val):
+                raise ResearchError("invalid deadline date")
+            try:
+                datetime.fromisoformat(date_val)
+            except ValueError:
+                raise ResearchError("invalid deadline date")
+            dl_res["date"] = date_val
+        result["deadline"] = dl_res
+    if "effort" in document:
+        eff_raw = document.get("effort")
+        eff_res = _claim(eff_raw, "effort claim", source_ids, allowed_extra_keys={"size"})
+        if isinstance(eff_raw, Mapping) and "size" in eff_raw:
+            size_val = eff_raw["size"]
+            if size_val not in {"hour", "day", "week"}:
+                raise ResearchError("invalid effort size")
+            eff_res["size"] = size_val
+        result["effort"] = eff_res
     recommendations = document.get("scheduling_recommendations", [])
     if not isinstance(recommendations, list) or len(recommendations) > 3:
         raise ResearchError("invalid scheduling recommendations")
@@ -352,6 +382,23 @@ def render_markdown(document: Mapping[str, object]) -> str:
         assert isinstance(claim, Mapping)
         refs = ", ".join(f"[{ref}]" for ref in claim["source_refs"])
         lines.extend([f"## {title}", "", f"{claim['text']} ({claim['status']}) {refs}".rstrip(), ""])
+    timing_items = []
+    if "deadline" in report and report["deadline"]:
+        dl_claim = report["deadline"]
+        assert isinstance(dl_claim, Mapping)
+        refs = ", ".join(f"[{ref}]" for ref in dl_claim["source_refs"])
+        suffix = f" {refs}" if refs else ""
+        date_prefix = f"Deadline: {dl_claim['date']} — " if "date" in dl_claim else ""
+        timing_items.append(f"- {date_prefix}{dl_claim['text']} ({dl_claim['status']}){suffix}".rstrip())
+    if "effort" in report and report["effort"]:
+        eff_claim = report["effort"]
+        assert isinstance(eff_claim, Mapping)
+        refs = ", ".join(f"[{ref}]" for ref in eff_claim["source_refs"])
+        suffix = f" {refs}" if refs else ""
+        size_prefix = f"Effort: {eff_claim['size']} — " if "size" in eff_claim else ""
+        timing_items.append(f"- {size_prefix}{eff_claim['text']} ({eff_claim['status']}){suffix}".rstrip())
+    if timing_items:
+        lines.extend(["## Timing", ""] + timing_items + [""])
     if "guide" in report and report["guide"]:
         guide_claim = report["guide"]
         assert isinstance(guide_claim, Mapping)
@@ -410,6 +457,10 @@ def consumer_projection(document: Mapping[str, object]) -> dict[str, object]:
     }
     if "guide" in report and report["guide"]:
         projection["guide"] = report["guide"]
+    if "deadline" in report and report["deadline"]:
+        projection["deadline"] = report["deadline"]
+    if "effort" in report and report["effort"]:
+        projection["effort"] = report["effort"]
     while len(_canonical_bytes(projection)) > MAX_PROJECTION_BYTES:
         for key in ("findings", "open_questions", "constraints", "dependencies"):
             values = projection[key]
