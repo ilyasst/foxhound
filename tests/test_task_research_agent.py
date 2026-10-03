@@ -9,6 +9,7 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from unittest import mock
 from unittest.mock import MagicMock
 
 import pytest
@@ -1901,3 +1902,84 @@ def test_convert_research_json_scheduling(tmp_path: Path) -> None:
     assert len(recs_many) == 3
     assert [r["related_task_id"] for r in recs_many] == [1, 2, 3]
     validate_draft(draft_many, sources_many)
+
+
+def test_agent_synthesize_task_json_runtime_and_due_in_days(tmp_path: Path) -> None:
+    fake_hermes = tmp_path / "fake_hermes.py"
+    valid_research = {
+        "ownership": {"verdict": "reader", "evidence": []},
+        "requested_deliverable": {"text": "Produce research summary", "evidence": []},
+        "constraints": [],
+        "entities": [],
+        "facts": [],
+        "open_questions": [],
+        "recommendation": {"text": "Proceed", "evidence": []},
+    }
+    _write_fake_hermes(fake_hermes, output_json=valid_research)
+
+    config = AgentResearchConfig(
+        hermes_command=str(fake_hermes),
+        model="test-model",
+    )
+
+    fake_runtime = {
+        "today": "2026-05-10",
+        "today_weekday": "Sunday",
+        "now": "2026-05-10T14:00-04:00",
+        "timezone": "America/Toronto",
+        "timezone_abbreviation": "EDT",
+        "next_week": {
+            "start": "2026-05-11",
+            "start_weekday": "Monday",
+            "end": "2026-05-17",
+            "end_weekday": "Sunday",
+        },
+    }
+
+    # Case 1: due in the future
+    ctx_future = {
+        "task_snapshot": {
+            "task_id": 101,
+            "title": "Future task",
+            "due": "2026-05-15",
+        },
+    }
+    run_dir_1 = tmp_path / "run_future"
+    with mock.patch("foxhound.task_research_agent._clock", return_value=fake_runtime):
+        agent_synthesize(ctx_future, config=config, bound_sources=None, run_dir=run_dir_1)
+
+    task_json_1 = json.loads((run_dir_1 / "task.json").read_text())
+    assert task_json_1["runtime"] == fake_runtime
+    assert task_json_1["due_in_days"] == 5
+
+    # Case 2: overdue (due in past)
+    ctx_past = {
+        "task_snapshot": {
+            "task_id": 102,
+            "title": "Overdue task",
+            "due": "2026-05-08",
+        },
+    }
+    run_dir_2 = tmp_path / "run_past"
+    with mock.patch("foxhound.task_research_agent._clock", return_value=fake_runtime):
+        agent_synthesize(ctx_past, config=config, bound_sources=None, run_dir=run_dir_2)
+
+    task_json_2 = json.loads((run_dir_2 / "task.json").read_text())
+    assert task_json_2["runtime"] == fake_runtime
+    assert task_json_2["due_in_days"] == -2
+
+    # Case 3: no due date or malformed due date
+    ctx_nodue = {
+        "task_snapshot": {
+            "task_id": 103,
+            "title": "No due task",
+            "due": "not-a-valid-date",
+        },
+    }
+    run_dir_3 = tmp_path / "run_nodue"
+    with mock.patch("foxhound.task_research_agent._clock", return_value=fake_runtime):
+        agent_synthesize(ctx_nodue, config=config, bound_sources=None, run_dir=run_dir_3)
+
+    task_json_3 = json.loads((run_dir_3 / "task.json").read_text())
+    assert task_json_3["runtime"] == fake_runtime
+    assert "due_in_days" not in task_json_3

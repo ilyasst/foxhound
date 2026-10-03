@@ -29,6 +29,7 @@ from .knowledge_client import (
 )
 from .contracts import SourceSnapshotContractError
 from . import work_digest, voice_summary, tts_client
+from .local_clock import local_calendar, local_today
 from .task_execution import (
     PHASE_OUTCOMES,
     ExecutionResultEnvelope,
@@ -117,7 +118,11 @@ _RESULT_INPUTS = (
 
 def _local_today() -> str:
     """Return the host's authoritative local calendar date."""
-    return datetime.now().astimezone().date().isoformat()
+    return local_today()
+
+
+def _local_calendar() -> dict[str, object]:
+    return local_calendar(today_str=_local_today())
 
 
 
@@ -256,26 +261,6 @@ def _pass_budget(state: "ExecutionRunState") -> dict[str, object]:
         "pass_budget_seconds": state.pass_budget_seconds,
         "pass_deadline": state.pass_deadline.isoformat(timespec="seconds"),
         "pass_remaining_seconds": max(0, int(remaining)),
-    }
-
-
-def _local_calendar() -> dict[str, object]:
-    today = datetime.fromisoformat(_local_today()).date()
-    next_week_start = today + timedelta(days=7 - today.weekday())
-    next_week_end = next_week_start + timedelta(days=6)
-    weekdays = (
-        "Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
-        "Saturday", "Sunday",
-    )
-    return {
-        "today": today.isoformat(),
-        "today_weekday": weekdays[today.weekday()],
-        "next_week": {
-            "start": next_week_start.isoformat(),
-            "start_weekday": weekdays[next_week_start.weekday()],
-            "end": next_week_end.isoformat(),
-            "end_weekday": weekdays[next_week_end.weekday()],
-        },
     }
 
 

@@ -9,7 +9,7 @@ import re
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, Sequence
@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 
 from . import task_research_synthesis
 from .hermes_session import extract_session_id_from_bytes
+from .local_clock import runtime_clock as _default_runtime_clock
 from .task_research import validate_sources
 from .task_research_synthesis import (
     DRAFT_SCHEMA,
@@ -26,6 +27,9 @@ from .task_research_synthesis import (
     _validate_resource_locator,
     validate_draft,
 )
+
+
+_clock = _default_runtime_clock
 
 
 @dataclass(frozen=True)
@@ -1337,11 +1341,23 @@ def agent_synthesize(
     # Write run_dir/.ripgreprc containing "--follow\n"
     (run_dir / ".ripgreprc").write_text("--follow\n", encoding="utf-8")
 
+    runtime_data = _clock()
     task_json_payload = {
         **task_snapshot,
+        "runtime": runtime_data,
         "knowledge_roots": knowledge_roots_data,
         "starting_points": starting_points_data,
     }
+    due = task_snapshot.get("due")
+    if isinstance(due, str) and due.strip():
+        try:
+            today_str = runtime_data.get("today")
+            if isinstance(today_str, str):
+                task_json_payload["due_in_days"] = (
+                    date.fromisoformat(due.strip()) - date.fromisoformat(today_str)
+                ).days
+        except Exception:
+            pass
     if config.reader_aliases:
         task_json_payload["reader"] = {"aliases": list(config.reader_aliases)}
     if config.read_only_commands:
