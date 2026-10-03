@@ -342,6 +342,21 @@ class KnowledgeClientTests(unittest.TestCase):
             },
         }])
 
+    def test_execution_context_tolerates_gw_owner_projection(self):
+        """gw#1337 adds an owners list; it must not take the context down."""
+        def with_owners(document):
+            document["variables"]["owners"] = [
+                {"id": "owner-a", "aliases": ["Person A"]}]
+            canonical = json.dumps(
+                document["variables"], ensure_ascii=True,
+                separators=(",", ":"), sort_keys=True).encode("utf-8")
+            document["revision"] = hashlib.sha256(canonical).hexdigest()
+            return document
+
+        with server(transform=with_owners) as (endpoint, _requests):
+            result = client(endpoint).execution_context()
+        self.assertEqual(result.display_name, "Person A")
+
     def test_execution_context_shape_identity_and_revision_fail_closed(self):
         def extra_variable(document):
             document["variables"]["source_settings"] = {"enabled": True}
