@@ -20,6 +20,55 @@ def _candidate_stub(source_kind: str) -> object:
     return SimpleNamespace(source=SimpleNamespace(kind=source_kind))
 
 
+def close_forge_withdrawn_task(
+    connection: sqlite3.Connection,
+    *,
+    task_id: int,
+    candidate_id: str,
+    source_kind: str,
+    now: str,
+) -> int | None:
+    """Close an open task withdrawn with reader_conflict if not running.
+
+    Does not open or commit a transaction on connection. Returns the new task
+    version on success, or None if skipped/refused.
+    """
+    curr_task = connection.execute(
+        "SELECT * FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if curr_task is None or curr_task["status"] != "open":
+        return None
+
+    wf = connection.execute(
+        "SELECT status FROM task_execution_workflows WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    if wf is not None and wf["status"] == "running":
+        return None
+
+    stub = _candidate_stub(source_kind)
+    new_version = TaskLedger._close_for_forge_source(
+        connection,
+        candidate=stub,  # type: ignore[arg-type]
+        task=curr_task,
+        now=now,
+    )
+    if new_version is None:
+        return None
+
+    connection.execute(
+        "UPDATE task_candidate_lifecycle "
+        "SET resolution = 'closed_by_source', task_version = ?, decided_at = ? "
+        "WHERE candidate_id = ?",
+        (new_version, now, candidate_id),
+    )
+    connection.execute(
+        "UPDATE work_items SET state = 'closed' WHERE task_id = ?",
+        (task_id,),
+    )
+    return int(new_version)
+
+
 def run_forge_close_backfill(
     *,
     database_path: Path,
@@ -84,16 +133,15 @@ def run_forge_close_backfill(
 
             connection.execute("BEGIN IMMEDIATE")
             try:
-                # Re-fetch task row under transaction
+                # Check why it might be skipped if close_forge_withdrawn_task returns None
                 curr_task = connection.execute(
-                    "SELECT * FROM tasks WHERE id = ?", (task_id,)
+                    "SELECT status FROM tasks WHERE id = ?", (task_id,)
                 ).fetchone()
                 if curr_task is None or curr_task["status"] != "open":
                     connection.rollback()
                     skipped.append({"task_id": task_id, "reason": "refused"})
                     continue
 
-                # Check workflow status
                 wf = connection.execute(
                     "SELECT status FROM task_execution_workflows WHERE task_id = ?",
                     (task_id,),
@@ -103,17 +151,15 @@ def run_forge_close_backfill(
                     skipped.append({"task_id": task_id, "reason": "running"})
                     continue
 
-                stub = _candidate_stub(source_kind)
-                new_version = TaskLedger._close_for_forge_source(
+                version = close_forge_withdrawn_task(
                     connection,
-                    candidate=stub,  # type: ignore[arg-type]
-                    task=curr_task,
+                    task_id=task_id,
+                    candidate_id=candidate_id,
+                    source_kind=source_kind,
                     now=timestamp,
                 )
-                if new_version is None:
+                if version is None:
                     connection.rollback()
-                    # Could be running if raced, but we checked running above, so refused
-                    # or if workflow became running between check and call
                     wf_after = connection.execute(
                         "SELECT status FROM task_execution_workflows WHERE task_id = ?",
                         (task_id,),
@@ -122,16 +168,6 @@ def run_forge_close_backfill(
                     skipped.append({"task_id": task_id, "reason": reason})
                     continue
 
-                connection.execute(
-                    "UPDATE task_candidate_lifecycle "
-                    "SET resolution = 'closed_by_source', task_version = ?, decided_at = ? "
-                    "WHERE candidate_id = ?",
-                    (new_version, timestamp, candidate_id),
-                )
-                connection.execute(
-                    "UPDATE work_items SET state = 'closed' WHERE task_id = ?",
-                    (task_id,),
-                )
                 connection.commit()
                 closed.append(task_id)
             except Exception:

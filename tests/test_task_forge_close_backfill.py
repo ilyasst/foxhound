@@ -391,6 +391,120 @@ class TaskForgeCloseBackfillTests(unittest.TestCase):
         ret = main(["--database", str(self.database)])
         self.assertEqual(ret, 0)
 
+    def test_schedule_new_closes_forge_reader_conflict_when_run_ends(self):
+        self.activate()
+        # Task 1: review_request candidate (forge)
+        self.inbox.import_feed(feed(0, review_candidate("a" * 40, index=42)))
+        self.intake()
+
+        execution = TaskExecutionService(
+            self.database,
+            clock=lambda: NOW,
+            token_factory=lambda: CLAIM_TOKEN,
+        )
+        scheduled = execution.schedule(1, expected_task_version=1)
+        self.assertIsNotNone(scheduled.version)
+        assert scheduled.version is not None
+        if scheduled.status == WorkflowStatus.AWAITING_START:
+            execution.start_action(
+                1, expected_version=scheduled.version, action="start"
+            )
+        claim = execution.claim_next()
+        self.assertIsNotNone(claim)
+        assert claim is not None
+        wf = execution.get(1)
+        self.assertIsNotNone(wf)
+        assert wf is not None
+        self.assertEqual(wf.status, WorkflowStatus.RUNNING)
+
+        # Withdraw while running -> leaves workflow running and produces reader_conflict
+        self._withdraw_review(index=42)
+
+        task = self.ledger.get(1)
+        self.assertIsNotNone(task)
+        assert task is not None
+        self.assertEqual(task.status, TaskStatus.OPEN)
+
+        with closing(sqlite3.connect(self.database)) as connection:
+            row = connection.execute(
+                "SELECT resolution FROM task_candidate_lifecycle"
+            ).fetchone()
+            self.assertEqual(row[0], "reader_conflict")
+
+        # While workflow is running, schedule_new does not close the task
+        execution.schedule_new()
+        task = self.ledger.get(1)
+        assert task is not None
+        self.assertEqual(task.status, TaskStatus.OPEN)
+
+        # Also create an email candidate with reader_conflict to verify it is untouched
+        email_active = history_candidate(2, generation=1)
+        self.inbox.import_feed(feed(2, email_active))
+        self.intake()
+        # Withdraw the email candidate with generation 2
+        email_withdrawn = history_candidate(2, generation=2)
+        email_withdrawn["lifecycle"]["state"] = "withdrawn"
+        email_withdrawn["source"]["revision"] = hashlib.sha256(
+            json.dumps(email_withdrawn, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        self.inbox.import_feed(feed(3, email_withdrawn))
+        self.intake()
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "UPDATE task_candidate_lifecycle SET state = 'withdrawn', resolution = 'reader_conflict' "
+                "WHERE candidate_id = ?",
+                (email_active["candidate_id"],),
+            )
+            connection.commit()
+
+        # Run records a result -> moves workflow to awaiting_review (not running)
+        execution.record_result(
+            ExecutionResultEnvelope(
+                result_id="res-1",
+                task_id=1,
+                task_version=1,
+                workflow_version=claim.workflow_version,
+                phase=WorkflowPhase.PLAN,
+                claim_token=claim.token,
+                outcome=ExecutionOutcome.AWAITING_PLAN,
+                summary="Synthetic summary",
+                work_markdown="Synthetic plan.",
+                questions=("Proceed?",),
+            )
+        )
+        wf_after_run = execution.get(1)
+        self.assertIsNotNone(wf_after_run)
+        assert wf_after_run is not None
+        self.assertNotEqual(wf_after_run.status, WorkflowStatus.RUNNING)
+
+        # Next schedule_new pass closes the task
+        execution.schedule_new()
+
+        task_after = self.ledger.get(1)
+        assert task_after is not None
+        self.assertEqual(task_after.status, TaskStatus.DONE)
+
+        with closing(sqlite3.connect(self.database)) as connection:
+            lifecycle = connection.execute(
+                "SELECT l.state, l.resolution, l.task_version FROM task_candidate_lifecycle AS l "
+                "JOIN task_candidate_bindings AS b ON b.candidate_id = l.candidate_id "
+                "WHERE b.task_id = 1 AND b.relation = 'accepted'"
+            ).fetchone()
+            work_item_state = connection.execute(
+                "SELECT state FROM work_items WHERE task_id = 1"
+            ).fetchone()[0]
+            email_lc = connection.execute(
+                "SELECT state, resolution FROM task_candidate_lifecycle WHERE candidate_id = ?",
+                (email_active["candidate_id"],),
+            ).fetchone()
+        self.assertEqual(tuple(lifecycle), ("withdrawn", "closed_by_source", task_after.version))
+        self.assertEqual(work_item_state, "closed")
+        # Email reader_conflict task candidate is untouched
+        self.assertEqual(tuple(email_lc), ("withdrawn", "reader_conflict"))
+        email_task = self.ledger.get(2)
+        assert email_task is not None
+        self.assertEqual(email_task.status, TaskStatus.OPEN)
+
 
 if __name__ == "__main__":
     unittest.main()
