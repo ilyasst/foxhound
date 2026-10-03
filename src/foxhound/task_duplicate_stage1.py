@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import math
+import re
 import sqlite3
 import urllib.request
 from collections import Counter
@@ -40,6 +41,60 @@ ROUTE_WEIGHTS = {
     "working_group": 0.2,
     "reread": 0.8,
 }
+
+XLANG_EMBEDDING_THRESHOLD = 0.75
+_FR_WORDS = frozenset({
+    "le", "la", "les", "des", "du", "de", "et", "pour", "sur", "avec",
+    "une", "un", "est", "dans", "aux", "au", "que", "qui", "ce", "cette",
+})
+_EN_WORDS = frozenset({
+    "the", "and", "for", "with", "to", "of", "a", "an", "is", "in",
+    "on", "that", "this", "from", "by",
+})
+
+
+def guess_language(text: str) -> str | None:
+    """Heuristically guess whether text is French or English, or None if uncertain."""
+    tokens = re.findall(r"[a-zàâäéèêëîïôöùûüçœæ]+", text.lower())
+    fr = sum(1 for w in tokens if w in _FR_WORDS) + (1 if any(c in "éèêàçùôîâ" for c in text.lower()) else 0)
+    en = sum(1 for w in tokens if w in _EN_WORDS)
+    if fr >= 2 and fr >= 2 * en:
+        return "fr"
+    if en >= 2 and en >= 2 * fr:
+        return "en"
+    return None
+
+
+def _fold(s: str) -> str:
+    import unicodedata
+    normalized = unicodedata.normalize("NFKD", s)
+    stripped = "".join(c for c in normalized if not unicodedata.combining(c))
+    return stripped.lower()
+
+
+def _names(text: str) -> frozenset[str]:
+    # Capitalised words of length >= 4 that are not the first word of the text
+    # (regex r"\b([A-ZÀ-Ý][\w'-]{3,})\b")
+    # plus code-like identifiers (r"\b[A-Z]{2,}-?\d+\b" e.g. TP3, VAL-483)
+    # and all-caps words of length >= 3 (r"\b[A-Z]{3,}\b")
+    # return the folded set.
+    names: set[str] = set()
+    # First word:
+    m_first = re.search(r"\b\w+", text)
+    first_word_span = m_first.span() if m_first else (-1, -1)
+
+    for m in re.finditer(r"\b([A-ZÀ-Ý][\w'-]{3,})\b", text):
+        if m.span() == first_word_span:
+            continue
+        names.add(_fold(m.group(1)))
+
+    for m in re.finditer(r"\b[A-Z]{2,}-?\d+\b", text):
+        names.add(_fold(m.group(0)))
+
+    for m in re.finditer(r"\b[A-Z]{3,}\b", text):
+        names.add(_fold(m.group(0)))
+
+    return frozenset(names)
 
 INDEPENDENT_ROUTES = frozenset(ROUTE_WEIGHTS) - BOOST_ONLY_ROUTES
 
@@ -396,6 +451,13 @@ def _owner_score(left: lexical.DuplicateCandidate, right: lexical.DuplicateCandi
     return None
 
 
+def _cross_language(left: lexical.DuplicateCandidate, right: lexical.DuplicateCandidate) -> bool:
+    """Return True if left and right appear to be in different languages (e.g. FR vs EN)."""
+    a = guess_language(_embedding_text(left))
+    b = guess_language(_embedding_text(right))
+    return a is not None and b is not None and a != b
+
+
 def _working_group_score(
     left: lexical.DuplicateCandidate,
     right: lexical.DuplicateCandidate,
@@ -507,6 +569,12 @@ def run(
     calibration: Calibration | None = None
     embedding_failed = False
     try:
+        name_sets = {c.task_id: _names(c.task_text) for c in candidates}
+        df: Counter[str] = Counter()
+        for s in name_sets.values():
+            df.update(s)
+        common = {n for n, k in df.items() if k >= 8}
+
         vectors = _vectors(connection, candidates, backend=backend, now=now)
         calibration = calibrate(connection, vectors)
         for left in candidates:
@@ -516,7 +584,16 @@ def run(
                 if right.task_id == left.task_id or not lexical._comparable(left, right, now=now):
                     continue
                 score = _similarity(vectors[left.task_id], vectors[right.task_id])
+                # Calibrated threshold comes from same-language labels; across languages
+                # shared words are absent and the multilingual similarity runs lower;
+                # stage two verifies; a shared distinctive name (accent-insensitive) is required because cross-language similarity alone does not separate duplicates from unrelated tasks
                 if score >= calibration.threshold:
+                    offer(left, right, "embedding", score)
+                elif (
+                    score >= XLANG_EMBEDDING_THRESHOLD
+                    and _cross_language(left, right)
+                    and ((name_sets[left.task_id] & name_sets[right.task_id]) - common)
+                ):
                     offer(left, right, "embedding", score)
     except (EmbeddingUnavailable, OSError, RuntimeError, ValueError):
         embedding_failed = True
