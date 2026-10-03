@@ -277,6 +277,10 @@ FAILURE_REASONS = frozenset({
     "claim_expired",
     "lease_failed",
     "result_invalid",
+    #: This pass ran out of turns with in-scope work incomplete, and left
+    #: a handoff note. It parks immediately so the reader gets a Start card
+    #: on the first stop, but automatic retries follow ordinary backoff.
+    "budget_handoff",
     #: The runtime refused the request because its measured context did not
     #: fit any served window. Retrying unchanged cannot make it fit.
     "context_exhausted",
@@ -619,6 +623,22 @@ class ExecutionProfileHealth:
     #: False for a profile the registry no longer offers at all, where
     #: `available` already says the stronger thing.
     current: bool = False
+
+
+def _unanswered_handoff_parks(
+    connection: sqlite3.Connection, task_id: int, phase: str
+) -> int:
+    row = connection.execute(
+        "SELECT count(*) FROM task_execution_events "
+        "WHERE task_id = ? AND phase = ? AND kind = 'parked' "
+        "AND sequence > COALESCE(("
+        "    SELECT MAX(sequence) FROM task_execution_events "
+        "    WHERE task_id = ? "
+        "    AND kind IN ('start_approved', 'phase_approved', 'revision_requested', 'discussion_requested', 'phase_granted')"
+        "), 0)",
+        (task_id, phase, task_id),
+    ).fetchone()
+    return int(row[0]) if row is not None else 0
 
 
 class TaskExecutionService:
@@ -3000,6 +3020,34 @@ class TaskExecutionService:
             )
             parked = None
             kind = event_kind or "retry_scheduled"
+        elif reason == "budget_handoff" and _unanswered_handoff_parks(connection, int(row["task_id"]), str(row["phase"])) < self._max_attempts - 1:
+            # A pass that ran out of turns and left a handoff note parks
+            # immediately so the reader gets a Start card with Continue on
+            # the first such stop, but automatic retries schedule at the
+            # ordinary backoff for that failure count so retry timing is
+            # unchanged for a reader who never answers. At the attempt limit
+            # it parks like any other failure, so continuation stays bounded
+            # by the same attempt history.
+            status = WorkflowStatus.PARKED
+            delay = min(
+                RETRY_MAX_SECONDS,
+                RETRY_BASE_SECONDS * (2 ** (failures - 1)),
+            )
+            next_attempt = (stamp + timedelta(seconds=delay)).isoformat(
+                timespec="seconds"
+            )
+            parked = now
+            kind = "parked"
+        elif reason == "budget_handoff":
+            # Continuation without a reader is bounded by the same attempt limit;
+            # a reader's Continue (start_approved) resets it because the reader
+            # is then in the loop.
+            status = WorkflowStatus.PARKED
+            next_attempt = (stamp + PARK_RETRY_INTERVAL).isoformat(
+                timespec="seconds"
+            )
+            parked = now
+            kind = "parked"
         elif reason == "context_exhausted":
             # This is an explicit refusal from the runtime's context filter,
             # not a slow run. The next attempt would re-read the same material
