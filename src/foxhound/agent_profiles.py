@@ -148,11 +148,18 @@ class AgentProfile:
             "(procedural guides) and `Repositories.md` (local checkouts). Search those roots "
             "with an explicit path instead of the current directory.\n\n"
         )
+        research_section = (
+            "Research comes first. When `context` includes `research`, it is verified starting "
+            "evidence for this task: read it before searching, build on its findings, constraints "
+            "and recommended action, re-verify only what you change or doubt, and say in your work "
+            "where you depart from it and why. Do not redo research it already covers.\n\n"
+        )
         return (
             PHASE_CONTRACT_PRECEDENCE
             + budget_sentence
             + handoff_section
             + where_things_are_section
+            + research_section
             + self.prompt_template.replace(WORKER_COMMAND_TOKEN, worker_command)
         )
 
@@ -1273,7 +1280,7 @@ GENERAL_PROFILE_RELEASE_REVISION = (
     "e872e60cd96be5dc6e3b092d7e077e10f6bc67e3925552a7fd640154f1373bfc"
 )
 GENERAL_PROFILE_RELEASE_PROMPT_SHA256 = (
-    "612e86096b527edd3ba5d42f39caf39e6015f9aff91d13759739f3b6a6acb97b"
+    "5e70f211df40e45b39a346ec36b1d3502b9d18169af64c491fa5cd42b53f2e74"
 )
 
 
