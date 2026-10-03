@@ -462,6 +462,27 @@ class ExecutionCardArtifacts:
 
 
 @dataclass(frozen=True)
+class WorkflowArtifacts:
+    """A version-fenced list of files belonging to a workflow's latest result.
+
+    Read through the workflow rather than a card, so a result can still be
+    reviewed once its card is resolved, or when its card was delivered to
+    another surface. ``artifacts`` carries bytes only for a single-file read.
+    """
+
+    task_id: int
+    workflow_version: int | None = None
+    artifacts: tuple[ExecutionCardArtifact, ...] = field(
+        default=(), repr=False
+    )
+    refusal: WorkflowRefusal | None = None
+
+    @property
+    def accepted(self) -> bool:
+        return self.refusal is None
+
+
+@dataclass(frozen=True)
 class ExecutionCardDetail:
     """Bounded, non-mutating current-run projection for a queue reader."""
 
@@ -2068,6 +2089,86 @@ class ExecutionCardService:
             ExecutionCardDisposition.UNCHANGED,
             card_id,
             card_version=expected_version,
+            artifacts=(ExecutionCardArtifact(
+                ordinal=int(record["ordinal"]), name=str(record["name"]),
+                size_bytes=int(record["size_bytes"]), content=content,
+            ),),
+        )
+
+    def workflow_artifacts(
+        self, task_id: int, *, expected_version: int
+    ) -> WorkflowArtifacts:
+        """List the recorded files of one workflow's latest result.
+
+        The same files :meth:`artifacts` serves through a delivered review
+        card, fenced on the workflow version instead, so they stay readable
+        after the card is resolved. A workflow with no recorded result lists
+        no files rather than refusing: nothing was produced yet.
+        """
+        if not _valid_identity(task_id, expected_version):
+            return WorkflowArtifacts(
+                task_id if isinstance(task_id, int) else 0,
+                refusal=WorkflowRefusal.INVALID_ARGUMENT,
+            )
+        if self._artifact_root is None:
+            return WorkflowArtifacts(
+                task_id, refusal=WorkflowRefusal.ARTIFACTS_UNAVAILABLE)
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT version,last_result_id FROM task_execution_workflows "
+                "WHERE task_id=?", (task_id,),
+            ).fetchone()
+            if row is None:
+                return WorkflowArtifacts(task_id, refusal=WorkflowRefusal.NOT_FOUND)
+            if int(row["version"]) != expected_version:
+                return WorkflowArtifacts(
+                    task_id, refusal=WorkflowRefusal.STALE_WORKFLOW)
+            artifact_rows = () if row["last_result_id"] is None else connection.execute(
+                "SELECT ordinal,name,size_bytes FROM execution_result_artifacts "
+                "WHERE result_id=? ORDER BY ordinal",
+                (row["last_result_id"],),
+            ).fetchall()
+        return WorkflowArtifacts(
+            task_id,
+            workflow_version=expected_version,
+            artifacts=tuple(
+                ExecutionCardArtifact(
+                    ordinal=int(item["ordinal"]), name=str(item["name"]),
+                    size_bytes=int(item["size_bytes"]),
+                ) for item in artifact_rows
+            ),
+        )
+
+    def workflow_artifact(
+        self, task_id: int, *, expected_version: int, ordinal: int
+    ) -> WorkflowArtifacts:
+        """Read one file of a workflow's latest result after checking its digest."""
+        if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 0:
+            return WorkflowArtifacts(
+                task_id if isinstance(task_id, int) else 0,
+                refusal=WorkflowRefusal.INVALID_ARGUMENT,
+            )
+        listed = self.workflow_artifacts(task_id, expected_version=expected_version)
+        if not listed.accepted:
+            return listed
+        with closing(self._connect()) as connection:
+            record = connection.execute(
+                "SELECT a.ordinal,a.relative_path,a.name,a.size_bytes,"
+                "a.content_digest,a.run_directory "
+                "FROM task_execution_workflows AS w "
+                "JOIN execution_result_artifacts AS a ON a.result_id=w.last_result_id "
+                "WHERE w.task_id=? AND w.version=? AND a.ordinal=?",
+                (task_id, expected_version, ordinal),
+            ).fetchone()
+        if record is None:
+            return WorkflowArtifacts(task_id, refusal=WorkflowRefusal.NOT_FOUND)
+        try:
+            content = self._read_recorded_artifact(record)
+        except (OSError, ValueError):
+            return WorkflowArtifacts(task_id, refusal=WorkflowRefusal.INVALID_STATE)
+        return WorkflowArtifacts(
+            task_id,
+            workflow_version=expected_version,
             artifacts=(ExecutionCardArtifact(
                 ordinal=int(record["ordinal"]), name=str(record["name"]),
                 size_bytes=int(record["size_bytes"]), content=content,
