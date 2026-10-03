@@ -31,6 +31,7 @@ from .execution_cards import (
     ExecutionCardPresentation,
     ExecutionCardArtifacts,
     ExecutionCardArtifact,
+    WorkflowArtifacts,
     ExecutionCardDeliverables,
     ExecutionCardDetail,
     ExecutionCardScheduleResult,
@@ -108,6 +109,11 @@ EXECUTION_STATS_SCHEMA = "foxhound.execution-card-service.stats"
 EXECUTION_BRIEF_SCHEMA = "foxhound.execution-card-service.brief"
 EXECUTION_DELIVERABLES_SCHEMA = "foxhound.execution-card-service.deliverables"
 EXECUTION_ARTIFACTS_SCHEMA = "foxhound.execution-card-service.artifacts"
+WORKFLOW_ARTIFACTS_SCHEMA = "foxhound.execution-workflow-service.artifacts"
+#: Its own version rather than `SERVICE_VERSION`, like the workflow detail
+#: document: a consumer pins it exactly, and it should move only when this
+#: document does.
+WORKFLOW_ARTIFACTS_SCHEMA_VERSION = 1
 EXECUTION_VIEW_SCHEMA = "foxhound.execution-card-service.view"
 EXECUTION_DETAIL_SCHEMA = "foxhound.execution-card-service.detail"
 EXECUTION_DETAIL_SCHEMA_VERSION = 4
@@ -205,6 +211,8 @@ ROUTES = {
     "/v1/execution-cards/resolve": "execution_resolve",
     "/v1/execution-workflows/board": "workflow_board",
     "/v1/execution-workflows/detail": "workflow_detail",
+    "/v1/execution-workflows/artifacts": "workflow_artifacts",
+    "/v1/execution-workflows/artifact": "workflow_artifact",
     "/v1/execution-workflows/priority": "execution_priority",
 }
 
@@ -981,6 +989,33 @@ class TaskCardApplication:
                     limit=_integer(request["limit"], minimum=1, maximum=100)
                 )
             )
+        if operation in {"workflow_artifacts", "workflow_artifact"}:
+            single = operation == "workflow_artifact"
+            fields = {"task_id", "workflow_version"} | ({"ordinal"} if single else set())
+            request = _strict_request(payload, required=fields, optional=set())
+            identity = self.resolve_execution_consumer(authorization)
+            if identity is None or identity.role != QUEUE_VIEW_ROLE:
+                raise TaskCardServerRequestError(
+                    "role_forbidden",
+                    "workflow artifacts require the queue_view role",
+                    HTTPStatus.FORBIDDEN,
+                )
+            task_id = _integer(request["task_id"], minimum=1)
+            version = _integer(request["workflow_version"], minimum=1)
+            if not single:
+                return _workflow_artifacts_document(
+                    self._execution_cards().workflow_artifacts(
+                        task_id, expected_version=version))
+            result = self._execution_cards().workflow_artifact(
+                task_id, expected_version=version,
+                ordinal=_integer(request["ordinal"], minimum=0),
+            )
+            if not result.accepted:
+                return _workflow_artifacts_document(result)
+            artifact = result.artifacts[0]
+            if len(artifact.content) > self.limits.max_artifact_bytes:
+                raise TaskCardServerResponseTooLarge
+            return {**_workflow_artifacts_document(result), "artifact": artifact}
         if operation == "workflow_detail":
             request = _strict_request(
                 payload, required={"task_id", "workflow_version"}, optional=set()
@@ -1462,7 +1497,7 @@ class TaskCardRequestHandler(BaseHTTPRequestHandler):
                 authorization=auth_headers[0],
             )
             artifact = result.pop("artifact", None)
-            if operation == "execution_artifact" and isinstance(
+            if operation in {"execution_artifact", "workflow_artifact"} and isinstance(
                 artifact, ExecutionCardArtifact
             ):
                 self._binary(HTTPStatus.OK, artifact.content)
@@ -2160,6 +2195,26 @@ def _execution_artifacts_document(
         "disposition": result.disposition.value,
         "card_id": result.card_id,
         "card_version": result.card_version,
+        "artifacts": [
+            {
+                "ordinal": artifact.ordinal,
+                "name": artifact.name,
+                "size_bytes": artifact.size_bytes,
+            }
+            for artifact in result.artifacts
+        ] if result.accepted else None,
+        "refusal": None if result.refusal is None else result.refusal.value,
+    }
+
+
+def _workflow_artifacts_document(result: WorkflowArtifacts) -> dict[str, Any]:
+    """Serialize file metadata for a workflow's latest result; no paths or digests."""
+    return {
+        "schema": WORKFLOW_ARTIFACTS_SCHEMA,
+        "schema_version": WORKFLOW_ARTIFACTS_SCHEMA_VERSION,
+        "ok": result.accepted,
+        "task_id": result.task_id,
+        "workflow_version": result.workflow_version,
         "artifacts": [
             {
                 "ordinal": artifact.ordinal,

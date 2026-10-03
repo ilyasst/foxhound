@@ -334,6 +334,9 @@ class WorkflowRefusal(StrEnum):
     RESULT_CONFLICT = "result_conflict"
     RESULT_UNCHANGED = "result_unchanged"
     AGENT_PROFILE_UNAVAILABLE = "agent_profile_unavailable"
+    #: This deployment serves no result files at all -- distinct from a
+    #: workflow whose files cannot be read, so a reader is not left waiting.
+    ARTIFACTS_UNAVAILABLE = "artifacts_unavailable"
 
 
 #: Statuses whose pin may be rebound. `running` is excluded deliberately: an

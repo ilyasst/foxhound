@@ -865,6 +865,12 @@ detail; they do not expose raw transcripts, paths, or another consumer's card.
 The board's `limit` bounds its active rows; workflows completed in the last
 seven days follow them, newest first, up to thirty rows, and the `completed`
 column total counts that same window. Cancelled workflows are not listed.
+The files a workflow's latest result recorded are listed at
+`POST /v1/execution-workflows/artifacts` (`task_id`, exact `workflow_version`;
+ordinal, name and size only) and one file's digest-checked bytes are read at
+`POST /v1/execution-workflows/artifact` (plus `ordinal`), under the same size
+cap as the card route. They are fenced on the workflow, not a card, so a
+result stays readable after its card is resolved. Both are `queue_view` only.
 
 The same execution `queue_view` credential may also request bounded priority
 for one exact ready workflow at `POST /v1/execution-workflows/priority` with

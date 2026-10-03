@@ -621,6 +621,101 @@ class TaskCardServerTests(unittest.TestCase):
         self.assertFalse(refused.accepted)
         self.assertEqual(refused.refusal.value, "invalid_state")
 
+    def test_workflow_artifacts_are_read_by_task_without_a_current_card(self):
+        queue = "q" * 43
+        app = TaskCardApplication(
+            self.cards, {DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: queue},
+            execution_cards=self.execution_cards, execution_workflows=self.execution,
+            execution_tokens={DRIP_ROLE: TOKEN, QUEUE_VIEW_ROLE: queue},
+        )
+        workflow = self.execution.schedule(1, expected_task_version=1)
+        empty = app.dispatch("workflow_artifacts", request_document(
+            task_id=1, workflow_version=workflow.version,
+        ), authorization=f"Bearer {queue}")
+        # Nothing recorded yet is an empty answer, not a refusal.
+        self.assertTrue(empty["ok"])
+        self.assertEqual(empty["artifacts"], [])
+
+        self.execution.start_action(1, expected_version=workflow.version, action="start")
+        run = self.execution.claim_next()
+        run_directory = self.artifact_root / "task-1" / "runs" / "execute-example"
+        run_directory.mkdir(parents=True, mode=0o700)
+        content = b"Synthetic report body.\n"
+        (run_directory / "report.md").write_bytes(content)
+        self.execution.record_result(ExecutionResultEnvelope(
+            result_id="synthetic-workflow-artifact",
+            task_id=1, task_version=1, workflow_version=run.workflow_version,
+            phase="plan", claim_token=run.token, outcome="awaiting_plan",
+            summary="Synthetic plan.", work_markdown="Synthetic work.",
+            artifacts=({
+                "relative_path": "report.md", "name": "report.md",
+                "size_bytes": len(content),
+                "content_digest": hashlib.sha256(content).hexdigest(),
+                "run_directory": str(run_directory),
+            },),
+        ))
+        # The work is finished and no card is current for it.
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "UPDATE task_execution_workflows SET status='completed',completed_at=? "
+                "WHERE task_id=1", (NOW.isoformat(timespec="seconds"),))
+            version = connection.execute(
+                "SELECT version FROM task_execution_workflows WHERE task_id=1"
+            ).fetchone()[0]
+
+        listed = app.dispatch("workflow_artifacts", request_document(
+            task_id=1, workflow_version=version,
+        ), authorization=f"Bearer {queue}")
+        self.assertEqual(listed["schema"], "foxhound.execution-workflow-service.artifacts")
+        self.assertEqual(listed["schema_version"], 1)
+        self.assertEqual(listed["artifacts"], [
+            {"ordinal": 0, "name": "report.md", "size_bytes": len(content)},
+        ])
+        self.assertNotIn("run_directory", json.dumps(listed))
+        with running_server(app) as endpoint:
+            raw_request = urllib.request.Request(
+                endpoint + "/v1/execution-workflows/artifact",
+                data=json.dumps(request_document(
+                    task_id=1, workflow_version=version, ordinal=0,
+                )).encode("utf-8"),
+                headers={"Authorization": f"Bearer {queue}",
+                         "Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(raw_request, timeout=2) as response:
+                self.assertEqual(response.headers["Content-Type"], "application/octet-stream")
+                self.assertEqual(response.read(), content)
+
+        def refusal(operation, **fields):
+            document = app.dispatch(operation, request_document(**fields),
+                                    authorization=f"Bearer {queue}")
+            self.assertFalse(document["ok"])
+            self.assertIsNone(document["artifacts"])
+            return document["refusal"]
+
+        self.assertEqual(refusal("workflow_artifacts", task_id=1, workflow_version=version + 1),
+                         "stale_workflow")
+        self.assertEqual(refusal("workflow_artifact", task_id=1, workflow_version=version, ordinal=5),
+                         "not_found")
+        self.assertEqual(refusal("workflow_artifacts", task_id=99, workflow_version=1),
+                         "not_found")
+        (run_directory / "report.md").write_bytes(b"Changed after recording.")
+        self.assertEqual(refusal("workflow_artifact", task_id=1, workflow_version=version, ordinal=0),
+                         "invalid_state")
+        with self.assertRaises(TaskCardServerRequestError):
+            app.dispatch("workflow_artifacts", request_document(
+                task_id=1, workflow_version=version,
+            ), authorization=f"Bearer {TOKEN}")
+
+        unconfigured = ExecutionCardService(
+            self.database, clock=self.clock,
+            token_factory=lambda: EXECUTION_DELIVERY_TOKEN,
+        )
+        self.assertEqual(
+            unconfigured.workflow_artifacts(1, expected_version=version).refusal.value,
+            "artifacts_unavailable",
+        )
+
     def _queue_card(self):
         self.execution.schedule(1, expected_task_version=1)
         self.execution_cards.schedule()
