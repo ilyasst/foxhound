@@ -735,6 +735,45 @@ class NativeCandidateIntakeTests(unittest.TestCase):
         self.assertFalse(task.owner_pinned)
         self.assertFalse(task.owner_provisional)
 
+    def test_registry_id_only_revision_keeps_the_task_and_its_workflow(self):
+        """A speaker-view rebuild is not a new task (#830)."""
+        self.activate()
+        item = owner_candidate(1)
+        self.assertTrue(self.inbox.import_feed(feed(0, item)).accepted)
+        self.intake()
+        execution = TaskExecutionService(self.database, clock=lambda: NOW)
+        scheduled = execution.schedule(1, expected_task_version=1)
+        self.assertNotEqual(scheduled.status, WorkflowStatus.CANCELLED)
+
+        revised = copy.deepcopy(item)
+        revised["task"]["owner_ref"]["speaker_registry_id"] = "registry-beta"
+        revised["source"]["revision"] = hashlib.sha256(
+            json.dumps(revised, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        self.assertTrue(self.inbox.import_feed(feed(1, revised)).accepted)
+        self.intake()
+
+        task = self.ledger.get(1)
+        self.assertEqual(task.version, 1)
+        self.assertEqual(task.owner_speaker_registry_id, "registry-beta")
+        execution.schedule_new()
+        self.assertNotEqual(execution.get(1).status, WorkflowStatus.CANCELLED)
+
+    def test_owner_change_with_registry_change_still_revises(self):
+        self.activate()
+        item = owner_candidate(1)
+        self.inbox.import_feed(feed(0, item))
+        self.intake()
+        revised = copy.deepcopy(item)
+        revised["task"]["owner_ref"]["speaker_registry_id"] = "registry-beta"
+        revised["task"]["owner_ref"]["speaker_id"] = "SPK_102"
+        revised["source"]["revision"] = hashlib.sha256(
+            json.dumps(revised, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        self.inbox.import_feed(feed(1, revised))
+        self.intake()
+        self.assertEqual(self.ledger.get(1).version, 2)
+
     def test_person_identity_is_persisted_for_owner_and_participants(self):
         self.activate()
         item = person_identity_candidate(1)

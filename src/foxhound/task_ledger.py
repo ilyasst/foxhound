@@ -899,13 +899,32 @@ class TaskLedger:
                     if (
                         task["text"] == candidate.task.text
                         and task["due"] == candidate.task.due
-                        and _row_owner_values(task) == desired_owner
+                        and _without_owner_registry(_row_owner_values(task))
+                        == _without_owner_registry(desired_owner)
                         and _row_structure_values(task)
                         == _candidate_structure_values(candidate)
-                        and _stored_participants(connection, int(task["id"]))
-                        == _candidate_participants(candidate)
+                        and _without_participant_registry(
+                            _stored_participants(connection, int(task["id"])))
+                        == _without_participant_registry(
+                            _candidate_participants(candidate))
                         and not review_head_changed
                     ):
+                        # The speaker registry id names which speaker view a
+                        # reference was resolved in, not who the person is.
+                        # A view rebuild changes it on every task at once:
+                        # 57 open tasks were versioned, and every plan on
+                        # them cancelled, for that alone (#830). Record it
+                        # without making the task a different task.
+                        if _row_owner_values(task)[5] != desired_owner[5]:
+                            connection.execute(
+                                "UPDATE tasks SET owner_speaker_registry_id=?,"
+                                "updated_at=? WHERE id=?",
+                                (desired_owner[5], now, int(binding["task_id"])),
+                            )
+                        if (_stored_participants(connection, int(task["id"]))
+                                != _candidate_participants(candidate)):
+                            _replace_participants(
+                                connection, int(binding["task_id"]), candidate)
                         # A producer may enrich the evidence for an already
                         # accepted task without changing the work itself.
                         # Advancing the binding is necessary so cards read the
@@ -2245,6 +2264,18 @@ def _candidate_participants(candidate: TaskCandidate) -> tuple[tuple[object, ...
          reference.speaker_registry_id, reference.person_id)
         for reference in candidate.task.participants
     )
+
+
+def _without_owner_registry(values: tuple[object, ...]) -> tuple[object, ...]:
+    """Owner state without the speaker registry id (position 5)."""
+    return values[:5] + (None,) + values[6:]
+
+
+def _without_participant_registry(
+    participants: tuple[tuple[object, ...], ...],
+) -> tuple[tuple[object, ...], ...]:
+    """Participants without their speaker registry id (position 3)."""
+    return tuple(item[:3] + (None,) + item[4:] for item in participants)
 
 
 def _stored_participants(
