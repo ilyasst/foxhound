@@ -882,7 +882,9 @@ class TaskCardApplication:
                 "schema": EXECUTION_QUEUE_SCHEMA,
                 "schema_version": EXECUTION_QUEUE_SCHEMA_VERSION,
                 "ok": True,
-                "cards": [_execution_queue_card_document(card) for card in cards],
+                "cards": _bounded_queue_rows(
+                    cards, self.limits.max_response_bytes - QUEUE_ENVELOPE_RESERVE
+                ),
             }
         if operation == "execution_board":
             request = _request(payload, required={"limit"})
@@ -1881,6 +1883,57 @@ def _queue_projection_records(records: object) -> list[dict[str, str]]:
             "subject": _queue_projection_text(record.subject, 500),
         })
     return result
+
+
+#: Bytes kept back for the queue reply's envelope and JSON punctuation.
+QUEUE_ENVELOPE_RESERVE = 4 * 1024
+
+
+def _row_bytes(row: Mapping[str, Any]) -> int:
+    return len(json.dumps(row, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) + 1
+
+
+def _shrink_queue_row(row: dict[str, Any], budget: int) -> dict[str, Any]:
+    """Trim a row's lists, longest first, until it fits `budget` bytes."""
+    row = dict(row)
+    for key in ("deliverables", "external_actions", "questions"):
+        row[key] = list(row[key])
+    while _row_bytes(row) > budget and any(row[k] for k in ("deliverables", "external_actions", "questions")):
+        longest = max(("deliverables", "external_actions", "questions"),
+                      key=lambda key: len(row[key]))
+        row[longest].pop()
+    for key, size in (("work_digest", 500), ("summary", 500), ("task", 500)):
+        if _row_bytes(row) <= budget:
+            break
+        row[key] = _queue_projection_text(row[key], size)
+    return row
+
+
+def _bounded_queue_rows(cards: Any, budget: int) -> list[dict[str, Any]]:
+    """Queue rows in order, as many as one reply can carry (#708).
+
+    The per-record bounds allow one row of ~230 KB (32 records of 3000
+    characters in each of two lists, plus 32 questions of 1000) against a
+    192 KiB reply, and the route accepts `limit` up to 1000. Measured rows
+    are ~1.4 KiB at the median and ~6 KiB at worst, so a realistic page
+    rarely reaches the budget; when one does, the remaining rows are left for
+    the next read instead of failing the whole reply with a 502. A row too
+    large on its own is shortened rather than dropped, so a pathological card
+    cannot hide the queue behind it.
+    """
+    rows: list[dict[str, Any]] = []
+    used = 2
+    for card in cards:
+        row = _execution_queue_card_document(card)
+        size = _row_bytes(row)
+        if used + size > budget:
+            if rows:
+                break
+            row = _shrink_queue_row(row, budget - used)
+            size = _row_bytes(row)
+        rows.append(row)
+        used += size
+    return rows
 
 
 def _execution_queue_card_document(card: Any) -> dict[str, Any]:
