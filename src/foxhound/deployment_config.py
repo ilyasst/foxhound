@@ -301,6 +301,9 @@ class ResearchRunnerConsumerConfig:
     profile_id: str | None = None
     worker_id: str | None = None
     lease_seconds: int | None = None
+    #: Apply the scheduling recommendations a published research report
+    #: makes (#771). Off unless the operator turns it on.
+    apply_scheduling: bool = False
 
 
 @dataclass(frozen=True)
@@ -513,6 +516,8 @@ class DeploymentConfig:
             cmd.extend(("--agent-toolsets", cfg.agent_toolsets))
         if cfg.agent_max_turns is not None:
             cmd.extend(("--agent-max-turns", str(cfg.agent_max_turns)))
+        if cfg.apply_scheduling:
+            cmd.append("--apply-scheduling")
         if cfg.agent_timeout is not None:
             cmd.extend(("--agent-timeout", str(cfg.agent_timeout)))
         for name, path in cfg.knowledge_roots:
@@ -1273,7 +1278,7 @@ def _parse_research_runner(
     optional = {
         "hermes_command", "agent_toolsets", "agent_max_turns",
         "agent_timeout", "knowledge_roots", "read_only_commands",
-        "profile_id", "worker_id", "lease_seconds",
+        "profile_id", "worker_id", "lease_seconds", "apply_scheduling",
     }
     document = _enabled_document(value, required, optional)
     if document is None:
@@ -1416,7 +1421,14 @@ def _parse_research_runner(
         profile_id=profile_id,
         worker_id=worker_id,
         lease_seconds=lease_seconds,
+        apply_scheduling=_optional_bool(document.get("apply_scheduling", False)),
     )
+
+
+def _optional_bool(value: object) -> bool:
+    if not isinstance(value, bool):
+        raise DeploymentConfigError("database consumer configuration is invalid")
+    return value
 
 
 def _parse_failure_digest(value: object) -> int | None:

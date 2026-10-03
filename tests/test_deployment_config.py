@@ -892,6 +892,17 @@ class DeploymentConfigTests(unittest.TestCase):
         command = config.argv("research-runner")
 
         self.assertEqual(command[0], "foxhound-task-research-runner")
+        self.assertNotIn("--apply-scheduling", command)
+        document["database_consumers"]["research_runner"]["apply_scheduling"] = True
+        self._write_config(document)
+        self.assertIn("--apply-scheduling",
+                      load_deployment_config(self.config_path).argv("research-runner"))
+        document["database_consumers"]["research_runner"]["apply_scheduling"] = "yes"
+        self._write_config(document)
+        with self.assertRaises(DeploymentConfigError):
+            load_deployment_config(self.config_path)
+        del document["database_consumers"]["research_runner"]["apply_scheduling"]
+        self._write_config(document)
         self.assertEqual(command[command.index("--database") + 1], str(self.database))
         self.assertEqual(command[command.index("--cas-root") + 1], str(self.root / "cas"))
         self.assertEqual(command[command.index("--task-work-root") + 1], str(self.task_work_root))
