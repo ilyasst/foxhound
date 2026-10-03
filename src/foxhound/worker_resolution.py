@@ -33,6 +33,8 @@ Two things close that, and they are complementary:
 
 from __future__ import annotations
 
+import importlib
+import importlib.util
 import json
 import os
 import re
@@ -59,9 +61,17 @@ REPORT_TIMEOUT_SECONDS = 30
 REPORT_SCHEMA = "foxhound.worker-report"
 REPORT_SCHEMA_VERSION = 1
 
+#: A release directory name looks like a hex revision (7-40 characters).
+#: Matches the pattern used in ``release_revision._looks_like_revision``.
+_RELEASE_REVISION_RE = re.compile(r"^[0-9a-f]{7,40}$")
+
 
 class WorkerMismatch(RuntimeError):
     """The worker that would run is not compatible with this runner."""
+
+
+class PackageOutsideRelease(RuntimeError):
+    """The imported foxhound package is not inside the selected release."""
 
 
 def is_worker_command(value: object) -> bool:
@@ -176,3 +186,97 @@ def verify_worker(
             f"{reported}, runner writes {run_state_schema_version}"
         )
     return document
+
+
+def _release_root() -> Path | None:
+    """The release directory this interpreter's environment belongs to, or None.
+
+    A release is ``releases/<revision>/`` with its own virtualenv at
+    ``<release>/venv``. The environment is located by ``sys.prefix``, not by
+    ``sys.executable``: a virtualenv's interpreter is a symlink to the system
+    Python, so resolving the executable lands outside every release and would
+    switch this check off on exactly the hosts it protects.
+    """
+    prefix = Path(sys.prefix).resolve()
+    for parent in (prefix, *prefix.parents):
+        if parent.parent.name == "releases" and _RELEASE_REVISION_RE.fullmatch(
+            parent.name
+        ):
+            return parent
+    return None
+
+
+def _is_release_deployment() -> bool:
+    """Whether this process runs from a release's own environment."""
+    return _release_root() is not None
+
+
+def _running_package_root(package: str = "foxhound") -> Path | None:
+    """Return the filesystem root that contains the imported package.
+
+    For a normal installed package this is the directory that contains
+    ``<package>/`` (e.g. ``site-packages``).  For an editable install it is
+    the working tree root.  Returns None if the package cannot be found.
+    """
+    spec = importlib.util.find_spec(package)
+    if spec is None:
+        return None
+    origin = spec.origin
+    if origin is None:
+        # Namespace package or similar; cannot determine location.
+        return None
+    return Path(origin).resolve().parent.parent
+
+
+def verify_release_integrity(
+    *,
+    package: str = "foxhound",
+    release_root: Path | None = None,
+    is_release: bool | None = None,
+) -> None:
+    """Refuse to claim when the imported package is not inside the release.
+
+    An editable install pointed at a development checkout replaces the
+    release's own package while every path and symlink still reads as
+    correct.  This check resolves where the ``foxhound`` package actually
+    lives on disk and refuses when it sits outside the selected release.
+
+    The check only applies to release deployments.  A development checkout
+    run directly, or a test suite run from a working tree, must not be
+    refused — the check exists to protect a release deployment, not to
+    block development.  ``is_release`` controls this: when ``True`` (or
+    unset, in which case the interpreter path is inspected) the check runs;
+    when explicitly ``False`` it is skipped.
+
+    Raises :class:`PackageOutsideRelease` with a content-free message when
+    the package resolves outside the release root.
+    """
+    # Determine whether this is a release deployment.
+    if is_release is None:
+        is_release = _is_release_deployment()
+    if not is_release:
+        # Development checkout, test suite, or non-release invocation: skip.
+        return
+
+    # Determine the release root.
+    if release_root is None:
+        release_root = _release_root()
+    if release_root is None:
+        # Could not identify the release root; skip rather than refusing a
+        # deployment that might be valid under a non-standard layout.
+        return
+
+    # Resolve where the package actually lives.
+    package_root = _running_package_root(package)
+    if package_root is None:
+        # Cannot determine the package's location.  This is a fault, but not
+        # one we can diagnose content-free; skip so the runner still starts.
+        return
+
+    # The package must be inside the release root.
+    try:
+        package_root.relative_to(release_root)
+    except ValueError:
+        raise PackageOutsideRelease(
+            "running package is not inside the selected release"
+        )
