@@ -1954,3 +1954,76 @@ def test_agent_synthesize_task_json_runtime_and_due_in_days(tmp_path: Path) -> N
     assert "due_in_days" not in task_json
     assert task_json["task_id"] == 101
     assert task_json["title"] == "Future task"
+
+
+def test_agent_synthesize_task_json_neighbours(tmp_path: Path) -> None:
+    fake_hermes = tmp_path / "fake_hermes.py"
+    valid_research = {
+        "ownership": {"verdict": "reader", "evidence": []},
+        "requested_deliverable": {"text": "Produce research summary", "evidence": []},
+        "constraints": [],
+        "entities": [],
+        "facts": [],
+        "open_questions": [],
+        "recommendation": {"text": "Proceed", "evidence": []},
+    }
+    _write_fake_hermes(fake_hermes, output_json=valid_research)
+
+    config = AgentResearchConfig(
+        hermes_command=str(fake_hermes),
+        model="test-model",
+    )
+
+    # 1. Directly in ctx["neighbours"]
+    neighbours_payload = {
+        "items": [
+            {
+                "id": 102,
+                "text": "Sibling task",
+                "status": "open",
+                "owner": "Person A",
+                "selection": "same_source",
+            }
+        ],
+        "total_count": 1,
+        "truncated": False,
+    }
+    ctx = {
+        "task_snapshot": {"task_id": 101, "title": "Main task"},
+        "neighbours": neighbours_payload,
+    }
+    run_dir = tmp_path / "run_neighbours_ctx"
+    agent_synthesize(ctx, config=config, bound_sources=None, run_dir=run_dir)
+    task_json = json.loads((run_dir / "task.json").read_text())
+    assert task_json["neighbours"] == neighbours_payload
+
+    # 2. Derived from ctx["database_path"]
+    import sqlite3
+    from foxhound import migrate_database
+    db_path = tmp_path / "foxhound.sqlite3"
+    migrate_database(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO tasks(id,status,text,owner,version,created_at,updated_at) "
+            "VALUES(101, 'open', 'Main', 'Person A', 1, '2030-01-01T00:00:00Z', '2030-01-01T00:00:00Z')"
+        )
+        conn.execute(
+            "INSERT INTO tasks(id,status,text,owner,version,created_at,updated_at) "
+            "VALUES(102, 'open', 'Sibling', 'Person B', 1, '2030-01-01T00:00:00Z', '2030-01-01T00:00:00Z')"
+        )
+        conn.execute(
+            "INSERT INTO task_relations(subject_id,object_id,kind,basis,asserted_by,created_at) "
+            "VALUES(101, 102, 'duplicate_of', 'same topic', 'machine', '2030-01-01T00:00:00Z')"
+        )
+        conn.commit()
+
+    ctx_db = {
+        "task_snapshot": {"task_id": 101, "title": "Main task"},
+        "database_path": str(db_path),
+    }
+    run_dir_db = tmp_path / "run_neighbours_db"
+    agent_synthesize(ctx_db, config=config, bound_sources=None, run_dir=run_dir_db)
+    task_json_db = json.loads((run_dir_db / "task.json").read_text())
+    assert "neighbours" in task_json_db
+    assert task_json_db["neighbours"]["total_count"] == 1
+    assert task_json_db["neighbours"]["items"][0]["id"] == 102
