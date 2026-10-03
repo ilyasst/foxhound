@@ -1417,6 +1417,116 @@ class TaskExecutionTests(unittest.TestCase):
         claims = [service.claim_next() for _ in range(4)]
         self.assertEqual([claim.task_id for claim in claims], [2, 3, 1, 4])
 
+    def test_claim_runs_predecessor_of_urgent_work_first(self):
+        """Predecessor inherits urgent effective deadline band (#771)."""
+        today = self.clock().date()
+        self._add_task(2, "Synthetic predecessor task no due date")
+        self._add_task(3, "Synthetic urgent task due tomorrow")
+        self._add_task(4, "Synthetic older task no due date")
+        now = self._now()
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "UPDATE tasks SET due=? WHERE id=?",
+                ((today + timedelta(days=1)).isoformat(), 3),
+            )
+            # Create a change set row for task_scheduling_conditions
+            connection.execute(
+                "INSERT INTO task_scheduling_change_sets("
+                "id,target_task_id,target_task_version,expected_workflow_version,"
+                "kind,state,research_receipt_id,research_document_digest,"
+                "recommendation_digest,recommendation_json,resulting_workflow_version,"
+                "created_at,updated_at) VALUES(1,3,1,1,'after_task_completed','active',"
+                "'receipt-1',?,?,?,1,?,?)",
+                ("0" * 64, "0" * 64, "{}", now, now),
+            )
+            # Task 3 depends on task 2 being completed
+            connection.execute(
+                "INSERT INTO task_scheduling_conditions("
+                "task_id,task_version,kind,depends_on_task_id,not_before,"
+                "state,change_set_id,created_at,updated_at) "
+                "VALUES(3,1,'after_task_completed',2,NULL,'active',1,?,?)",
+                (now, now),
+            )
+            connection.commit()
+
+        # Task 4 is created after task 2, but let's test task 2 claimed before task 4
+        self._schedule_and_start()
+        for task_id in (4, 3, 2):
+            workflow = self.service.schedule(task_id, expected_task_version=1)
+            assert workflow is not None
+            self.service.start_action(
+                task_id, expected_version=workflow.version, action="start",
+            )
+        service = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: TOKEN,
+            execution_slot_cap=4,
+            profile_registry=self.service._profile_registry,
+        )
+        claims = [service.claim_next() for _ in range(3)]
+        self.assertEqual([claim.task_id for claim in claims if claim is not None], [2, 1, 4])
+
+    def test_claim_handles_dependency_cycle_without_error(self):
+        """A dependency cycle does not break claiming."""
+        self._add_task(2, "Task 2")
+        self._add_task(3, "Task 3")
+        now = self._now()
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "INSERT INTO task_scheduling_change_sets("
+                "id,target_task_id,target_task_version,expected_workflow_version,"
+                "kind,state,research_receipt_id,research_document_digest,"
+                "recommendation_digest,recommendation_json,resulting_workflow_version,"
+                "created_at,updated_at) VALUES(1,2,1,1,'after_task_completed','active',"
+                "'receipt-1',?,?,?,1,?,?)",
+                ("0" * 64, "0" * 64, "{}", now, now),
+            )
+            connection.execute(
+                "INSERT INTO task_scheduling_change_sets("
+                "id,target_task_id,target_task_version,expected_workflow_version,"
+                "kind,state,research_receipt_id,research_document_digest,"
+                "recommendation_digest,recommendation_json,resulting_workflow_version,"
+                "created_at,updated_at) VALUES(2,3,1,1,'after_task_completed','active',"
+                "'receipt-2',?,?,?,1,?,?)",
+                ("0" * 64, "0" * 64, "{}", now, now),
+            )
+            # 2 depends on 3, and 3 depends on 2 (cycle)
+            connection.execute(
+                "INSERT INTO task_scheduling_conditions("
+                "task_id,task_version,kind,depends_on_task_id,not_before,"
+                "state,change_set_id,created_at,updated_at) "
+                "VALUES(2,1,'after_task_completed',3,NULL,'active',1,?,?)",
+                (now, now),
+            )
+            connection.execute(
+                "INSERT INTO task_scheduling_conditions("
+                "task_id,task_version,kind,depends_on_task_id,not_before,"
+                "state,change_set_id,created_at,updated_at) "
+                "VALUES(3,1,'after_task_completed',2,NULL,'active',2,?,?)",
+                (now, now),
+            )
+            connection.commit()
+
+        self._schedule_and_start()
+        for task_id in (2, 3):
+            workflow = self.service.schedule(task_id, expected_task_version=1)
+            assert workflow is not None
+            self.service.start_action(
+                task_id, expected_version=workflow.version, action="start",
+            )
+        service = TaskExecutionService(
+            self.database,
+            clock=self.clock,
+            token_factory=lambda: TOKEN,
+            execution_slot_cap=4,
+            profile_registry=self.service._profile_registry,
+        )
+        claim = service.claim_next()
+        self.assertIsNotNone(claim)
+        assert claim is not None
+        self.assertEqual(claim.task_id, 1)
+
     def test_new_work_and_reader_waiting_have_separate_gw_caps(self):
         with closing(sqlite3.connect(self.database)) as connection:
             for task_id in range(2, 36):
