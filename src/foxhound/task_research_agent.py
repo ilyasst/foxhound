@@ -1342,22 +1342,15 @@ def agent_synthesize(
     (run_dir / ".ripgreprc").write_text("--follow\n", encoding="utf-8")
 
     runtime_data = _clock()
+    task_json_snapshot = {
+        key: val for key, val in task_snapshot.items() if key != "due"
+    }
     task_json_payload = {
-        **task_snapshot,
+        **task_json_snapshot,
         "runtime": runtime_data,
         "knowledge_roots": knowledge_roots_data,
         "starting_points": starting_points_data,
     }
-    due = task_snapshot.get("due")
-    if isinstance(due, str) and due.strip():
-        try:
-            today_str = runtime_data.get("today")
-            if isinstance(today_str, str):
-                task_json_payload["due_in_days"] = (
-                    date.fromisoformat(due.strip()) - date.fromisoformat(today_str)
-                ).days
-        except Exception:
-            pass
     if config.reader_aliases:
         task_json_payload["reader"] = {"aliases": list(config.reader_aliases)}
     if config.read_only_commands:
