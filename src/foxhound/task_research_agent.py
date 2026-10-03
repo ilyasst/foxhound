@@ -705,7 +705,20 @@ def _convert_research_json(
             run_dir=run_dir, basename_cache=basename_cache,
             degrade=degrade, stats=stats,
         )
-        if claim["source_refs"]:
+        # The guide is the file the plan is told to follow, read from the
+        # claim's first source, so that source must be the guide itself.
+        # Agents reported "no guide matches" with only the index cited,
+        # which then told every later pass to follow guides.md.
+        mapped_guide = (
+            _map_locator(str(guide_path), knowledge_roots, read_only_commands,
+                         run_dir=run_dir, basename_cache=basename_cache)
+            if guide_path else None
+        )
+        if (
+            claim["source_refs"]
+            and mapped_guide is not None
+            and PurePosixPath(mapped_guide[1]).name.lower() != "guides.md"
+        ):
             guide_claim = claim
 
     # deadline <- deadline
