@@ -588,20 +588,43 @@ class ResearchStore:
         token_digest = _digest(token.encode())
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
-            if bounded_root is None:
-                row = connection.execute(
-                    "SELECT * FROM task_research_jobs WHERE state='queued' "
-                    "ORDER BY requested_at,job_id LIMIT 1"
-                ).fetchone()
-            else:
-                row = connection.execute(
-                    "SELECT * FROM task_research_jobs WHERE state='queued' "
-                    "AND task_work_root=? ORDER BY requested_at,job_id LIMIT 1",
-                    (bounded_root,),
-                ).fetchone()
-            if row is None:
-                connection.commit()
-                return None
+            while True:
+                if bounded_root is None:
+                    row = connection.execute(
+                        "SELECT j.*, t.version AS current_task_version, t.status AS task_status "
+                        "FROM task_research_jobs j "
+                        "JOIN tasks t ON t.id = j.task_id "
+                        "WHERE j.state='queued' "
+                        "ORDER BY j.requested_at, j.job_id LIMIT 1"
+                    ).fetchone()
+                else:
+                    row = connection.execute(
+                        "SELECT j.*, t.version AS current_task_version, t.status AS task_status "
+                        "FROM task_research_jobs j "
+                        "JOIN tasks t ON t.id = j.task_id "
+                        "WHERE j.state='queued' AND j.task_work_root=? "
+                        "ORDER BY j.requested_at, j.job_id LIMIT 1",
+                        (bounded_root,),
+                    ).fetchone()
+                if row is None:
+                    connection.commit()
+                    return None
+
+                if row["task_status"] != "open" or row["task_version"] != row["current_task_version"]:
+                    connection.execute(
+                        "UPDATE task_research_jobs "
+                        "SET state='canceled', failure_code='superseded', updated_at=? "
+                        "WHERE job_id=?",
+                        (now, row["job_id"]),
+                    )
+                    connection.execute(
+                        "INSERT INTO task_research_events(job_id,task_id,kind,from_state,to_state,occurred_at) "
+                        "VALUES(?,?,'canceled','queued','canceled',?)",
+                        (row["job_id"], row["task_id"], now),
+                    )
+                    continue
+
+                break
             connection.execute(
                 "UPDATE task_research_jobs SET state='running',attempts=attempts+1,updated_at=? "
                 "WHERE job_id=?", (now, row["job_id"]),
